@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { DECISION_JSON_SCHEMA, RunInput } from '@thuli/core';
+import { GRAPH_ANSWER_JSON_SCHEMA, GraphRecord } from '@thuli/core';
 import { loadEnv } from '../env.ts';
 import { fetchJsonCapped, type JsonReply } from '../http.ts';
 
@@ -12,8 +12,6 @@ export interface ServReply {
   /** SERV's run id from the x-openserv-request-id header: the audit id for this decision. */
   requestId: string | null;
   rawText: string;
-  /** Transaction hashes our own tools returned during the run. Always empty until paid lookups exist. */
-  toolTxs: string[];
 }
 
 export class ServError extends Error {
@@ -29,26 +27,10 @@ export class ServError extends Error {
 }
 
 export const SERV_TIMEOUT_MS = 120_000;
-// The graph itself fails a run that asks for an eleventh tool round, so ten answers is the most worth sending.
-export const MAX_TOOL_ROUNDS = 10;
 export const V2_MODEL = 'gpt-6-luna';
 const MAX_REPLY_BYTES = 1024 * 1024;
 const MAX_RULEBOOK_CHARS = 50_000;
 const REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-
-const FUNDER_HOP_TOOL = {
-  type: 'function',
-  name: 'buy_funder_hop',
-  description: 'Buy one paid lookup of who funded an address. About one cent, from the capped budget.',
-  parameters: {
-    type: 'object',
-    properties: { address: { type: 'string' } },
-    required: ['address'],
-    additionalProperties: false,
-  },
-} as const;
-
-const LOOKUPS_DISABLED = JSON.stringify({ error: 'paid lookups are not enabled in this build' });
 
 const ResponsesBody = z.object({
   id: z.string().min(1).max(256),
@@ -56,13 +38,6 @@ const ResponsesBody = z.object({
   output_text: z.string().optional(),
 });
 type ResponsesBody = z.infer<typeof ResponsesBody>;
-
-const FunctionCallItem = z.object({
-  type: z.literal('function_call'),
-  call_id: z.string().min(1).max(256),
-  name: z.string(),
-  arguments: z.string(),
-});
 
 const MessageItem = z.object({
   type: z.literal('message'),
@@ -126,17 +101,6 @@ function parseResponsesBody(json: unknown, requestId: string | null): ResponsesB
   return parsed.data;
 }
 
-function functionCalls(body: ResponsesBody, requestId: string | null) {
-  const asked = body.output.filter(
-    (item) => typeof item === 'object' && item !== null && (item as { type?: unknown }).type === 'function_call',
-  );
-  return asked.map((item) => {
-    const call = FunctionCallItem.safeParse(item);
-    if (!call.success) throw new ServError('the graph asked for a tool in an unexpected shape', null, requestId);
-    return call.data;
-  });
-}
-
 // SERV documents output_text on the Responses body; if it is ever absent, the same text sits in the message items.
 function outputText(body: ResponsesBody): string {
   if (body.output_text !== undefined) return body.output_text;
@@ -152,56 +116,40 @@ function outputText(body: ResponsesBody): string {
 }
 
 /**
- * Runs one wallet through Thuli's rulebook graph on SERV v3. The run input travels as JSON in `instructions`; any
- * tool call is answered with an error because paid lookups are not built yet, which the rulebook treats as missing
- * and therefore hold. Never streams. Each request has a 120 second timeout.
+ * Runs one wallet through Thuli's rulebook graph on SERV v3. The flat wallet record travels as JSON in
+ * `instructions` and nothing else is sent: graph generation fails whenever the prompt names a caller tool, so the
+ * graph gets none, and any funder lookup is bought by Thuli's code before the call. The record is checked again here,
+ * so a bad one throws before it is sent. Never streams. Each request has a 120 second timeout.
  *
- * @throws ServError on a non-2xx status, a reply in an unexpected shape, or more than 10 tool rounds.
+ * @throws ServError on a non-2xx status, a reply in an unexpected shape, or a reply that asks for a tool.
  */
-export async function decideViaGraph(input: RunInput, opts: ServConnection & { graphId: string }): Promise<ServReply> {
-  const runInput = RunInput.parse(input);
-  const tools = [FUNDER_HOP_TOOL];
-  const first = await postJson(opts, '/responses', {
-    model: opts.graphId,
-    instructions: JSON.stringify(runInput),
-    tools,
-  });
-  const requestId = first.requestId;
-  let body = parseResponsesBody(first.reply.json, requestId);
-
-  for (let round = 0; ; round += 1) {
-    const calls = functionCalls(body, requestId);
-    if (calls.length === 0) break;
-    if (round >= MAX_TOOL_ROUNDS) {
-      throw new ServError(`the graph asked for tools more than ${MAX_TOOL_ROUNDS} times`, null, requestId);
-    }
-    const next = await postJson(opts, '/responses', {
-      model: opts.graphId,
-      previous_response_id: body.id,
-      input: calls.map((call) => ({ type: 'function_call_output', call_id: call.call_id, output: LOOKUPS_DISABLED })),
-      tools,
-    });
-    body = parseResponsesBody(next.reply.json, requestId);
-  }
-
-  return { requestId, rawText: outputText(body), toolTxs: [] };
+export async function decideViaGraph(record: GraphRecord, opts: ServConnection & { graphId: string }): Promise<ServReply> {
+  const instructions = JSON.stringify(GraphRecord.parse(record));
+  const { reply, requestId } = await postJson(opts, '/responses', { model: opts.graphId, instructions });
+  const body = parseResponsesBody(reply.json, requestId);
+  const askedForTool = body.output.some(
+    (item) => typeof item === 'object' && item !== null && (item as { type?: unknown }).type === 'function_call',
+  );
+  if (askedForTool) throw new ServError('the graph asked for a tool, and this build gives it none', null, requestId);
+  return { requestId, rawText: outputText(body) };
 }
 
 /**
- * Runs one wallet through the rulebook on SERV v2: the rulebook is the system message and the run input is the user
- * message, with the reply held to the decision schema. Each request has a 120 second timeout.
+ * Runs one wallet through the rulebook on SERV v2: the rulebook is the system message and the flat wallet record is
+ * the user message, with the reply held to the same answer schema the graph uses. The record is checked again here,
+ * so a bad one throws before it is sent. Each request has a 120 second timeout.
  *
- * No Prompt Guard: the run input carries no text a stranger wrote (C14, C34), so the guard has nothing to catch, and
+ * No Prompt Guard: the record carries no text a stranger wrote (C14, C34), so the guard has nothing to catch, and
  * live it refused this rulebook outright with "I can't share that." before the model ran (run 075f6409, 3 Nov).
  *
- * @throws ServError on a non-2xx status or a reply in an unexpected shape.
+ * @throws ServError on a non-2xx status, an empty or overlong rulebook, or a reply in an unexpected shape.
  */
 export async function decideViaV2(
-  input: RunInput,
+  record: GraphRecord,
   rulebookText: string,
   conn: ServConnection = connectionFromEnv(),
 ): Promise<ServReply> {
-  const runInput = RunInput.parse(input);
+  const recordJson = JSON.stringify(GraphRecord.parse(record));
   if (rulebookText.trim() === '' || rulebookText.length > MAX_RULEBOOK_CHARS) {
     throw new ServError('the rulebook text is empty or too long', null, null);
   }
@@ -209,14 +157,14 @@ export async function decideViaV2(
     model: V2_MODEL,
     messages: [
       { role: 'system', content: rulebookText },
-      { role: 'user', content: JSON.stringify(runInput) },
+      { role: 'user', content: recordJson },
     ],
     response_format: {
       type: 'json_schema',
-      json_schema: { name: 'thuli_decision', strict: true, schema: DECISION_JSON_SCHEMA },
+      json_schema: { name: 'thuli_answer', strict: true, schema: GRAPH_ANSWER_JSON_SCHEMA },
     },
   });
   const body = ChatBody.safeParse(reply.json);
   if (!body.success) throw new ServError('SERV reply did not match the chat completion shape', reply.status, requestId);
-  return { requestId, rawText: body.data.choices[0]?.message.content ?? '', toolTxs: [] };
+  return { requestId, rawText: body.data.choices[0]?.message.content ?? '' };
 }

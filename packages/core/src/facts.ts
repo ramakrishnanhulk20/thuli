@@ -1,9 +1,5 @@
 import { z } from 'zod';
 import { isCanonicalAddress, type Address } from './address.ts';
-import { CHAIN_NAMES } from './chains.ts';
-import { OutcomeSchema } from './outcome.ts';
-import { Settings } from './settings.ts';
-import { Start } from './start.ts';
 
 // Every field below is a number, a boolean, a fixed word, an address or a hash. There is deliberately no free-text
 // field anywhere in what the model sees, so text a stranger wrote on-chain has no way in (threat model C14, C34).
@@ -65,18 +61,3 @@ export const Facts = z.strictObject({
 });
 
 export type Facts = z.infer<typeof Facts>;
-
-export const RunInput = z.strictObject({
-  wallet: CanonicalAddress,
-  snapshot: z.strictObject({
-    chain: z.enum(CHAIN_NAMES),
-    block: Count,
-    time: z.iso.datetime(),
-  }),
-  settings: Settings,
-  ceiling: OutcomeSchema,
-  start: Start,
-  facts: Facts,
-});
-
-export type RunInput = z.infer<typeof RunInput>;

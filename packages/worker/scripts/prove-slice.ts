@@ -4,17 +4,17 @@ import {
   AddressError,
   computeCeiling,
   computeStart,
+  decisionFromGraphAnswer,
   DEFAULT_SETTINGS,
   holdForReview,
   parseAddress,
-  parseRawDecision,
-  RunInput,
+  toGraphRecord,
   validateDecision,
   type Address,
   type FactName,
 } from '@thuli/core';
 import { EnvError, loadEnv } from '../src/env.ts';
-import { collectBasicFacts, readSnapshotTime, type FactSources } from '../src/facts/basic.ts';
+import { collectBasicFacts, type FactSources } from '../src/facts/basic.ts';
 import { decideViaGraph, decideViaV2, ServError, type ServReply } from '../src/serv/client.ts';
 
 // One block before the first ROBO claim (block 24546233), so no fact can include the claim or anything after it.
@@ -82,22 +82,17 @@ async function main(): Promise<number> {
   console.log(`ceiling: ${ceiling} (${reason})`);
   console.log(`start: ${start.outcome} (${start.rule})`);
 
-  const input = RunInput.parse({
-    wallet,
-    snapshot: { chain: 'ethereum', block, time: await readSnapshotTime(block, sources) },
-    settings: DEFAULT_SETTINGS,
-    ceiling,
-    start,
-    facts,
-  });
+  const record = toGraphRecord(facts, start);
+  console.log('record:');
+  console.log(JSON.stringify(record, null, 2));
   const connection = { baseUrl: env.SERV_BASE_URL, apiKey: env.SERV_API_KEY };
 
   let reply: ServReply;
   try {
     reply =
       mode === 'v3'
-        ? await decideViaGraph(input, { ...connection, graphId: env.SERV_GRAPH_ID as string })
-        : await decideViaV2(input, await readFile(RULEBOOK_PATH, 'utf8'), connection);
+        ? await decideViaGraph(record, { ...connection, graphId: env.SERV_GRAPH_ID as string })
+        : await decideViaV2(record, await readFile(RULEBOOK_PATH, 'utf8'), connection);
   } catch (error) {
     if (!(error instanceof ServError)) throw error;
     const held = holdForReview('the SERV call failed');
@@ -113,22 +108,25 @@ async function main(): Promise<number> {
   console.log('raw model text:');
   console.log(displayText(reply.rawText));
 
-  const result = validateDecision(reply.rawText, {
-    facts,
-    settings: DEFAULT_SETTINGS,
-    ceiling,
-    start,
-    toolTxs: reply.toolTxs,
-    // This build answers every buy_funder_hop call with an error, so nothing is ever paid for.
-    paidHopsMade: 0,
-  });
+  // This build buys no funder lookups, so the decision must report none and no lookup hash can be cited.
+  const answer = decisionFromGraphAnswer(reply.rawText, DEFAULT_SETTINGS, 0);
+  if (answer.ok) console.log(`verdict: ${answer.verdict}`);
+  else console.error(`the model reply was not usable: ${answer.cause}`);
+  const result = answer.ok
+    ? validateDecision(answer.decision, {
+        facts,
+        settings: DEFAULT_SETTINGS,
+        ceiling,
+        start,
+        toolTxs: [],
+        paidHopsMade: 0,
+      })
+    : holdForReview(answer.cause);
   console.log('final decision:');
   console.log(JSON.stringify(result.decision, null, 2));
   console.log(`accepted: ${result.accepted}`);
 
-  const parsed = parseRawDecision(reply.rawText);
-  if (!parsed.ok) console.error(`the model reply was not usable: ${parsed.cause}`);
-  return reply.requestId !== null && parsed.ok ? 0 : 1;
+  return reply.requestId !== null && answer.ok ? 0 : 1;
 }
 
 main().then(
