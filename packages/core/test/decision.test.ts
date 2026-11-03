@@ -1,7 +1,7 @@
 // Not covered here: real model replies (these are recorded bad and good outputs written by hand), and whether the
 // reason's sentences are true.
 import { describe, expect, it } from 'vitest';
-import { validateDecision, type DecisionContext } from '../src/decision.ts';
+import { DECISION_JSON_SCHEMA, RawDecision, validateDecision, type DecisionContext } from '../src/decision.ts';
 import type { Facts } from '../src/facts.ts';
 import { DEFAULT_SETTINGS } from '../src/settings.ts';
 
@@ -107,6 +107,14 @@ describe('validateDecision: answers that break the campaign or the run record en
     const settings = { ...DEFAULT_SETTINGS, allowPartial: false };
     const partial = reply({ action: 'partial', shareBps: settings.partialShareBps, rule: 'B2' });
     expectRejected(validateDecision(partial, ctx({ settings, ceiling: 'full' })));
+  });
+});
+
+describe('DECISION_JSON_SCHEMA', () => {
+  it('asks SERV for exactly the fields validateDecision accepts, all required', () => {
+    const fields = Object.keys(RawDecision.shape).sort();
+    expect(Object.keys(DECISION_JSON_SCHEMA.properties).sort()).toEqual(fields);
+    expect([...DECISION_JSON_SCHEMA.required].sort()).toEqual(fields);
   });
 });
 

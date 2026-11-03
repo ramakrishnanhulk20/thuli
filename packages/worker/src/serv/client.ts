@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { RunInput } from '@thuli/core';
+import { DECISION_JSON_SCHEMA, RunInput } from '@thuli/core';
 import { loadEnv } from '../env.ts';
 import { fetchJsonCapped, type JsonReply } from '../http.ts';
 
@@ -189,7 +189,8 @@ export async function decideViaGraph(input: RunInput, opts: ServConnection & { g
 
 /**
  * Runs one wallet through the rulebook on SERV v2: the rulebook is the system message and the run input is the user
- * message, with Prompt Guard switched on. Each request has a 120 second timeout.
+ * message, with Prompt Guard switched on and the reply held to the decision schema. Each request has a 120 second
+ * timeout.
  *
  * @throws ServError on a non-2xx status or a reply in an unexpected shape.
  */
@@ -209,6 +210,10 @@ export async function decideViaV2(
       { role: 'user', content: JSON.stringify(runInput) },
     ],
     tools: [{ type: 'function', function: { name: 'serv_prompt_guard', parameters: { type: 'object', properties: {} } } }],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'thuli_decision', strict: true, schema: DECISION_JSON_SCHEMA },
+    },
   });
   const body = ChatBody.safeParse(reply.json);
   if (!body.success) throw new ServError('SERV reply did not match the chat completion shape', reply.status, requestId);

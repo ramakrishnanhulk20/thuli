@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
-import { leastGenerous, OutcomeSchema, type Outcome } from './outcome.ts';
+import { leastGenerous, OUTCOMES, OutcomeSchema, type Outcome } from './outcome.ts';
 import type { Settings } from './settings.ts';
 
 export const DECISION_RULES = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'B1', 'B2'] as const;
@@ -16,6 +16,26 @@ export const RawDecision = z.strictObject({
 });
 
 export type RawDecision = z.infer<typeof RawDecision>;
+
+/**
+ * RawDecision as a JSON Schema for SERV's structured outputs. SERV rewrites the system prompt before the model sees
+ * it, so without this the model invented its own field names and SERV's filter replaced the rule and reason with
+ * "redacted" (live run 32256e58, 3 Nov). No minimum or maximum keywords: builders report SERV rejects numeric
+ * ranges, and validateDecision checks them anyway.
+ */
+export const DECISION_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: [...OUTCOMES] },
+    shareBps: { type: 'integer' },
+    rule: { type: 'string', enum: [...DECISION_RULES] },
+    reason: { type: 'string' },
+    citedTxs: { type: 'array', items: { type: 'string' } },
+    paidHops: { type: 'integer' },
+  },
+  required: ['action', 'shareBps', 'rule', 'reason', 'citedTxs', 'paidHops'],
+  additionalProperties: false,
+} as const;
 
 export type FinalDecision = RawDecision & { clampedFrom?: Outcome };
 
