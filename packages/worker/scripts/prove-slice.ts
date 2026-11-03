@@ -6,6 +6,8 @@ import {
   computeStart,
   decisionFromGraphAnswer,
   DEFAULT_SETTINGS,
+  graphVersion,
+  GraphVersionError,
   holdForReview,
   parseAddress,
   toGraphRecord,
@@ -86,6 +88,10 @@ async function main(): Promise<number> {
   console.log('record:');
   console.log(JSON.stringify(record, null, 2));
   const connection = { baseUrl: env.SERV_BASE_URL, apiKey: env.SERV_API_KEY };
+  if (mode === 'v3') {
+    const version = graphVersion(env.SERV_GRAPH_ID as string);
+    if (version !== undefined) console.log(`graph: ${version.name} (${version.graphId})`);
+  }
 
   let reply: ServReply;
   try {
@@ -109,7 +115,10 @@ async function main(): Promise<number> {
   console.log(displayText(reply.rawText));
 
   // This build buys no funder lookups, so the decision must report none and no lookup hash can be cited.
-  const answer = decisionFromGraphAnswer(reply.rawText, DEFAULT_SETTINGS, 0);
+  const answer: ReturnType<typeof decisionFromGraphAnswer> =
+    reply.answerProblem !== null
+      ? { ok: false, cause: reply.answerProblem }
+      : decisionFromGraphAnswer(reply.answer, DEFAULT_SETTINGS, 0);
   if (answer.ok) console.log(`verdict: ${answer.verdict}`);
   else console.error(`the model reply was not usable: ${answer.cause}`);
   const result = answer.ok
@@ -134,7 +143,7 @@ main().then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    if (error instanceof UsageError || error instanceof EnvError) {
+    if (error instanceof UsageError || error instanceof EnvError || error instanceof GraphVersionError) {
       console.error(error.message);
       process.exitCode = 2;
       return;

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { GRAPH_ANSWER_JSON_SCHEMA, GraphRecord } from '@thuli/core';
+import { GRAPH_ANSWER_JSON_SCHEMA, GraphRecord, graphVersion } from '@thuli/core';
 import { loadEnv } from '../env.ts';
 import { fetchJsonCapped, type JsonReply } from '../http.ts';
 
@@ -12,6 +12,10 @@ export interface ServReply {
   /** SERV's run id from the x-openserv-request-id header: the audit id for this decision. */
   requestId: string | null;
   rawText: string;
+  /** What decisionFromGraphAnswer checks: our answer translated from the graph's reply, or the v2 reply text as is. */
+  answer: unknown;
+  /** A fixed cause when the graph's reply could not be translated, in which case answer is null. */
+  answerProblem: string | null;
 }
 
 export class ServError extends Error {
@@ -116,22 +120,35 @@ function outputText(body: ResponsesBody): string {
 }
 
 /**
- * Runs one wallet through Thuli's rulebook graph on SERV v3. The flat wallet record travels as JSON in
- * `instructions` and nothing else is sent: graph generation fails whenever the prompt names a caller tool, so the
- * graph gets none, and any funder lookup is bought by Thuli's code before the call. The record is checked again here,
- * so a bad one throws before it is sent. Never streams. Each request has a 120 second timeout.
+ * Runs one wallet through a frozen rulebook graph on SERV v3. Each graph id has its own input and answer shapes, so
+ * the flat record is translated into that graph's input and travels as JSON in `instructions`, and nothing else is
+ * sent: graph generation fails whenever the prompt names a caller tool, so the graph gets none, and any funder lookup
+ * is bought by Thuli's code before the call. The record is checked during translation, so a bad one throws before it
+ * is sent. The reply is translated back into our answer; when that fails, answer is null and answerProblem says why.
+ * Never streams. Each request has a 120 second timeout.
  *
- * @throws ServError on a non-2xx status, a reply in an unexpected shape, or a reply that asks for a tool.
+ * @throws ServError for a graph id with no translation (before any request), a non-2xx status, a reply in an
+ * unexpected shape, or a reply that asks for a tool.
+ * @throws GraphVersionError when the record holds a fact the graph has no field for, before any request.
  */
 export async function decideViaGraph(record: GraphRecord, opts: ServConnection & { graphId: string }): Promise<ServReply> {
-  const instructions = JSON.stringify(GraphRecord.parse(record));
+  const version = graphVersion(opts.graphId);
+  if (version === undefined) throw new ServError(`no translation for graph ${opts.graphId}`, null, null);
+  const instructions = JSON.stringify(version.toInput(record));
   const { reply, requestId } = await postJson(opts, '/responses', { model: opts.graphId, instructions });
   const body = parseResponsesBody(reply.json, requestId);
   const askedForTool = body.output.some(
     (item) => typeof item === 'object' && item !== null && (item as { type?: unknown }).type === 'function_call',
   );
   if (askedForTool) throw new ServError('the graph asked for a tool, and this build gives it none', null, requestId);
-  return { requestId, rawText: outputText(body) };
+  const rawText = outputText(body);
+  const translated = version.toAnswer(rawText, record);
+  return {
+    requestId,
+    rawText,
+    answer: translated.ok ? translated.answer : null,
+    answerProblem: translated.ok ? null : translated.cause,
+  };
 }
 
 /**
@@ -166,5 +183,6 @@ export async function decideViaV2(
   });
   const body = ChatBody.safeParse(reply.json);
   if (!body.success) throw new ServError('SERV reply did not match the chat completion shape', reply.status, requestId);
-  return { requestId, rawText: body.data.choices[0]?.message.content ?? '' };
+  const rawText = body.data.choices[0]?.message.content ?? '';
+  return { requestId, rawText, answer: rawText, answerProblem: null };
 }
