@@ -10,3 +10,4 @@ export * from './start.ts';
 export * from './decision.ts';
 export * from './graph.ts';
 export * from './graphVersions.ts';
+export * from './replayScore.ts';

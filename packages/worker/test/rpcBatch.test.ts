@@ -146,6 +146,17 @@ describe('accountStates', () => {
     await reader().read([A, B], BLOCK);
     expect(sentAddresses()).toEqual([A, B]);
   });
+
+  it('gives up at once on a refused request (4xx other than 429), so a wrong key costs one call, not half a minute', async () => {
+    for (const status of [400, 401, 403, 413]) {
+      fetchMock.mockReset();
+      fetchMock.mockImplementation(async () => json({ error: 'refused' }, status));
+      const states = await reader().read([A, B], BLOCK);
+      expect(fetchMock, String(status)).toHaveBeenCalledTimes(1);
+      expect(states.get(A)).toEqual({ nonce: null, code: null });
+      expect(states.get(B)).toEqual({ nonce: null, code: null });
+    }
+  });
 });
 
 describe('RateLimiter', () => {

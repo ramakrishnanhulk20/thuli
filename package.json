@@ -12,7 +12,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p packages/core/tsconfig.json && tsc -p packages/worker/tsconfig.json",
-    "prove:slice": "node --env-file=.env --import tsx packages/worker/scripts/prove-slice.ts"
+    "prove:slice": "node --env-file=.env --import tsx packages/worker/scripts/prove-slice.ts",
+    "replay:robo": "node --env-file=.env --import tsx packages/worker/scripts/replay-robo.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

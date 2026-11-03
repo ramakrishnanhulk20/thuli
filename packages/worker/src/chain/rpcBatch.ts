@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { z } from 'zod';
-import { parseAddress } from '@thuli/core';
+import { parseAddress, type AccountState } from '@thuli/core';
 import { fetchJsonCapped } from '../http.ts';
 import { JsonlCache } from './jsonlCache.ts';
 import { pause, RateLimiter, RETRY_DELAYS_MS } from './rateLimiter.ts';
@@ -13,11 +13,9 @@ const MAX_BATCH_SIZE = 500;
 // larger code limit and the JSON around it, while a batch reply still has a fixed ceiling (C41).
 const MAX_REPLY_BYTES_PER_ADDRESS = 128 * 1024;
 
-export interface AccountState {
-  nonce: number | null;
-  /** '0x' means the account has no code. */
-  code: string | null;
-}
+// The facts engine reads these states as they are, so the shape comes from core and cannot drift. A code of '0x' means
+// the account has no code.
+export type { AccountState };
 
 const RpcItem = z.object({ id: z.int(), result: z.unknown().optional(), error: z.unknown().optional() });
 const Quantity = z
@@ -66,9 +64,9 @@ function statesFrom(batch: string[], items: unknown[]): Map<string, AccountState
  * read() lowercases and de-duplicates the addresses, serves cached ones without a request, and sends the rest as batch
  * POSTs of eth_getTransactionCount and eth_getCode at the block, one rate-limit token per batch, one batch at a time.
  * A field that came back as an error or in a bad shape is null, and that address is not cached, so the next run asks
- * again. A batch that fails as a whole (network error, timeout, non-2xx, not a batch reply) is retried after 1, 2, 4,
- * 8 and 16 seconds, then its addresses are left null. Network problems never throw, and nothing this module writes
- * contains the RPC URL (C40).
+ * again. A batch that fails as a whole (network error, timeout, 429, 5xx, not a batch reply) is retried after 1, 2, 4,
+ * 8 and 16 seconds, then its addresses are left null. Any other 4xx is not retried: its addresses come back null at
+ * once. Network problems never throw, and nothing this module writes contains the RPC URL (C40).
  *
  * The cache files are named only by block, so cacheDir must belong to one chain.
  *
@@ -105,19 +103,24 @@ export function accountStates(opts: {
     return cache;
   }
 
-  /** The batch reply's items, or null when the batch failed as a whole. */
-  async function postBatch(body: string, callCount: number): Promise<unknown[] | null> {
+  /**
+   * The batch reply's items, 'retry' when the batch failed as a whole in a way that may pass later, or 'refused' when
+   * the node turned the request itself down.
+   */
+  async function postBatch(body: string, callCount: number): Promise<unknown[] | 'retry' | 'refused'> {
     try {
       const reply = await fetchJsonCapped(
         opts.rpcUrl,
         { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body },
         { timeoutMs, maxBytes: (callCount / 2) * MAX_REPLY_BYTES_PER_ADDRESS },
       );
-      if (!reply.ok) return null;
+      // A 4xx other than 429 (bad key, plan limit, request too large) gets the same answer however long we wait.
+      if (reply.status >= 400 && reply.status < 500 && reply.status !== 429) return 'refused';
+      if (!reply.ok) return 'retry';
       const items = z.array(z.unknown()).min(1).max(callCount).safeParse(reply.json);
-      return items.success ? items.data : null;
+      return items.success ? items.data : 'retry';
     } catch {
-      return null;
+      return 'retry';
     }
   }
 
@@ -130,7 +133,8 @@ export function accountStates(opts: {
     for (let attempt = 0; ; attempt += 1) {
       await limiter.take();
       const items = await postBatch(body, calls.length);
-      if (items !== null) return statesFrom(batch, items);
+      if (items === 'refused') return null;
+      if (items !== 'retry') return statesFrom(batch, items);
       const delay = RETRY_DELAYS_MS[attempt];
       if (delay === undefined) return null;
       await pause(delay);

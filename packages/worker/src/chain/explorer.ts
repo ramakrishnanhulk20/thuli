@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { z } from 'zod';
-import { parseAddress, TxHash } from '@thuli/core';
+import { parseAddress, TxHash, type Transfer, type TransferPage } from '@thuli/core';
 import { fetchJsonCapped, HttpError, type JsonReply } from '../http.ts';
 import { JsonlCache } from './jsonlCache.ts';
 import { pause, RateLimiter, RETRY_DELAYS_MS } from './rateLimiter.ts';
@@ -12,22 +12,10 @@ const MAX_REPLY_BYTES = 8 * 1024 * 1024;
 const MAX_LIMIT = 10_000;
 const NOT_INDEXED = 'internal transactions are not indexed for this block range';
 
-export interface ExplorerTransfer {
-  hash: string;
-  block: number;
-  time: number;
-  from: string;
-  to: string | null;
-  valueWei: string;
-  failed: boolean;
-  kind: 'external' | 'internal';
-}
-
-export interface TransferPage {
-  transfers: ExplorerTransfer[];
-  /** Fewer rows came back than the limit, so this is every row up to endBlock. */
-  complete: boolean;
-}
+// The facts engine reads these pages as they are, so the shapes come from core and cannot drift apart. A page is
+// complete when fewer rows came back than the limit, so it holds every row up to endBlock.
+export type ExplorerTransfer = Transfer;
+export type { TransferPage };
 
 export class ExplorerError extends Error {
   override name = 'ExplorerError';
