@@ -3,6 +3,7 @@ import { meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
 import { leastGenerous, OUTCOMES, OutcomeSchema, type Outcome } from './outcome.ts';
 import type { Settings } from './settings.ts';
+import { FIXED_RULES, type Start } from './start.ts';
 
 export const DECISION_RULES = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'B1', 'B2'] as const;
 
@@ -43,6 +44,7 @@ export interface DecisionContext {
   facts: Facts;
   settings: Settings;
   ceiling: Outcome;
+  start: Start;
   toolTxs: string[];
   /** Paid lookups the worker actually made in this run; when given, the model's own count must match it. */
   paidHopsMade?: number;
@@ -106,9 +108,11 @@ export function holdForReview(cause: string): { decision: FinalDecision; accepte
  * Checks a model's decision like untrusted input, then applies the code ceiling.
  *
  * Any failed check gives a hold with rule A1 and accepted false (threat model C11, C13). An exclude without the A3
- * self-linked group evidence becomes a hold (C15). Otherwise the final action is the less generous of the model's
- * action and the ceiling; when that lowers it, clampedFrom records the model's action and the share is recomputed
- * (C12). The cause texts are fixed strings, so no model text is ever copied into a fallback reason.
+ * self-linked group evidence becomes a hold (C15). The rule must fit the code's start: a fixed rule must repeat it
+ * exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise an A4 to A6 hold. Otherwise the
+ * final action is the less generous of the model's action and the ceiling; when that lowers it, clampedFrom
+ * records the model's action and the share is recomputed (C12). The cause texts are fixed strings, so no model text
+ * is ever copied into a fallback reason.
  */
 export function validateDecision(
   raw: unknown,
@@ -140,6 +144,19 @@ export function validateDecision(
   }
   if (reply.action === 'partial' && !ctx.settings.allowPartial) {
     return holdForReview('the model chose partial but this campaign has partial rewards switched off');
+  }
+  const fixedRule = (FIXED_RULES as readonly string[]).includes(reply.rule);
+  if (fixedRule && (reply.rule !== ctx.start.rule || reply.action !== ctx.start.outcome)) {
+    return holdForReview('the model changed the fixed-check result without using rule B1 or B2');
+  }
+  if (reply.rule === 'B1' && (!['A8', 'A9'].includes(ctx.start.rule) || reply.action !== 'hold')) {
+    return holdForReview('the model used rule B1 outside a funder check that ends in hold');
+  }
+  if (
+    reply.rule === 'B2' &&
+    (!['A4', 'A5', 'A6'].includes(ctx.start.rule) || (reply.action !== 'partial' && reply.action !== 'full'))
+  ) {
+    return holdForReview('the model used rule B2 outside a group, shared funder or shared deposit hold');
   }
   if (reply.action === 'exclude' && !meetsGroupExcludeRule(ctx.facts, ctx.settings)) {
     return holdForReview('the model chose exclude without the self-linked group evidence that rule A3 requires');

@@ -3,6 +3,7 @@ import { parseArgs } from 'node:util';
 import {
   AddressError,
   computeCeiling,
+  computeStart,
   DEFAULT_SETTINGS,
   holdForReview,
   parseAddress,
@@ -77,13 +78,16 @@ async function main(): Promise<number> {
   console.log(JSON.stringify(facts, null, 2));
 
   const { ceiling, reason } = computeCeiling(facts, DEFAULT_SETTINGS);
+  const start = computeStart(facts, DEFAULT_SETTINGS);
   console.log(`ceiling: ${ceiling} (${reason})`);
+  console.log(`start: ${start.outcome} (${start.rule})`);
 
   const input = RunInput.parse({
     wallet,
     snapshot: { chain: 'ethereum', block, time: await readSnapshotTime(block, sources) },
     settings: DEFAULT_SETTINGS,
     ceiling,
+    start,
     facts,
   });
   const connection = { baseUrl: env.SERV_BASE_URL, apiKey: env.SERV_API_KEY };
@@ -113,6 +117,7 @@ async function main(): Promise<number> {
     facts,
     settings: DEFAULT_SETTINGS,
     ceiling,
+    start,
     toolTxs: reply.toolTxs,
     // This build answers every buy_funder_hop call with an error, so nothing is ever paid for.
     paidHopsMade: 0,

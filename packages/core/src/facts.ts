@@ -3,6 +3,7 @@ import { isCanonicalAddress, type Address } from './address.ts';
 import { CHAIN_NAMES } from './chains.ts';
 import { OutcomeSchema } from './outcome.ts';
 import { Settings } from './settings.ts';
+import { Start } from './start.ts';
 
 // Every field below is a number, a boolean, a fixed word, an address or a hash. There is deliberately no free-text
 // field anywhere in what the model sees, so text a stranger wrote on-chain has no way in (threat model C14, C34).
@@ -74,6 +75,7 @@ export const RunInput = z.strictObject({
   }),
   settings: Settings,
   ceiling: OutcomeSchema,
+  start: Start,
   facts: Facts,
 });
 

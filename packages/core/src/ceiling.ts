@@ -17,8 +17,14 @@ export function meetsGroupExcludeRule(facts: Facts, settings: Settings): boolean
   );
 }
 
-// A missing link fact could hide a farm, so without it the code will not allow more than hold.
-const LINK_FACTS: readonly FactName[] = ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress', 'firstFunder'];
+/** Facts the checks rely on that could not be read. evidenceTxs is left out because no check depends on it. */
+function unreadFacts(facts: Facts): FactName[] {
+  const unread = facts.missing.filter((name) => name !== 'evidenceTxs');
+  if (facts.claimPaidToOtherAddress === null && !unread.includes('claimPaidToOtherAddress')) {
+    unread.push('claimPaidToOtherAddress');
+  }
+  return unread;
+}
 
 /**
  * The most generous outcome Thuli's code allows for this wallet, computed before the model runs (threat model C12).
@@ -34,15 +40,17 @@ export function computeCeiling(facts: Facts, settings: Settings): { ceiling: Out
       reason: `Account type is ${facts.accountType === 'contract' ? 'a contract' : 'unknown'}, so a person must review it.`,
     };
   }
+  // Checked before the group rule: with a fact unread, even proven group evidence ends in a person's review, not an
+  // automatic exclusion, matching rule A1's place at the top of the fixed checks.
+  const unread = unreadFacts(facts);
+  if (unread.length > 0) {
+    return { ceiling: 'hold', reason: `Facts not yet available: ${unread.join(', ')}. Doubt means hold.` };
+  }
   if (meetsGroupExcludeRule(facts, settings)) {
     return { ceiling: 'exclude', reason: 'Wallet belongs to a group it linked itself by sweeping or shared funding.' };
   }
   if (facts.claimPaidToOtherAddress === true) {
     return { ceiling: 'hold', reason: 'The reward was claimed to a different address, so a person must review it.' };
-  }
-  const missingLinks = LINK_FACTS.filter((name) => facts.missing.includes(name));
-  if (missingLinks.length > 0) {
-    return { ceiling: 'hold', reason: `Facts not yet available: ${missingLinks.join(', ')}. Doubt means hold.` };
   }
   if (facts.walletAgeDays < settings.minWalletAgeDays || facts.txCountAtSnapshot < settings.minTxCount) {
     return settings.allowPartial

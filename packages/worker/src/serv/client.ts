@@ -189,8 +189,10 @@ export async function decideViaGraph(input: RunInput, opts: ServConnection & { g
 
 /**
  * Runs one wallet through the rulebook on SERV v2: the rulebook is the system message and the run input is the user
- * message, with Prompt Guard switched on and the reply held to the decision schema. Each request has a 120 second
- * timeout.
+ * message, with the reply held to the decision schema. Each request has a 120 second timeout.
+ *
+ * No Prompt Guard: the run input carries no text a stranger wrote (C14, C34), so the guard has nothing to catch, and
+ * live it refused this rulebook outright with "I can't share that." before the model ran (run 075f6409, 3 Nov).
  *
  * @throws ServError on a non-2xx status or a reply in an unexpected shape.
  */
@@ -209,7 +211,6 @@ export async function decideViaV2(
       { role: 'system', content: rulebookText },
       { role: 'user', content: JSON.stringify(runInput) },
     ],
-    tools: [{ type: 'function', function: { name: 'serv_prompt_guard', parameters: { type: 'object', properties: {} } } }],
     response_format: {
       type: 'json_schema',
       json_schema: { name: 'thuli_decision', strict: true, schema: DECISION_JSON_SCHEMA },

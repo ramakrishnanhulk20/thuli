@@ -27,7 +27,14 @@ function facts(overrides: Partial<Facts> = {}): Facts {
 const otherWalletFacts = facts({ evidenceTxs: [OTHER_WALLET_TX] });
 
 function ctx(overrides: Partial<DecisionContext> = {}): DecisionContext {
-  return { facts: facts(), settings: DEFAULT_SETTINGS, ceiling: 'hold', toolTxs: [], ...overrides };
+  return {
+    facts: facts(),
+    settings: DEFAULT_SETTINGS,
+    ceiling: 'hold',
+    start: { outcome: 'hold', rule: 'A8' },
+    toolTxs: [],
+    ...overrides,
+  };
 }
 
 const VALID_HOLD = {
@@ -106,7 +113,8 @@ describe('validateDecision: answers that break the campaign or the run record en
   it('rejects partial when the campaign has partial rewards switched off', () => {
     const settings = { ...DEFAULT_SETTINGS, allowPartial: false };
     const partial = reply({ action: 'partial', shareBps: settings.partialShareBps, rule: 'B2' });
-    expectRejected(validateDecision(partial, ctx({ settings, ceiling: 'full' })));
+    const context = ctx({ settings, ceiling: 'full', start: { outcome: 'hold', rule: 'A4' } });
+    expectRejected(validateDecision(partial, context));
   });
 });
 
@@ -119,15 +127,19 @@ describe('DECISION_JSON_SCHEMA', () => {
 });
 
 describe('validateDecision: exclude needs A3 evidence (C15)', () => {
+  const excludeStart = { outcome: 'exclude', rule: 'A3' } as const;
+
   it('turns an exclude without the A3 group condition into hold', () => {
-    expectRejected(validateDecision(reply({ action: 'exclude', rule: 'A3' }), ctx({ ceiling: 'exclude' })));
+    const exclude = reply({ action: 'exclude', rule: 'A3' });
+    expectRejected(validateDecision(exclude, ctx({ ceiling: 'exclude', start: excludeStart })));
   });
 
   it('accepts an exclude when the self-linked group meets A3', () => {
     const farm = facts({
       group: { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true },
     });
-    const result = validateDecision(reply({ action: 'exclude', rule: 'A3' }), ctx({ facts: farm, ceiling: 'exclude' }));
+    const exclude = reply({ action: 'exclude', rule: 'A3' });
+    const result = validateDecision(exclude, ctx({ facts: farm, ceiling: 'exclude', start: excludeStart }));
     expect(result.accepted).toBe(true);
     expect(result.decision.action).toBe('exclude');
   });
@@ -135,7 +147,8 @@ describe('validateDecision: exclude needs A3 evidence (C15)', () => {
 
 describe('validateDecision: the ceiling wins (C12)', () => {
   it("clamps a 'full' answer under a 'partial' ceiling and recomputes the share", () => {
-    const result = validateDecision(reply({ action: 'full', shareBps: 10000, rule: 'A9' }), ctx({ ceiling: 'partial' }));
+    const full = reply({ action: 'full', shareBps: 10000, rule: 'A9' });
+    const result = validateDecision(full, ctx({ ceiling: 'partial', start: { outcome: 'full', rule: 'A9' } }));
     expect(result.accepted).toBe(true);
     expect(result.decision.action).toBe('partial');
     expect(result.decision.clampedFrom).toBe('full');
@@ -149,5 +162,62 @@ describe('validateDecision: the ceiling wins (C12)', () => {
     expect(result.cause).toBeUndefined();
     expect(result.decision.action).toBe('hold');
     expect(result.decision.clampedFrom).toBeUndefined();
+  });
+});
+
+describe('validateDecision: the rule must fit the code start', () => {
+  const CHANGED_START = 'the model changed the fixed-check result without using rule B1 or B2';
+  const B1_MISPLACED = 'the model used rule B1 outside a funder check that ends in hold';
+  const B2_MISPLACED = 'the model used rule B2 outside a group, shared funder or shared deposit hold';
+  const FULL = { action: 'full', shareBps: 10000 };
+  const PARTIAL = { action: 'partial', shareBps: DEFAULT_SETTINGS.partialShareBps };
+
+  // Asserting the cause proves the start check fired, not some earlier check that happened to reject the reply too.
+  function expectRejectedFor(result: ReturnType<typeof validateDecision>, cause: string): void {
+    expectRejected(result);
+    expect(result.cause).toBe(cause);
+  }
+
+  it("rejects a fixed rule other than the start's rule", () => {
+    expectRejectedFor(validateDecision(reply({ rule: 'A7' }), ctx()), CHANGED_START);
+  });
+
+  it("rejects the start's rule with a different action", () => {
+    const context = ctx({ ceiling: 'partial', start: { outcome: 'partial', rule: 'A8' } });
+    expectRejectedFor(validateDecision(reply({ ...FULL, rule: 'A8' }), context), CHANGED_START);
+  });
+
+  it("rejects B1 under an A9 start with action 'partial'", () => {
+    const context = ctx({ ceiling: 'full', start: { outcome: 'full', rule: 'A9' } });
+    expectRejectedFor(validateDecision(reply({ ...PARTIAL, rule: 'B1' }), context), B1_MISPLACED);
+  });
+
+  it('rejects B1 under an A4 start', () => {
+    const context = ctx({ start: { outcome: 'hold', rule: 'A4' } });
+    expectRejectedFor(validateDecision(reply({ rule: 'B1' }), context), B1_MISPLACED);
+  });
+
+  it('rejects B2 under an A8 start', () => {
+    const context = ctx({ ceiling: 'full', start: { outcome: 'partial', rule: 'A8' } });
+    expectRejectedFor(validateDecision(reply({ ...FULL, rule: 'B2' }), context), B2_MISPLACED);
+  });
+
+  it("accepts B2 raising an A4 hold to 'full' under a 'full' ceiling", () => {
+    const context = ctx({ ceiling: 'full', start: { outcome: 'hold', rule: 'A4' } });
+    const result = validateDecision(reply({ ...FULL, rule: 'B2' }), context);
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
+    expect(result.decision.action).toBe('full');
+    expect(result.decision.rule).toBe('B2');
+    expect(result.decision.clampedFrom).toBeUndefined();
+  });
+
+  it('accepts B1 holding an A9 start', () => {
+    const context = ctx({ ceiling: 'full', start: { outcome: 'full', rule: 'A9' } });
+    const result = validateDecision(reply({ rule: 'B1' }), context);
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
+    expect(result.decision.action).toBe('hold');
+    expect(result.decision.rule).toBe('B1');
   });
 });
