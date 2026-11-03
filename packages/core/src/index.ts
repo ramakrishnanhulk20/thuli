@@ -3,6 +3,7 @@ export * from './chains.ts';
 export * from './outcome.ts';
 export * from './settings.ts';
 export * from './facts.ts';
+export * from './factsEngine.ts';
 export * from './accountType.ts';
 export * from './ceiling.ts';
 export * from './start.ts';

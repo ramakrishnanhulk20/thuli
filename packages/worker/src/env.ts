@@ -17,6 +17,8 @@ const EnvSchema = z.object({
   SERV_BASE_URL: BaseUrl,
   ETH_RPC_URL: BaseUrl,
   BLOCKSCOUT_ETH_API: BaseUrl,
+  EXPLORER_API_URL: z.preprocess(blankAsMissing, BaseUrl.default('https://api.etherscan.io/v2/api')),
+  EXPLORER_API_KEY: z.preprocess(blankAsMissing, z.string().trim().min(1).optional()),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

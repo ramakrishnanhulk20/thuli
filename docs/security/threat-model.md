@@ -312,9 +312,10 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   requests keep bodies, not headers. Shown by: after a full run, a search of a database dump, the logs and the client
   bundle for each secret's prefix finds nothing.
 - **C41. Every loop, call and payload has a limit.** Every external call has a timeout and every response a size cap.
-  First-funder lookups stop at 4 hops or any repeated address. Transfers per wallet, CSV rows and bytes, rules length,
+  First-funder tracing follows at most 6 single-use pass-through wallets (one in, one out, so a cycle cannot form);
+  money still passing through at the 6th hop is doubt, not a source. Transfers per wallet, CSV rows and bytes, rules length,
   appeal length and graph size all have stated caps. Hitting a cap means hold under C11. Shown by: a wallet fixture with
-  a million transfers and one with a funder cycle both end in hold within the timeout.
+  a million transfers and one still passing money on at the hop cap both end in hold within the timeout.
 - **C42. Public endpoints are rate limited on an identity the client cannot forge**, using the platform's trusted client
   address, never a client-sent `X-Forwarded-For`. One open appeal per campaign and address. Shown by: a burst with
   rotating `X-Forwarded-For` values is still limited.

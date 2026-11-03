@@ -32,3 +32,6 @@ broadcast/
 *.log
 .DS_Store
 .vercel/
+
+# Replay data and caches (large, rebuilt by scripts)
+data/
