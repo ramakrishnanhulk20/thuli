@@ -96,6 +96,20 @@ function valueSendsFrom(address: string, data: AddressData): Transfer[] {
   return data.external.transfers.filter((t) => !t.failed && lower(t.from) === address && wei(t) > 0n);
 }
 
+/**
+ * Sends that emptied the wallet: each moved at least half of everything the wallet had received up to that block. A
+ * farm sweeps its wallets into a collector; an ordinary user paying the same service fee does not. Live, 4 Nov: five
+ * old wallets each paid about 0.002 ETH to one fee wallet (nonce 5,524) over 17 months, and counting those payments
+ * as links excluded all five under A3. Only sweeps link wallets or count as a shared deposit (C15).
+ */
+function sweepsFrom(address: string, data: AddressData): Transfer[] {
+  const incoming = incomingTo(address, data);
+  return valueSendsFrom(address, data).filter((send) => {
+    const received = incoming.filter((t) => t.block <= send.block).reduce((sum, t) => sum + wei(t), 0n);
+    return wei(send) * 2n >= received;
+  });
+}
+
 /** Larger value first, then the earliest: lower block, external before internal, then hash order. */
 function outranks(a: Transfer, b: Transfer): boolean {
   const valueA = wei(a);
@@ -206,15 +220,15 @@ export function funderKind(state: AccountState | undefined): FunderKind {
 }
 
 /**
- * Each address that two or more claim wallets sent a successful external value to before the snapshot, with the claim
- * wallets that sent it. The runner calls this to learn which destinations' states to fetch.
+ * Each address that two or more claim wallets swept into before the snapshot (see sweepsFrom), with the claim wallets
+ * that swept. The runner calls this to learn which destinations' states to fetch.
  */
 export function sharedDestinations(input: Pick<ReplayInput, 'wallets' | 'data'>): Map<string, Set<string>> {
   const senders = new Map<string, Set<string>>();
   for (const wallet of uniqueLower(input.wallets)) {
     const data = input.data.get(wallet);
     if (data === undefined) continue;
-    for (const send of valueSendsFrom(wallet, data)) {
+    for (const send of sweepsFrom(wallet, data)) {
       if (send.to === null) continue;
       const dest = lower(send.to);
       const set = senders.get(dest) ?? new Set<string>();
@@ -380,7 +394,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     let swept = false;
     let largestDeposit = 0;
     const sendHashes: string[] = [];
-    for (const send of walletData === undefined ? [] : valueSendsFrom(wallet, walletData)) {
+    for (const send of walletData === undefined ? [] : sweepsFrom(wallet, walletData)) {
       const dest = send.to === null ? undefined : lower(send.to);
       const senders = dest === undefined ? undefined : shared.get(dest)?.size;
       if (dest === undefined || senders === undefined) continue;

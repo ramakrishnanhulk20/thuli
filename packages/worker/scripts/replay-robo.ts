@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
-import { DEFAULT_SETTINGS, REPLAY_WALLET_LIMIT, scoreReplay, scoreToMarkdown, type TransferPage } from '@thuli/core';
+import { DEFAULT_SETTINGS, parseAddress, REPLAY_WALLET_LIMIT, scoreReplay, scoreToMarkdown, type TransferPage } from '@thuli/core';
 import { ExplorerError, explorerSource, type ExplorerSource } from '../src/chain/explorer.ts';
 import { JsonlCache } from '../src/chain/jsonlCache.ts';
 import { accountStates } from '../src/chain/rpcBatch.ts';
@@ -19,7 +19,10 @@ const ETHEREUM = 1;
 // Etherscan's free plan allows 3 calls a second; a little under it leaves room for timing jitter.
 const DEFAULT_PER_SECOND = 2.8;
 const MAX_PER_SECOND = 100;
-const RPC_BATCHES_PER_SECOND = 2;
+// The Tenderly public gateway counts every call inside a batch against its rate limit. Measured 4 Nov: 10 addresses
+// (20 calls) once a second always passed, 20 addresses a second and 10 every half second were refused with 429.
+const RPC_BATCHES_PER_SECOND = 1;
+const RPC_BATCH_SIZE = 10;
 // Offline nothing is ever sent, so there is nothing to pace.
 const OFFLINE_PER_SECOND = 1_000_000;
 // Reserved never to resolve (RFC 2606). Offline readers need some https URL, and this one cannot reach anyone.
@@ -30,13 +33,15 @@ const KEYS_DIR = path.join(REPO_ROOT, 'reference', 'answer-keys');
 const OUT_DIR = path.join(REPO_ROOT, 'data', 'replay', 'robo');
 const DEFAULT_CACHE_DIR = path.join(REPO_ROOT, 'data', 'cache', 'eth');
 const NO_KEY = 'Set EXPLORER_API_KEY in .env (free Etherscan key; see STATE.md)';
-const USAGE = 'Usage: npm run replay:robo -- [--limit N] [--per-second N] [--cache-dir PATH] [--offline]';
+const USAGE = 'Usage: npm run replay:robo -- [--wallets FILE] [--limit N] [--per-second N] [--cache-dir PATH] [--offline]';
 
 class UsageError extends Error {
   override name = 'UsageError';
 }
 
 interface Arguments {
+  /** A file of claim wallets, one per line, to screen instead of the whole list (a sample with farm wallets in it). */
+  walletsFile: string | undefined;
   limit: number | undefined;
   perSecond: number;
   cacheDir: string;
@@ -44,10 +49,11 @@ interface Arguments {
 }
 
 function readArguments(): Arguments {
-  let values: { limit?: string; 'per-second'?: string; 'cache-dir'?: string; offline?: boolean };
+  let values: { wallets?: string; limit?: string; 'per-second'?: string; 'cache-dir'?: string; offline?: boolean };
   try {
     values = parseArgs({
       options: {
+        wallets: { type: 'string' },
         limit: { type: 'string' },
         'per-second': { type: 'string' },
         'cache-dir': { type: 'string' },
@@ -67,6 +73,7 @@ function readArguments(): Arguments {
     throw new UsageError(`--per-second must be a number above 0 and at most ${MAX_PER_SECOND}`);
   }
   return {
+    walletsFile: values.wallets === undefined ? undefined : path.resolve(values.wallets),
     limit: limitText === undefined ? undefined : Number(limitText),
     perSecond,
     cacheDir: values['cache-dir'] === undefined ? DEFAULT_CACHE_DIR : path.resolve(values['cache-dir']),
@@ -113,7 +120,14 @@ async function main(): Promise<number> {
   const key = loadFarmKey(path.join(KEYS_DIR, 'robo-farm-claim-wallets-reconstructed.csv'));
   const claimedWei = new Map<string, bigint>();
   for (const event of events) claimedWei.set(event.recipient, (claimedWei.get(event.recipient) ?? 0n) + event.amountWei);
-  const recipients = [...claimedWei.keys()];
+  let recipients = [...claimedWei.keys()];
+  if (args.walletsFile !== undefined) {
+    const lines = fs.readFileSync(args.walletsFile, 'utf8').split(/\r?\n/).filter((line) => line.trim() !== '');
+    const chosen = [...new Set(lines.map((line) => parseAddress(line.trim()).toLowerCase()))];
+    const strangers = chosen.filter((wallet) => !claimedWei.has(wallet)).length;
+    if (strangers > 0) throw new UsageError(`--wallets: ${strangers} of ${chosen.length} lines are not ROBO claim wallets`);
+    recipients = chosen;
+  }
   const wallets = args.limit === undefined ? recipients : recipients.slice(0, args.limit);
 
   if (args.offline) refuseNetwork();
@@ -130,6 +144,7 @@ async function main(): Promise<number> {
   const accounts = accountStates({
     rpcUrl: env === undefined ? OFFLINE_URL : env.ETH_RPC_URL,
     perSecond: env === undefined ? OFFLINE_PER_SECOND : RPC_BATCHES_PER_SECOND,
+    batchSize: RPC_BATCH_SIZE,
     cacheDir: args.cacheDir,
   });
 

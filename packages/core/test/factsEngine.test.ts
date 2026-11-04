@@ -297,6 +297,23 @@ describe('buildReplayFacts', () => {
     }
   });
 
+  it('does not link 5 old wallets that each paid one small fee to the same service wallet (live, 4 Nov)', () => {
+    const feeWallet = synthetic('fe', 1);
+    const wallets = Array.from({ length: 5 }, (_, i) => synthetic('cc', i));
+    const ledger = wallets.flatMap((w, i) => [
+      send(BINANCE_14, w, OLD_BLOCK + 10 * i, '0.5'),
+      send(w, feeWallet, ANCHOR_BLOCK - 60 * DAY_BLOCKS * i, '0.002'),
+    ]);
+    const states: [string, AccountState][] = [[BINANCE_14, BINANCE_STATE], [feeWallet, eoa(5_524)], ...wallets.map((w): [string, AccountState] => [w, eoa(120)])];
+    const input = replay(wallets, ledger, states);
+    expect(sharedDestinations(input).has(feeWallet)).toBe(false);
+    for (const f of buildReplayFacts(input).values()) {
+      expect(f.group).toBeNull();
+      expect(f.sharedDepositAddress).toBeNull();
+      expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+    }
+  });
+
   it('holds 3 wallets that share one deposit address under A6', () => {
     for (const f of buildReplayFacts(depositReplay(eoa(0))).values()) {
       expect(f.sharedDepositAddress).toEqual({ sharedWithClaimants: 2 });
