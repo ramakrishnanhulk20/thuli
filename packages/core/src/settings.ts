@@ -9,6 +9,8 @@ export const Settings = z.strictObject({
   partialShareBps: z.int().min(0).max(10000),
   allowPartial: z.boolean(),
   maxPaidHops: z.int().min(0).max(3),
+  burstMinWallets: z.int().min(2),
+  burstSpreadBps: z.int().min(0).max(10000),
 });
 
 export type Settings = z.infer<typeof Settings>;
@@ -21,4 +23,6 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
   partialShareBps: 5000,
   allowPartial: true,
   maxPaidHops: 3,
+  burstMinWallets: 20,
+  burstSpreadBps: 2500,
 });

@@ -84,6 +84,7 @@ const HELD_BY_B1: readonly FixedRule[] = ['A8', 'A9'];
 function g1Input(input: GraphRecord): G1Input {
   const record = GraphRecord.parse(input);
   if (record.traced_funder_kind !== 'none') throw new GraphVersionError('graph g1 has no field for a traced funder');
+  if (record.funding_burst_wallets > 0) throw new GraphVersionError('graph g1 has no field for a funding burst');
   const hasFunder = record.first_funder_kind !== 'none';
   const unreadable: string[] = [...record.unreadable_facts];
   if (record.first_funder_claim_wallets === null && hasFunder) unreadable.push('first_funder_claim_wallet_count');

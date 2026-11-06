@@ -28,6 +28,7 @@ const CLEAN: Facts = {
   firstFunder: { address: FUNDER, kind: 'exchange', fanoutInList: 3, hopsTraced: 1 },
   group: null,
   sharedDepositAddress: null,
+  fundingBurst: null,
   claimPaidToOtherAddress: false,
   evidenceTxs: [OWN_TX],
   missing: [],
@@ -74,9 +75,19 @@ describe('toGraphRecord: one flat record with no free text (C14, C34)', () => {
       group_swept_to_shared_collector: false,
       group_links_made_by_wallet: false,
       shared_deposit_claimants: 0,
+      funding_burst_wallets: 0,
       claim_paid_to_other_address: false,
       evidence_tx_hashes: [OWN_TX],
       unreadable_facts: [],
+    });
+  });
+
+  it('carries the funding burst size, and 0 when there is none', () => {
+    expect(recordFor(CLEAN).funding_burst_wallets).toBe(0);
+    expect(recordFor({ ...CLEAN, fundingBurst: { wallets: 23 } })).toMatchObject({
+      start_outcome: 'partial',
+      start_rule: 'A8',
+      funding_burst_wallets: 23,
     });
   });
 

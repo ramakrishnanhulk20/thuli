@@ -20,6 +20,7 @@ function facts(overrides: Partial<Facts> = {}): Facts {
     firstFunder: null,
     group: null,
     sharedDepositAddress: null,
+    fundingBurst: null,
     claimPaidToOtherAddress: false,
     evidenceTxs: [],
     missing: [],
@@ -131,6 +132,19 @@ describe('computeStart', () => {
     }
   });
 
+  it('A8 starts an old active wallet in a funding burst at partial, or hold when partial is off (C45)', () => {
+    const burst = facts({ fundingBurst: { wallets: 20 } });
+    expect(computeStart(burst, DEFAULT_SETTINGS)).toEqual({ outcome: 'partial', rule: 'A8' });
+    expect(computeStart(burst, PARTIAL_OFF)).toEqual({ outcome: 'hold', rule: 'A8' });
+  });
+
+  it('keeps A3 and A4 ahead of a funding burst, and ignores a burst under the minimum', () => {
+    const fundingBurst = { wallets: 20 };
+    expect(computeStart(facts({ group: FARM_GROUP, fundingBurst }), DEFAULT_SETTINGS)).toEqual({ outcome: 'exclude', rule: 'A3' });
+    expect(computeStart(facts({ group: UNPROVEN_GROUP, fundingBurst }), DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
+    expect(computeStart(facts({ fundingBurst: { wallets: 19 } }), DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+  });
+
   it('A9 starts at full when no fixed check applies', () => {
     expect(computeStart(CLEAN, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
   });
@@ -155,8 +169,8 @@ describe('computeStart', () => {
     }
   });
 
-  // 29,160 combinations; before the ceiling checked unread facts first, 1,584 of them started at hold under an
-  // exclude ceiling.
+  // 58,320 combinations; before the ceiling checked unread facts first, 1,584 of the first 29,160 started at hold under
+  // an exclude ceiling. A burst may only ever move an A9 start to A8 (C45).
   it('never starts more generous than the code ceiling across a grid of every fact combination', () => {
     const funders = [null, fundedBy('wallet', FANOUT_MIN).firstFunder, FANOUT_UNCOUNTED.firstFunder];
     const groups = [null, FARM_GROUP, UNPROVEN_GROUP];
@@ -170,23 +184,29 @@ describe('computeStart', () => {
               for (const sharedDepositAddress of [null, { sharedWithClaimants: 1 }, { sharedWithClaimants: 2 }])
                 for (const claimPaidToOtherAddress of [null, false, true])
                   for (const missing of missings)
-                    for (const settings of [DEFAULT_SETTINGS, PARTIAL_OFF]) {
-                      const f = facts({
-                        walletAgeDays,
-                        txCountAtSnapshot,
-                        accountType,
-                        firstFunder,
-                        group,
-                        sharedDepositAddress,
-                        claimPaidToOtherAddress,
-                        missing,
-                      });
-                      const start = computeStart(f, settings).outcome;
-                      if (leastGenerous(start, computeCeiling(f, settings).ceiling) !== start) {
-                        expect.fail(`start ${start} is above the ceiling for ${JSON.stringify(f)}`);
+                    for (const fundingBurst of [null, { wallets: 20 }])
+                      for (const settings of [DEFAULT_SETTINGS, PARTIAL_OFF]) {
+                        const f = facts({
+                          walletAgeDays,
+                          txCountAtSnapshot,
+                          accountType,
+                          firstFunder,
+                          group,
+                          sharedDepositAddress,
+                          fundingBurst,
+                          claimPaidToOtherAddress,
+                          missing,
+                        });
+                        const fixed = computeStart(f, settings);
+                        const start = fixed.outcome;
+                        if (leastGenerous(start, computeCeiling(f, settings).ceiling) !== start) {
+                          expect.fail(`start ${start} is above the ceiling for ${JSON.stringify(f)}`);
+                        }
+                        const unburst = computeStart({ ...f, fundingBurst: null }, settings);
+                        const allowed = unburst.rule === 'A9' && fundingBurst !== null ? 'A8' : unburst.rule;
+                        if (fixed.rule !== allowed) expect.fail(`a burst moved the start to ${fixed.rule} for ${JSON.stringify(f)}`);
+                        checked += 1;
                       }
-                      checked += 1;
-                    }
-    expect(checked).toBe(29_160);
+    expect(checked).toBe(58_320);
   });
 });

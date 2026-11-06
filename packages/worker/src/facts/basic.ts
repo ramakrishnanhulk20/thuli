@@ -178,6 +178,8 @@ export async function collectBasicFacts(
     firstFunder,
     group: null,
     sharedDepositAddress: null,
+    // One wallet alone has no list to measure a burst against.
+    fundingBurst: null,
     claimPaidToOtherAddress: null,
     evidenceTxs,
     missing: [...missing],

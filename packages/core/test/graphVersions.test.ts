@@ -23,6 +23,7 @@ const CLEAN: GraphRecord = {
   group_swept_to_shared_collector: false,
   group_links_made_by_wallet: false,
   shared_deposit_claimants: 0,
+  funding_burst_wallets: 0,
   claim_paid_to_other_address: false,
   evidence_tx_hashes: [FUNDING_TX],
   unreadable_facts: [],
@@ -139,9 +140,16 @@ describe('GRAPH_G1.toInput: our record in g1 field names', () => {
     expect(traced).toThrow('graph g1 has no field for a traced funder');
     expect(() => GRAPH_G1.toInput({ ...CLEAN, evidence_tx_hashes: [`0x${'A1'.repeat(32)}`] })).toThrow(ZodError);
   });
+
+  it('refuses a funding burst it has no field for, and accepts a record with none', () => {
+    const burst = () => GRAPH_G1.toInput({ ...CLEAN, funding_burst_wallets: 20 });
+    expect(burst).toThrow(GraphVersionError);
+    expect(burst).toThrow('graph g1 has no field for a funding burst');
+    expect(() => GRAPH_G1.toInput({ ...CLEAN, funding_burst_wallets: 0 })).not.toThrow();
+  });
 });
 
-const REASON = 'Wallet is 400 days old with 120 transactions and was first funded by an exchange.';
+const REASON ='Wallet is 400 days old with 120 transactions and was first funded by an exchange.';
 
 function g1Reply(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({ verdict: 'ordinary_user', recommended_outcome: 'full_reward', reason: REASON, ...overrides });

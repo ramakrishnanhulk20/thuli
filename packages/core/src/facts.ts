@@ -55,6 +55,7 @@ export const Facts = z.strictObject({
     })
     .nullable(),
   sharedDepositAddress: z.strictObject({ sharedWithClaimants: Count }).nullable(),
+  fundingBurst: z.strictObject({ wallets: Count }).nullable(),
   claimPaidToOtherAddress: z.boolean().nullable(),
   evidenceTxs: z.array(TxHash).max(MAX_EVIDENCE_TXS),
   missing: z.array(z.enum(FACT_NAMES)).max(FACT_NAMES.length),

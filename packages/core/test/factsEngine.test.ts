@@ -7,10 +7,12 @@ import { Facts } from '../src/facts.ts';
 import {
   buildReplayFacts,
   funderKind,
+  fundingBursts,
   fundingTransfer,
   HIGH_VOLUME_NONCE,
   isPassThrough,
   PASS_THROUGH_MAX_BLOCKS,
+  SECONDS_PER_DAY,
   sharedDestinations,
   traceFunding,
   type AccountState,
@@ -127,6 +129,28 @@ function exchangeReplay(tag: string, count: number, sharedTo?: string, sharedSta
 const collectorReplay = (collectorState?: AccountState) => exchangeReplay('aa', 5, COLLECTOR, collectorState);
 const depositReplay = (depositState?: AccountState) => exchangeReplay('bb', 3, DEPOSIT, depositState);
 
+const BURST_DAY = Math.floor(timeOf(OLD_BLOCK) / SECONDS_PER_DAY) * SECONDS_PER_DAY;
+const BURST_MIDDAY = BURST_DAY + SECONDS_PER_DAY / 2;
+const BURST_MIDNIGHT = BURST_DAY + SECONDS_PER_DAY;
+const CONTRACT_STATE: AccountState = { nonce: 1, code: '0x6080604052' };
+
+interface BurstShape {
+  funder?: string;
+  funderState?: AccountState;
+  eth?: (index: number) => string;
+  time?: (index: number) => number;
+}
+
+/** Old, active wallets each funded once by one source. Left alone: one exchange, one UTC day, one amount. */
+function burstReplay(count: number, shape: BurstShape = {}): ReplayInput {
+  const { funder = BINANCE_14, funderState = BINANCE_STATE, eth = () => '0.5', time = () => BURST_MIDDAY } = shape;
+  const wallets = Array.from({ length: count }, (_, i) => synthetic('b0', i));
+  const ledger = wallets.map((w, i) => ({ ...send(funder, w, OLD_BLOCK + i, eth(i)), time: time(i) }));
+  return replay(wallets, ledger, [[funder, funderState], ...wallets.map((w): [string, AccountState] => [w, eoa(120)])]);
+}
+
+const burstOf = (input: ReplayInput) => [...buildReplayFacts(input).values()].map((f) => f.fundingBurst);
+
 describe('fundingTransfer', () => {
   it('does not take an earlier dust transfer from a stranger as the funder', () => {
     const dust = send(STRANGER, FARM_WALLET, 24_511_000, '0.000000000000000001');
@@ -224,6 +248,97 @@ describe('traceFunding', () => {
     expect(traceFunding(FARM_WALLET, lookupFrom(FARM_LEDGER), 0)).toEqual({ status: 'unknown' });
     expect(traceFunding(FARM_WALLET, lookupFrom(FARM_LEDGER), 2)).toEqual({ status: 'unknown' });
     expect(traceFunding(FARM_WALLET, lookupFrom(FARM_LEDGER), 3)).toMatchObject({ status: 'done', root: ROOT });
+  });
+});
+
+describe('fundingBursts', () => {
+  const candidate = (tag: string, index: number, wei: bigint, source = BINANCE_14, time = BURST_MIDDAY) => ({
+    wallet: synthetic(tag, index),
+    source,
+    time,
+    amount: wei,
+  });
+  const ETH = 10n ** 18n;
+
+  it('gives each wallet its largest single window, and sources and days never mix', () => {
+    const overlapping = Array.from({ length: 30 }, (_, i) => candidate('a0', i, ETH + (BigInt(i) * ETH) / 100n));
+    const between = candidate('a5', 0, 2n * ETH);
+    const farApart = Array.from({ length: 20 }, (_, i) => candidate('a1', i, 3n * ETH));
+    const otherSource = Array.from({ length: 19 }, (_, i) => candidate('a2', i, ETH, ROOT));
+    const otherDay = Array.from({ length: 19 }, (_, i) => candidate('a3', i, ETH, BINANCE_14, BURST_MIDNIGHT));
+    const bursts = fundingBursts([...overlapping, between, ...farApart, ...otherSource, ...otherDay], DEFAULT_SETTINGS);
+    expect(bursts.size).toBe(50);
+    // 30 wallets a hundredth of an ETH apart: only 26 of them fit inside 25% of any one wallet.
+    expect(bursts.get(synthetic('a0', 0))).toBe(26);
+    expect(bursts.get(synthetic('a0', 29))).toBe(26);
+    expect(bursts.get(synthetic('a1', 0))).toBe(20);
+    expect(bursts.has(between.wallet)).toBe(false);
+  });
+
+  it('gives 30 wallets at 1 ETH and 20 at 3 ETH bursts of 30 and 20, not one of 50', () => {
+    const low = Array.from({ length: 30 }, (_, i) => candidate('a6', i, ETH));
+    const high = Array.from({ length: 20 }, (_, i) => candidate('a7', i, 3n * ETH));
+    const bursts = fundingBursts([...low, ...high], DEFAULT_SETTINGS);
+    expect(bursts.size).toBe(50);
+    expect(new Set(low.map((c) => bursts.get(c.wallet)))).toEqual(new Set([30]));
+    expect(new Set(high.map((c) => bursts.get(c.wallet)))).toEqual(new Set([20]));
+  });
+
+  // The 1.25 ETH wallet is the only one in both windows: 25% above the 1 ETH wallets, and 1.5 ETH is within 25% of it.
+  it('keeps two windows that share one wallet at their own sizes', () => {
+    const low = Array.from({ length: 19 }, (_, i) => candidate('a8', i, ETH));
+    const shared = candidate('a9', 0, (5n * ETH) / 4n);
+    const high = Array.from({ length: 19 }, (_, i) => candidate('aa', i, (3n * ETH) / 2n));
+    const bursts = fundingBursts([...low, shared, ...high], DEFAULT_SETTINGS);
+    expect(bursts.size).toBe(39);
+    expect(new Set(bursts.values())).toEqual(new Set([20]));
+  });
+
+  // A slow reading of the rule itself, so the count is checked against the definition and not against a second copy.
+  function slowLargestWindow(amounts: bigint[], index: number): number {
+    let best = 0;
+    for (let start = 0; start <= index; start += 1) {
+      const fits = amounts.filter((amount, at) => at >= start && amount * 10_000n <= (amounts[start] as bigint) * 12_500n).length;
+      if (start + fits - 1 >= index) best = Math.max(best, fits);
+    }
+    return best;
+  }
+
+  it('never counts a chain of overlapping windows as one burst of near-equal amounts', () => {
+    const chain = Array.from({ length: 400 }, (_, i) => candidate('ab', i, ETH + (BigInt(i) * ETH) / 100n));
+    const bursts = fundingBursts(chain, DEFAULT_SETTINGS);
+    expect(bursts.size).toBe(400);
+    expect(Math.max(...bursts.values())).toBeLessThan(400);
+    const amounts = chain.map((c) => c.amount);
+    chain.forEach((c, index) => expect(bursts.get(c.wallet)).toBe(slowLargestWindow(amounts, index)));
+  });
+
+  it('matches the slow reading of the rule on an uneven list', () => {
+    let seed = 20_261_106;
+    const next = () => {
+      seed = (seed * 1_664_525 + 1_013_904_223) % 2 ** 32;
+      return BigInt(seed);
+    };
+    const uneven = Array.from({ length: 300 }, (_, i) => ({ i, wei: ETH + next() * 100_000_000n }))
+      .sort((a, b) => (a.wei < b.wei ? -1 : a.wei > b.wei ? 1 : 0))
+      .map(({ i, wei }) => candidate('ac', i, wei));
+    const bursts = fundingBursts(uneven, DEFAULT_SETTINGS);
+    const amounts = uneven.map((c) => c.amount);
+    uneven.forEach((c, index) => {
+      const size = slowLargestWindow(amounts, index);
+      expect(bursts.get(c.wallet)).toBe(size >= 20 ? size : undefined);
+    });
+  });
+
+  // Every amount fits one window, the worst case. The limit is 1 second, not 5, because a tight member-by-member loop
+  // took 3.3 seconds here: it would pass at 5, and this test exists to fail on it.
+  it('finishes 100,000 candidates with distinct amounts in one bucket inside the 5 second limit (C41)', () => {
+    const candidates = Array.from({ length: 100_000 }, (_, i) => candidate('a4', i, ETH + BigInt(100_000 - i) * 10n ** 9n));
+    const started = performance.now();
+    const bursts = fundingBursts(candidates, DEFAULT_SETTINGS);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(bursts.size).toBe(100_000);
+    expect(bursts.get(synthetic('a4', 0))).toBe(100_000);
   });
 });
 
@@ -328,6 +443,64 @@ describe('buildReplayFacts', () => {
         expect(f.missing).toEqual(['group']);
         expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A1' });
       }
+    }
+  });
+
+  it('gives 20 wallets one exchange funded on one UTC day within 25% a burst of 20, with no group (C45)', () => {
+    const amounts = (i: number) => (i === 19 ? '0.625' : (0.5 + i * 0.001).toFixed(3));
+    for (const f of buildReplayFacts(burstReplay(20, { eth: amounts })).values()) {
+      expect(f.fundingBurst).toEqual({ wallets: 20 });
+      expect(f.group).toBeNull();
+      expect(f.firstFunder).toMatchObject({ kind: 'exchange', fanoutInList: 20, hopsTraced: 0 });
+      expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'partial', rule: 'A8' });
+    }
+  });
+
+  it('gives no burst to 19 wallets, one under the minimum', () => {
+    for (const f of buildReplayFacts(burstReplay(19)).values()) {
+      expect(f.fundingBurst).toBeNull();
+      expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+    }
+  });
+
+  // A known limit, named in the threat model: a burst split across UTC midnight is not caught.
+  it('gives no burst to 20 wallets with 10 on each side of UTC midnight', () => {
+    const time = (i: number) => (i < 10 ? BURST_MIDNIGHT - 60 : BURST_MIDNIGHT + 60);
+    expect(burstOf(burstReplay(20, { time }))).toEqual(Array(20).fill(null));
+  });
+
+  it('leaves out a wallet funded 1.26 times the amount of the 20 in the burst', () => {
+    const eth = (i: number) => (i === 20 ? '0.63' : '0.5');
+    expect(burstOf(burstReplay(21, { eth }))).toEqual([...Array(20).fill({ wallets: 20 }), null]);
+  });
+
+  it('gives no burst when a wallet funder funded the same 20, and groups them by the existing rule', () => {
+    for (const f of buildReplayFacts(burstReplay(20, { funder: ROOT, funderState: eoa(20) })).values()) {
+      expect(f.fundingBurst).toBeNull();
+      expect(f.group?.size).toBe(20);
+      expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
+    }
+  });
+
+  it('gives no burst when a contract funded the same 20', () => {
+    const facts = buildReplayFacts(burstReplay(20, { funder: synthetic('cc', 1), funderState: CONTRACT_STATE }));
+    for (const f of facts.values()) {
+      expect(f.firstFunder?.kind).toBe('contract');
+      expect(f.fundingBurst).toBeNull();
+      expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+    }
+  });
+
+  it('gives no burst when the same 20 were funded through a pass-through hop to an exchange', () => {
+    const wallets = Array.from({ length: 20 }, (_, i) => synthetic('b0', i));
+    const ledger = wallets.flatMap((w, i) => {
+      const hop = synthetic('b1', i);
+      return [send(BINANCE_14, hop, OLD_BLOCK + 2 * i, '0.5'), send(hop, w, OLD_BLOCK + 2 * i + 1, '0.5')];
+    });
+    const states: [string, AccountState][] = [[BINANCE_14, BINANCE_STATE], ...wallets.map((w): [string, AccountState] => [w, eoa(120)])];
+    for (const f of buildReplayFacts(replay(wallets, ledger, states)).values()) {
+      expect(f.firstFunder).toMatchObject({ kind: 'exchange', hopsTraced: 1 });
+      expect(f.fundingBurst).toBeNull();
     }
   });
 

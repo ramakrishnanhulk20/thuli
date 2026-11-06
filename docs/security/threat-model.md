@@ -322,6 +322,17 @@ or attack that demonstrates it. A work order that carries an invariant also carr
 - **C43. Input never changes the shape of a query.** Shown by: injection fixtures (`'; drop table`, `%00`, oversized
   unicode) are stored and read back unchanged.
 
+**Funding bursts**
+- **C45. A funding burst can only cut a wallet to partial.** A burst is at least `burstMinWallets` wallets first funded by
+  one exchange on one UTC day in amounts within `burstSpreadBps` of each other. It is a pattern, not proof of one owner,
+  so it never starts a hold or an exclude and never joins wallets into a group. On a burst wallet whose start is partial
+  the outcome is the code's alone: any parsed reply that moves it, changes the rule or leaves the burst out of the reason
+  is replaced by the start and a code-written reason. A reply that does not parse, or fails C13, still holds under C11,
+  because that doubt is about the reply and not the pattern. A project that switches partial off gets the normal A8 hold.
+  Non-goals: one wallet screened alone has no list to measure a burst against, and a burst split across UTC midnight or
+  kept under the minimum is not caught. Shown by: stand-in replies of hold, exclude and full on a burst wallet all end
+  partial; a burst wallet never gets a group.
+
 **Demo campaign**
 - **C44. The demo pays at most 20 USDC, 1 USDC each, only to wallets that proved control.** A slot is taken only by a
   wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at

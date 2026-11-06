@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { meetsGroupExcludeRule } from './ceiling.ts';
+import { inFundingBurst, meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
 import { leastGenerous, OutcomeSchema, type Outcome } from './outcome.ts';
 import type { Settings } from './settings.ts';
@@ -85,14 +85,38 @@ export function holdForReview(cause: string): { decision: FinalDecision; accepte
 }
 
 /**
+ * The code's own partial for a burst wallet whose reply tried to move it. Holding the wallet here would let the pattern
+ * alone cost it the whole reward, which is the one thing a funding burst must not do (threat model C45). The reason is
+ * code-written, so no model text survives, and accepted stays false so the record shows the reply was replaced.
+ */
+function keepBurstPartial(ctx: DecisionContext, replied: Outcome): { decision: FinalDecision; accepted: false; cause: string } {
+  const decision: FinalDecision = {
+    action: 'partial',
+    shareBps: shareFor('partial', ctx.settings),
+    rule: ctx.start.rule,
+    reason: `First funded in a burst of ${ctx.facts.fundingBurst?.wallets} wallets from one exchange on one day in near-equal amounts. A funding pattern alone does not prove one owner, so the reward is partial.`,
+    citedTxs: [],
+    paidHops: ctx.paidHopsMade ?? 0,
+  };
+  return {
+    decision: replied === 'partial' ? decision : { ...decision, clampedFrom: replied },
+    accepted: false,
+    cause: 'a funding burst keeps this wallet at partial',
+  };
+}
+
+/**
  * Checks a model's decision like untrusted input, then applies the code ceiling.
  *
- * Any failed check gives a hold with rule A1 and accepted false (threat model C11, C13). An exclude without the A3
+ * On a burst wallet whose start is partial, a parsed reply that moves the action, changes the rule or leaves the burst
+ * out of its reason is replaced by the start with a code-written reason (C45). That replacement skips the final clamp,
+ * so it only runs when the ceiling allows partial; a context with a lower ceiling takes the normal checks instead (C12).
+ * Any other failed check gives a hold with rule A1 and accepted false (threat model C11, C13). An exclude without the A3
  * self-linked group evidence becomes a hold (C15). The rule must fit the code's start: a fixed rule must repeat it
- * exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise an A4 to A6 hold. Otherwise the
- * final action is the less generous of the model's action and the ceiling; when that lowers it, clampedFrom
- * records the model's action and the share is recomputed (C12). The cause texts are fixed strings, so no model text
- * is ever copied into a fallback reason.
+ * exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise an A4 to A6 hold. Otherwise the final
+ * action is the less generous of the model's action and the ceiling; when that lowers it, clampedFrom records the
+ * model's action and the share is recomputed (C12). The cause texts are fixed strings, so no model text is ever copied
+ * into a fallback reason.
  */
 export function validateDecision(
   raw: unknown,
@@ -101,6 +125,15 @@ export function validateDecision(
   const parsed = parseRawDecision(raw);
   if (!parsed.ok) return holdForReview(parsed.cause);
   const reply = parsed.decision;
+
+  if (
+    ctx.start.outcome === 'partial' &&
+    leastGenerous('partial', ctx.ceiling) === 'partial' &&
+    inFundingBurst(ctx.facts, ctx.settings)
+  ) {
+    const namesBurst = reply.reason.toLowerCase().includes('burst');
+    if (reply.action !== 'partial' || reply.rule !== ctx.start.rule || !namesBurst) return keepBurstPartial(ctx, reply.action);
+  }
 
   if (reply.shareBps !== shareFor(reply.action, ctx.settings)) {
     return holdForReview('the share did not match the action');

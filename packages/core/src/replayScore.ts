@@ -1,6 +1,7 @@
 import { formatUnits } from 'viem';
 import { FACT_NAMES, type FactName, type Facts } from './facts.ts';
 import type { Outcome } from './outcome.ts';
+import type { Settings } from './settings.ts';
 import { FIXED_RULES, type FixedRule, type Start } from './start.ts';
 
 /** Transfers read per claim wallet in the replay. The scorecard names this limit in its "Not covered" list. */
@@ -53,6 +54,8 @@ export interface ReplayScore {
   /** Key wallets traced back to the funding wallet the key names, out of fundedWallets. */
   rootMatches: number;
   dataGaps: { a1: number; missing: Record<FactName, number> };
+  /** The thresholds used, wallets in a burst, and those on A8 only because of the burst. */
+  burst: { minWallets: number; spreadBps: number; key: number; other: number; burstOnly: number };
 }
 
 const ROBO_DECIMALS = 18;
@@ -74,10 +77,19 @@ function isHeld(start: Start): boolean {
   return start.outcome === 'hold' || start.outcome === 'exclude';
 }
 
+function meetsAgeAndActivity(facts: Facts, settings: Pick<Settings, 'minWalletAgeDays' | 'minTxCount'>): boolean {
+  return (
+    facts.walletAgeDays !== null &&
+    facts.txCountAtSnapshot !== null &&
+    facts.walletAgeDays >= settings.minWalletAgeDays &&
+    facts.txCountAtSnapshot >= settings.minTxCount
+  );
+}
+
 /**
  * Scores one replay against a farm answer key: how many key wallets the code held (recall), how many families it
  * reached, how many other wallets it held, the ROBO behind each, whether its traced funding root matches the key's
- * funding wallet, and where facts were missing. Pure: no network, no clock.
+ * funding wallet, where facts were missing, and how far funding bursts reached. Pure: no network, no clock.
  *
  * @throws RangeError when two rows name the same wallet, because every count would then be off.
  */
@@ -85,6 +97,7 @@ export function scoreReplay(
   rows: ReplayRow[],
   key: Map<string, FarmKeyEntry>,
   claimedWei: Map<string, bigint>,
+  settings: Pick<Settings, 'minWalletAgeDays' | 'minTxCount' | 'burstMinWallets' | 'burstSpreadBps'>,
 ): ReplayScore {
   const keyLower = new Map([...key].map(([wallet, family]) => [lower(wallet), family]));
   const claimedLower = new Map([...claimedWei].map(([wallet, wei]) => [lower(wallet), wei]));
@@ -106,6 +119,9 @@ export function scoreReplay(
   let heldKeyWei = 0n;
   let allKeyWei = 0n;
   let heldOtherWei = 0n;
+  let burstKey = 0;
+  let burstOther = 0;
+  let burstOnly = 0;
 
   for (const row of rows) {
     const wallet = lower(row.wallet);
@@ -116,10 +132,13 @@ export function scoreReplay(
     const wei = claimedLower.get(wallet) ?? 0n;
     if (row.start.rule === 'A1') a1 += 1;
     for (const name of row.facts.missing) missing[name] += 1;
+    const inBurst = row.facts.fundingBurst !== null;
+    if (inBurst && row.start.rule === 'A8' && meetsAgeAndActivity(row.facts, settings)) burstOnly += 1;
 
     const family = keyLower.get(wallet);
     if (family === undefined) {
       byRule.other[row.start.rule] += 1;
+      if (inBurst) burstOther += 1;
       if (row.start.outcome === 'partial') otherPartial += 1;
       if (row.start.outcome === 'full') otherFull += 1;
       if (held) {
@@ -130,6 +149,7 @@ export function scoreReplay(
     }
     byRule.key[row.start.rule] += 1;
     keyWallets += 1;
+    if (inBurst) burstKey += 1;
     allKeyWei += wei;
     if (held) {
       keyHeld += 1;
@@ -178,6 +198,13 @@ export function scoreReplay(
     },
     rootMatches,
     dataGaps: { a1, missing },
+    burst: {
+      minWallets: settings.burstMinWallets,
+      spreadBps: settings.burstSpreadBps,
+      key: burstKey,
+      other: burstOther,
+      burstOnly,
+    },
   };
 }
 
@@ -189,7 +216,7 @@ const RULE_MEANING: Record<FixedRule, string> = {
   A5: 'its funder funded many listed wallets, so hold',
   A6: 'it shares a deposit address, so hold',
   A7: 'the claim was paid elsewhere, so hold',
-  A8: 'newer or quieter than the minimum, so partial (hold when partial is off)',
+  A8: 'newer, quieter or funded in a burst, so partial (hold when partial is off)',
   A9: 'no check limits it, so full',
 };
 
@@ -254,6 +281,15 @@ export function scoreToMarkdown(
     `Cut to partial: ${count(score.otherPartial)} (${percent(ratio(score.otherPartial, score.otherWallets))})`,
     `Paid in full: ${count(score.otherFull)} (${percent(ratio(score.otherFull, score.otherWallets))})`,
     '',
+    '## Funding bursts',
+    '',
+    'Added after the held-out score was frozen, with thresholds set by reading this same data, so this part is not held out. It moves wallets from full to partial and changes no hold.',
+    `A burst is at least ${count(score.burst.minWallets)} wallets first funded by one exchange on one UTC day in amounts within ${score.burst.spreadBps / 100}% of each other.`,
+    'It is a pattern, not proof of one owner, so it can cut a wallet to partial and can never hold or exclude it.',
+    '',
+    `Wallets in a burst: ${count(score.burst.key + score.burst.other)} (key wallets: ${count(score.burst.key)}, other wallets: ${count(score.burst.other)})`,
+    `Cut to partial by the burst alone: ${count(score.burst.burstOnly)}`,
+    '',
     '## Funding roots',
     '',
     `Key wallets traced back to the funding wallet Bitquery names: ${count(score.rootMatches)} of ${count(score.fundedWallets)}`,
@@ -276,6 +312,8 @@ export function scoreToMarkdown(
     "- Holds outside Bitquery's key are an upper bound on false holds, because the key may miss farms.",
     `- Transfers past a wallet's first ${REPLAY_WALLET_LIMIT} are not read.`,
     '- Only native ETH funding is traced, not tokens.',
+    '- A funding burst is a pattern, so real users funded in one are cut to partial too.',
+    '- The burst thresholds still need the Hop check.',
     '',
   ].join('\n');
 }

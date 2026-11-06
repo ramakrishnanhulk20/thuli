@@ -9,8 +9,9 @@ export const PASS_THROUGH_MAX_BLOCKS = 50;
 export const MAX_TRACE_HOPS = 6;
 /** A sender with at least this many transactions at the snapshot counts as an exchange or service (C16). */
 export const HIGH_VOLUME_NONCE = 10_000;
-/** Fundings from one source inside this window count as one burst for the group rule. */
+/** Fundings from one source inside this window count together for the group rule. */
 export const FUNDING_WINDOW_SECONDS = 7 * 86_400;
+export const SECONDS_PER_DAY = 86_400;
 
 /**
  * One value movement as an explorer lists it. Addresses and hashes are lowercase, valueWei is whole wei in decimal
@@ -324,6 +325,97 @@ function sameFunderWindowCounts(members: { wallet: string; fundingTime: number }
   return result;
 }
 
+/** One claim wallet's first funding, as the burst rule reads it. Each wallet appears once. */
+export interface BurstCandidate {
+  wallet: string;
+  source: string;
+  time: number;
+  amount: bigint;
+}
+
+/**
+ * For each amount in ascending order, the size of the largest window holding it. Window starts only move forward, so
+ * the windows holding one amount are neighbours by end, and a queue of ever smaller sizes reads the largest in O(n).
+ */
+function largestWindowSizes(amounts: bigint[], spread: bigint): number[] {
+  const starts: number[] = [];
+  let start = 0;
+  amounts.forEach((amount, end) => {
+    while (amount * 10_000n > (amounts[start] as bigint) * spread) start += 1;
+    starts[end] = start;
+  });
+  const sizeOf = (end: number) => end - (starts[end] as number) + 1;
+
+  const queue: number[] = [];
+  let head = 0;
+  let nextEnd = 0;
+  return amounts.map((_, index) => {
+    while (nextEnd < amounts.length && (starts[nextEnd] as number) <= index) {
+      while (queue.length > head && sizeOf(queue[queue.length - 1] as number) <= sizeOf(nextEnd)) queue.pop();
+      queue.push(nextEnd);
+      nextEnd += 1;
+    }
+    while ((queue[head] as number) < index) head += 1;
+    return sizeOf(queue[head] as number);
+  });
+}
+
+/**
+ * Wallets first funded in a burst: at least burstMinWallets from one source on one UTC day, in amounts within
+ * burstSpreadBps of the smallest in the window. Each wallet maps to the size of the largest single window holding it,
+ * because that count lands in a reason that calls the amounts near-equal, and a chain of overlapping windows can span
+ * any range; a wallet in no burst is absent. One exchange can fund a whole list in a day, so the work stays O(n log n)
+ * (C41).
+ */
+export function fundingBursts(
+  candidates: BurstCandidate[],
+  settings: Pick<Settings, 'burstMinWallets' | 'burstSpreadBps'>,
+): Map<string, number> {
+  const buckets = new Map<string, BurstCandidate[]>();
+  for (const candidate of candidates) {
+    const key = `${candidate.source}:${Math.floor(candidate.time / SECONDS_PER_DAY)}`;
+    const bucket = buckets.get(key);
+    if (bucket === undefined) buckets.set(key, [candidate]);
+    else bucket.push(candidate);
+  }
+
+  const spread = 10_000n + BigInt(settings.burstSpreadBps);
+  const result = new Map<string, number>();
+  for (const bucket of buckets.values()) {
+    const sorted = [...bucket].sort((a, b) => (a.amount < b.amount ? -1 : a.amount > b.amount ? 1 : 0));
+    const largest = largestWindowSizes(sorted.map((candidate) => candidate.amount), spread);
+    sorted.forEach(({ wallet }, index) => {
+      const size = largest[index] as number;
+      if (size >= settings.burstMinWallets) result.set(wallet, size);
+    });
+  }
+  return result;
+}
+
+/**
+ * Claim wallets an exchange funded directly. A contract stays out on purpose: on the ROBO replay one contract source hit
+ * 63 of 742 old active control wallets and exchange sources hit none. A pass-through hop stays out because the amount
+ * that reached the wallet is no longer the amount the exchange sent.
+ */
+function directExchangeFundings(
+  wallets: string[],
+  { data, traces }: Pick<ReplayInput, 'data' | 'traces'>,
+  kindOf: (address: string) => FunderKind,
+): BurstCandidate[] {
+  const candidates: BurstCandidate[] = [];
+  for (const wallet of wallets) {
+    const trace = traces.get(wallet);
+    const walletData = data.get(wallet);
+    if (trace?.status !== 'done' || trace.hops.length > 0 || walletData === undefined) continue;
+    const source = lower(trace.root);
+    if (kindOf(source) !== 'exchange') continue;
+    const funding = fundingTransfer(wallet, walletData);
+    if (funding.status !== 'found') continue;
+    candidates.push({ wallet, source, time: funding.transfer.time, amount: wei(funding.transfer) });
+  }
+  return candidates;
+}
+
 function walletAgeDays(data: AddressData | undefined, snapshotTime: number): number | null {
   if (data === undefined) return null;
   let earliest: number | undefined;
@@ -338,6 +430,7 @@ function walletAgeDays(data: AddressData | undefined, snapshotTime: number): num
  * Works out every rulebook fact for each claim wallet from data the runner already read (pure, no network). Wallets
  * are linked into groups by a shared funding root or a shared destination, but only through addresses that are
  * wallets or unknown: doubt should make a hold more likely, never less, and contracts and exchanges never link (C16).
+ * A funding burst is a pattern, not a link, so it is reported on its own and never joins wallets into a group (C45).
  * Each result goes through Facts.parse, so a bad fact throws instead of reaching a decision.
  */
 export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
@@ -369,6 +462,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
   for (const [dest, senders] of shared) {
     if (linkable(dest)) components.join(senders);
   }
+  const bursts = fundingBursts(directExchangeFundings(wallets, input, kindOf), settings);
 
   const result = new Map<string, Facts>();
   for (const wallet of wallets) {
@@ -426,6 +520,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     if (accountType === 'unknown') missing.add('accountType');
 
     const traceTxs = trace?.status === 'done' ? trace.txs.map(lower) : [];
+    const burstWallets = bursts.get(wallet);
     result.set(
       wallet,
       Facts.parse({
@@ -435,6 +530,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
         firstFunder,
         group,
         sharedDepositAddress: largestDeposit >= 2 ? { sharedWithClaimants: largestDeposit - 1 } : null,
+        fundingBurst: burstWallets === undefined ? null : { wallets: burstWallets },
         // Pre-claim replay: claims have not opened, so there is no claim to redirect (DECISIONS.md 3 Nov, M3).
         claimPaidToOtherAddress: false,
         evidenceTxs: [...new Set([...traceTxs, ...sendHashes])].slice(0, MAX_EVIDENCE_TXS),

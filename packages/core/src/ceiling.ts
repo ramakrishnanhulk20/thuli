@@ -17,6 +17,21 @@ export function meetsGroupExcludeRule(facts: Facts, settings: Settings): boolean
   );
 }
 
+/** True for a wallet first funded in a burst at least the project's minimum size. */
+export function inFundingBurst(facts: Facts, settings: Settings): boolean {
+  return facts.fundingBurst !== null && facts.fundingBurst.wallets >= settings.burstMinWallets;
+}
+
+/**
+ * Rulebook check A8's condition: newer, quieter or burst-funded. The ceiling and the start both call this one function,
+ * so a burst can reach A8 and nothing above it (threat model C45).
+ */
+export function limitedToPartial(facts: Facts, settings: Settings): boolean {
+  const tooNew = facts.walletAgeDays !== null && facts.walletAgeDays < settings.minWalletAgeDays;
+  const tooQuiet = facts.txCountAtSnapshot !== null && facts.txCountAtSnapshot < settings.minTxCount;
+  return tooNew || tooQuiet || inFundingBurst(facts, settings);
+}
+
 /** Facts the checks rely on that could not be read. evidenceTxs is left out because no check depends on it. */
 function unreadFacts(facts: Facts): FactName[] {
   const unread = facts.missing.filter((name) => name !== 'evidenceTxs');
@@ -52,7 +67,12 @@ export function computeCeiling(facts: Facts, settings: Settings): { ceiling: Out
   if (facts.claimPaidToOtherAddress === true) {
     return { ceiling: 'hold', reason: 'The reward was claimed to a different address, so a person must review it.' };
   }
-  if (facts.walletAgeDays < settings.minWalletAgeDays || facts.txCountAtSnapshot < settings.minTxCount) {
+  if (limitedToPartial(facts, settings)) {
+    if (inFundingBurst(facts, settings)) {
+      return settings.allowPartial
+        ? { ceiling: 'partial', reason: 'Wallet was first funded in an exchange funding burst, so at most partial.' }
+        : { ceiling: 'hold', reason: 'Wallet was first funded in an exchange funding burst and partial is off.' };
+    }
     return settings.allowPartial
       ? { ceiling: 'partial', reason: 'Wallet is newer or less active than the project minimum, so at most partial.' }
       : { ceiling: 'hold', reason: 'Wallet is newer or less active than the project minimum and partial is off.' };

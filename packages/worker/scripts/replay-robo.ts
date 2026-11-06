@@ -167,7 +167,7 @@ async function main(): Promise<number> {
     { explorer, accounts, log: (line) => console.error(line) },
   );
 
-  const report = scoreToMarkdown(scoreReplay(rows, key, claimedWei), {
+  const report = scoreToMarkdown(scoreReplay(rows, key, claimedWei, DEFAULT_SETTINGS), {
     snapshotBlock: SNAPSHOT_BLOCK,
     snapshotTime: new Date(snapshotTime * 1000).toISOString(),
     runDate: new Date().toISOString().slice(0, 10),

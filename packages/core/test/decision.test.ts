@@ -17,6 +17,7 @@ function facts(overrides: Partial<Facts> = {}): Facts {
     firstFunder: null,
     group: null,
     sharedDepositAddress: null,
+    fundingBurst: null,
     claimPaidToOtherAddress: false,
     evidenceTxs: [OWN_TX],
     missing: [],
@@ -154,6 +155,92 @@ describe('validateDecision: the ceiling wins (C12)', () => {
     expect(result.cause).toBeUndefined();
     expect(result.decision.action).toBe('hold');
     expect(result.decision.clampedFrom).toBeUndefined();
+  });
+});
+
+describe('validateDecision: a funding burst keeps a wallet at partial (C45)', () => {
+  const BURST_WALLET = facts({ walletAgeDays: 400, txCountAtSnapshot: 120, fundingBurst: { wallets: 23 } });
+  const BURST_CTX = ctx({ facts: BURST_WALLET, ceiling: 'partial', start: { outcome: 'partial', rule: 'A8' } });
+  const NAMES_BURST = 'First funded in a Funding Burst of 23 wallets, so partial.';
+  const PARTIAL_A8 = { action: 'partial', shareBps: DEFAULT_SETTINGS.partialShareBps, rule: 'A8', reason: NAMES_BURST };
+  const HOLD = { action: 'hold', shareBps: 0, reason: NAMES_BURST };
+
+  it.each([
+    ['hold under B1', { ...HOLD, rule: 'B1' }, 'hold'],
+    ['hold under A8', { ...HOLD, rule: 'A8' }, 'hold'],
+    ['full under A9', { action: 'full', shareBps: 10000, rule: 'A9', reason: NAMES_BURST }, 'full'],
+    ['exclude under A3', { action: 'exclude', shareBps: 0, rule: 'A3', reason: NAMES_BURST }, 'exclude'],
+    ['partial under B2', { ...PARTIAL_A8, rule: 'B2' }, undefined],
+    ['partial under A8 with the burst left out of the reason', { ...PARTIAL_A8, reason: 'Old and active wallet.' }, undefined],
+  ])('replaces %s with the start and a code-written reason', (_case, overrides, clampedFrom) => {
+    const result = validateDecision(reply(overrides), BURST_CTX);
+    expect(result.accepted).toBe(false);
+    expect(result.cause).toBe('a funding burst keeps this wallet at partial');
+    expect(result.decision).toEqual({
+      action: 'partial',
+      shareBps: 5000,
+      rule: 'A8',
+      reason:
+        'First funded in a burst of 23 wallets from one exchange on one day in near-equal amounts. A funding pattern alone does not prove one owner, so the reward is partial.',
+      citedTxs: [],
+      paidHops: 0,
+      ...(clampedFrom === undefined ? {} : { clampedFrom }),
+    });
+    expect('clampedFrom' in result.decision).toBe(clampedFrom !== undefined);
+  });
+
+  it('reports the paid lookups the worker made, not the model count', () => {
+    const result = validateDecision(reply({ ...HOLD, rule: 'B1', paidHops: 3 }), { ...BURST_CTX, paidHopsMade: 2 });
+    expect(result.decision).toMatchObject({ action: 'partial', paidHops: 2 });
+  });
+
+  it('accepts partial under A8 that names the burst, in any letter case, and keeps the model reason', () => {
+    const result = validateDecision(reply(PARTIAL_A8), BURST_CTX);
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
+    expect(result.decision).toMatchObject({ action: 'partial', rule: 'A8', reason: NAMES_BURST });
+  });
+
+  it('still ends a reply that does not parse in hold (C11)', () => {
+    expectRejected(validateDecision('not json', BURST_CTX));
+  });
+
+  it('still runs every other check on a reply that passes the guard (C13)', () => {
+    expectRejected(validateDecision(reply({ ...PARTIAL_A8, reason: `A funding burst. ${'a'.repeat(280)}` }), BURST_CTX));
+  });
+
+  it('leaves a wallet with no burst, or one under the minimum, free to be held under B1', () => {
+    for (const wallet of [facts(), facts({ fundingBurst: { wallets: 19 } })]) {
+      const context = ctx({ facts: wallet, ceiling: 'partial', start: { outcome: 'partial', rule: 'A8' } });
+      const result = validateDecision(reply({ ...HOLD, rule: 'B1' }), context);
+      expect(result.accepted).toBe(true);
+      expect(result.decision).toMatchObject({ action: 'hold', rule: 'B1', reason: NAMES_BURST });
+    }
+  });
+
+  it('never pays above the ceiling: with a hold ceiling the normal checks decide (C12)', () => {
+    const context = { ...BURST_CTX, ceiling: 'hold' as const };
+    const held = validateDecision(reply({ ...HOLD, rule: 'B1' }), context);
+    expect(held.accepted).toBe(true);
+    expect(held.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1', reason: NAMES_BURST });
+
+    for (const overrides of [PARTIAL_A8, { ...PARTIAL_A8, rule: 'B2' }, { ...HOLD, rule: 'A8' }, { action: 'full', shareBps: 10000, rule: 'A9' }]) {
+      const result = validateDecision(reply(overrides), context);
+      expect(result.decision.action, JSON.stringify(overrides)).toBe('hold');
+      expect(result.decision.shareBps, JSON.stringify(overrides)).toBe(0);
+    }
+  });
+
+  it('does not run when partial is off, because the start is then a hold', () => {
+    const context = ctx({
+      facts: BURST_WALLET,
+      settings: { ...DEFAULT_SETTINGS, allowPartial: false },
+      ceiling: 'hold',
+      start: { outcome: 'hold', rule: 'A8' },
+    });
+    const result = validateDecision(reply({ reason: 'Held because partial is off.' }), context);
+    expect(result.accepted).toBe(true);
+    expect(result.decision).toMatchObject({ action: 'hold', rule: 'A8', reason: 'Held because partial is off.' });
   });
 });
 

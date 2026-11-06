@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { meetsGroupExcludeRule } from './ceiling.ts';
+import { limitedToPartial, meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
 import { OutcomeSchema } from './outcome.ts';
 import type { Settings } from './settings.ts';
@@ -41,7 +41,7 @@ export function computeStart(facts: Facts, settings: Settings): Start {
     return { outcome: 'hold', rule: 'A6' };
   }
   if (facts.claimPaidToOtherAddress) return { outcome: 'hold', rule: 'A7' };
-  if (facts.walletAgeDays < settings.minWalletAgeDays || facts.txCountAtSnapshot < settings.minTxCount) {
+  if (limitedToPartial(facts, settings)) {
     return { outcome: settings.allowPartial ? 'partial' : 'hold', rule: 'A8' };
   }
   return { outcome: 'full', rule: 'A9' };

@@ -13,6 +13,7 @@ function facts(overrides: Partial<Facts> = {}): Facts {
     firstFunder: null,
     group: null,
     sharedDepositAddress: null,
+    fundingBurst: null,
     claimPaidToOtherAddress: false,
     evidenceTxs: [],
     missing: [],
@@ -52,6 +53,33 @@ describe('computeCeiling', () => {
     expect(computeCeiling(facts({ walletAgeDays: 3 }), DEFAULT_SETTINGS).ceiling).toBe('partial');
     expect(computeCeiling(facts({ txCountAtSnapshot: 1 }), DEFAULT_SETTINGS).ceiling).toBe('partial');
     expect(computeCeiling(facts({ walletAgeDays: 3 }), { ...DEFAULT_SETTINGS, allowPartial: false }).ceiling).toBe('hold');
+  });
+
+  it('caps a burst wallet at partial with the true reason, or hold when partial is off (C45)', () => {
+    const burst = facts({ fundingBurst: { wallets: 20 } });
+    expect(computeCeiling(burst, DEFAULT_SETTINGS)).toEqual({
+      ceiling: 'partial',
+      reason: 'Wallet was first funded in an exchange funding burst, so at most partial.',
+    });
+    expect(computeCeiling(burst, { ...DEFAULT_SETTINGS, allowPartial: false })).toEqual({
+      ceiling: 'hold',
+      reason: 'Wallet was first funded in an exchange funding burst and partial is off.',
+    });
+  });
+
+  it('gives a new wallet its own reason, byte for byte, and ignores a burst under the minimum', () => {
+    expect(computeCeiling(facts({ walletAgeDays: 3 }), DEFAULT_SETTINGS)).toEqual({
+      ceiling: 'partial',
+      reason: 'Wallet is newer or less active than the project minimum, so at most partial.',
+    });
+    expect(computeCeiling(facts({ txCountAtSnapshot: 1 }), { ...DEFAULT_SETTINGS, allowPartial: false })).toEqual({
+      ceiling: 'hold',
+      reason: 'Wallet is newer or less active than the project minimum and partial is off.',
+    });
+    expect(computeCeiling(facts({ fundingBurst: { wallets: 19 } }), DEFAULT_SETTINGS)).toEqual({
+      ceiling: 'full',
+      reason: 'No code check limits this wallet.',
+    });
   });
 
   it('allows full when no check limits the wallet', () => {
