@@ -12,3 +12,4 @@ export * from './graph.ts';
 export * from './graphVersions.ts';
 export * from './replayScore.ts';
 export * from './reppo.ts';
+export * from './appeal.ts';
