@@ -16,6 +16,8 @@ export interface ServReply {
   answer: unknown;
   /** A fixed cause when the graph's reply could not be translated, in which case answer is null. */
   answerProblem: string | null;
+  /** SERV's token counts for this call, or null when it sent none or sent something odd. */
+  usage: { inputTokens: number; outputTokens: number } | null;
 }
 
 export class ServError extends Error {
@@ -54,6 +56,10 @@ const ChatBody = z.object({
     .min(1),
 });
 
+const TokenCount = z.int().min(0);
+const GraphUsage = z.object({ usage: z.object({ input_tokens: TokenCount, output_tokens: TokenCount }) });
+const ChatUsage = z.object({ usage: z.object({ prompt_tokens: TokenCount, completion_tokens: TokenCount }) });
+
 export function connectionFromEnv(): ServConnection {
   const env = loadEnv();
   return { baseUrl: env.SERV_BASE_URL, apiKey: env.SERV_API_KEY };
@@ -74,6 +80,20 @@ function serverDetail(reply: JsonReply, apiKey: string): string {
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
     .slice(0, 200);
   return `: ${text}`;
+}
+
+// Usage is a receipt, not an answer: it is read on its own from the whole body, so a missing or odd one is null and
+// can never fail a call that carried a good answer.
+function graphUsage(json: unknown): ServReply['usage'] {
+  const parsed = GraphUsage.safeParse(json);
+  if (!parsed.success) return null;
+  return { inputTokens: parsed.data.usage.input_tokens, outputTokens: parsed.data.usage.output_tokens };
+}
+
+function chatUsage(json: unknown): ServReply['usage'] {
+  const parsed = ChatUsage.safeParse(json);
+  if (!parsed.success) return null;
+  return { inputTokens: parsed.data.usage.prompt_tokens, outputTokens: parsed.data.usage.completion_tokens };
 }
 
 // The key goes only into the Authorization header of the outgoing request. Nothing here logs or returns a request
@@ -148,6 +168,7 @@ export async function decideViaGraph(record: GraphRecord, opts: ServConnection &
     rawText,
     answer: translated.ok ? translated.answer : null,
     answerProblem: translated.ok ? null : translated.cause,
+    usage: graphUsage(reply.json),
   };
 }
 
@@ -184,5 +205,5 @@ export async function decideViaV2(
   const body = ChatBody.safeParse(reply.json);
   if (!body.success) throw new ServError('SERV reply did not match the chat completion shape', reply.status, requestId);
   const rawText = body.data.choices[0]?.message.content ?? '';
-  return { requestId, rawText, answer: rawText, answerProblem: null };
+  return { requestId, rawText, answer: rawText, answerProblem: null, usage: chatUsage(reply.json) };
 }

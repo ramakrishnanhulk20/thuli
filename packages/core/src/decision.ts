@@ -32,6 +32,9 @@ export interface DecisionContext {
 
 export const MAX_REASON_CHARS = 280;
 
+/** The cause on a burst reply the code replaced. The scorecard counts these on their own, so both share this one text. */
+export const BURST_KEPT_CAUSE = 'a funding burst keeps this wallet at partial';
+
 // A real decision is well under 2 KB. Anything far larger is refused before JSON.parse ever sees it (C41).
 const MAX_RAW_TEXT_CHARS = 16_384;
 
@@ -101,7 +104,7 @@ function keepBurstPartial(ctx: DecisionContext, replied: Outcome): { decision: F
   return {
     decision: replied === 'partial' ? decision : { ...decision, clampedFrom: replied },
     accepted: false,
-    cause: 'a funding burst keeps this wallet at partial',
+    cause: BURST_KEPT_CAUSE,
   };
 }
 

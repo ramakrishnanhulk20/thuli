@@ -65,7 +65,7 @@ function lower(value: string): string {
   return value.toLowerCase();
 }
 
-function ratio(part: number, whole: number): number | null {
+export function ratio(part: number, whole: number): number | null {
   return whole === 0 ? null : part / whole;
 }
 
@@ -73,11 +73,11 @@ function zeroCounts<T extends string>(names: readonly T[]): Record<T, number> {
   return Object.fromEntries(names.map((name) => [name, 0])) as Record<T, number>;
 }
 
-function isHeld(start: Start): boolean {
+export function isHeld(start: Start): boolean {
   return start.outcome === 'hold' || start.outcome === 'exclude';
 }
 
-function meetsAgeAndActivity(facts: Facts, settings: Pick<Settings, 'minWalletAgeDays' | 'minTxCount'>): boolean {
+export function meetsAgeAndActivity(facts: Facts, settings: Pick<Settings, 'minWalletAgeDays' | 'minTxCount'>): boolean {
   return (
     facts.walletAgeDays !== null &&
     facts.txCountAtSnapshot !== null &&
@@ -208,7 +208,7 @@ export function scoreReplay(
   };
 }
 
-const RULE_MEANING: Record<FixedRule, string> = {
+export const RULE_MEANING: Record<FixedRule, string> = {
   A1: 'a fact could not be read, so hold',
   A2: 'the wallet is a contract, so hold',
   A3: 'a group it linked itself, so exclude',
@@ -220,11 +220,11 @@ const RULE_MEANING: Record<FixedRule, string> = {
   A9: 'no check limits it, so full',
 };
 
-function count(value: number): string {
+export function count(value: number): string {
   return value.toLocaleString('en-US');
 }
 
-function percent(value: number | null): string {
+export function percent(value: number | null): string {
   return value === null ? 'n/a' : `${(value * 100).toFixed(1)}%`;
 }
 
