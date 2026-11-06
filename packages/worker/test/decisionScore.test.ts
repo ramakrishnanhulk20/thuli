@@ -20,6 +20,7 @@ const ROBO = 10n ** 18n;
 const LONG_DASH = String.fromCharCode(0x2014);
 const BAD_SHARE = 'the share did not match the action';
 const BAD_JSON = 'the model reply was not valid JSON';
+const TOO_LONG = 'the reason was longer than 280 characters';
 
 const SHARE_FOR: Record<Outcome, number> = { full: 10000, partial: DEFAULT_SETTINGS.partialShareBps, hold: 0, exclude: 0 };
 
@@ -64,6 +65,8 @@ function record(address: string, start: Start, action: Outcome, overrides: Parti
     clampedFrom: null,
     accepted: true,
     cause: null,
+    secondAsk: false,
+    firstCause: null,
     ...overrides,
   };
 }
@@ -113,9 +116,9 @@ const RECORDS: DecisionRecord[] = [
   record(K3, EXCLUDE_A3, 'exclude'),
   record(K4, PARTIAL_A8, 'hold', { rule: 'B1', modelRule: 'B1' }),
   record(K6, FULL_A9, 'full', { verdict: 'likely_farm' }),
-  record(O1, FULL_A9, 'full', { verdict: 'ordinary_user' }),
+  record(O1, FULL_A9, 'full', { verdict: 'ordinary_user', secondAsk: true, firstCause: TOO_LONG }),
   record(O2, PARTIAL_A8, 'partial', { mode: 'v2', modelAction: 'hold', clampedFrom: 'hold', accepted: false, cause: BURST_KEPT_CAUSE }),
-  record(O3, FULL_A9, 'hold', { verdict: 'ordinary_user', modelAction: 'full', rule: 'A1', accepted: false, cause: BAD_SHARE }),
+  record(O3, FULL_A9, 'hold', { verdict: 'ordinary_user', modelAction: 'full', rule: 'A1', accepted: false, cause: BAD_SHARE, secondAsk: true, firstCause: TOO_LONG }),
   record(O4, HOLD_A1, 'hold', { mode: 'v2', fallback: true, usage: null, verdict: null, modelAction: null, modelRule: null, accepted: false, cause: BAD_JSON }),
   record(O5, FULL_A9, 'hold', { rule: 'B1', modelRule: 'B1' }),
   record(O7, HOLD_A6, 'partial', { mode: 'v2', fallback: true, rule: 'B2', modelRule: 'B2' }),
@@ -150,6 +153,7 @@ describe('scoreDecisions', () => {
       tokens: { v3: { input: 800, output: 80 }, v2: { input: 200, output: 20 } },
       accepted: 8,
       burstKept: 1,
+      secondAsks: { asked: 2, fixed: 1 },
       refused: { [BAD_SHARE]: 1, [BAD_JSON]: 1 },
       final: {
         key: { full: 2, partial: 0, hold: 2, exclude: 1 },
@@ -194,6 +198,7 @@ describe('scoreDecisions', () => {
       wallets: 13,
       decided: 0,
       undecided: 13,
+      secondAsks: { asked: 0, fixed: 0 },
       refused: {},
       final: { key: zeroOutcomes, other: zeroOutcomes },
       startHeld: { key: 0, other: 0 },
@@ -217,6 +222,13 @@ describe('scoreDecisions', () => {
     expect(() => score(record(K1, HOLD_A5, 'hold'))).toThrow(STALE_DECISION);
     expect(() => score(record(K1, HOLD_A4, 'hold', { ceiling: 'partial' }))).toThrow(STALE_DECISION);
     expect(score(record(K1, HOLD_A4, 'hold')).decided).toBe(1);
+  });
+
+  it('counts a refused first answer as asked even when the second call failed, and not as fixed', () => {
+    const failedSecond = record(O3, FULL_A9, 'hold', { rule: 'A1', accepted: false, cause: TOO_LONG, secondAsk: true, firstCause: TOO_LONG });
+    const score = scoreDecisions([failedSecond], [row(O3, FULL_A9)], new Map(), CLAIMED);
+    expect(score.secondAsks).toEqual({ asked: 1, fixed: 0 });
+    expect(score.refused).toEqual({ [TOO_LONG]: 1 });
   });
 
   it('refuses a wallet listed twice, in the rows or in the records', () => {
@@ -289,6 +301,7 @@ describe('decisionsToMarkdown', () => {
     expect(report).toContain('Decided: 11');
     expect(report).toContain('Undecided: 2');
     expect(report).toContain('Accepted by the checks: 8');
+    expect(report).toContain(`First answers refused: 2\nFixed by a second ask: 1\nStill refused and held:\n- ${BAD_JSON}: 1\n- ${BAD_SHARE}: 1`);
     expect(report).toContain(`- ${BAD_SHARE}: 1`);
     expect(report).toContain(`- ${BAD_JSON}: 1`);
     expect(report).not.toContain(`- ${BURST_KEPT_CAUSE}`);
@@ -316,7 +329,7 @@ describe('decisionsToMarkdown', () => {
     const empty = decisionsToMarkdown(scoreDecisions([], ROWS, KEY, CLAIMED), { runDate: '2026-11-06', spentCents: 0 });
     expect(empty).toContain('Wallets: 13 (0 decided, 13 undecided)');
     expect(empty).toContain('Held after SERV: 0 (n/a)');
-    expect(empty).toContain('Refused by the checks and held:\n- none');
+    expect(empty).toContain('First answers refused: 0\nFixed by a second ask: 0\nStill refused and held:\n- none');
     expect(empty).toContain('Spent, from the console balance: $0.00 (n/a cents per wallet)');
   });
 

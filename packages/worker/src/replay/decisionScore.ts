@@ -28,6 +28,8 @@ export interface DecisionScore {
   tokens: { v3: { input: number; output: number }; v2: { input: number; output: number } };
   accepted: number;
   burstKept: number;
+  /** asked counts first answers the checks refused, whether or not the second call worked. fixed counts those then accepted. */
+  secondAsks: { asked: number; fixed: number };
   /** Every other cause, by its text, with how many decisions it ended. */
   refused: Record<string, number>;
   final: { key: Record<Outcome, number>; other: Record<Outcome, number> };
@@ -85,6 +87,7 @@ export function scoreDecisions(
   const seen = new Set<string>();
   const modes = { v3: 0, v2: 0, fallbacks: 0 };
   const tokens = { v3: { input: 0, output: 0 }, v2: { input: 0, output: 0 } };
+  const secondAsks = { asked: 0, fixed: 0 };
   const refused = new Map<string, number>();
   const final = { key: zeroOutcomes(), other: zeroOutcomes() };
   const startHeld = { key: 0, other: 0 };
@@ -130,6 +133,8 @@ export function scoreDecisions(
     tokens[record.mode].input += record.usage?.inputTokens ?? 0;
     tokens[record.mode].output += record.usage?.outputTokens ?? 0;
     if (record.accepted) accepted += 1;
+    if (record.secondAsk) secondAsks.asked += 1;
+    if (record.secondAsk && record.accepted) secondAsks.fixed += 1;
     // The code keeping its own start is not a refused answer, so it gets its own line.
     if (record.cause === BURST_KEPT_CAUSE) burstKept += 1;
     else if (record.cause !== null) refused.set(record.cause, (refused.get(record.cause) ?? 0) + 1);
@@ -151,6 +156,7 @@ export function scoreDecisions(
     tokens,
     accepted,
     burstKept,
+    secondAsks,
     refused: Object.fromEntries(refused),
     final,
     startHeld,
@@ -261,7 +267,9 @@ export function decisionsToMarkdown(score: DecisionScore, meta: { runDate: strin
     `Decided: ${count(score.decided)}`,
     `Undecided: ${count(score.undecided)}`,
     `Accepted by the checks: ${count(score.accepted)}`,
-    'Refused by the checks and held:',
+    `First answers refused: ${count(score.secondAsks.asked)}`,
+    `Fixed by a second ask: ${count(score.secondAsks.fixed)}`,
+    'Still refused and held:',
     ...refusalLines(score.refused),
     `Verdict clashes: ${count(score.verdictClash.ordinaryButHeld)} called ordinary but held, ${count(score.verdictClash.farmButPaidInFull)} called likely farm but paid in full`,
     '',

@@ -49,7 +49,7 @@ const UNREADABLE: Facts = {
 const FARM: Facts = {
   ...CLEAN,
   firstFunder: { address: FUNDER, kind: 'wallet', fanoutInList: 12, hopsTraced: 1 },
-  group: { size: 8, sameFunderWithinWindow: 6, sweptToSharedCollector: true, authoredEvidence: true },
+  group: { size: 8, sameFunderWithinWindow: 6, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true },
   sharedDepositAddress: { sharedWithClaimants: 3 },
   evidenceTxs: [OWN_TX, SWEEP_TX],
 };
@@ -136,6 +136,12 @@ describe('toGraphRecord: one flat record with no free text (C14, C34)', () => {
       evidence_tx_hashes: [OWN_TX, SWEEP_TX],
       unreadable_facts: [],
     });
+  });
+
+  it('tells the model about links the wallet made even when they are not exclude-grade evidence', () => {
+    const linked = { size: 2, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: true };
+    expect(recordFor({ ...CLEAN, group: linked }).group_links_made_by_wallet).toBe(true);
+    expect(recordFor({ ...CLEAN, group: { ...linked, linkedByWallet: false } }).group_links_made_by_wallet).toBe(false);
   });
 
   it('throws before sending a record that breaks the schema', () => {

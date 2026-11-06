@@ -68,7 +68,9 @@ export function toGraphRecord(facts: Facts, start: Start): GraphRecord {
     group_size: group?.size ?? 0,
     group_same_funder: group?.sameFunderWithinWindow ?? null,
     group_swept_to_shared_collector: group?.sweptToSharedCollector ?? false,
-    group_links_made_by_wallet: group?.authoredEvidence ?? false,
+    // Not authoredEvidence: that is exclude-grade evidence for A3, and this is a plain fact the model repeats in a reason.
+    // Reading the stricter one here told the model a wallet made no links when its own sweep had made them (C15 unchanged).
+    group_links_made_by_wallet: group?.linkedByWallet ?? false,
     shared_deposit_claimants: facts.sharedDepositAddress?.sharedWithClaimants ?? 0,
     funding_burst_wallets: facts.fundingBurst?.wallets ?? 0,
     claim_paid_to_other_address: facts.claimPaidToOtherAddress,

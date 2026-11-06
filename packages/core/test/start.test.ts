@@ -32,13 +32,14 @@ function fundedBy(kind: (typeof FUNDER_KINDS)[number], fanoutInList: number | nu
   return facts({ firstFunder: { address: FUNDER, kind, fanoutInList, hopsTraced: 1 } });
 }
 
-const FARM_GROUP = { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true };
+const FARM_GROUP = { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true };
 // Big enough to count, but not linked by this wallet's own transactions, so A3 cannot exclude it and A4 holds it.
 const UNPROVEN_GROUP = {
   size: DEFAULT_SETTINGS.groupMinSize,
   sameFunderWithinWindow: null,
   sweptToSharedCollector: true,
   authoredEvidence: false,
+  linkedByWallet: false,
 };
 
 const UNREADABLE = [

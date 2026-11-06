@@ -3,6 +3,7 @@
 import { keccak256, parseEther, toHex } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { parseAddress } from '../src/address.ts';
+import { computeCeiling, meetsGroupExcludeRule } from '../src/ceiling.ts';
 import { Facts } from '../src/facts.ts';
 import {
   buildReplayFacts,
@@ -367,7 +368,7 @@ describe('buildReplayFacts', () => {
         fanoutInList: 19,
         hopsTraced: wallet === FARM_WALLET ? 3 : 1,
       });
-      expect(f.group).toEqual({ size: 19, sameFunderWithinWindow: 19, sweptToSharedCollector: false, authoredEvidence: false });
+      expect(f.group).toEqual({ size: 19, sameFunderWithinWindow: 19, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: false });
       expect(f.missing).toEqual([]);
       expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
     }
@@ -391,7 +392,7 @@ describe('buildReplayFacts', () => {
     const input = collectorReplay(eoa(0));
     expect(sharedDestinations(input).get(COLLECTOR)?.size).toBe(5);
     for (const [wallet, f] of buildReplayFacts(input)) {
-      expect(f.group).toEqual({ size: 5, sameFunderWithinWindow: null, sweptToSharedCollector: true, authoredEvidence: true });
+      expect(f.group).toEqual({ size: 5, sameFunderWithinWindow: null, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true });
       expect(f.evidenceTxs).toHaveLength(2);
       expect(f.evidenceTxs[1]).toBe(input.data.get(wallet)?.external.transfers.find((t) => t.to === COLLECTOR)?.hash);
       expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'exclude', rule: 'A3' });
@@ -432,9 +433,75 @@ describe('buildReplayFacts', () => {
   it('holds 3 wallets that share one deposit address under A6', () => {
     for (const f of buildReplayFacts(depositReplay(eoa(0))).values()) {
       expect(f.sharedDepositAddress).toEqual({ sharedWithClaimants: 2 });
-      expect(f.group).toEqual({ size: 3, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false });
+      expect(f.group).toEqual({ size: 3, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: true });
       expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A6' });
     }
+  });
+
+  describe('linkedByWallet: links this wallet made, wider than the exclude-grade authoredEvidence', () => {
+    const funder = synthetic('fa', 2);
+    const funded = Array.from({ length: 5 }, (_, i) => synthetic('fc', i));
+    const fundings = funded.map((w, i) => send(funder, w, ANCHOR_BLOCK + i, '0.1'));
+    const walletStates = (wallets: string[]) => wallets.map((w): [string, AccountState] => [w, eoa(120)]);
+    const linked = (input: ReplayInput, wallet: string) => buildReplayFacts(input).get(wallet)?.group?.linkedByWallet;
+
+    it('is true for a sweep to a destination shared with one other claim wallet, with authoredEvidence false', () => {
+      const facts = [...buildReplayFacts(exchangeReplay('dd', 2, DEPOSIT, eoa(0))).values()];
+      expect(facts).toHaveLength(2);
+      for (const f of facts) {
+        expect(f.group).toEqual({ size: 2, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: true });
+      }
+    });
+
+    it('is true for a claim wallet that funded another claim wallet', () => {
+      const input = replay([funder, ...funded], [send(BINANCE_14, funder, OLD_BLOCK, '2'), ...fundings], [
+        [BINANCE_14, BINANCE_STATE],
+        ...walletStates([funder, ...funded]),
+      ]);
+      expect(linked(input, funder)).toBe(true);
+      expect(buildReplayFacts(input).get(funder)?.group?.authoredEvidence).toBe(false);
+    });
+
+    it('is false for a wallet only funded by a shared root', () => {
+      const input = replay(funded, fundings, [[funder, eoa(5)], ...walletStates(funded)]);
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.group).toMatchObject({ size: 5, linkedByWallet: false });
+      }
+    });
+
+    it('is false for a funding root that is not linkable, even when it sits in a group', () => {
+      const root = synthetic('fa', 3);
+      const [busy, peer, fundedA, fundedB] = [synthetic('fd', 1), synthetic('fd', 2), synthetic('fd', 3), synthetic('fd', 4)];
+      const wallets = [busy, peer, fundedA, fundedB];
+      const ledger = [
+        send(root, busy, ANCHOR_BLOCK, '1'),
+        send(root, peer, ANCHOR_BLOCK + 1, '1'),
+        send(busy, fundedA, ANCHOR_BLOCK + 2, '0.1'),
+        send(busy, fundedB, ANCHOR_BLOCK + 3, '0.1'),
+      ];
+      const input = replay(wallets, ledger, [[root, eoa(5)], [busy, eoa(HIGH_VOLUME_NONCE)], ...walletStates([peer, fundedA, fundedB])]);
+      expect(buildReplayFacts(input).get(busy)?.group).toMatchObject({ size: 2, linkedByWallet: false });
+    });
+
+    it('is false for a sweep to a shared exchange, even when the wallet sits in a group', () => {
+      const exchangeDeposit = synthetic('e1', 1);
+      const ledger = [...fundings, ...funded.map((w, i) => send(w, exchangeDeposit, ANCHOR_BLOCK + 100 + i, '0.09'))];
+      const input = replay(funded, ledger, [[funder, eoa(5)], [exchangeDeposit, BINANCE_STATE], ...walletStates(funded)]);
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.group).toMatchObject({ size: 5, linkedByWallet: false });
+      }
+    });
+
+    it('never reaches check A3, which still needs authoredEvidence', () => {
+      const [first, second] = funded as [string, string];
+      const sweeps = [first, second].map((w, i) => send(w, DEPOSIT, ANCHOR_BLOCK + 100 + i, '0.09'));
+      const input = replay(funded, [...fundings, ...sweeps], [[funder, eoa(5)], [DEPOSIT, eoa(0)], ...walletStates(funded)]);
+      const facts = buildReplayFacts(input).get(first) as Facts;
+      expect(facts.group).toMatchObject({ size: 5, sameFunderWithinWindow: 5, authoredEvidence: false, linkedByWallet: true });
+      expect(meetsGroupExcludeRule(facts, DEFAULT_SETTINGS)).toBe(false);
+      expect(computeStart(facts, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
+      expect(computeCeiling(facts, DEFAULT_SETTINGS).ceiling).not.toBe('exclude');
+    });
   });
 
   it('marks the group unread when a shared destination has no state, so the start is A1, never an exclude', () => {

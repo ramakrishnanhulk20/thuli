@@ -51,7 +51,10 @@ export const Facts = z.strictObject({
       size: Count,
       sameFunderWithinWindow: Count.nullable(),
       sweptToSharedCollector: z.boolean(),
+      /** Exclude-grade evidence, and the only group fact check A3 reads (C15). */
       authoredEvidence: z.boolean(),
+      /** This wallet made a link itself, even one too small to exclude on. A plain fact for the model to repeat. */
+      linkedByWallet: z.boolean(),
     })
     .nullable(),
   sharedDepositAddress: z.strictObject({ sharedWithClaimants: Count }).nullable(),

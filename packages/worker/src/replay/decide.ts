@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  BURST_KEPT_CAUSE,
   computeCeiling,
   computeStart,
   DECISION_RULES,
@@ -11,6 +12,7 @@ import {
   toGraphRecord,
   validateDecision,
   VERDICTS,
+  type DecisionContext,
   type GraphRecord,
   type ReplayRow,
   type Settings,
@@ -23,7 +25,8 @@ import { ServError, type ServReply } from '../serv/client.ts';
 const MAX_STORED_TEXT_CHARS = 8192;
 /** The most wallets sent to SERV at once (C41). Measured 6 Nov: no rate limit seen up to 40 v2 and 32 graph calls at once. */
 export const MAX_DECIDE_WIDTH = 64;
-// One wait per retry, so a wallet costs at most 4 calls per route and a stuck provider cannot hold a lane forever (C41).
+// One wait per retry, so an ask costs at most 4 calls and a stuck provider cannot hold a lane forever. A wallet gets the
+// first ask, a fallback ask when the graph fails, and one second ask, so at most 12 calls in all (C41).
 const RETRY_WAITS_MS = [2_000, 8_000, 30_000] as const;
 const PROGRESS_EVERY_WALLETS = 500;
 // A bad key or a dead provider fails every wallet alike, so this many in a row means stop, not carry on (C11, C41).
@@ -52,6 +55,10 @@ export const DecisionRecord = z.strictObject({
   clampedFrom: OutcomeSchema.nullable(),
   accepted: z.boolean(),
   cause: z.string().nullable(),
+  /** True when the first answer was refused, so v2 was asked again, even if that call failed. */
+  secondAsk: z.boolean(),
+  /** Why the first answer was refused. Null when there was no second ask. */
+  firstCause: z.string().nullable(),
 });
 export type DecisionRecord = z.infer<typeof DecisionRecord>;
 
@@ -125,16 +132,43 @@ async function askServ(record: GraphRecord, deps: DecideDeps, mode: 'auto' | 'v2
   }
 }
 
+interface Checked {
+  served: Served;
+  answer: ReturnType<typeof decisionFromGraphAnswer>;
+  result: ReturnType<typeof validateDecision>;
+}
+
+function checkAnswer(served: Served, context: DecisionContext): Checked {
+  const { reply } = served;
+  const answer: Checked['answer'] =
+    reply.answerProblem === null
+      ? decisionFromGraphAnswer(reply.answer, context.settings, 0)
+      : { ok: false, cause: reply.answerProblem };
+  const result = answer.ok ? validateDecision(answer.decision, context) : holdForReview(answer.cause);
+  return { served, answer, result };
+}
+
+function addUsage(first: ServReply['usage'], second: ServReply['usage']): ServReply['usage'] {
+  if (first === null) return second;
+  if (second === null) return first;
+  return { inputTokens: first.inputTokens + second.inputTokens, outputTokens: first.outputTokens + second.outputTokens };
+}
+
 /**
  * Sends one wallet through SERV and checks the answer with the code's rules. A burst wallet goes to v2 because graph g1
  * has no field for a burst; a graph call that fails after its retries also goes to v2, marked as a fallback.
+ *
+ * An answer the checks refuse gets one second ask on v2, so a wallet is not held only because the model wrote a reason
+ * too long. The second answer takes the same checks with the same ceiling, so asking again can never pay more than the
+ * first ask could (C12, C13). If it is refused too, that refusal stands, and if the call fails the first hold stands
+ * (C11). A burst reply the code replaced is not asked again, because the outcome there is already the code's own (C45).
  *
  * Returns null when no route gave an answer: nothing was approved for the wallet, and a rerun asks again (C11). Any
  * answer that arrived, however bad, ends in a record, with a failed check holding the wallet (C11, C13). The final
  * action is never above the ceiling (C12).
  *
  * @throws Error when the row's start or ceiling no longer match its facts, before any call.
- * @throws OutOfCredit on a 402 from either route.
+ * @throws OutOfCredit on a 402 from either route, on either ask.
  */
 export async function decideWallet(
   row: ReplayRow,
@@ -148,27 +182,26 @@ export async function decideWallet(
     throw new Error(STALE_ROWS);
   }
 
-  const served = await askServ(toGraphRecord(row.facts, start), deps, mode);
+  const record = toGraphRecord(row.facts, start);
+  const served = await askServ(record, deps, mode);
   if (served === null) return null;
-  const { reply } = served;
 
-  const answer: ReturnType<typeof decisionFromGraphAnswer> =
-    reply.answerProblem === null
-      ? decisionFromGraphAnswer(reply.answer, settings, 0)
-      : { ok: false, cause: reply.answerProblem };
-  const result = answer.ok
-    ? validateDecision(answer.decision, { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0 })
-    : holdForReview(answer.cause);
+  const context: DecisionContext = { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0 };
+  const first = checkAnswer(served, context);
+  const askAgain = !first.result.accepted && first.result.cause !== BURST_KEPT_CAUSE;
+  const secondServed = askAgain ? await askV2(record, deps, served.fallback) : null;
+  const { answer, result, served: kept } = secondServed === null ? first : checkAnswer(secondServed, context);
+  const { reply } = kept;
 
   return DecisionRecord.parse({
     wallet: row.wallet,
-    mode: served.mode,
-    fallback: served.fallback,
+    mode: kept.mode,
+    fallback: kept.fallback,
     start,
     ceiling,
     requestId: reply.requestId,
     rawText: reply.rawText.slice(0, MAX_STORED_TEXT_CHARS),
-    usage: reply.usage,
+    usage: addUsage(served.reply.usage, secondServed?.reply.usage ?? null),
     verdict: answer.ok ? answer.verdict : null,
     modelAction: answer.ok ? answer.decision.action : null,
     modelRule: answer.ok ? answer.decision.rule : null,
@@ -180,6 +213,8 @@ export async function decideWallet(
     clampedFrom: result.decision.clampedFrom ?? null,
     accepted: result.accepted,
     cause: result.cause ?? null,
+    secondAsk: askAgain,
+    firstCause: askAgain ? (first.result.cause ?? null) : null,
   });
 }
 

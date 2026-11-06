@@ -501,6 +501,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     }
 
     const size = components.sizeOf(wallet);
+    const fundedAnotherClaimWallet = linkable(wallet) && (byRoot.get(wallet) ?? []).some((member) => member.wallet !== wallet);
     const group =
       size >= 2
         ? {
@@ -509,6 +510,9 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
             sweptToSharedCollector: swept,
             // Only a sweep is something this wallet did. A funding it received could have come from anyone (C15).
             authoredEvidence: swept,
+            // Wider than authoredEvidence on purpose: a sweep shared with one other wallet, or funding another claim wallet,
+            // is this wallet's own doing but too thin to exclude on. It tells the model what happened and A3 never reads it.
+            linkedByWallet: sendHashes.length > 0 || fundedAnotherClaimWallet,
           }
         : null;
 

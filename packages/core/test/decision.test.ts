@@ -129,7 +129,7 @@ describe('validateDecision: exclude needs A3 evidence (C15)', () => {
 
   it('accepts an exclude when the self-linked group meets A3', () => {
     const farm = facts({
-      group: { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true },
+      group: { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true },
     });
     const exclude = reply({ action: 'exclude', rule: 'A3' });
     const result = validateDecision(exclude, ctx({ facts: farm, ceiling: 'exclude', start: excludeStart }));

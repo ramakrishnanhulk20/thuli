@@ -21,7 +21,7 @@ function facts(overrides: Partial<Facts> = {}): Facts {
   };
 }
 
-const FARM_GROUP = { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true };
+const FARM_GROUP = { size: 8, sameFunderWithinWindow: 8, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true };
 
 describe('computeCeiling', () => {
   it('holds when age, tx count or account type is unreadable, or the account is a contract', () => {
