@@ -263,6 +263,7 @@ describe('hopToMarkdown', () => {
     expect(notCovered).toContain('It stays counted as a hold under A1, so a failed read can only raise the rate, never hide.');
     expect(notCovered).toContain("Transfers past a wallet's first 100 are not read.");
     expect(notCovered).toContain('This is the code alone, with no model in the loop.');
+    expect(notCovered).toContain('A shared address counts as private when at least half the senders in its oldest 100 transfers are on the list, so a new public address used first by list wallets can still link them.');
   });
 
   it('prints no wallet and no long dash', () => {

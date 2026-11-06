@@ -216,6 +216,7 @@ describe('scoreToMarkdown', () => {
       'Only native ETH funding is traced, not tokens',
       'A funding burst is a pattern, so real users funded in one are cut to partial too.',
       'The burst thresholds still need the Hop check.',
+      'A shared address counts as private when at least half the senders in its oldest 100 transfers are on the list, so a new public address used first by list wallets can still link them.',
     ]) {
       expect(lastSection).toContain(line);
     }

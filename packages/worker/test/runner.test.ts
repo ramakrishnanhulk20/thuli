@@ -149,7 +149,7 @@ describe('runReplay', () => {
       expect(row.facts.group?.size).toBe(18);
     }
     expect(log.some((line) => line.includes(broken))).toBe(true);
-    for (const phase of ['wallets: ', 'internal transfers: ', 'funding trace pass 1: ', 'account states: ', 'facts: ']) {
+    for (const phase of ['wallets: ', 'internal transfers: ', 'funding trace pass 1: ', 'account states: ', 'destination pages: ', 'facts: ']) {
       expect(log.some((line) => line.startsWith(phase))).toBe(true);
     }
     for (const line of log) expect(line).not.toMatch(/http|apikey|K3YSECRET/i);
@@ -177,6 +177,72 @@ describe('runReplay', () => {
     expect(rows.find((r) => r.wallet === INTERNALLY_FUNDED)?.facts.firstFunder).toMatchObject({
       address: parseAddress(PAYOUT_CONTRACT),
       kind: 'contract',
+    });
+  });
+
+  describe('destination pages', () => {
+    const EXCHANGE = synthetic('e0', 1);
+    const SHARED = synthetic('d0', 1);
+    const OTHER_SHARED = synthetic('d0', 2);
+    const SWEEPERS = Array.from({ length: 5 }, (_, i) => synthetic('a0', i));
+    const fundings = SWEEPERS.map((w, i) => send(EXCHANGE, w, 24_000_000 + i, '0.5'));
+    const sweepsTo = (dest: string) => SWEEPERS.map((w, i) => send(w, dest, 24_100_000 + i, '0.49'));
+    const strangerPayments = (dest: string) => Array.from({ length: 95 }, (_, i) => send(synthetic('5a', i), dest, 23_000_000 + i, '1'));
+    const baseStates: [string, AccountState][] = [[EXCHANGE, { nonce: 20_000, code: '0x' }], ...SWEEPERS.map((w): [string, AccountState] => [w, eoa(120)])];
+    const statesWith = (...extra: [string, AccountState][]) => new Map([...baseStates, ...extra]);
+    const askedFor = (calls: { address: string }[], address: string) => calls.filter((c) => c.address === address);
+
+    it('reads a page once per destination, at the wallet limit, and a private address still links', async () => {
+      const ledger = [...fundings, ...sweepsTo(SHARED)];
+      const { rows, calls, log } = await run(SWEEPERS, ledger, statesWith([SHARED, eoa(0)]));
+      expect(askedFor(calls, SHARED)).toEqual([{ action: 'txlist', address: SHARED, limit: WALLET_LIMIT }]);
+      expect(log.some((line) => line.startsWith('destination pages: 1/1'))).toBe(true);
+      for (const row of rows) expect(row.start).toEqual({ outcome: 'exclude', rule: 'A3' });
+    });
+
+    it('reads each destination when wallets share more than one', async () => {
+      const second = SWEEPERS.map((w, i) => send(w, OTHER_SHARED, 24_200_000 + i, '0.3'));
+      const ledger = [...fundings, ...sweepsTo(SHARED), ...second];
+      const { calls } = await run(SWEEPERS, ledger, statesWith([SHARED, eoa(0)], [OTHER_SHARED, eoa(0)]));
+      expect(askedFor(calls, SHARED)).toHaveLength(1);
+      expect(askedFor(calls, OTHER_SHARED)).toHaveLength(1);
+    });
+
+    it('lets a public address link nobody, so the wallets stay on A9', async () => {
+      const ledger = [...strangerPayments(SHARED), ...fundings, ...sweepsTo(SHARED)];
+      const { rows } = await run(SWEEPERS, ledger, statesWith([SHARED, eoa(48)]));
+      for (const row of rows) {
+        expect(row.facts.group).toBeNull();
+        expect(row.facts.missing).toEqual([]);
+        expect(row.start).toEqual({ outcome: 'full', rule: 'A9' });
+      }
+    });
+
+    it.each([
+      ['an exchange', { nonce: 20_000, code: '0x' }],
+      ['a contract', { nonce: 1, code: '0x6080' }],
+    ])('skips the page for %s', async (_name, state) => {
+      const { rows, calls } = await run(SWEEPERS, [...fundings, ...sweepsTo(SHARED)], statesWith([SHARED, state]));
+      expect(askedFor(calls, SHARED)).toEqual([]);
+      for (const row of rows) expect(row.start).toEqual({ outcome: 'full', rule: 'A9' });
+    });
+
+    it('still reads the page when the destination state is unknown', async () => {
+      const { calls, rows } = await run(SWEEPERS, [...fundings, ...sweepsTo(SHARED)], statesWith());
+      expect(askedFor(calls, SHARED)).toHaveLength(1);
+      for (const row of rows) expect(row.start).toEqual({ outcome: 'hold', rule: 'A1' });
+    });
+
+    it('leaves the wallets on A1 when the page read fails, logging no URL or key', async () => {
+      const { rows, calls, log } = await run(SWEEPERS, [...fundings, ...sweepsTo(SHARED)], statesWith([SHARED, eoa(0)]), [SHARED]);
+      expect(askedFor(calls, SHARED)).toHaveLength(1);
+      for (const row of rows) {
+        expect(row.start).toEqual({ outcome: 'hold', rule: 'A1' });
+        expect(row.facts.missing).toEqual(['group']);
+        expect(row.facts.group).toBeNull();
+      }
+      expect(log.some((line) => line.startsWith('destination pages: could not read') && line.includes(SHARED))).toBe(true);
+      for (const line of log) expect(line).not.toMatch(/http|apikey|K3YSECRET/i);
     });
   });
 });

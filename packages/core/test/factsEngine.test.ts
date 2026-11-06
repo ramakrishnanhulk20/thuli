@@ -14,12 +14,14 @@ import {
   isPassThrough,
   PASS_THROUGH_MAX_BLOCKS,
   SECONDS_PER_DAY,
+  senderListShareBps,
   sharedDestinations,
   traceFunding,
   type AccountState,
   type AddressData,
   type ReplayInput,
   type Transfer,
+  type TransferPage,
 } from '../src/factsEngine.ts';
 import { DEFAULT_SETTINGS } from '../src/settings.ts';
 import { computeStart } from '../src/start.ts';
@@ -98,15 +100,21 @@ function hashOf(from: string, to: string): string {
   return found.hash;
 }
 
-function replay(wallets: string[], ledger: Transfer[], states: [string, AccountState][]): ReplayInput {
+type PageEntry = [string, TransferPage];
+
+// Unless a test names its pages, each shared destination's page comes from the ledger, so its crowd is list wallets only.
+function replay(wallets: string[], ledger: Transfer[], states: [string, AccountState][], pages?: PageEntry[]): ReplayInput {
   const lookup = lookupFrom(ledger, { incomplete: [BINANCE_14] });
+  const data = new Map(wallets.map((w) => [w, dataFor(w, ledger)]));
+  const fromLedger = [...sharedDestinations({ wallets, data }).keys()].map((dest): PageEntry => [dest, dataFor(dest, ledger).external]);
   return {
     wallets,
     snapshotTime: SNAPSHOT_TIME,
     settings: DEFAULT_SETTINGS,
-    data: new Map(wallets.map((w) => [w, dataFor(w, ledger)])),
+    data,
     traces: new Map(wallets.map((w) => [w, traceFunding(w, lookup)])),
     states: new Map(states),
+    destinationPages: new Map(pages ?? fromLedger),
   };
 }
 
@@ -116,7 +124,7 @@ function farmReplay(): ReplayInput {
 }
 
 /** Old wallets funded by Binance 14, each optionally sending to one shared address. */
-function exchangeReplay(tag: string, count: number, sharedTo?: string, sharedState?: AccountState): ReplayInput {
+function exchangeReplay(tag: string, count: number, sharedTo?: string, sharedState?: AccountState, pages?: PageEntry[]): ReplayInput {
   const wallets = Array.from({ length: count }, (_, i) => synthetic(tag, i));
   const ledger = wallets.flatMap((w, i) => [
     send(BINANCE_14, w, OLD_BLOCK + 10 * i, '0.5'),
@@ -124,7 +132,7 @@ function exchangeReplay(tag: string, count: number, sharedTo?: string, sharedSta
   ]);
   const states: [string, AccountState][] = [[BINANCE_14, BINANCE_STATE], ...wallets.map((w): [string, AccountState] => [w, eoa(120)])];
   if (sharedTo !== undefined && sharedState !== undefined) states.push([sharedTo, sharedState]);
-  return replay(wallets, ledger, states);
+  return replay(wallets, ledger, states, pages);
 }
 
 const collectorReplay = (collectorState?: AccountState) => exchangeReplay('aa', 5, COLLECTOR, collectorState);
@@ -357,6 +365,46 @@ describe('funderKind', () => {
   });
 });
 
+describe('senderListShareBps', () => {
+  const DEST = synthetic('d0', 1);
+  const [LISTED_A, LISTED_B, OUTSIDER] = [synthetic('a1', 1), synthetic('a1', 2), synthetic('a1', 3)] as [string, string, string];
+  const list = new Set([LISTED_A, LISTED_B]);
+  const pageOf = (transfers: Transfer[]): TransferPage => ({ transfers, complete: true });
+
+  it('counts a sender once however often it paid', () => {
+    const page = pageOf([send(LISTED_A, DEST, 100, '1'), send(LISTED_A, DEST, 101, '1'), send(LISTED_A, DEST, 102, '1'), send(OUTSIDER, DEST, 103, '1')]);
+    expect(senderListShareBps(DEST, page, list)).toBe(5000);
+  });
+
+  it('ignores failed and zero-value transfers', () => {
+    const failed = { ...send(LISTED_A, DEST, 100, '1'), failed: true };
+    const zero = send(LISTED_B, DEST, 101, '0');
+    expect(senderListShareBps(DEST, pageOf([failed, zero, send(OUTSIDER, DEST, 102, '1')]), list)).toBe(0);
+  });
+
+  it("ignores the address's own sends, even when the address is itself on the list", () => {
+    const withDest = new Set([...list, DEST]);
+    const page = pageOf([send(DEST, OUTSIDER, 100, '1'), send(DEST, DEST, 101, '1'), send(OUTSIDER, DEST, 102, '1')]);
+    expect(senderListShareBps(DEST, page, withDest)).toBe(0);
+  });
+
+  it('returns 10000 when the page shows no sender, because nothing shows the address is public', () => {
+    expect(senderListShareBps(DEST, pageOf([]), list)).toBe(10000);
+    expect(senderListShareBps(DEST, pageOf([send(DEST, OUTSIDER, 100, '1')]), list)).toBe(10000);
+  });
+
+  it('rounds down to whole basis points', () => {
+    const page = pageOf([send(LISTED_A, DEST, 100, '1'), send(LISTED_B, DEST, 101, '1'), send(OUTSIDER, DEST, 102, '1')]);
+    expect(senderListShareBps(DEST, page, list)).toBe(6666);
+    expect(senderListShareBps(DEST, page, new Set([LISTED_A]))).toBe(3333);
+  });
+
+  it('reads the destination and the senders in any spelling', () => {
+    const page = pageOf([{ ...send(LISTED_A, DEST, 100, '1'), from: parseAddress(LISTED_A), to: parseAddress(DEST) }]);
+    expect(senderListShareBps(parseAddress(DEST), page, list)).toBe(10000);
+  });
+});
+
 describe('buildReplayFacts', () => {
   it('groups the 19 wallets 0x8439 funded in a quarter hour and holds every one under A4', () => {
     const facts = buildReplayFacts(farmReplay());
@@ -501,6 +549,134 @@ describe('buildReplayFacts', () => {
       expect(meetsGroupExcludeRule(facts, DEFAULT_SETTINGS)).toBe(false);
       expect(computeStart(facts, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
       expect(computeCeiling(facts, DEFAULT_SETTINGS).ceiling).not.toBe('exclude');
+    });
+  });
+
+  describe('a shared destination links only when it looks private', () => {
+    const PUBLIC = synthetic('b1', 1);
+    const sweepers = (count: number) => Array.from({ length: count }, (_, i) => synthetic('a7', i));
+    const strangers = (count: number) => Array.from({ length: count }, (_, i) => synthetic('5a', i));
+    const pageOf = (destination: string, senders: string[]): TransferPage => ({
+      transfers: senders.map((from, i) => send(from, destination, OLD_BLOCK + i, '0.1')),
+      complete: true,
+    });
+    const sweepTo = (count: number, crowd: string[], state: AccountState = eoa(48)) =>
+      exchangeReplay('a7', count, PUBLIC, state, [[PUBLIC, pageOf(PUBLIC, crowd)]]);
+    const SELF_LINKED = { size: 5, sameFunderWithinWindow: null, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true };
+
+    const funder = synthetic('fa', 4);
+    const funded = Array.from({ length: 5 }, (_, i) => synthetic('fe', i));
+    const fundings = funded.map((w, i) => send(funder, w, ANCHOR_BLOCK + i, '0.1'));
+    const fundedStates: [string, AccountState][] = [[funder, eoa(5)], ...funded.map((w): [string, AccountState] => [w, eoa(120)])];
+
+    it('gives five wallets sweeping to a public address no group, no evidence, no A3 and no shared deposit', () => {
+      const input = sweepTo(5, [...strangers(95), ...sweepers(5)]);
+      expect(sharedDestinations(input).get(PUBLIC)?.size).toBe(5);
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.group).toBeNull();
+        expect(f.sharedDepositAddress).toBeNull();
+        expect(f.evidenceTxs).toHaveLength(1);
+        expect(f.missing).toEqual([]);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+        expect(computeCeiling(f, DEFAULT_SETTINGS).ceiling).toBe('full');
+      }
+    });
+
+    it('gives three wallets sharing a public address no A6', () => {
+      for (const f of buildReplayFacts(sweepTo(3, [...strangers(95), ...sweepers(3)])).values()) {
+        expect(f.group).toBeNull();
+        expect(f.sharedDepositAddress).toBeNull();
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+      }
+    });
+
+    it('keeps A3 for five wallets sweeping to a private address', () => {
+      for (const f of buildReplayFacts(sweepTo(5, [...strangers(3), ...sweepers(5)])).values()) {
+        expect(f.group).toEqual(SELF_LINKED);
+        expect(f.evidenceTxs).toHaveLength(2);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'exclude', rule: 'A3' });
+      }
+    });
+
+    it('links at exactly 5000 bps', () => {
+      const crowd = [...strangers(5), ...sweepers(5)];
+      const input = sweepTo(5, crowd);
+      expect(senderListShareBps(PUBLIC, input.destinationPages.get(PUBLIC) as TransferPage, new Set(input.wallets))).toBe(5000);
+      for (const f of buildReplayFacts(input).values()) expect(f.group).toEqual(SELF_LINKED);
+    });
+
+    it('does not link at 4999 bps, the nearest share below it', () => {
+      const quiet = Array.from({ length: 2495 }, (_, i) => synthetic('9e', i));
+      const crowd = [...sweepers(5), ...quiet, ...strangers(2501)];
+      const input = sweepTo(5, crowd);
+      const list = { ...input, wallets: [...input.wallets, ...quiet] };
+      expect(senderListShareBps(PUBLIC, input.destinationPages.get(PUBLIC) as TransferPage, new Set(list.wallets))).toBe(4999);
+      const facts = buildReplayFacts(list);
+      for (const wallet of sweepers(5)) {
+        expect(facts.get(wallet)?.group).toBeNull();
+        expect(facts.get(wallet)?.sharedDepositAddress).toBeNull();
+      }
+    });
+
+    it('follows the setting, so a project can tighten or loosen it', () => {
+      const input = sweepTo(5, [...strangers(5), ...sweepers(5)]);
+      const tightened = { ...input, settings: { ...DEFAULT_SETTINGS, collectorMinListShareBps: 5001 } };
+      const opened = { ...input, settings: { ...DEFAULT_SETTINGS, collectorMinListShareBps: 0 } };
+      expect(buildReplayFacts(tightened).get(sweepers(5)[0] as string)?.group).toBeNull();
+      expect(buildReplayFacts(opened).get(sweepers(5)[0] as string)?.group).toEqual(SELF_LINKED);
+    });
+
+    it('treats a missing page as doubt: the group stays unread, the wallet holds on A1 and nothing is excluded', () => {
+      for (const f of buildReplayFacts(exchangeReplay('a7', 5, PUBLIC, eoa(0), [])).values()) {
+        expect(f.group).toBeNull();
+        expect(f.missing).toEqual(['group']);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A1' });
+        expect(computeCeiling(f, DEFAULT_SETTINGS).ceiling).toBe('hold');
+      }
+    });
+
+    it.each([
+      ['an exchange', BINANCE_STATE],
+      ['a contract', CONTRACT_STATE],
+    ])('asks for no page from %s, so its missing page is not doubt', (_name, state) => {
+      for (const f of buildReplayFacts(exchangeReplay('a7', 5, PUBLIC, state, [])).values()) {
+        expect(f.group).toBeNull();
+        expect(f.missing).toEqual([]);
+      }
+    });
+
+    it('leaves a funding-root group alone, whatever the setting and with no pages at all', () => {
+      const input = replay(funded, fundings, fundedStates, []);
+      const strict = { ...input, settings: { ...DEFAULT_SETTINGS, collectorMinListShareBps: 10000 } };
+      for (const f of buildReplayFacts(strict).values()) {
+        expect(f.group).toEqual({ size: 5, sameFunderWithinWindow: 5, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: false });
+        expect(f.missing).toEqual([]);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A4' });
+      }
+    });
+
+    it('keeps linkedByWallet false for a sweep to a public address, even inside a funding group', () => {
+      const sweeps = funded.map((w, i) => send(w, PUBLIC, ANCHOR_BLOCK + 100 + i, '0.09'));
+      const input = replay(funded, [...fundings, ...sweeps], [...fundedStates, [PUBLIC, eoa(48)]], [[PUBLIC, pageOf(PUBLIC, strangers(95))]]);
+      for (const [wallet, f] of buildReplayFacts(input)) {
+        expect(f.group).toEqual({ size: 5, sameFunderWithinWindow: 5, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: false });
+        expect(f.evidenceTxs).not.toContain(sweeps.find((t) => t.from === wallet)?.hash);
+      }
+    });
+
+    it('judges each destination alone, so a public one does not cancel a private one', () => {
+      const wallets = sweepers(5);
+      const ledger = wallets.flatMap((w, i) => [
+        send(BINANCE_14, w, OLD_BLOCK + 10 * i, '1'),
+        send(w, PUBLIC, ANCHOR_BLOCK + i, '0.8'),
+        send(w, COLLECTOR, ANCHOR_BLOCK + 100 + i, '0.9'),
+      ]);
+      const states: [string, AccountState][] = [[BINANCE_14, BINANCE_STATE], [PUBLIC, eoa(48)], [COLLECTOR, eoa(0)], ...wallets.map((w): [string, AccountState] => [w, eoa(120)])];
+      const pages: PageEntry[] = [[PUBLIC, pageOf(PUBLIC, strangers(95))], [COLLECTOR, pageOf(COLLECTOR, wallets)]];
+      for (const f of buildReplayFacts(replay(wallets, ledger, states, pages)).values()) {
+        expect(f.group).toEqual(SELF_LINKED);
+        expect(f.evidenceTxs).toHaveLength(2);
+      }
     });
   });
 

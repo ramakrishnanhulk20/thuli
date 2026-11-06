@@ -65,6 +65,8 @@ export interface ReplayInput {
   data: Map<string, AddressData>;
   traces: Map<string, TraceResult>;
   states: Map<string, AccountState>;
+  /** Each shared destination's oldest transfers, keyed by lowercase address. An absent page means it could not be read. */
+  destinationPages: Map<string, TransferPage>;
 }
 
 const DECIMAL_DIGITS = /^[0-9]+$/;
@@ -241,6 +243,26 @@ export function sharedDestinations(input: Pick<ReplayInput, 'wallets' | 'data'>)
     if (set.size < 2) senders.delete(dest);
   }
   return senders;
+}
+
+/**
+ * How much of an address's early crowd is on the claim list, in whole basis points rounded down: the distinct senders of
+ * successful incoming value in the page, and the share of them in claimWallets (lowercase addresses). The address's own
+ * sends, failed transfers and zero-value transfers do not count, and a sender counts once however often it paid.
+ *
+ * It tells a public address from a private collector where nonce cannot: a bridge or a donation address is paid by
+ * strangers from the start, and a donation address can have a nonce of 48 with tens of thousands of senders (C16).
+ *
+ * An empty sender set gives 10000: nothing shows the address is public, and the wallets that swept there are themselves
+ * senders the page may not reach. Not covered: a new public address used first mostly by list wallets still links, and
+ * only the oldest transfers are seen, so an address that went public later looks as private as it first was. A farm that
+ * pays its collector from enough throwaway wallets before using it looks public and is not linked through that address.
+ */
+export function senderListShareBps(destination: string, page: TransferPage, claimWallets: ReadonlySet<string>): number {
+  const senders = new Set(incomingTo(lower(destination), { external: page }).map((t) => lower(t.from)));
+  if (senders.size === 0) return 10_000;
+  const onList = [...senders].filter((sender) => claimWallets.has(sender)).length;
+  return Math.floor((onList * 10_000) / senders.size);
 }
 
 /** Union-find over the claim wallets, so every wallet reachable through any link shares one component. */
@@ -430,14 +452,22 @@ function walletAgeDays(data: AddressData | undefined, snapshotTime: number): num
  * Works out every rulebook fact for each claim wallet from data the runner already read (pure, no network). Wallets
  * are linked into groups by a shared funding root or a shared destination, but only through addresses that are
  * wallets or unknown: doubt should make a hold more likely, never less, and contracts and exchanges never link (C16).
+ * A shared destination must also look private by senderListShareBps, so a bridge or a donation address links nobody;
+ * one whose page could not be read leaves the group unread, so the wallet holds (C11). Funding roots take no such check.
  * A funding burst is a pattern, not a link, so it is reported on its own and never joins wallets into a group (C45).
  * Each result goes through Facts.parse, so a bad fact throws instead of reaching a decision.
  */
 export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
-  const { snapshotTime, settings, data, traces, states } = input;
+  const { snapshotTime, settings, data, traces, states, destinationPages } = input;
   const wallets = uniqueLower(input.wallets);
+  const claimWallets = new Set(wallets);
   const kindOf = (address: string) => funderKind(states.get(address));
   const linkable = (address: string) => kindOf(address) === 'wallet' || kindOf(address) === 'unknown';
+  // The one test for a destination, so groups, A3, A6, evidence and linkedByWallet can never disagree about an address.
+  const linksWallets = (dest: string) => {
+    const page = destinationPages.get(dest);
+    return linkable(dest) && page !== undefined && senderListShareBps(dest, page, claimWallets) >= settings.collectorMinListShareBps;
+  };
 
   const byRoot = new Map<string, { wallet: string; fundingTime: number }[]>();
   for (const wallet of wallets) {
@@ -452,7 +482,6 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
   const shared = sharedDestinations({ wallets, data });
   const components = new Components(wallets);
   const windowCounts = new Map<string, number>();
-  const claimWallets = new Set(wallets);
   for (const [root, members] of byRoot) {
     if (!linkable(root)) continue;
     // A claim wallet that funded other claim wallets belongs in their group too.
@@ -460,7 +489,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     for (const [wallet, fits] of sameFunderWindowCounts(members)) windowCounts.set(wallet, fits);
   }
   for (const [dest, senders] of shared) {
-    if (linkable(dest)) components.join(senders);
+    if (linksWallets(dest)) components.join(senders);
   }
   const bursts = fundingBursts(directExchangeFundings(wallets, input, kindOf), settings);
 
@@ -492,9 +521,10 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
       const dest = send.to === null ? undefined : lower(send.to);
       const senders = dest === undefined ? undefined : shared.get(dest)?.size;
       if (dest === undefined || senders === undefined) continue;
-      // Without the destination's state we cannot tell a farm collector from an exchange, so the group stays unread.
-      if (kindOf(dest) === 'unknown') missing.add('group');
-      if (!linkable(dest)) continue;
+      // Without the destination's state or its page we cannot tell a farm collector from an exchange or a public address,
+      // so the group stays unread.
+      if (kindOf(dest) === 'unknown' || (linkable(dest) && !destinationPages.has(dest))) missing.add('group');
+      if (!linksWallets(dest)) continue;
       sendHashes.push(lower(send.hash));
       if (senders >= settings.groupMinSize) swept = true;
       else largestDeposit = Math.max(largestDeposit, senders);

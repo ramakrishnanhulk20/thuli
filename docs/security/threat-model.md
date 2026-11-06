@@ -322,6 +322,16 @@ or attack that demonstrates it. A work order that carries an invariant also carr
 - **C43. Input never changes the shape of a query.** Shown by: injection fixtures (`'; drop table`, `%00`, oversized
   unicode) are stored and read back unchanged.
 
+**Public addresses**
+- **C46. A public address never links wallets.** A shared destination links wallets only when at least
+  `collectorMinListShareBps` of the senders in its oldest transfers are on the claim list. Using a bridge, an exchange's
+  smaller hot wallet or a donation address together is not coordination, and a nonce cannot show it, because an address
+  that only receives has a low nonce. A page that cannot be read means hold under C11. Non-goals: a new public address
+  used first mostly by list wallets still links them, and funding roots are not covered, because the same test on
+  funders would drop real farms that reuse a busy funder. A farm that pays its collector from enough throwaway wallets
+  first makes it look public, so A3 stops firing through that address; shared funding still catches it. Shown by: Hop wallets that swept to Orbiter's bridge, Multichain's
+  bridge and the Ukraine donation address are no longer excluded, and ROBO's farm key is unchanged.
+
 **Funding bursts**
 - **C45. A funding burst can only cut a wallet to partial.** A burst is at least `burstMinWallets` wallets first funded by
   one exchange on one UTC day in amounts within `burstSpreadBps` of each other. It is a pattern, not proof of one owner,

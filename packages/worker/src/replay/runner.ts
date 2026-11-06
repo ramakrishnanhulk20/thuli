@@ -2,6 +2,7 @@ import {
   buildReplayFacts,
   computeCeiling,
   computeStart,
+  funderKind,
   fundingTransfer,
   MAX_TRACE_HOPS,
   parseAddress,
@@ -125,9 +126,9 @@ function wholeNumber(name: string, value: number, min: number): void {
  *
  * Reads each wallet's oldest transfers, then internal transfers only where no external funding was found, then walks
  * funding back through pass-through wallets one pass at a time, asking for each address once, then reads nonce and
- * code for every claim wallet, funding root and shared destination in one call. A read that fails leaves its facts
- * missing, so the wallet starts on A1 and is held, and the run goes on (C11). Resuming is the sources' job: the real
- * explorer and account readers cache every page they read.
+ * code for every claim wallet, funding root and shared destination in one call, then the oldest transfers of each shared
+ * destination that could link wallets. A read that fails leaves its facts missing, so the wallet starts on A1 and is
+ * held, and the run goes on (C11). Resuming is the sources' job: the real explorer and account readers cache every page.
  *
  * @throws AddressError for a wallet that is not a 0x address, and RangeError for options that are not whole numbers,
  * both before any read.
@@ -201,8 +202,20 @@ export async function runReplay(wallets: string[], opts: ReplayOptions, deps: Re
   const states = await deps.accounts.read(stateAddresses, snapshotBlock);
   progress.end();
 
+  // Exchanges and contracts never link, so their crowd would cost a read and change nothing.
+  const destinations = [...shared.keys()].filter((dest) => ['wallet', 'unknown'].includes(funderKind(states.get(dest))));
+  const destinationPages = new Map<string, TransferPage>();
+  progress.begin('destination pages', destinations.length);
+  await inFlight(destinations, async (dest) => {
+    const page = await pageOrNothing(() => deps.explorer.oldestTransfers(dest, snapshotBlock, walletLimit));
+    progress.step(true);
+    if (page === undefined) deps.log(`destination pages: could not read ${dest}, so the wallets that swept there stay missing a group`);
+    else destinationPages.set(dest, page);
+  });
+  progress.end();
+
   progress.begin('facts', claimWallets.length);
-  const facts = buildReplayFacts({ wallets: claimWallets, snapshotTime: opts.snapshotTime, settings, data, traces, states });
+  const facts = buildReplayFacts({ wallets: claimWallets, snapshotTime: opts.snapshotTime, settings, data, traces, states, destinationPages });
   const rows = claimWallets.map((wallet): ReplayRow => {
     const walletFacts = facts.get(wallet);
     if (walletFacts === undefined) throw new Error('the facts engine returned no facts for a claim wallet');

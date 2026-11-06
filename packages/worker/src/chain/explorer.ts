@@ -60,6 +60,10 @@ const Row = z
     'row names two different transaction hashes',
   );
 
+function isGenesisRow(item: unknown): boolean {
+  return typeof item === 'object' && item !== null && (item as { from?: unknown }).from === 'GENESIS';
+}
+
 const Envelope = z.object({ status: z.string(), message: z.string().optional(), result: z.unknown() });
 
 const LowerAddress = z.string().regex(/^0x[0-9a-f]{40}$/);
@@ -162,6 +166,8 @@ export function explorerSource(opts: {
       const kind = action === 'txlist' ? 'external' : 'internal';
       const transfers: ExplorerTransfer[] = [];
       for (const item of result) {
+        // A genesis allocation is not a transfer from anyone: it has no hash and no sender, so it is skipped, not refused.
+        if (isGenesisRow(item)) continue;
         const row = Row.safeParse(item);
         if (!row.success) throw fail('a row did not match the expected shape');
         const previous = transfers.at(-1);
@@ -180,7 +186,7 @@ export function explorerSource(opts: {
           kind,
         });
       }
-      return { page: { transfers, complete: transfers.length < limit } };
+      return { page: { transfers, complete: result.length < limit } };
     }
     // Checked before the empty-result case: "not indexed yet" with an empty list must never read as "no transfers".
     if (status === '2' || /not yet been processed/i.test(message) || /not yet been processed/i.test(resultText)) {

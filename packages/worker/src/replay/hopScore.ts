@@ -248,6 +248,7 @@ export function hopToMarkdown(score: HopScore, meta: { snapshotBlock: number; sn
     '- A wallet whose read failed is not one of those. It stays counted as a hold under A1, so a failed read can only raise the rate, never hide.',
     `- Transfers past a wallet's first ${REPLAY_WALLET_LIMIT} are not read.`,
     '- This is the code alone, with no model in the loop.',
+    '- A shared address counts as private when at least half the senders in its oldest 100 transfers are on the list, so a new public address used first by list wallets can still link them.',
     '',
   ].join('\n');
 }

@@ -3,7 +3,7 @@
 Thuli is Tamil for "a drop": every drop of an airdrop lands in a real hand.
 
 Picked 27 Oct 2026: a screening service with an immutable reward vault on Base (PLAN.md, Option 2). The numbered
-rules (C1 to C45) are in docs/security/threat-model.md. This file grows the interface section (addresses, ABI, the
+rules (C1 to C46) are in docs/security/threat-model.md. This file grows the interface section (addresses, ABI, the
 exact reads and writes the UI makes) as the backend lands.
 
 ## 1. System overview

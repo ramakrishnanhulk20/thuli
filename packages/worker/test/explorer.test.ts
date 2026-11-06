@@ -130,6 +130,21 @@ describe('explorerSource replies', () => {
     });
   });
 
+  it('skips a genesis allocation instead of refusing the page, and still counts it toward completeness', async () => {
+    const genesis = { blockNumber: '0', timeStamp: '1438269973', hash: `GENESIS_${WALLET.slice(2)}`, from: 'GENESIS', to: WALLET, value: '5', isError: '0' };
+    const send = { blockNumber: '5', timeStamp: '1438270000', hash: `0x${'1a'.repeat(32)}`, from: WALLET, to: OTHER, value: '1', isError: '0' };
+    answer({ status: '1', message: 'OK', result: [genesis, send] });
+    const page = await source().oldestTransfers(WALLET, END, 2);
+    expect(page.transfers.map((t) => t.from)).toEqual([WALLET]);
+    expect(page.complete).toBe(false);
+  });
+
+  it('still refuses a row from an unknown sender word', async () => {
+    const odd = { blockNumber: '0', timeStamp: '1438269973', hash: `GENESIS_${WALLET.slice(2)}`, from: 'NOTGENESIS', to: WALLET, value: '5', isError: '0' };
+    answer({ status: '1', message: 'OK', result: [odd] });
+    await expect(source().oldestTransfers(WALLET, END, 5)).rejects.toThrow();
+  });
+
   it('turns "No transactions found" into an empty, complete page', async () => {
     answer(NOTHING);
     await expect(source().oldestTransfers(WALLET, END, 10)).resolves.toEqual({ transfers: [], complete: true });
