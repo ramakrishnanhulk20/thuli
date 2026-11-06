@@ -10,6 +10,7 @@ import {
   computeCeiling,
   computeStart,
   DEFAULT_SETTINGS,
+  EXCHANGE_KEPT_CAUSE,
   GRAPH_G1,
   parseAddress,
   toGraphRecord,
@@ -51,6 +52,8 @@ const PLAIN: Facts = {
   missing: [],
 };
 const BURST: Facts = { ...PLAIN, fundingBurst: { wallets: 40 } };
+// PLAIN's funder is an exchange, where the code replaces a hold. A hold that stands needs another kind of funder.
+const WALLET_FUNDED: Facts = { ...PLAIN, firstFunder: { address: FUNDER, kind: 'wallet', fanoutInList: 1, hopsTraced: 0 } };
 // A group big enough to hold, on a wallet too new for more than partial: the case where a B2 raise meets the ceiling.
 const NEW_IN_GROUP: Facts = {
   ...PLAIN,
@@ -462,6 +465,48 @@ describe('decideWallet second ask', () => {
     expect(record).toMatchObject({ action: 'partial', cause: BURST_KEPT_CAUSE, secondAsk: false, firstCause: null });
   });
 
+  describe('on an exchange funder', () => {
+    const NEW_WALLET: Facts = { ...PLAIN, walletAgeDays: 3 };
+    const holdB1: GraphAnswer = { verdict: 'likely_farm', action: 'hold', rule: 'B1', reason: 'Looks like a farm.', cited_tx_hashes: [] };
+    const exclude: GraphAnswer = { ...holdB1, action: 'exclude', rule: 'A3' };
+
+    it.each([
+      ['a hold on an A9 start', PLAIN, holdB1, { action: 'full', shareBps: 10000, rule: 'A9', clampedFrom: 'hold' }],
+      ['a hold on an A8 start', NEW_WALLET, holdB1, { action: 'partial', shareBps: 5000, rule: 'A8', clampedFrom: 'hold' }],
+      ['an exclude on an A9 start', PLAIN, exclude, { action: 'full', shareBps: 10000, rule: 'A9', clampedFrom: 'exclude' }],
+    ])('sends no second ask after replacing %s', async (_name, facts, answer, ending) => {
+      const viaGraph = vi.fn(async (_record: GraphRecord) => replyWith(answer));
+      const deps = stubDeps({ viaGraph });
+      const record = await decideWallet(rowFor(facts), DEFAULT_SETTINGS, deps, 'auto');
+      expect(viaGraph).toHaveBeenCalledTimes(1);
+      expect(deps.viaV2).not.toHaveBeenCalled();
+      expect(record).toMatchObject({
+        ...ending,
+        modelAction: answer.action,
+        modelRule: answer.rule,
+        accepted: false,
+        cause: EXCHANGE_KEPT_CAUSE,
+        secondAsk: false,
+        firstCause: null,
+      });
+    });
+
+    it('stays on one call on the v2 route too', async () => {
+      const viaV2 = vi.fn(async (_record: GraphRecord) => replyWith(holdB1));
+      const deps = stubDeps({ viaV2 });
+      const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'v2');
+      expect(viaV2).toHaveBeenCalledTimes(1);
+      expect(record).toMatchObject({ mode: 'v2', action: 'full', cause: EXCHANGE_KEPT_CAUSE, secondAsk: false });
+    });
+
+    it('ends at the start when a refused first answer comes back as a hold', async () => {
+      const viaGraph = inTurn(replyWith(TOO_LONG), replyWith(holdB1));
+      const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto');
+      expect(viaGraph).toHaveBeenCalledTimes(2);
+      expect(record).toMatchObject({ action: 'full', accepted: false, cause: EXCHANGE_KEPT_CAUSE, secondAsk: true, firstCause: TOO_LONG_CAUSE });
+    });
+  });
+
   it("does ask again when a burst wallet's first reply is unreadable, and the code still keeps it at partial", async () => {
     const hold: GraphAnswer = { verdict: 'likely_farm', action: 'hold', rule: 'B1', reason: 'Looks like a farm.', cited_tx_hashes: [] };
     const viaV2 = inTurn(replyWith(hold, { answer: 'not json', rawText: 'not json' }), replyWith(hold));
@@ -489,7 +534,7 @@ describe('decideWallet second ask', () => {
 
     const hold: GraphAnswer = { ...FULL_ANSWER, verdict: 'likely_farm', action: 'hold', reason: 'Its funding trail leads to a shared source.' };
     const held = stubDeps({ viaGraph: inTurn(replyWith(TOO_LONG), replyWith(hold)) });
-    expect(await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, held, 'auto')).toMatchObject({
+    expect(await decideWallet(rowFor(WALLET_FUNDED), DEFAULT_SETTINGS, held, 'auto')).toMatchObject({
       action: 'hold',
       rule: 'B1',
       accepted: true,
@@ -598,7 +643,7 @@ describe('decideWallet settles the rule from how the outcome moved the start', (
   });
 
   it.each(['A9', 'A4', 'B2'] as const)('ends a hold on an A9 start on rule B1, labelled %s', async (label) => {
-    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, askOnce(answerOf('hold', label)), 'v2');
+    const record = await decideWallet(rowFor(WALLET_FUNDED), DEFAULT_SETTINGS, askOnce(answerOf('hold', label)), 'v2');
     expect(record).toMatchObject({ action: 'hold', rule: 'B1', modelRule: label, accepted: true, secondAsk: false });
   });
 

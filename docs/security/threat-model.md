@@ -332,13 +332,21 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   first makes it look public, so A3 stops firing through that address; shared funding still catches it. Shown by: Hop wallets that swept to Orbiter's bridge, Multichain's
   bridge and the Ukraine donation address are no longer excluded, and ROBO's farm key is unchanged.
 
+- **C47. An exchange funder alone cannot hold a wallet.** The model's own hold (B1) has no signal on a shared exchange:
+  among exchange-funded wallets it fired on 1.25% of Hop's probably-real wallets and 1.13% of its eliminated ones. A clean
+  hold reply on a wallet with an exchange funder and no link of its own is replaced by the code's start with a
+  code-written reason. A wallet that made a link, or shares a deposit address, keeps the model's hold. A reply failing C13
+  still holds under C11. Non-goal: holds on contract funders stay, and they are close to a coin flip (21.7% of real users
+  against 31.4% of farms among contract-funded wallets), so a person reviews them. Shown by: a clean hold on an
+  exchange-funded A9 wallet ends at the start, and a malformed one ends in hold.
+
 **Funding bursts**
 - **C45. A funding burst can only cut a wallet to partial.** A burst is at least `burstMinWallets` wallets first funded by
   one exchange on one UTC day in amounts within `burstSpreadBps` of each other. It is a pattern, not proof of one owner,
   so it never starts a hold or an exclude and never joins wallets into a group. On a burst wallet whose start is partial
   the outcome is the code's alone: any parsed reply that moves it, changes the rule or leaves the burst out of the reason
-  is replaced by the start and a code-written reason. A reply that does not parse, or fails C13, still holds under C11,
-  because that doubt is about the reply and not the pattern. A project that switches partial off gets the normal A8 hold.
+  is replaced by the start and a code-written reason, whatever its form. A reply that does not parse, or a partial reply
+  that fails C13, still holds under C11, because that doubt is about the reply and not the pattern. A project that switches partial off gets the normal A8 hold.
   Non-goals: one wallet screened alone has no list to measure a burst against, and a burst split across UTC midnight or
   kept under the minimum is not caught. Shown by: stand-in replies of hold, exclude and full on a burst wallet all end
   partial; a burst wallet never gets a group.

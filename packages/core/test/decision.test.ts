@@ -1,7 +1,8 @@
 // Not covered here: real model replies (these are recorded bad and good outputs written by hand), and whether the
 // reason's sentences are true.
 import { describe, expect, it } from 'vitest';
-import { validateDecision, type DecisionContext } from '../src/decision.ts';
+import { parseAddress } from '../src/address.ts';
+import { BURST_KEPT_CAUSE, EXCHANGE_KEPT_CAUSE, validateDecision, type DecisionContext } from '../src/decision.ts';
 import type { Facts } from '../src/facts.ts';
 import { DEFAULT_SETTINGS } from '../src/settings.ts';
 
@@ -241,6 +242,137 @@ describe('validateDecision: a funding burst keeps a wallet at partial (C45)', ()
     const result = validateDecision(reply({ reason: 'Held because partial is off.' }), context);
     expect(result.accepted).toBe(true);
     expect(result.decision).toMatchObject({ action: 'hold', rule: 'A8', reason: 'Held because partial is off.' });
+  });
+});
+
+describe('validateDecision: an exchange funder alone cannot hold a wallet', () => {
+  const funder = (kind: 'exchange' | 'contract' | 'wallet') => ({ address: parseAddress(`0x${'f1'.repeat(20)}`), kind, fanoutInList: 3, hopsTraced: 0 });
+  const OLD = { walletAgeDays: 400, txCountAtSnapshot: 120 };
+  const fundedBy = (kind: 'exchange' | 'contract' | 'wallet') => facts({ ...OLD, firstFunder: funder(kind) });
+  const A9 = (wallet: Facts) => ctx({ facts: wallet, ceiling: 'full', start: { outcome: 'full', rule: 'A9' } });
+  const A8 = ctx({ facts: facts({ firstFunder: funder('exchange') }), ceiling: 'partial', start: { outcome: 'partial', rule: 'A8' } });
+  const HOLD_B1 = { action: 'hold', shareBps: 0, rule: 'B1', reason: 'Its funding trail leads to a shared source.', citedTxs: [] };
+  const EXCLUDE = { action: 'exclude', shareBps: 0, rule: 'A3', reason: 'Looks like one operator.', citedTxs: [] };
+  const FIXED_REASON = "The first funder is an exchange, and sharing an exchange is weak evidence on its own, so the code's start stands.";
+
+  it('keeps an A9 start full against a hold under B1, and says so', () => {
+    const result = validateDecision(reply(HOLD_B1), A9(fundedBy('exchange')));
+    expect(result).toEqual({
+      decision: { action: 'full', shareBps: 10000, rule: 'A9', reason: FIXED_REASON, citedTxs: [], paidHops: 0, clampedFrom: 'hold' },
+      accepted: false,
+      cause: EXCHANGE_KEPT_CAUSE,
+    });
+    expect(EXCHANGE_KEPT_CAUSE).toBe('an exchange funder alone cannot hold this wallet');
+  });
+
+  it('keeps an A8 start partial at the partial share', () => {
+    const result = validateDecision(reply(HOLD_B1), A8);
+    expect(result.accepted).toBe(false);
+    expect(result.cause).toBe(EXCHANGE_KEPT_CAUSE);
+    expect(result.decision).toMatchObject({ action: 'partial', shareBps: DEFAULT_SETTINGS.partialShareBps, rule: 'A8', clampedFrom: 'hold', reason: FIXED_REASON });
+  });
+
+  it.each([
+    ['full', 'A9', 10000, A9(fundedBy('exchange'))],
+    ['partial', 'A8', DEFAULT_SETTINGS.partialShareBps, A8],
+  ])('ends an exclude on a %s start at the start', (action, rule, shareBps, context) => {
+    const result = validateDecision(reply(EXCLUDE), context);
+    expect(result.cause).toBe(EXCHANGE_KEPT_CAUSE);
+    expect(result.decision).toMatchObject({ action, rule, shareBps, clampedFrom: 'exclude', citedTxs: [] });
+  });
+
+  it('reports the paid lookups the worker made, not the model count', () => {
+    const result = validateDecision(reply({ ...HOLD_B1, paidHops: 2 }), { ...A9(fundedBy('exchange')), paidHopsMade: 2 });
+    expect(result.decision).toMatchObject({ action: 'full', paidHops: 2 });
+  });
+
+  it.each(['contract', 'wallet'] as const)('accepts a hold under B1 on a %s-funded A9 wallet', (kind) => {
+    const result = validateDecision(reply(HOLD_B1), A9(fundedBy(kind)));
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
+    expect(result.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1' });
+  });
+
+  it('accepts a hold under B1 on a wallet with no funder on record', () => {
+    expect(validateDecision(reply(HOLD_B1), A9(facts(OLD))).decision).toMatchObject({ action: 'hold', rule: 'B1' });
+  });
+
+  it('leaves an exchange-funded A4 hold accepted and unchanged', () => {
+    const held = { ...HOLD_B1, rule: 'A4' };
+    const result = validateDecision(reply(held), ctx({ facts: fundedBy('exchange'), ceiling: 'full', start: { outcome: 'hold', rule: 'A4' } }));
+    expect(result.accepted).toBe(true);
+    expect(result.decision).toEqual({ ...held, paidHops: 0 });
+  });
+
+  it('still holds an exchange-funded wallet on A1 when the reply does not parse (C11)', () => {
+    expectRejected(validateDecision('not json', A9(fundedBy('exchange'))));
+  });
+
+  it.each([
+    ['a too-long reason', { reason: 'x'.repeat(281) }, 'the reason was longer than 280 characters'],
+    ['a link', { reason: 'See https://example.org for why.' }, 'the reason contained a link, markup or control characters'],
+    ['a made-up hash', { citedTxs: [MADE_UP_TX] }, 'the reason cited a transaction Thuli did not fetch for this wallet'],
+    ['a wrong share', { shareBps: 10000 }, 'the share did not match the action'],
+    ['a wrong paid-hop count', { paidHops: 2 }, 'the model reported a different number of paid lookups than were made'],
+  ])('holds on A1 when a hold reply has %s, because doubt about the reply is not the exchange (C11, C13)', (_name, overrides, cause) => {
+    const result = validateDecision(reply({ ...HOLD_B1, ...overrides }), { ...A9(fundedBy('exchange')), paidHopsMade: 0 });
+    expectRejected(result);
+    expect(result.cause).toBe(cause);
+  });
+
+  describe('alone means alone', () => {
+    const GROUP = { size: 2, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false };
+    const onExchange = (overrides: Partial<Facts>) => A9({ ...fundedBy('exchange'), ...overrides });
+
+    it('lets a clean hold stand when the wallet made links of its own', () => {
+      const result = validateDecision(reply(HOLD_B1), onExchange({ group: { ...GROUP, linkedByWallet: true } }));
+      expect(result.accepted).toBe(true);
+      expect(result.cause).toBeUndefined();
+      expect(result.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1' });
+    });
+
+    it('lets a clean hold stand when the wallet shares a deposit address', () => {
+      const result = validateDecision(reply(HOLD_B1), onExchange({ sharedDepositAddress: { sharedWithClaimants: 1 } }));
+      expect(result.accepted).toBe(true);
+      expect(result.cause).toBeUndefined();
+      expect(result.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1' });
+    });
+
+    it('still ends a clean hold at the start when the wallet is in a group it did not link', () => {
+      const result = validateDecision(reply(HOLD_B1), onExchange({ group: { ...GROUP, linkedByWallet: false } }));
+      expect(result.cause).toBe(EXCHANGE_KEPT_CAUSE);
+      expect(result.decision).toMatchObject({ action: 'full', shareBps: 10000, rule: 'A9', clampedFrom: 'hold' });
+    });
+
+    it('sends an exclude on a wallet with its own links to the normal checks, which hold it', () => {
+      expectRejected(validateDecision(reply(EXCLUDE), onExchange({ group: { ...GROUP, linkedByWallet: true } })));
+    });
+  });
+
+  it('leaves the burst guard first, so a burst wallet still gets the burst reason', () => {
+    const burst = facts({ ...OLD, firstFunder: funder('exchange'), fundingBurst: { wallets: 23 } });
+    const result = validateDecision(reply(HOLD_B1), ctx({ facts: burst, ceiling: 'partial', start: { outcome: 'partial', rule: 'A8' } }));
+    expect(result.cause).toBe(BURST_KEPT_CAUSE);
+    expect(result.decision.reason).toContain('First funded in a burst of 23 wallets');
+  });
+
+  it('takes the normal checks and never pays when the ceiling is below the start (C12)', () => {
+    const lowered = ctx({ facts: fundedBy('exchange'), ceiling: 'hold', start: { outcome: 'full', rule: 'A9' } });
+    const held = validateDecision(reply(HOLD_B1), lowered);
+    expect(held.accepted).toBe(true);
+    expect(held.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1' });
+
+    const paid = validateDecision(reply({ action: 'full', shareBps: 10000, rule: 'A9', citedTxs: [] }), lowered);
+    expect(paid.decision).toMatchObject({ action: 'hold', shareBps: 0, clampedFrom: 'full' });
+
+    const partial = ctx({ facts: fundedBy('exchange'), ceiling: 'hold', start: { outcome: 'partial', rule: 'A8' } });
+    expect(validateDecision(reply(HOLD_B1), partial).decision).toMatchObject({ action: 'hold', shareBps: 0 });
+  });
+
+  it('leaves a reply that keeps the start alone', () => {
+    const result = validateDecision(reply({ action: 'full', shareBps: 10000, rule: 'A9', citedTxs: [] }), A9(fundedBy('exchange')));
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
   });
 });
 
