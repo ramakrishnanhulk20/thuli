@@ -69,7 +69,7 @@ function hasNoEthereumHistory(facts: Facts): boolean {
   return facts.walletAgeDays === 0 && facts.txCountAtSnapshot === 0 && facts.firstFunder === null && facts.missing.length === 0;
 }
 
-function wilson(part: number, whole: number): { low: number; high: number } | null {
+export function wilson(part: number, whole: number): { low: number; high: number } | null {
   if (whole === 0) return null;
   const share = part / whole;
   const zSquared = Z_95 * Z_95;

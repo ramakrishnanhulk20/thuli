@@ -87,8 +87,8 @@ describe('reppoInput', () => {
   it('builds the payload in the fixed order', () => {
     expect(reppoInput(RECORD, 'hold', 'A9: The first funder is a contract that funded 62 claim wallets.')).toBe(
       "User prompt: You screen one wallet on a crypto project's airdrop list. Decide: full reward, partial reward, hold for a person to review, or exclude. " +
-        'Be fair to real users: ordinary people often share a popular bridge, an exchange or a faucet, and a new wallet is not a farm by itself. Links a wallet made itself are strong evidence of one operator. Links it did not make are weak on their own. A funding burst is a pattern, not proof of one owner, so it caps a wallet at a partial reward and never justifies a hold. ' +
-        "Facts from public chain data, identifiers removed: wallet age 324 days; 16 transactions before the snapshot; normal account; first funded by a contract; it funded 62 other wallets on this list; no group of linked wallets; no sweep to a shared collector; no shared deposit address; no funding burst; the code's own starting decision: full reward." +
+        'Be fair to real users: ordinary people often share a popular bridge, an exchange or a faucet, and a new wallet is not a farm by itself. Links a wallet made itself are strong evidence of one operator. Links it did not make are weak on their own. A funding burst is a pattern, not proof of one owner, so it caps a wallet at a partial reward and never justifies a hold. A group of five or more listed wallets funded together, or sweeping to a shared collector, is held for a person, and excluded when the wallet itself swept to that collector. A wallet heading to a reward is held only on a traced funding trail or a link it made itself, never on how many wallets its funder paid. ' +
+        "Facts from public chain data, identifiers removed: wallet age 324 days; 16 transactions before the snapshot; normal account; first funded by a contract; its first funder also funded 62 other wallets on this list; no group of linked wallets; no sweep to a shared collector; no shared deposit address; no funding burst; the code's own starting decision: full reward." +
         '\n\nAI response: Decision: hold for a person to review. Reason: The first funder is a contract that funded 62 claim wallets.',
     );
   });
@@ -115,8 +115,46 @@ describe('reppoInput', () => {
       'A pattern only.',
     );
     expect(input).toContain(
-      "wallet age unreadable; 1 transaction before the snapshot; normal account with delegated code; first funded by an exchange; it funded no other wallets on this list; in a group of 12 linked wallets; the group shares funding; the group sweeps to a shared collector; this wallet made the links itself; its deposit address is used by 3 listed wallets; first funded in a burst of 40 wallets; unreadable facts: wallet age, linked group; the code's own starting decision: partial reward.",
+      "wallet age unreadable; 1 transaction before the snapshot; normal account with delegated code; first funded by an exchange; its first funder funded no other wallets on this list; in a group of 12 linked wallets; the group shares funding; the group sweeps to a shared collector; this wallet itself made links to other listed wallets; its deposit address is used by 3 listed wallets; first funded in a burst of 40 wallets; unreadable facts: wallet age, linked group; the code's own starting decision: partial reward.",
     );
+  });
+
+  it.each([
+    [1, 'its first funder funded no other wallets on this list'],
+    [2, 'its first funder also funded 1 other wallet on this list'],
+    [63, 'its first funder also funded 62 other wallets on this list'],
+  ])('names the funder for a count of %i, never a bare "it"', (count, sentence) => {
+    const input = reppoInput({ ...RECORD, first_funder_claim_wallets: count }, 'hold', 'Plain words.');
+    expect(input).toContain(sentence);
+    expect(input).not.toMatch(/\bit funded\b/i);
+  });
+
+  it('keeps the funder sentence plain when the funder is what ties the wallet to its group', () => {
+    const input = reppoInput({ ...RECORD, first_funder_claim_wallets: 21, group_size: 21, group_same_funder: 21 }, 'hold', 'Plain words.');
+    expect(input).toContain('its first funder funded 20 other wallets on this list; in a group of 21 linked wallets; the group shares funding');
+    expect(input).not.toContain('also funded');
+  });
+
+  it('says the wallet made links only when it did', () => {
+    const inGroup = { ...RECORD, group_size: 3, group_same_funder: null };
+    const own = reppoInput({ ...inGroup, group_links_made_by_wallet: true }, 'hold', 'Plain words.');
+    expect(own).toContain('; this wallet itself made links to other listed wallets;');
+
+    const notOwn = reppoInput(inGroup, 'hold', 'Plain words.');
+    expect(notOwn).toContain('; this wallet did not make the links;');
+    expect(reppoInput(RECORD, 'hold', 'Plain words.')).not.toContain('made links');
+    expect(notOwn).not.toContain('made links to other listed wallets');
+  });
+
+  it('tells the evaluators the group rule and the limit on holding a wallet heading to a reward', () => {
+    const input = reppoInput(RECORD, 'hold', 'Plain words.');
+    expect(input).toContain(
+      'A group of five or more listed wallets funded together, or sweeping to a shared collector, is held for a person, and excluded when the wallet itself swept to that collector.',
+    );
+    expect(input).toContain(
+      'A wallet heading to a reward is held only on a traced funding trail or a link it made itself, never on how many wallets its funder paid.',
+    );
+    expect(input.indexOf('never on how many wallets')).toBeLessThan(input.indexOf('Facts from public chain data'));
   });
 
   it('says plainly when a wallet has no funder on record', () => {

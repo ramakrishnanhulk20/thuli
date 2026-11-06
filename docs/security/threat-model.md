@@ -332,13 +332,13 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   first makes it look public, so A3 stops firing through that address; shared funding still catches it. Shown by: Hop wallets that swept to Orbiter's bridge, Multichain's
   bridge and the Ukraine donation address are no longer excluded, and ROBO's farm key is unchanged.
 
-- **C47. An exchange funder alone cannot hold a wallet.** The model's own hold (B1) has no signal on a shared exchange:
-  among exchange-funded wallets it fired on 1.25% of Hop's probably-real wallets and 1.13% of its eliminated ones. A clean
-  hold reply on a wallet with an exchange funder and no link of its own is replaced by the code's start with a
-  code-written reason. A wallet that made a link, or shares a deposit address, keeps the model's hold. A reply failing C13
-  still holds under C11. Non-goal: holds on contract funders stay, and they are close to a coin flip (21.7% of real users
-  against 31.4% of farms among contract-funded wallets), so a person reviews them. Shown by: a clean hold on an
-  exchange-funded A9 wallet ends at the start, and a malformed one ends in hold.
+- **C47. A shared funder alone cannot hold a wallet.** The model's own hold (B1) needs a traced funding trail or a link the
+  wallet made itself. A clean hold with neither, on a wallet heading to a reward, is replaced by the code's start with a
+  code-written reason. Reppo's judges accepted 0 of 15 such holds and blocked 11, and among exchange-funded wallets the hold
+  had no signal (1.25% of probably-real wallets against 1.13% of eliminated ones). A reply failing C13 still holds under C11.
+  Non-goal: this gives up holds that were sometimes right: on Hop's eliminated A8 and A9 sample, 10.6% held fell to 2.2%, by
+  Ram's decision on 6 Nov. The verdict still flags those wallets for the feedback set. Shown by: a clean hold on an A9 wallet
+  with any funder and no link ends at the start, and with a link of its own stays a hold.
 
 **Funding bursts**
 - **C45. A funding burst can only cut a wallet to partial.** A burst is at least `burstMinWallets` wallets first funded by

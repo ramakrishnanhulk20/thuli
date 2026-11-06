@@ -139,9 +139,11 @@ const USER_PROMPT =
   "User prompt: You screen one wallet on a crypto project's airdrop list. Decide: full reward, partial reward, hold for a person to review, or exclude. ";
 
 const RULES =
-  'Be fair to real users: ordinary people often share a popular bridge, an exchange or a faucet, and a new wallet is not a farm by itself. Links a wallet made itself are strong evidence of one operator. Links it did not make are weak on their own. A funding burst is a pattern, not proof of one owner, so it caps a wallet at a partial reward and never justifies a hold.';
+  'Be fair to real users: ordinary people often share a popular bridge, an exchange or a faucet, and a new wallet is not a farm by itself. Links a wallet made itself are strong evidence of one operator. Links it did not make are weak on their own. A funding burst is a pattern, not proof of one owner, so it caps a wallet at a partial reward and never justifies a hold. A group of five or more listed wallets funded together, or sweeping to a shared collector, is held for a person, and excluded when the wallet itself swept to that collector. A wallet heading to a reward is held only on a traced funding trail or a link it made itself, never on how many wallets its funder paid.';
 
 const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+
+const groupSharesFunding = (record: GraphRecord) => (record.group_same_funder ?? 0) >= 2;
 
 function funderFacts(record: GraphRecord): string[] {
   if (record.first_funder_kind === 'none') return ['no first funder on record'];
@@ -150,16 +152,19 @@ function funderFacts(record: GraphRecord): string[] {
   // Our count includes this wallet and the reasons count only the others. On the one real check every evaluator read
   // that gap as a factual error, so the facts here use the reasons' count.
   const others = Math.max(record.first_funder_claim_wallets - 1, 0);
-  return [...funded, `it funded ${others === 0 ? 'no' : others} other ${others === 1 ? 'wallet' : 'wallets'} on this list`];
+  // "It funded" was read as the wallet being screened on 4 of the first 49 checks, so the funder is always named. When the
+  // funder is what ties the wallet to its group, "also" would read as a second, separate link.
+  const verb = others === 0 || groupSharesFunding(record) ? 'funded' : 'also funded';
+  return [...funded, `its first funder ${verb} ${others === 0 ? 'no' : others} other ${others === 1 ? 'wallet' : 'wallets'} on this list`];
 }
 
 function groupFacts(record: GraphRecord): string[] {
   if (record.group_size === 0) return ['no group of linked wallets', 'no sweep to a shared collector'];
   return [
     `in a group of ${plural(record.group_size, 'linked wallet')}`,
-    (record.group_same_funder ?? 0) >= 2 ? 'the group shares funding' : 'the group does not share funding',
+    groupSharesFunding(record) ? 'the group shares funding' : 'the group does not share funding',
     record.group_swept_to_shared_collector ? 'the group sweeps to a shared collector' : 'no sweep to a shared collector',
-    record.group_links_made_by_wallet ? 'this wallet made the links itself' : 'this wallet did not make the links',
+    record.group_links_made_by_wallet ? 'this wallet itself made links to other listed wallets' : 'this wallet did not make the links',
   ];
 }
 

@@ -1,7 +1,7 @@
 // Not covered here: how the records were made (decide.test.ts), whether Bitquery's key or its claim-day value is right,
 // and the real ROBO data. This file checks only the arithmetic of the scorecard and the words it prints.
 import { describe, expect, it } from 'vitest';
-import { BURST_KEPT_CAUSE, DEFAULT_SETTINGS, EXCHANGE_KEPT_CAUSE, parseAddress, type FarmKeyEntry, type Outcome, type ReplayRow, type Start } from '@thuli/core';
+import { BURST_KEPT_CAUSE, DEFAULT_SETTINGS, FUNDER_KEPT_CAUSE, parseAddress, type FarmKeyEntry, type Outcome, type ReplayRow, type Start } from '@thuli/core';
 import type { DecisionRecord } from '../src/replay/decide.ts';
 import { decisionsToMarkdown, scoreDecisions, STALE_DECISION, USD_PER_ROBO_AT_CLAIM } from '../src/replay/decisionScore.ts';
 
@@ -153,7 +153,7 @@ describe('scoreDecisions', () => {
       tokens: { v3: { input: 800, output: 80 }, v2: { input: 200, output: 20 } },
       accepted: 8,
       burstKept: 1,
-      exchangeKept: 0,
+      funderKept: 0,
       secondAsks: { asked: 2, fixed: 1 },
       refused: { [BAD_SHARE]: 1, [BAD_JSON]: 1 },
       final: {
@@ -225,13 +225,13 @@ describe('scoreDecisions', () => {
     expect(score(record(K1, HOLD_A4, 'hold')).decided).toBe(1);
   });
 
-  it('counts a hold the code replaced on an exchange funder apart from refused, burst and held', () => {
-    const replaced = record(O1, FULL_A9, 'full', { modelAction: 'hold', modelRule: 'B1', clampedFrom: 'hold', accepted: false, cause: EXCHANGE_KEPT_CAUSE });
+  it('counts a hold the code replaced on a funder alone apart from refused, burst and held', () => {
+    const replaced = record(O1, FULL_A9, 'full', { modelAction: 'hold', modelRule: 'B1', clampedFrom: 'hold', accepted: false, cause: FUNDER_KEPT_CAUSE });
     const score = scoreDecisions([replaced], [row(O1, FULL_A9)], new Map(), CLAIMED);
-    expect(score).toMatchObject({ exchangeKept: 1, burstKept: 0, refused: {}, accepted: 0, finalHeld: { key: 0, other: 0 }, final: { other: { full: 1 } } });
+    expect(score).toMatchObject({ funderKept: 1, burstKept: 0, refused: {}, accepted: 0, finalHeld: { key: 0, other: 0 }, final: { other: { full: 1 } } });
     expect(score.robo.keptOther).toBe('0');
     const report = decisionsToMarkdown(score, { runDate: '2026-11-06', spentCents: null });
-    expect(report).toContain('Holds on an exchange funder alone, replaced by the code: 1');
+    expect(report).toContain('Holds on a funder alone, replaced by the code: 1');
     expect(report).toContain('Still refused and held:\n- none');
   });
 
@@ -281,7 +281,7 @@ describe('decisionsToMarkdown', () => {
     expect(report).toContain('Held after SERV: 3 key wallets, 3 others');
     expect(report).toContain('Raised by rule B2: 1 key wallets, 1 others');
     expect(report).toContain('Held by rule B1: 1 key wallets, 1 others');
-    expect(report).toContain("Burst replies replaced by the code's partial: 1\nHolds on an exchange funder alone, replaced by the code: 0");
+    expect(report).toContain("Burst replies replaced by the code's partial: 1\nHolds on a funder alone, replaced by the code: 0");
   });
 
   it('shows the final recall after the B2 raise, and the families', () => {

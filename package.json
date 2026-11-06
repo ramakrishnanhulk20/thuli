@@ -17,6 +17,7 @@
     "replay:hop": "node --env-file=.env --import tsx packages/worker/scripts/replay-hop.ts",
     "decide:robo": "node --env-file=.env --import tsx packages/worker/scripts/decide-robo.ts",
     "feedback:reppo": "node --env-file=.env --import tsx packages/worker/scripts/feedback-reppo.ts",
+    "versions:score": "node --env-file=.env --import tsx packages/worker/scripts/versions-score.ts",
     "appeal:demo": "node --env-file=.env --import tsx packages/worker/scripts/appeal-demo.ts"
   },
   "devDependencies": {

@@ -35,8 +35,8 @@ export const MAX_REASON_CHARS = 280;
 /** The cause on a burst reply the code replaced. The scorecard counts these on their own, so both share this one text. */
 export const BURST_KEPT_CAUSE = 'a funding burst keeps this wallet at partial';
 
-/** The cause on a hold or exclude the code replaced on an exchange-funded wallet. The scorecard counts these on their own. */
-export const EXCHANGE_KEPT_CAUSE = 'an exchange funder alone cannot hold this wallet';
+/** The cause on a hold or exclude the code replaced because a shared funder was all there was. The scorecard counts these on their own. */
+export const FUNDER_KEPT_CAUSE = 'a shared funder alone cannot hold this wallet';
 
 // A real decision is well under 2 KB. Anything far larger is refused before JSON.parse ever sees it (C41).
 const MAX_RAW_TEXT_CHARS = 16_384;
@@ -111,17 +111,18 @@ function keepBurstPartial(ctx: DecisionContext, replied: Outcome): { decision: F
   };
 }
 
-// A wallet with links of its own has evidence beyond the shared exchange, so the model's hold stands.
-function onlyExchangeEvidence(facts: Facts): boolean {
-  return facts.firstFunder?.kind === 'exchange' && facts.group?.linkedByWallet !== true && facts.sharedDepositAddress === null;
+// B1 needs a traced trail. With none traced and no link of its own, a hold has nothing behind it but a funder count,
+// which Reppo's judges rejected on all 15 such holds. Any funder counts here, because the count is the weak part, not the kind.
+function onlyFunderEvidence(facts: Facts, paidHopsMade: number | undefined): boolean {
+  return facts.group?.linkedByWallet !== true && facts.sharedDepositAddress === null && (paidHopsMade ?? 0) === 0;
 }
 
 /**
- * The code's start for a wallet whose reply tried to hold or exclude it when a shared exchange is all there is. The start
- * already passed every fixed check, and sharing an exchange is weak evidence on its own: measured live on Hop among
+ * The code's start for a wallet whose reply tried to hold or exclude it when a shared funder is all there is. The start
+ * already passed every fixed check, and a funder count is weak evidence on its own: measured live on Hop among
  * exchange-funded wallets, the model's B1 hit 1.25% of probably-real users and 1.13% of farmers. Only a reply that passed
  * the output checks gets here, so doubt about the reply still holds (C11). The reason is code-written, so no model text
- * survives, and accepted stays false so the record shows the reply was replaced.
+ * survives, and accepted stays false so the record shows the reply was replaced. No paid lookup was made on this path.
  */
 function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDecision; accepted: false; cause: string } {
   const action = ctx.start.outcome;
@@ -130,13 +131,13 @@ function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDec
       action,
       shareBps: shareFor(action, ctx.settings),
       rule: ctx.start.rule,
-      reason: "The first funder is an exchange, and sharing an exchange is weak evidence on its own, so the code's start stands.",
+      reason: "No funding trail was traced and this wallet made no links of its own, so the code's start stands.",
       citedTxs: [],
-      paidHops: ctx.paidHopsMade ?? 0,
+      paidHops: 0,
       clampedFrom: replied,
     },
     accepted: false,
-    cause: EXCHANGE_KEPT_CAUSE,
+    cause: FUNDER_KEPT_CAUSE,
   };
 }
 
@@ -147,9 +148,10 @@ function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDec
  * out of its reason is replaced by the start with a code-written reason (C45). That replacement skips the final clamp,
  * so it only runs when the ceiling allows partial; a context with a lower ceiling takes the normal checks instead (C12).
  * Any other failed check gives a hold with rule A1 and accepted false (threat model C11, C13). After the output checks, a
- * hold or exclude on a wallet with only a shared exchange against it is replaced by a start the ceiling allows (C12). An
- * exclude without the A3 self-linked group evidence becomes a hold (C15). The rule must fit the code's start: a fixed
- * rule must repeat it exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise an A4 to A6 hold.
+ * hold or exclude on a wallet with no traced trail, no link of its own and no shared deposit is replaced by a start the
+ * ceiling allows (C12). An exclude without the A3 self-linked group evidence becomes a hold (C15). The rule must fit the
+ * code's start: a fixed rule must repeat it exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise
+ * an A4 to A6 hold.
  * Otherwise the final action is the less generous of the model's action and the ceiling; when that lowers it, clampedFrom
  * records the model's action and the share is recomputed (C12). The cause texts are fixed strings, so no model text is
  * ever copied into a fallback reason.
@@ -194,7 +196,7 @@ export function validateDecision(
   if (
     (ctx.start.outcome === 'full' || ctx.start.outcome === 'partial') &&
     leastGenerous(ctx.start.outcome, ctx.ceiling) === ctx.start.outcome &&
-    onlyExchangeEvidence(ctx.facts) &&
+    onlyFunderEvidence(ctx.facts, ctx.paidHopsMade) &&
     (reply.action === 'hold' || reply.action === 'exclude')
   ) {
     return keepStart(ctx, reply.action);

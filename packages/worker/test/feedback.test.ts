@@ -4,10 +4,22 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ReppoPayloadError, type GraphRecord, type ReppoVerdict } from '@thuli/core';
+import {
+  computeCeiling,
+  computeStart,
+  DEFAULT_SETTINGS,
+  parseAddress,
+  reppoInput,
+  ReppoPayloadError,
+  type Facts,
+  type GraphRecord,
+  type ReplayRow,
+  type ReppoVerdict,
+} from '@thuli/core';
 import { JsonlCache } from '../src/chain/jsonlCache.ts';
+import type { DecisionRecord } from '../src/replay/decide.ts';
 import { ReppoOutOfCredit, type ReppoEval } from '../src/reppo/client.ts';
-import { FeedbackEntry, runFeedback, type FeedbackItem } from '../src/reppo/feedback.ts';
+import { FeedbackEntry, feedbackItem, namesOtherVersion, runFeedback, type FeedbackItem } from '../src/reppo/feedback.ts';
 
 const RECORD: GraphRecord = {
   start_outcome: 'full',
@@ -145,6 +157,23 @@ describe('runFeedback', () => {
     expect(evaluate).toHaveBeenCalledTimes(3);
   });
 
+  it('stores one list under v1-recheck and v2 with no clash, and a rerun of either pays nothing', async () => {
+    const evaluate = vi.fn(async () => completed('accept'));
+    const list = [item(1), item(2)];
+    await runFeedback(list, { evaluate }, { ...options(open()), rulebook: 'v1-recheck' });
+    await runFeedback(list, { evaluate }, { ...options(open()), rulebook: 'v2' });
+    expect(evaluate).toHaveBeenCalledTimes(4);
+
+    const stored = open();
+    expect(stored.size).toBe(4);
+    expect(stored.get(`v1-recheck:robo:${walletAt(1)}`)?.rulebook).toBe('v1-recheck');
+    expect(stored.get(`v2:robo:${walletAt(1)}`)?.rulebook).toBe('v2');
+
+    await runFeedback(list, { evaluate }, { ...options(open()), rulebook: 'v1-recheck' });
+    await runFeedback(list, { evaluate }, { ...options(open()), rulebook: 'v2' });
+    expect(evaluate).toHaveBeenCalledTimes(4);
+  });
+
   it('stops on out of credit, keeps finished work, and rethrows', async () => {
     const evaluate = vi
       .fn<() => Promise<ReppoEval>>()
@@ -206,5 +235,75 @@ describe('runFeedback', () => {
     await runFeedback([item(1)], { evaluate: async () => completed('reject') }, options(open()));
     expect(logLines).toEqual(['feedback: 1/1 sent, 1 disagreed, 0 failed']);
     expect(logLines.join()).not.toContain('0x');
+  });
+});
+
+describe('feedbackItem', () => {
+  const FACTS: Facts = {
+    walletAgeDays: 324,
+    txCountAtSnapshot: 16,
+    accountType: 'eoa',
+    firstFunder: { address: parseAddress(`0x${'f1'.repeat(20)}`), kind: 'contract', fanoutInList: 63, hopsTraced: 0 },
+    group: null,
+    sharedDepositAddress: null,
+    fundingBurst: null,
+    claimPaidToOtherAddress: false,
+    evidenceTxs: [],
+    missing: [],
+  };
+  const start = computeStart(FACTS, DEFAULT_SETTINGS);
+  const ceiling = computeCeiling(FACTS, DEFAULT_SETTINGS).ceiling;
+  const ROW: ReplayRow = { wallet: walletAt(1), start, ceiling, facts: FACTS };
+  const STORED: DecisionRecord = {
+    wallet: walletAt(1),
+    mode: 'v3',
+    fallback: false,
+    start,
+    ceiling,
+    requestId: 'run-1',
+    rawText: '{}',
+    usage: null,
+    verdict: 'likely_farm',
+    modelAction: 'hold',
+    modelRule: 'B1',
+    action: 'hold',
+    shareBps: 0,
+    rule: 'B1',
+    reason: 'The contract first funder also funded 62 claim wallets.',
+    citedTxs: [],
+    clampedFrom: null,
+    accepted: true,
+    cause: null,
+    secondAsk: false,
+    firstCause: null,
+  };
+  const LISTED = { wallet: walletAt(1), set: 'robo', group: 'contract-hold' } as const;
+
+  it('sends the stored decision as it stands without --use-v2', () => {
+    const built = feedbackItem(LISTED, ROW, STORED, { useV2: false, settings: DEFAULT_SETTINGS });
+    expect(built).toMatchObject({ ...LISTED, action: 'hold', rule: 'B1', reason: STORED.reason });
+  });
+
+  it('sends what v2 decided with --use-v2, in the payload as well as the item', () => {
+    const built = feedbackItem(LISTED, ROW, STORED, { useV2: true, settings: DEFAULT_SETTINGS });
+    expect(built).toMatchObject({ ...LISTED, action: 'full', rule: 'A9' });
+    const input = reppoInput(built.record, built.action, built.reason);
+    expect(input).toContain("Decision: full reward. Reason: No funding trail was traced and this wallet made no links of its own, so the code's start stands.");
+  });
+});
+
+describe('namesOtherVersion', () => {
+  it.each([
+    ['v1', false, false],
+    ['v1-recheck', false, false],
+    ['v2', true, false],
+    ['v2-recheck', true, false],
+    ['nov-sample', false, false],
+    ['nov-sample', true, false],
+    ['v1', true, true],
+    ['v1-recheck', true, true],
+    ['v2', false, true],
+  ])('reads %s with useV2 %s as %s', (rulebook, useV2, clash) => {
+    expect(namesOtherVersion(rulebook, useV2)).toBe(clash);
   });
 });

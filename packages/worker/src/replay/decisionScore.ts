@@ -1,5 +1,5 @@
 import { formatUnits } from 'viem';
-import { BURST_KEPT_CAUSE, EXCHANGE_KEPT_CAUSE, OUTCOMES, type FarmKeyEntry, type Outcome, type ReplayRow } from '@thuli/core';
+import { BURST_KEPT_CAUSE, FUNDER_KEPT_CAUSE, OUTCOMES, type FarmKeyEntry, type Outcome, type ReplayRow } from '@thuli/core';
 import type { DecisionRecord } from './decide.ts';
 
 // Source: Bitquery, 329.1M ROBO worth $13.8M on the days they were claimed.
@@ -28,7 +28,7 @@ export interface DecisionScore {
   tokens: { v3: { input: number; output: number }; v2: { input: number; output: number } };
   accepted: number;
   burstKept: number;
-  exchangeKept: number;
+  funderKept: number;
   /** asked counts first answers the checks refused, whether or not the second call worked. fixed counts those then accepted. */
   secondAsks: { asked: number; fixed: number };
   /** Every other cause, by its text, with how many decisions it ended. */
@@ -101,7 +101,7 @@ export function scoreDecisions(
   let decided = 0;
   let accepted = 0;
   let burstKept = 0;
-  let exchangeKept = 0;
+  let funderKept = 0;
 
   for (const row of rows) {
     const wallet = lower(row.wallet);
@@ -139,7 +139,7 @@ export function scoreDecisions(
     if (record.secondAsk && record.accepted) secondAsks.fixed += 1;
     // The code keeping its own start is not a refused answer, so it gets its own line.
     if (record.cause === BURST_KEPT_CAUSE) burstKept += 1;
-    else if (record.cause === EXCHANGE_KEPT_CAUSE) exchangeKept += 1;
+    else if (record.cause === FUNDER_KEPT_CAUSE) funderKept += 1;
     else if (record.cause !== null) refused.set(record.cause, (refused.get(record.cause) ?? 0) + 1);
     final[side][record.action] += 1;
     if (isHeld(row.start.outcome)) startHeld[side] += 1;
@@ -159,7 +159,7 @@ export function scoreDecisions(
     tokens,
     accepted,
     burstKept,
-    exchangeKept,
+    funderKept,
     secondAsks,
     refused: Object.fromEntries(refused),
     final,
@@ -240,7 +240,7 @@ export function decisionsToMarkdown(score: DecisionScore, meta: { runDate: strin
     `Raised by rule B2: ${count(score.moved.raisedByB2.key)} key wallets, ${count(score.moved.raisedByB2.other)} others`,
     `Held by rule B1: ${count(score.moved.heldByB1.key)} key wallets, ${count(score.moved.heldByB1.other)} others`,
     `Burst replies replaced by the code's partial: ${count(score.burstKept)}`,
-    `Holds on an exchange funder alone, replaced by the code: ${count(score.exchangeKept)}`,
+    `Holds on a funder alone, replaced by the code: ${count(score.funderKept)}`,
     '',
     "## Bitquery's farm key",
     '',

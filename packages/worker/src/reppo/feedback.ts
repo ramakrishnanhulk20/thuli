@@ -1,6 +1,18 @@
 import { z } from 'zod';
-import { DECISION_RULES, OutcomeSchema, ReppoVerdict, reppoInput, type GraphRecord, type Outcome } from '@thuli/core';
+import {
+  DECISION_RULES,
+  OutcomeSchema,
+  ReppoVerdict,
+  reppoInput,
+  toGraphRecord,
+  type GraphRecord,
+  type Outcome,
+  type ReplayRow,
+  type Settings,
+} from '@thuli/core';
 import type { JsonlCache } from '../chain/jsonlCache.ts';
+import type { DecisionRecord } from '../replay/decide.ts';
+import { asRulebookV2 } from '../replay/versions.ts';
 import type { ReppoEval } from './client.ts';
 
 export const FeedbackEntry = z.strictObject({
@@ -29,6 +41,9 @@ export interface FeedbackItem {
   reason: string;
 }
 
+/** The wallet, set and group one line of a list file names. */
+export type ListedWallet = Pick<FeedbackItem, 'wallet' | 'set' | 'group'>;
+
 export interface FeedbackDeps {
   evaluate(input: string): Promise<ReppoEval>;
 }
@@ -51,6 +66,39 @@ export interface FeedbackCounts {
 
 // 12 wallets sit in both replay sets, and a new rulebook is a new decision, so the wallet alone would skip real work.
 const feedbackKey = (item: FeedbackItem, rulebook: string) => `${rulebook}:${item.set}:${item.wallet}`;
+
+/**
+ * Builds one item from a wallet's stored decision. With useV2 the decision goes through asRulebookV2 first, so a re-check
+ * sends what v2 actually decided, not what v1 stored.
+ *
+ * @throws Error STALE_ROWS when useV2 is on and the stored decision no longer matches the row's facts.
+ * @throws ZodError when the row's facts do not make a GraphRecord.
+ */
+export function feedbackItem(
+  listed: ListedWallet,
+  row: ReplayRow,
+  stored: DecisionRecord,
+  opts: { useV2: boolean; settings: Settings },
+): FeedbackItem {
+  const decision = opts.useV2 ? asRulebookV2(stored, row, opts.settings) : stored;
+  return {
+    ...listed,
+    record: toGraphRecord(row.facts, row.start),
+    action: decision.action,
+    rule: decision.rule,
+    reason: decision.reason,
+  };
+}
+
+/**
+ * True when a rulebook label names the other version from the decisions being sent, such as v2 decisions under
+ * v1-recheck. A stored entry says which version Reppo judged, so a wrong label would mark the wrong version right or
+ * wrong, and under plain v1 the wallets would be skipped as already sent. A label with no version in it is left alone.
+ */
+export function namesOtherVersion(rulebook: string, useV2: boolean): boolean {
+  const version = /^v\d+/.exec(rulebook)?.[0];
+  return version !== undefined && version !== (useV2 ? 'v2' : 'v1');
+}
 
 /**
  * Sends each wallet's decision to Reppo, one at a time because an account may run only one evaluation at once, and stores

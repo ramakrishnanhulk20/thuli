@@ -5,21 +5,21 @@ import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import {
   AddressError,
+  DEFAULT_SETTINGS,
   Facts,
   OutcomeSchema,
   parseAddress,
   ReppoPayloadError,
   reppoInput,
   Start,
-  toGraphRecord,
   type ReplayRow,
 } from '@thuli/core';
 import { JsonlCache } from '../src/chain/jsonlCache.ts';
 import { EnvError } from '../src/env.ts';
 import { refuseNetwork, UsageError } from '../src/replay/cliSupport.ts';
-import { DecisionRecord } from '../src/replay/decide.ts';
+import { DecisionRecord, STALE_ROWS } from '../src/replay/decide.ts';
 import { evaluate, ReppoError, ReppoOutOfCredit, reppoConnectionFromEnv } from '../src/reppo/client.ts';
-import { FeedbackEntry, runFeedback, type FeedbackItem } from '../src/reppo/feedback.ts';
+import { FeedbackEntry, feedbackItem, namesOtherVersion, runFeedback, type FeedbackItem } from '../src/reppo/feedback.ts';
 
 const OUT_OF_CREDIT_EXIT = 3;
 // A full account buys about 50 evaluations, so a list far past this is a mistake (C41).
@@ -32,7 +32,7 @@ const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const REPLAY_DIR = path.join(REPO_ROOT, 'data', 'replay');
 const DEFAULT_OUT = path.join(REPO_ROOT, 'data', 'feedback', 'reppo.jsonl');
-const USAGE = 'Usage: npm run feedback:reppo -- --list FILE [--limit N] [--rulebook NAME] [--out FILE] [--dry-run]';
+const USAGE = 'Usage: npm run feedback:reppo -- --list FILE [--limit N] [--use-v2] [--rulebook NAME] [--out FILE] [--dry-run]';
 
 const SETS = ['robo', 'hop'] as const;
 type SetName = (typeof SETS)[number];
@@ -62,18 +62,20 @@ interface Arguments {
   listFile: string;
   limit: number | undefined;
   rulebook: string;
+  useV2: boolean;
   outFile: string;
   dryRun: boolean;
 }
 
 function readArguments(): Arguments {
-  let values: { list?: string; limit?: string; rulebook?: string; out?: string; 'dry-run'?: boolean };
+  let values: { list?: string; limit?: string; rulebook?: string; 'use-v2'?: boolean; out?: string; 'dry-run'?: boolean };
   try {
     values = parseArgs({
       options: {
         list: { type: 'string' },
         limit: { type: 'string' },
         rulebook: { type: 'string' },
+        'use-v2': { type: 'boolean' },
         out: { type: 'string' },
         'dry-run': { type: 'boolean' },
       },
@@ -86,12 +88,15 @@ function readArguments(): Arguments {
   if (values.list === undefined) throw new UsageError(USAGE);
   const limitText = values.limit;
   if (limitText !== undefined && !/^[1-9][0-9]{0,6}$/.test(limitText)) throw new UsageError('--limit must be a whole number above 0');
-  const rulebook = values.rulebook ?? 'v1';
+  const useV2 = values['use-v2'] ?? false;
+  const rulebook = values.rulebook ?? (useV2 ? 'v2' : 'v1');
   if (!LABEL.test(rulebook)) throw new UsageError('--rulebook must be letters, digits, dots, dashes or underscores');
+  if (namesOtherVersion(rulebook, useV2)) throw new UsageError('--rulebook names a different version from the decisions being sent');
   return {
     listFile: path.resolve(values.list),
     limit: limitText === undefined ? undefined : Number(limitText),
     rulebook,
+    useV2,
     outFile: values.out === undefined ? DEFAULT_OUT : path.resolve(values.out),
     dryRun: values['dry-run'] ?? false,
   };
@@ -163,7 +168,7 @@ function loadDecisions(set: SetName, wanted: ReadonlySet<string>): Map<string, D
  * Turns the list into checked items. A wallet with no row or no stored decision, or one whose decision came from older
  * rows, stops the run here, so a whole list is either sendable or nothing is sent.
  */
-function buildItems(list: ListLine[]): FeedbackItem[] {
+function buildItems(list: ListLine[], useV2: boolean): FeedbackItem[] {
   const items: FeedbackItem[] = [];
   for (const set of SETS) {
     const lines = list.filter((line) => line.set === set);
@@ -179,15 +184,7 @@ function buildItems(list: ListLine[]): FeedbackItem[] {
       if (decision.start.outcome !== row.start.outcome || decision.start.rule !== row.start.rule) {
         throw new UsageError(`--list: a ${set} decision came from older rows, so nothing was sent`);
       }
-      items.push({
-        wallet: line.wallet,
-        set,
-        group: line.group,
-        record: toGraphRecord(row.facts, row.start),
-        action: decision.action,
-        rule: decision.rule,
-        reason: decision.reason,
-      });
+      items.push(feedbackItem(line, row, decision, { useV2, settings: DEFAULT_SETTINGS }));
     }
   }
   return items;
@@ -204,7 +201,7 @@ function printPayloads(items: FeedbackItem[], limit: number | undefined): void {
 
 async function main(): Promise<number> {
   const args = readArguments();
-  const items = buildItems(loadList(args.listFile));
+  const items = buildItems(loadList(args.listFile), args.useV2);
   if (args.dryRun) {
     refuseNetwork();
     printPayloads(items, args.limit);
@@ -237,6 +234,11 @@ main().then(
   },
   (error: unknown) => {
     if (error instanceof UsageError || error instanceof EnvError || error instanceof AddressError) {
+      console.error(error.message);
+      process.exitCode = 2;
+      return;
+    }
+    if (error instanceof Error && error.message === STALE_ROWS) {
       console.error(error.message);
       process.exitCode = 2;
       return;

@@ -5,7 +5,7 @@ import {
   computeStart,
   DECISION_RULES,
   decisionFromGraphAnswer,
-  EXCHANGE_KEPT_CAUSE,
+  FUNDER_KEPT_CAUSE,
   GraphVersionError,
   holdForReview,
   OutcomeSchema,
@@ -181,7 +181,7 @@ function addUsage(first: ServReply['usage'], second: ServReply['usage']): ServRe
  * long. A second ask re-rolls the wording, it is not a second opinion, so it never changes route. The second answer
  * takes the same checks with the same ceiling, so asking again can never pay more than the first ask could (C12, C13).
  * If it is refused too, that refusal stands, and if the call fails the first hold stands (C11). A reply the code
- * replaced with its own start, on a burst or an exchange funder, is not asked again, because that outcome is the code's.
+ * replaced with its own start, on a burst or a funder alone, is not asked again, because that outcome is the code's.
  *
  * Returns null when no route gave an answer: nothing was approved for the wallet, and a rerun asks again (C11). Any
  * answer that arrived, however bad, ends in a record, with a failed check holding the wallet (C11, C13). The final
@@ -208,7 +208,7 @@ export async function decideWallet(
 
   const context: DecisionContext = { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0 };
   const first = checkAnswer(served, context, record);
-  const replaced = first.result.cause === BURST_KEPT_CAUSE || first.result.cause === EXCHANGE_KEPT_CAUSE;
+  const replaced = first.result.cause === BURST_KEPT_CAUSE || first.result.cause === FUNDER_KEPT_CAUSE;
   const askAgain = !first.result.accepted && !replaced;
   const secondServed = askAgain ? await askSameRoute(record, deps, served) : null;
   const { answer, result, served: kept } = secondServed === null ? first : checkAnswer(secondServed, context, record);
