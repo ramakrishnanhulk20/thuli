@@ -91,6 +91,8 @@ describe('scoreReplay', () => {
       otherWallets: 3,
       otherHeld: 1,
       otherHoldRate: 1 / 3,
+      otherPartial: 1,
+      otherFull: 1,
       robo: { heldKey: '3003.500000000000000001', allKey: '7003.500000000000000001', heldOther: '1.25' },
       rootMatches: 2,
       dataGaps: {
@@ -137,6 +139,8 @@ describe('scoreToMarkdown', () => {
     expect(opening).toContain('only chain data before block 24,546,233');
     expect(markdown).toContain('Held: 5 (83.3%), of which excluded: 1');
     expect(markdown).toContain('ROBO claimed by held key wallets: 3,003.5 ROBO');
+    expect(markdown).toContain('Cut to partial: 1 (33.3%)');
+    expect(markdown).toContain('Paid in full: 1 (33.3%)');
     expect(markdown).toContain('| A4 | a group of wallets that move together, so hold | 2 | 0 |');
   });
 

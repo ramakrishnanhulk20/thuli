@@ -45,6 +45,9 @@ export interface ReplayScore {
   otherWallets: number;
   otherHeld: number;
   otherHoldRate: number | null;
+  /** Other wallets the code would pay half or all of. Holds alone flatter the score: a cut to half is a cost too. */
+  otherPartial: number;
+  otherFull: number;
   /** ROBO as decimal text, from wei at 18 decimals. */
   robo: { heldKey: string; allKey: string; heldOther: string };
   /** Key wallets traced back to the funding wallet the key names, out of fundedWallets. */
@@ -96,6 +99,8 @@ export function scoreReplay(
   let fundedHeld = 0;
   let fundedExcluded = 0;
   let otherHeld = 0;
+  let otherPartial = 0;
+  let otherFull = 0;
   let rootMatches = 0;
   let a1 = 0;
   let heldKeyWei = 0n;
@@ -115,6 +120,8 @@ export function scoreReplay(
     const family = keyLower.get(wallet);
     if (family === undefined) {
       byRule.other[row.start.rule] += 1;
+      if (row.start.outcome === 'partial') otherPartial += 1;
+      if (row.start.outcome === 'full') otherFull += 1;
       if (held) {
         otherHeld += 1;
         heldOtherWei += wei;
@@ -162,6 +169,8 @@ export function scoreReplay(
     otherWallets,
     otherHeld,
     otherHoldRate: ratio(otherHeld, otherWallets),
+    otherPartial,
+    otherFull,
     robo: {
       heldKey: formatUnits(heldKeyWei, ROBO_DECIMALS),
       allKey: formatUnits(allKeyWei, ROBO_DECIMALS),
@@ -242,6 +251,8 @@ export function scoreToMarkdown(
     `Other wallets: ${count(score.otherWallets)}`,
     `Held: ${count(score.otherHeld)} (${percent(score.otherHoldRate)})`,
     `ROBO claimed by held other wallets: ${roboText(score.robo.heldOther)}`,
+    `Cut to partial: ${count(score.otherPartial)} (${percent(ratio(score.otherPartial, score.otherWallets))})`,
+    `Paid in full: ${count(score.otherFull)} (${percent(ratio(score.otherFull, score.otherWallets))})`,
     '',
     '## Funding roots',
     '',
