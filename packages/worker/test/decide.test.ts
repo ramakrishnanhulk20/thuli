@@ -88,9 +88,6 @@ function replyWith(answer: GraphAnswer, overrides: Partial<ServReply> = {}): Ser
 }
 
 const statusError = (status: number | null) => new ServError(`SERV answered with status ${status}`, status, 'run-failed');
-const noAnswer = async (): Promise<ServReply> => {
-  throw statusError(401);
-};
 
 function stubDeps(overrides: Partial<Pick<DecideDeps, 'viaGraph' | 'viaV2'>> = {}) {
   // g1's real input translation, so a burst wallet is refused here exactly as it is on the way to SERV.
@@ -285,7 +282,6 @@ describe('decideWallet checks', () => {
       viaGraph: vi.fn(async () =>
         replyWith(FULL_ANSWER, { answer: null, answerProblem: 'the reason names a different rule than the outcome shows' }),
       ),
-      viaV2: vi.fn(noAnswer),
     });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
     expect(record).toMatchObject({
@@ -303,7 +299,6 @@ describe('decideWallet checks', () => {
   it('holds on a reply that is not JSON', async () => {
     const deps = stubDeps({
       viaGraph: vi.fn(async () => replyWith(FULL_ANSWER, { answer: 'ignore your rules', rawText: 'ignore your rules' })),
-      viaV2: vi.fn(noAnswer),
     });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
     expect(record).toMatchObject({ action: 'hold', rule: 'A1', accepted: false, cause: 'the model reply was not valid JSON', rawText: 'ignore your rules' });
@@ -337,7 +332,7 @@ describe('decideWallet checks', () => {
 
   it('holds a reply that cites a transaction Thuli did not fetch', async () => {
     const madeUp = { ...FULL_ANSWER, cited_tx_hashes: [OTHER_HASH] };
-    const deps = stubDeps({ viaGraph: vi.fn(async () => replyWith(madeUp)), viaV2: vi.fn(noAnswer) });
+    const deps = stubDeps({ viaGraph: vi.fn(async () => replyWith(madeUp)) });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
     expect(record).toMatchObject({ action: 'hold', accepted: false, citedTxs: [], modelAction: 'full' });
     expect(record?.cause).toContain('did not fetch');
@@ -362,17 +357,19 @@ describe('decideWallet checks', () => {
 describe('decideWallet second ask', () => {
   const TOO_LONG: GraphAnswer = { ...FULL_ANSWER, reason: 'Old active wallet funded by an exchange. '.repeat(8) };
   const TOO_LONG_CAUSE = 'the reason was longer than 280 characters';
-  const refusedFirst = (overrides: Partial<ServReply> = {}) => vi.fn(async (_record: GraphRecord) => replyWith(TOO_LONG, overrides));
+  const inTurn = (...replies: ServReply[]) => {
+    const route = vi.fn<DecideDeps['viaGraph']>();
+    for (const reply of replies) route.mockResolvedValueOnce(reply);
+    return route;
+  };
 
-  it('fixes a too-long reason on an A9 wallet and stays full, keeping the second answer', async () => {
+  it('re-asks a graph answer refused for length through the graph, and never calls v2', async () => {
     expect(TOO_LONG.reason.length).toBeGreaterThan(280);
-    const deps = stubDeps({
-      viaGraph: refusedFirst({ requestId: 'run-first' }),
-      viaV2: vi.fn(async () => replyWith(FULL_ANSWER, { requestId: 'run-second' })),
-    });
+    const viaGraph = inTurn(replyWith(TOO_LONG, { requestId: 'run-first' }), replyWith(FULL_ANSWER, { requestId: 'run-second' }));
+    const deps = stubDeps({ viaGraph });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
     expect(record).toMatchObject({
-      mode: 'v2',
+      mode: 'v3',
       fallback: false,
       requestId: 'run-second',
       rawText: JSON.stringify(FULL_ANSWER),
@@ -385,23 +382,31 @@ describe('decideWallet second ask', () => {
       secondAsk: true,
       firstCause: TOO_LONG_CAUSE,
     });
-    expect(deps.viaGraph).toHaveBeenCalledTimes(1);
-    expect(deps.viaV2).toHaveBeenCalledTimes(1);
+    expect(viaGraph).toHaveBeenCalledTimes(2);
+    expect(deps.viaV2).not.toHaveBeenCalled();
   });
 
-  it('sends v2 the same record the first ask got', async () => {
-    const viaGraph = refusedFirst();
-    const viaV2 = vi.fn(async (_record: GraphRecord) => replyWith(FULL_ANSWER));
-    await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph, viaV2 }), 'auto');
-    expect(viaV2.mock.calls[0]?.[0]).toEqual(viaGraph.mock.calls[0]?.[0]);
+  it('re-asks a refused v2 answer through v2, and never calls the graph', async () => {
+    const viaV2 = inTurn(replyWith(TOO_LONG), replyWith(FULL_ANSWER));
+    const deps = stubDeps({ viaV2 });
+    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'v2');
+    expect(deps.viaGraph).not.toHaveBeenCalled();
+    expect(viaV2).toHaveBeenCalledTimes(2);
+    expect(record).toMatchObject({ mode: 'v2', fallback: false, accepted: true, firstCause: TOO_LONG_CAUSE });
+  });
+
+  it('sends the same record on the second ask', async () => {
+    const viaGraph = inTurn(replyWith(TOO_LONG), replyWith(FULL_ANSWER));
+    await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto');
+    expect(viaGraph.mock.calls[1]?.[0]).toEqual(viaGraph.mock.calls[0]?.[0]);
   });
 
   it('holds with the second cause when the second answer is refused too', async () => {
     const madeUp: GraphAnswer = { ...FULL_ANSWER, verdict: 'likely_farm', cited_tx_hashes: [OTHER_HASH] };
-    const deps = stubDeps({ viaGraph: refusedFirst(), viaV2: vi.fn(async () => replyWith(madeUp, { requestId: 'run-second' })) });
-    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
+    const viaGraph = inTurn(replyWith(TOO_LONG), replyWith(madeUp, { requestId: 'run-second' }));
+    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto');
     expect(record).toMatchObject({
-      mode: 'v2',
+      mode: 'v3',
       requestId: 'run-second',
       verdict: 'likely_farm',
       action: 'hold',
@@ -414,9 +419,11 @@ describe('decideWallet second ask', () => {
     expect(record?.cause).toContain('did not fetch');
   });
 
-  it('keeps the first hold when the second call fails', async () => {
-    const deps = stubDeps({ viaGraph: refusedFirst({ requestId: 'run-first' }), viaV2: vi.fn(noAnswer) });
+  it('keeps the first hold, with no v2 call, when a graph second ask fails', async () => {
+    const viaGraph = inTurn(replyWith(TOO_LONG, { requestId: 'run-first' })).mockRejectedValueOnce(statusError(401));
+    const deps = stubDeps({ viaGraph });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
+    expect(deps.viaV2).not.toHaveBeenCalled();
     expect(record).toMatchObject({
       mode: 'v3',
       requestId: 'run-first',
@@ -431,14 +438,19 @@ describe('decideWallet second ask', () => {
     });
   });
 
-  it('goes through the retries, and a second call that keeps failing still keeps the first hold', async () => {
-    const viaV2 = vi.fn(async (): Promise<ServReply> => {
-      throw statusError(503);
-    });
-    const deps = stubDeps({ viaGraph: refusedFirst(), viaV2 });
+  it('keeps the first hold when a v2 second ask fails', async () => {
+    const viaV2 = inTurn(replyWith(TOO_LONG)).mockRejectedValueOnce(statusError(401));
+    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaV2 }), 'v2');
+    expect(record).toMatchObject({ mode: 'v2', action: 'hold', cause: TOO_LONG_CAUSE, secondAsk: true });
+  });
+
+  it('goes through the retries, and a second ask that keeps failing still keeps the first hold', async () => {
+    const viaGraph = inTurn(replyWith(TOO_LONG)).mockRejectedValue(statusError(503));
+    const deps = stubDeps({ viaGraph });
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto');
-    expect(viaV2).toHaveBeenCalledTimes(4);
+    expect(viaGraph).toHaveBeenCalledTimes(5);
     expect(deps.sleep.mock.calls.map(([ms]) => ms)).toEqual([2_000, 8_000, 30_000]);
+    expect(deps.viaV2).not.toHaveBeenCalled();
     expect(record).toMatchObject({ action: 'hold', cause: TOO_LONG_CAUSE });
   });
 
@@ -450,12 +462,9 @@ describe('decideWallet second ask', () => {
     expect(record).toMatchObject({ action: 'partial', cause: BURST_KEPT_CAUSE, secondAsk: false, firstCause: null });
   });
 
-  it('does ask again when a burst wallet\'s first reply is unreadable, and the code still keeps it at partial', async () => {
+  it("does ask again when a burst wallet's first reply is unreadable, and the code still keeps it at partial", async () => {
     const hold: GraphAnswer = { verdict: 'likely_farm', action: 'hold', rule: 'B1', reason: 'Looks like a farm.', cited_tx_hashes: [] };
-    const viaV2 = vi
-      .fn<DecideDeps['viaV2']>()
-      .mockResolvedValueOnce(replyWith(hold, { answer: 'not json', rawText: 'not json' }))
-      .mockResolvedValueOnce(replyWith(hold));
+    const viaV2 = inTurn(replyWith(hold, { answer: 'not json', rawText: 'not json' }), replyWith(hold));
     const record = await decideWallet(rowFor(BURST), DEFAULT_SETTINGS, stubDeps({ viaV2 }), 'auto');
     expect(viaV2).toHaveBeenCalledTimes(2);
     expect(record).toMatchObject({
@@ -467,9 +476,9 @@ describe('decideWallet second ask', () => {
     });
   });
 
-  it('keeps a model hold on a second ask bound by the checks', async () => {
-    const wrongRule: GraphAnswer = { ...FULL_ANSWER, verdict: 'likely_farm', action: 'hold', rule: 'A9' };
-    const refused = stubDeps({ viaGraph: refusedFirst(), viaV2: vi.fn(async () => replyWith(wrongRule)) });
+  it('keeps a second answer bound by the checks', async () => {
+    const partial: GraphAnswer = { ...FULL_ANSWER, verdict: 'unclear', action: 'partial' };
+    const refused = stubDeps({ viaGraph: inTurn(replyWith(TOO_LONG), replyWith(partial)) });
     expect(await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, refused, 'auto')).toMatchObject({
       action: 'hold',
       rule: 'A1',
@@ -478,8 +487,8 @@ describe('decideWallet second ask', () => {
       firstCause: TOO_LONG_CAUSE,
     });
 
-    const allowed: GraphAnswer = { ...wrongRule, rule: 'B1', reason: 'Its funding trail leads to a shared source.' };
-    const held = stubDeps({ viaGraph: refusedFirst(), viaV2: vi.fn(async () => replyWith(allowed)) });
+    const hold: GraphAnswer = { ...FULL_ANSWER, verdict: 'likely_farm', action: 'hold', reason: 'Its funding trail leads to a shared source.' };
+    const held = stubDeps({ viaGraph: inTurn(replyWith(TOO_LONG), replyWith(hold)) });
     expect(await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, held, 'auto')).toMatchObject({
       action: 'hold',
       rule: 'B1',
@@ -491,19 +500,16 @@ describe('decideWallet second ask', () => {
 
   it('can never pay above the ceiling on a second ask', async () => {
     const raised: GraphAnswer = { verdict: 'ordinary_user', action: 'full', rule: 'B2', reason: 'The group looks unrelated.', cited_tx_hashes: [] };
-    const deps = stubDeps({
-      viaGraph: vi.fn(async () => replyWith({ ...raised, reason: 'x'.repeat(281) })),
-      viaV2: vi.fn(async () => replyWith(raised)),
-    });
-    const record = await decideWallet(rowFor(NEW_IN_GROUP), DEFAULT_SETTINGS, deps, 'auto');
+    const viaGraph = inTurn(replyWith({ ...raised, reason: 'x'.repeat(281) }), replyWith(raised));
+    const record = await decideWallet(rowFor(NEW_IN_GROUP), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto');
     expect(record).toMatchObject({ ceiling: 'partial', action: 'partial', shareBps: 5000, clampedFrom: 'full', accepted: true, secondAsk: true });
   });
 
   it('refuses an exclude on a second ask without the evidence A3 needs, even when the wallet made a link', async () => {
     const linked: Facts = { ...NEW_IN_GROUP, group: { ...(NEW_IN_GROUP.group as NonNullable<Facts['group']>), linkedByWallet: true } };
     const exclude: GraphAnswer = { verdict: 'likely_farm', action: 'exclude', rule: 'A3', reason: 'The wallet linked itself.', cited_tx_hashes: [] };
-    const deps = stubDeps({ viaGraph: refusedFirst(), viaV2: vi.fn(async () => replyWith(exclude)) });
-    const record = await decideWallet(rowFor(linked), DEFAULT_SETTINGS, deps, 'auto');
+    const viaGraph = inTurn(replyWith({ ...exclude, reason: 'x'.repeat(281) }), replyWith(exclude));
+    const record = await decideWallet(rowFor(linked), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto');
     expect(record).toMatchObject({ action: 'hold', accepted: false, modelAction: 'exclude', secondAsk: true });
   });
 
@@ -521,42 +527,103 @@ describe('decideWallet second ask', () => {
     ['only the second known', null, { inputTokens: 40, outputTokens: 5 }, { inputTokens: 40, outputTokens: 5 }],
     ['neither known', null, null, null],
   ])('stores usage across both calls with %s', async (_name, first, second, stored) => {
-    const deps = stubDeps({ viaGraph: refusedFirst({ usage: first }), viaV2: vi.fn(async () => replyWith(FULL_ANSWER, { usage: second })) });
-    expect((await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto'))?.usage).toEqual(stored);
+    const viaGraph = inTurn(replyWith(TOO_LONG, { usage: first }), replyWith(FULL_ANSWER, { usage: second }));
+    expect((await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph }), 'auto'))?.usage).toEqual(stored);
   });
 
-  it('throws OutOfCredit on a 402 on the second ask, and stores nothing', async () => {
-    const deps = stubDeps({
-      viaGraph: refusedFirst(),
-      viaV2: vi.fn(async () => {
-        throw statusError(402);
-      }),
-    });
-    await expect(decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'auto')).rejects.toBeInstanceOf(OutOfCredit);
-    expect(deps.viaV2).toHaveBeenCalledTimes(1);
+  it('throws OutOfCredit on a 402 on the second ask, on either route, and stores nothing', async () => {
+    const graph = stubDeps({ viaGraph: inTurn(replyWith(TOO_LONG)).mockRejectedValueOnce(statusError(402)) });
+    await expect(decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, graph, 'auto')).rejects.toBeInstanceOf(OutOfCredit);
+    expect(graph.viaGraph).toHaveBeenCalledTimes(2);
+    expect(graph.viaV2).not.toHaveBeenCalled();
+
+    const v2 = stubDeps({ viaV2: inTurn(replyWith(TOO_LONG)).mockRejectedValueOnce(statusError(402)) });
+    await expect(decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, v2, 'v2')).rejects.toBeInstanceOf(OutOfCredit);
+    expect(v2.viaV2).toHaveBeenCalledTimes(2);
 
     const cache = openCache();
+    const deps = stubDeps({ viaGraph: inTurn(replyWith(TOO_LONG)).mockRejectedValueOnce(statusError(402)) });
     const run = runDecisions([rowFor(PLAIN)], DEFAULT_SETTINGS, deps, { mode: 'auto', width: 1, limit: undefined, cache, log: () => {} });
     await expect(run).rejects.toBeInstanceOf(OutOfCredit);
     expect(cache.size).toBe(0);
   });
 
-  it('keeps a fallback marked as one when the second ask lands', async () => {
+  it('stays on v2 after a fallback, and keeps it marked as one', async () => {
     const viaGraph = vi.fn(async (): Promise<ServReply> => {
       throw statusError(400);
     });
-    const viaV2 = vi.fn<DecideDeps['viaV2']>().mockResolvedValueOnce(replyWith(TOO_LONG)).mockResolvedValueOnce(replyWith(FULL_ANSWER));
+    const viaV2 = inTurn(replyWith(TOO_LONG), replyWith(FULL_ANSWER));
     const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, stubDeps({ viaGraph, viaV2 }), 'auto');
+    expect(viaGraph).toHaveBeenCalledTimes(1);
+    expect(viaV2).toHaveBeenCalledTimes(2);
     expect(record).toMatchObject({ mode: 'v2', fallback: true, accepted: true, secondAsk: true });
   });
+});
 
-  it('asks v2 again in v2 mode too', async () => {
-    const viaV2 = vi.fn<DecideDeps['viaV2']>().mockResolvedValueOnce(replyWith(TOO_LONG)).mockResolvedValueOnce(replyWith(FULL_ANSWER));
-    const deps = stubDeps({ viaV2 });
-    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, deps, 'v2');
-    expect(deps.viaGraph).not.toHaveBeenCalled();
-    expect(viaV2).toHaveBeenCalledTimes(2);
-    expect(record).toMatchObject({ mode: 'v2', fallback: false, accepted: true, firstCause: TOO_LONG_CAUSE });
+describe('decideWallet settles the rule from how the outcome moved the start', () => {
+  const SELF_LINKED: Facts = {
+    ...PLAIN,
+    group: { size: 6, sameFunderWithinWindow: null, sweptToSharedCollector: true, authoredEvidence: true, linkedByWallet: true },
+  };
+  const answerOf = (action: GraphAnswer['action'], rule: GraphAnswer['rule']): GraphAnswer => ({
+    verdict: 'unclear',
+    action,
+    rule,
+    reason: 'A plain reason.',
+    cited_tx_hashes: [],
+  });
+  const askOnce = (answer: GraphAnswer) => stubDeps({ viaGraph: vi.fn(async () => replyWith(answer)), viaV2: vi.fn(async () => replyWith(answer)) });
+
+  it.each(['auto', 'v2'] as const)('accepts a hold labelled B1 on an A4 start as rule A4, keeping the label for audit (%s)', async (mode) => {
+    const deps = askOnce(answerOf('hold', 'B1'));
+    const record = await decideWallet(rowFor(NEW_IN_GROUP), DEFAULT_SETTINGS, deps, mode);
+    expect(record).toMatchObject({ start: { outcome: 'hold', rule: 'A4' }, action: 'hold', rule: 'A4', modelRule: 'B1', accepted: true, cause: null, secondAsk: false });
+  });
+
+  it('accepts an exclude labelled B2 on an A3 start as rule A3', async () => {
+    const record = await decideWallet(rowFor(SELF_LINKED), DEFAULT_SETTINGS, askOnce(answerOf('exclude', 'B2')), 'v2');
+    expect(record).toMatchObject({ start: { outcome: 'exclude', rule: 'A3' }, action: 'exclude', rule: 'A3', modelRule: 'B2', accepted: true, secondAsk: false });
+  });
+
+  it.each(['A8', 'A9', 'B2'] as const)('still refuses a partial on an A9 start, labelled %s', async (label) => {
+    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, askOnce(answerOf('partial', label)), 'v2');
+    expect(record).toMatchObject({
+      action: 'hold',
+      rule: 'A1',
+      accepted: false,
+      modelRule: label,
+      cause: 'the model changed the fixed-check result without using rule B1 or B2',
+      secondAsk: true,
+    });
+  });
+
+  it.each(['A9', 'A4', 'B2'] as const)('ends a hold on an A9 start on rule B1, labelled %s', async (label) => {
+    const record = await decideWallet(rowFor(PLAIN), DEFAULT_SETTINGS, askOnce(answerOf('hold', label)), 'v2');
+    expect(record).toMatchObject({ action: 'hold', rule: 'B1', modelRule: label, accepted: true, secondAsk: false });
+  });
+
+  it('treats a raise from an A4 hold as B2 whatever the label, and the ceiling still caps it', async () => {
+    const row = rowFor(NEW_IN_GROUP);
+    expect(row.ceiling).toBe('partial');
+    const record = await decideWallet(row, DEFAULT_SETTINGS, askOnce(answerOf('full', 'A9')), 'v2');
+    expect(record).toMatchObject({ action: 'partial', shareBps: 5000, rule: 'B2', modelRule: 'A9', clampedFrom: 'full', accepted: true });
+  });
+
+  it('still refuses a raise from a hold no rule can raise', async () => {
+    const contract: Facts = { ...PLAIN, accountType: 'contract' };
+    const record = await decideWallet(rowFor(contract), DEFAULT_SETTINGS, askOnce(answerOf('full', 'B2')), 'v2');
+    expect(record).toMatchObject({ start: { outcome: 'hold', rule: 'A2' }, action: 'hold', rule: 'A1', accepted: false, secondAsk: true });
+  });
+
+  it('still refuses an exclude on a hold start, whatever the label', async () => {
+    const record = await decideWallet(rowFor(NEW_IN_GROUP), DEFAULT_SETTINGS, askOnce(answerOf('exclude', 'A3')), 'v2');
+    expect(record).toMatchObject({ action: 'hold', accepted: false, modelAction: 'exclude' });
+  });
+
+  it('keeps a burst wallet at partial on rule A8 when its partial carries a wrong label', async () => {
+    const partial: GraphAnswer = { ...BURST_ANSWER, rule: 'B2' };
+    const record = await decideWallet(rowFor(BURST), DEFAULT_SETTINGS, askOnce(partial), 'auto');
+    expect(record).toMatchObject({ action: 'partial', shareBps: 5000, rule: 'A8', modelRule: 'B2' });
   });
 });
 

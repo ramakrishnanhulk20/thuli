@@ -8,6 +8,7 @@ import {
   GraphVersionError,
   holdForReview,
   OutcomeSchema,
+  ruleFor,
   Start,
   toGraphRecord,
   validateDecision,
@@ -55,7 +56,7 @@ export const DecisionRecord = z.strictObject({
   clampedFrom: OutcomeSchema.nullable(),
   accepted: z.boolean(),
   cause: z.string().nullable(),
-  /** True when the first answer was refused, so v2 was asked again, even if that call failed. */
+  /** True when the first answer was refused, so its route was asked again, even if that call failed. */
   secondAsk: z.boolean(),
   /** Why the first answer was refused. Null when there was no second ask. */
   firstCause: z.string().nullable(),
@@ -132,19 +133,36 @@ async function askServ(record: GraphRecord, deps: DecideDeps, mode: 'auto' | 'v2
   }
 }
 
+// v2 is not the graph: asked to second-guess a graph answer it judged old active wallets as farms. Staying on the route
+// keeps the judgement and only re-rolls the wording. g1 already accepted this record, so GraphVersionError cannot occur.
+async function askSameRoute(record: GraphRecord, deps: DecideDeps, first: Served): Promise<Served | null> {
+  if (first.mode === 'v2') return askV2(record, deps, first.fallback);
+  try {
+    return { reply: await withRetries(() => deps.viaGraph(record), deps.sleep), mode: 'v3', fallback: false };
+  } catch (error) {
+    if (error instanceof ServError) return null;
+    throw error;
+  }
+}
+
 interface Checked {
   served: Served;
   answer: ReturnType<typeof decisionFromGraphAnswer>;
   result: ReturnType<typeof validateDecision>;
 }
 
-function checkAnswer(served: Served, context: DecisionContext): Checked {
+function checkAnswer(served: Served, context: DecisionContext, record: GraphRecord): Checked {
   const { reply } = served;
   const answer: Checked['answer'] =
     reply.answerProblem === null
       ? decisionFromGraphAnswer(reply.answer, context.settings, 0)
       : { ok: false, cause: reply.answerProblem };
-  const result = answer.ok ? validateDecision(answer.decision, context) : holdForReview(answer.cause);
+  // g1 never lets the model name a rule, and v2 does and mislabels, so a good answer could be held for its label alone.
+  // Both routes now settle the rule from how the outcome moved the start. A move no rule allows keeps the start rule,
+  // which validateDecision refuses (C12, C13). The model's own label stays in answer for the stored modelRule.
+  const result = answer.ok
+    ? validateDecision({ ...answer.decision, rule: ruleFor(answer.decision.action, record) }, context)
+    : holdForReview(answer.cause);
   return { served, answer, result };
 }
 
@@ -158,10 +176,11 @@ function addUsage(first: ServReply['usage'], second: ServReply['usage']): ServRe
  * Sends one wallet through SERV and checks the answer with the code's rules. A burst wallet goes to v2 because graph g1
  * has no field for a burst; a graph call that fails after its retries also goes to v2, marked as a fallback.
  *
- * An answer the checks refuse gets one second ask on v2, so a wallet is not held only because the model wrote a reason
- * too long. The second answer takes the same checks with the same ceiling, so asking again can never pay more than the
- * first ask could (C12, C13). If it is refused too, that refusal stands, and if the call fails the first hold stands
- * (C11). A burst reply the code replaced is not asked again, because the outcome there is already the code's own (C45).
+ * An answer the checks refuse gets one second ask, so a wallet is not held only because the model wrote a reason too
+ * long. A second ask re-rolls the wording, it is not a second opinion, so it never changes route. The second answer
+ * takes the same checks with the same ceiling, so asking again can never pay more than the first ask could (C12, C13).
+ * If it is refused too, that refusal stands, and if the call fails the first hold stands (C11). A burst reply the code
+ * replaced is not asked again, because the outcome there is already the code's own (C45).
  *
  * Returns null when no route gave an answer: nothing was approved for the wallet, and a rerun asks again (C11). Any
  * answer that arrived, however bad, ends in a record, with a failed check holding the wallet (C11, C13). The final
@@ -187,10 +206,10 @@ export async function decideWallet(
   if (served === null) return null;
 
   const context: DecisionContext = { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0 };
-  const first = checkAnswer(served, context);
+  const first = checkAnswer(served, context, record);
   const askAgain = !first.result.accepted && first.result.cause !== BURST_KEPT_CAUSE;
-  const secondServed = askAgain ? await askV2(record, deps, served.fallback) : null;
-  const { answer, result, served: kept } = secondServed === null ? first : checkAnswer(secondServed, context);
+  const secondServed = askAgain ? await askSameRoute(record, deps, served) : null;
+  const { answer, result, served: kept } = secondServed === null ? first : checkAnswer(secondServed, context, record);
   const { reply } = kept;
 
   return DecisionRecord.parse({

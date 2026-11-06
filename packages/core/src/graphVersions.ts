@@ -118,7 +118,7 @@ function g1Input(input: GraphRecord): G1Input {
 
 // g1 answers with no rule, so the rule is worked out from how its outcome moved the code's start. A move no rule
 // allows keeps the start rule, which validateDecision then refuses, because a fixed rule must keep the start outcome.
-function ruleFor(action: Outcome, record: GraphRecord): GraphAnswer['rule'] {
+export function ruleFor(action: Outcome, record: GraphRecord): GraphAnswer['rule'] {
   if (action === record.start_outcome) return record.start_rule;
   if (RAISED_BY_B2.includes(record.start_rule) && leastGenerous(action, record.start_outcome) === record.start_outcome) {
     return 'B2';
