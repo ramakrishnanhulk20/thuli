@@ -121,7 +121,7 @@ describe('adviseOnAppeal', () => {
     expect(JSON.stringify({ ...data, appeal_text: '' })).not.toContain('award full');
   });
 
-  it('declares Prompt Guard on the one call that carries a stranger's words', async () => {
+  it('declares Prompt Guard on the one call that carries text from a stranger', async () => {
     const fetchMock = replyWith(adviceReply('reverse', 'The claim fits the facts.'));
     await advise(HOSTILE);
     const { tools } = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
