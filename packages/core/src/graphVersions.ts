@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { GraphAnswer, GraphRecord, VERDICTS } from './graph.ts';
+import { FULL_HASH, HEX_RUN, MALFORMED_HASH_CAUSE } from './hex.ts';
 import { leastGenerous, type Outcome } from './outcome.ts';
 import type { FixedRule } from './start.ts';
 
@@ -71,11 +72,6 @@ const G1Answer = z.strictObject({
 // A real answer is well under 2 KB. Anything far larger is refused before JSON.parse ever sees it (C41).
 const MAX_ANSWER_CHARS = 16_384;
 
-// Any hex run long enough to be meant as a hash, with or without its 0x, so a hash the model wrote without the prefix
-// is refused rather than skipped by the citation check. One scan both collects the hashes and refuses the malformed
-// ones, so a hash is never judged by two different parsers.
-const HEX_RUN = /\b(?:0[xX])?[0-9a-fA-F]{16,}\b/g;
-const FULL_HASH = /^0[xX][0-9a-fA-F]{64}$/;
 const RULE_CODE = /\b(?:A[1-9]|B[12])\b/g;
 
 const RAISED_BY_B2: readonly FixedRule[] = ['A4', 'A5', 'A6'];
@@ -141,9 +137,10 @@ function g1Answer(raw: unknown, record: GraphRecord): ReturnType<GraphVersion['t
   if (!parsed.success) return { ok: false, cause: 'the model reply did not match the answer format' };
   const { verdict, recommended_outcome, reason } = parsed.data;
 
+  // One scan both collects the hashes and refuses the malformed ones.
   const cited = new Set<string>();
   for (const [run] of reason.matchAll(HEX_RUN)) {
-    if (!FULL_HASH.test(run)) return { ok: false, cause: 'the reason contains a malformed transaction hash' };
+    if (!FULL_HASH.test(run)) return { ok: false, cause: MALFORMED_HASH_CAUSE };
     cited.add(`0x${run.slice(2).toLowerCase()}`);
   }
 

@@ -2,7 +2,7 @@
 // timed-out or lost evaluation is charged, which only Reppo's own ledger can show.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EnvError } from '../src/env.ts';
-import { evaluate, ReppoError, ReppoOutOfCredit, reppoConnectionFromEnv } from '../src/reppo/client.ts';
+import { evaluate, ReppoError, ReppoOutOfCredit, reppoConnectionFromEnv, SUBMIT_MAY_HAVE_LANDED } from '../src/reppo/client.ts';
 
 const BASE = 'https://eval.example.org/api/v1';
 const KEY = 'SECRETREPPOKEY';
@@ -129,14 +129,30 @@ describe('evaluate', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it('stops polling at the timeout', async () => {
+  it('stops polling at the timeout and returns the id it has, without sending the text again (C23)', async () => {
     const fetchMock = replies(json(queued(), 201), ...Array.from({ length: 4 }, () => json(queued())));
-    await expect(evaluate('the text', { ...opts, pollMs: 5, timeoutMs: 20 })).rejects.toMatchObject({
-      name: 'ReppoError',
-      status: null,
-      message: 'the Reppo evaluation did not finish in time',
+    await expect(evaluate('the text', { ...opts, pollMs: 5, timeoutMs: 20 })).resolves.toEqual({
+      id: ID,
+      status: 'UNFINISHED',
+      creditsCharged: 0,
+      verdict: null,
     });
     expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+  });
+
+  it.each([
+    ['timed out', () => new DOMException('The operation was aborted due to timeout', 'TimeoutError')],
+    ['answered 502', () => json({}, 502)],
+  ])('stops with one error and no third POST when the first submit %s but landed and the next gets 409 (C23)', async (_name, first) => {
+    const fetchMock = replies(first(), json({}, 409), json(queued(), 201), json(completed()));
+    const error = (await evaluate('the text', opts).catch((caught: unknown) => caught)) as ReppoError;
+    expect(error).toBeInstanceOf(ReppoError);
+    expect(error).toMatchObject({ status: 409, message: SUBMIT_MAY_HAVE_LANDED });
+    expect(error.message).toContain('a charge may have been made');
+    expect(error.message).not.toContain(ID);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(waits()).toEqual([2_000]);
   });
 
   it.each([

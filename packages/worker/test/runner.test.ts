@@ -180,6 +180,33 @@ describe('runReplay', () => {
     });
   });
 
+  it('reads internal transfers once for each wallet that paid an address another claim wallet paid, so a payment is not a sweep', async () => {
+    const exchange = synthetic('e0', 9);
+    const payout = synthetic('cc', 7);
+    const payee = synthetic('9a', 1);
+    const payers = Array.from({ length: 5 }, (_, i) => synthetic('a3', i));
+    // The first payer has no external funding at all, so it needs its internal transfers for two reasons and is read once.
+    const ledger = payers.flatMap((w, i) => [
+      ...(i === 0 ? [] : [send(exchange, w, 24_000_000 + 10 * i, '0.1')]),
+      send(payout, w, 24_000_000 + 10 * i + 5, '10', 'internal'),
+      send(w, payee, 24_100_000 + i, '1'),
+    ]);
+    const states = new Map<string, AccountState>([
+      [exchange, { nonce: 20_000, code: '0x' }],
+      [payout, { nonce: 1, code: '0x6080' }],
+      [payee, eoa(3)],
+      ...payers.map((w): [string, AccountState] => [w, eoa(120)]),
+    ]);
+    const { rows, calls } = await run(payers, ledger, states);
+
+    expect(calls.filter((c) => c.action === 'txlistinternal').map((c) => c.address).sort()).toEqual([...payers].sort());
+    for (const row of rows) {
+      expect(row.facts.group).toBeNull();
+      expect(row.facts.missing).toEqual([]);
+      expect(row.start).toEqual({ outcome: 'full', rule: 'A9' });
+    }
+  });
+
   describe('destination pages', () => {
     const EXCHANGE = synthetic('e0', 1);
     const SHARED = synthetic('d0', 1);
@@ -198,6 +225,15 @@ describe('runReplay', () => {
       expect(askedFor(calls, SHARED)).toEqual([{ action: 'txlist', address: SHARED, limit: WALLET_LIMIT }]);
       expect(log.some((line) => line.startsWith('destination pages: 1/1'))).toBe(true);
       for (const row of rows) expect(row.start).toEqual({ outcome: 'exclude', rule: 'A3' });
+    });
+
+    it('reads no internal transfers for a wallet that only paid the shared address, and leaves it unaffected', async () => {
+      const shopper = synthetic('a4', 1);
+      const ledger = [...fundings, ...sweepsTo(SHARED), send(EXCHANGE, shopper, 24_000_100, '1'), send(shopper, SHARED, 24_100_100, '0.1')];
+      const { rows, calls } = await run([...SWEEPERS, shopper], ledger, statesWith([SHARED, eoa(0)], [shopper, eoa(120)]));
+      expect(calls.filter((c) => c.action === 'txlistinternal').map((c) => c.address).sort()).toEqual([...SWEEPERS].sort());
+      expect(rows.find((r) => r.wallet === shopper)).toMatchObject({ start: { outcome: 'full', rule: 'A9' }, facts: { group: null, missing: [] } });
+      for (const row of rows.filter((r) => r.wallet !== shopper)) expect(row.start).toEqual({ outcome: 'exclude', rule: 'A3' });
     });
 
     it('reads each destination when wallets share more than one', async () => {

@@ -10,6 +10,7 @@ import {
   computeStart,
   DEFAULT_SETTINGS,
   FUNDER_KEPT_CAUSE,
+  MALFORMED_HASH_CAUSE,
   parseAddress,
   type AppealRecord,
   type Facts,
@@ -409,7 +410,7 @@ function storedLines<T>(name: string): T[] {
 
 describe.runIf(hasStoredRuns)('asRulebookV2 on the real stored runs', () => {
   it.each(STORED_RUNS)(
-    'leaves every refusal and burst replacement in %s unchanged, and moves only holds on a funder alone',
+    'leaves every refusal and burst replacement in %s unchanged, and moves only holds on a funder alone and reasons with a malformed hash',
     (name) => {
       const set = name.split('/')[0] as string;
       const rows = new Map(storedLines<ReplayRow>(`${set}/rows.jsonl`).map((row) => [row.wallet, row]));
@@ -424,6 +425,12 @@ describe.runIf(hasStoredRuns)('asRulebookV2 on the real stored runs', () => {
       const moved = records.filter((record) => {
         const after = asRulebookV2(record, rows.get(record.wallet) as ReplayRow, DEFAULT_SETTINGS);
         if (JSON.stringify(after) === JSON.stringify(record)) return false;
+        // The reason scan holds two accepted ROBO answers: one writes a full hash with a space between its 0x and its
+        // digits, the other writes 66 hex digits after 0x. Neither is a hash Thuli fetched, so both end on A1 (C13).
+        if (after.cause === MALFORMED_HASH_CAUSE) {
+          expect(after).toMatchObject({ action: 'hold', rule: 'A1', accepted: false });
+          return false;
+        }
         expect(record).toMatchObject({ action: 'hold', rule: 'B1', accepted: true, cause: null });
         expect(after).toMatchObject({ action: record.start.outcome, rule: record.start.rule, accepted: false, cause: FUNDER_KEPT_CAUSE, clampedFrom: 'hold' });
         expect(rows.get(record.wallet)?.facts).toMatchObject({ sharedDepositAddress: null });

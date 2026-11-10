@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isPlainText } from './appeal.ts';
 import type { FactName } from './facts.ts';
 import { GraphRecord } from './graph.ts';
 import type { Outcome } from './outcome.ts';
@@ -15,7 +16,8 @@ export const ReppoVerdict = z.strictObject({
   decision: z.enum(['accept', 'reject']),
   confidence: z.enum(['low', 'medium', 'high']),
   route: z.enum(['ship', 'review', 'block']),
-  reason: z.string().max(MAX_VERDICT_REASON_CHARS),
+  /** null when Reppo's critique held a link, markup or broken text, so it was not kept. */
+  reason: z.string().max(MAX_VERDICT_REASON_CHARS).nullable(),
 });
 
 export type ReppoVerdict = z.infer<typeof ReppoVerdict>;
@@ -209,10 +211,13 @@ export function reppoInput(record: GraphRecord, action: Outcome, reason: string)
 /**
  * Reads the `result` object of a finished evaluation. Reppo's text is treated like any other input (C35): only the five
  * fields are kept, the reason loses its control and format characters and is cut to 2000 characters, and anything out
- * of range or out of shape gives null.
+ * of range or out of shape gives null. A reason that is then still not plain text by isPlainText, the rule the model's
+ * reasons and appeals follow (C33), is stored as null, and the score, decision, confidence and route are kept, because
+ * they are fixed words and a number and the evaluation was paid for.
  */
 export function parseVerdict(raw: unknown): ReppoVerdict | null {
   const parsed = VerdictFields.safeParse(raw);
   if (!parsed.success) return null;
-  return { ...parsed.data, reason: parsed.data.reason.replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, MAX_VERDICT_REASON_CHARS) };
+  const reason = parsed.data.reason.replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, MAX_VERDICT_REASON_CHARS);
+  return { ...parsed.data, reason: isPlainText(reason) ? reason : null };
 }

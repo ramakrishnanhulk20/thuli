@@ -98,6 +98,7 @@ describe('runFeedback', () => {
       sent: 1,
       disagreed: 0,
       failed: 0,
+      unfinished: 0,
       skipped: 0,
       creditsCharged: 440,
     });
@@ -206,6 +207,28 @@ describe('runFeedback', () => {
     expect(open().get(`v1:robo:${walletAt(1)}`)).toMatchObject({ verdict: null, creditsCharged: 440 });
   });
 
+  it('stores an UNFINISHED evaluation with its id, apart from a null verdict, and a rerun does not pay for it again (C23)', async () => {
+    const unfinished: ReppoEval = { id: 'eval3', status: 'UNFINISHED', creditsCharged: 0, verdict: null };
+    const outOfShape: ReppoEval = { ...completed('accept'), id: 'eval4', verdict: null };
+    const evaluate = vi.fn<() => Promise<ReppoEval>>().mockResolvedValueOnce(unfinished).mockResolvedValueOnce(outOfShape);
+    const counts = await runFeedback([item(1), item(2)], { evaluate }, options(open()));
+    expect(counts).toMatchObject({ sent: 2, unfinished: 1, failed: 0, disagreed: 0 });
+    expect(logLines.at(-1)).toBe('feedback: 2/2 sent, 0 disagreed, 0 failed, 1 unfinished');
+
+    const stored = open();
+    expect(stored.get(`v1:robo:${walletAt(1)}`)).toMatchObject({ evalId: 'eval3', status: 'UNFINISHED', verdict: null, disagrees: false });
+    expect(stored.get(`v1:robo:${walletAt(2)}`)).toMatchObject({ evalId: 'eval4', status: 'COMPLETED', verdict: null });
+
+    const again = vi.fn(async () => completed('accept'));
+    await expect(runFeedback([item(1), item(2)], { evaluate: again }, options(open()))).resolves.toMatchObject({ sent: 0, skipped: 2 });
+    expect(again).not.toHaveBeenCalled();
+  });
+
+  it('still reads an entry stored before entries carried a status', () => {
+    const older = { wallet: walletAt(1), set: 'robo', group: 'g', rulebook: 'v1', evalId: 'eval1', input: 'x', action: 'full', rule: 'A9' };
+    expect(FeedbackEntry.safeParse({ ...older, verdict: verdict('accept'), creditsCharged: 440, disagrees: false }).success).toBe(true);
+  });
+
   it('does not store a FAILED evaluation, so a rerun asks again for free', async () => {
     const failed: ReppoEval = { id: 'eval2', status: 'FAILED', creditsCharged: 0, verdict: null };
     const counts = await runFeedback([item(1)], { evaluate: async () => failed }, options(open()));
@@ -233,7 +256,7 @@ describe('runFeedback', () => {
 
   it('logs counts only', async () => {
     await runFeedback([item(1)], { evaluate: async () => completed('reject') }, options(open()));
-    expect(logLines).toEqual(['feedback: 1/1 sent, 1 disagreed, 0 failed']);
+    expect(logLines).toEqual(['feedback: 1/1 sent, 1 disagreed, 0 failed, 0 unfinished']);
     expect(logLines.join()).not.toContain('0x');
   });
 });

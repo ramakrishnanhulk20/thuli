@@ -116,8 +116,9 @@ const MAX_ANSWER_CHARS = 16_384;
  * Turns SERV's answer into the decision shape validateDecision checks. The answer is untrusted input (C13): a string
  * must be exactly one JSON object, nothing around it is stripped or repaired, and its fields must match GraphAnswer
  * exactly. The share comes from the action and the settings, and paidHops is the worker's own count, so neither is
- * ever taken from the model. This does not check the reason or the cited hashes; validateDecision does. The cause
- * texts are fixed strings, so no model text is ever copied into a fallback reason.
+ * ever taken from the model. Cited hashes are lowercased and deduplicated, and an entry that is not a transaction hash
+ * refuses the answer. Whether each hash was fetched for this wallet, and what the reason says, is validateDecision's
+ * check. The cause texts are fixed strings, so no model text is ever copied into a fallback reason.
  */
 export function decisionFromGraphAnswer(
   raw: unknown,
@@ -136,6 +137,11 @@ export function decisionFromGraphAnswer(
   const parsed = GraphAnswer.safeParse(value);
   if (!parsed.success) return { ok: false, cause: 'the model reply did not match the answer format' };
   const answer = parsed.data;
+  // Stored hashes are lowercase only (TxHash), so a cited hash in another case is stored the way it is compared.
+  const cited = answer.cited_tx_hashes.map((hash) => hash.toLowerCase());
+  if (cited.some((hash) => !TxHash.safeParse(hash).success)) {
+    return { ok: false, cause: 'the answer cited something that is not a transaction hash' };
+  }
   return {
     ok: true,
     verdict: answer.verdict,
@@ -144,7 +150,7 @@ export function decisionFromGraphAnswer(
       shareBps: shareFor(answer.action, settings),
       rule: answer.rule,
       reason: answer.reason,
-      citedTxs: answer.cited_tx_hashes,
+      citedTxs: [...new Set(cited)],
       paidHops,
     },
   };

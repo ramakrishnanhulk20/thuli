@@ -17,7 +17,12 @@ export interface ReppoOptions extends ReppoConnection {
 
 export interface ReppoEval {
   id: string;
-  status: 'COMPLETED' | 'FAILED';
+  /**
+   * UNFINISHED: Reppo was still working when the wait ran out. It charges when it finishes, so the id comes back for a
+   * later look-up and the text is never sent again.
+   */
+  status: 'COMPLETED' | 'FAILED' | 'UNFINISHED';
+  /** What Reppo had charged by the last reply. For an UNFINISHED evaluation the real charge comes later. */
   creditsCharged: number;
   verdict: ReppoVerdict | null;
 }
@@ -78,16 +83,20 @@ export function reppoConnectionFromEnv(source: Record<string, string | undefined
 }
 
 /**
- * One HTTP call, retried on a 5xx or a failed call. Reppo has no way to ask whether a lost submit landed, so a retried
- * submit can start a second evaluation. It is left in because a 502 is the documented "try again", and the first one,
- * if it did land, makes the retry answer 409 until it finishes.
+ * One HTTP call, retried on a 5xx or a failed call. unanswered is true when an earlier try got no usable reply: for a
+ * submit, Reppo may have taken that try without our seeing it. Reppo has no way to ask whether a lost submit landed, but
+ * one that did makes the retry answer 409 until it finishes, which is how submit tells.
  */
-async function call(url: string, init: RequestInit, sleep: (ms: number) => Promise<void>): Promise<JsonReply> {
+async function call(
+  url: string,
+  init: RequestInit,
+  sleep: (ms: number) => Promise<void>,
+): Promise<{ reply: JsonReply; unanswered: boolean }> {
   for (let attempt = 0; ; attempt += 1) {
     let status: number | null = null;
     try {
       const reply = await fetchJsonCapped(url, init, LIMITS);
-      if (reply.status < 500) return reply;
+      if (reply.status < 500) return { reply, unanswered: attempt > 0 };
       status = reply.status;
     } catch {
       // fetch's own failure text can quote the URL, so nothing of it is copied (C40).
@@ -105,34 +114,53 @@ function refuse(reply: JsonReply): never {
   throw new ReppoError(`Reppo answered with status ${reply.status}`, reply.status);
 }
 
+/** The message names no evaluation id: there is none we saw, and a guessed one could point a person at someone else's. */
+export const SUBMIT_MAY_HAVE_LANDED =
+  'a Reppo submit got no reply and Reppo then said an evaluation was running, so a charge may have been made; this text was not sent again';
+
 async function submit(input: string, conn: Required<ReppoOptions>, headers: Record<string, string>): Promise<string> {
   const init = { method: 'POST', headers, body: JSON.stringify({ taskType: 'response', input }) };
+  let mayHaveLanded = false;
   for (let busy = 0; ; busy += 1) {
-    const reply = await call(`${conn.baseUrl}/agents/evals`, init, conn.sleep);
+    const { reply, unanswered } = await call(`${conn.baseUrl}/agents/evals`, init, conn.sleep);
+    mayHaveLanded ||= unanswered;
     if (reply.ok) {
       const submitted = Submitted.safeParse(reply.json);
       if (!submitted.success) throw new ReppoError('Reppo gave an evaluation id that is not safe to use', null);
       return submitted.data.id;
     }
     if (reply.status !== 409) refuse(reply);
+    // An account runs one evaluation at a time, so after a submit we never heard back from, the evaluation running is
+    // most likely that submit. Sending again would start a second paid evaluation once it ends (C23).
+    if (mayHaveLanded) throw new ReppoError(SUBMIT_MAY_HAVE_LANDED, 409);
     if (busy === MAX_BUSY_RESUBMITS) throw new ReppoError('Reppo still had another evaluation running', 409);
     await conn.sleep(BUSY_WAIT_MS);
   }
 }
 
-// Counted in polls, not by the clock, so a stalled clock or a stubbed sleep still ends the loop (C41).
+// Counted in polls, not by the clock, so a stalled clock or a stubbed sleep still ends the loop (C41). The last reply
+// comes back when the polls run out, still queued or processing.
 async function waitForEnd(id: string, conn: Required<ReppoOptions>, headers: Record<string, string>): Promise<EvalReply> {
-  const polls = Math.ceil(conn.timeoutMs / conn.pollMs);
+  const polls = Math.max(Math.ceil(conn.timeoutMs / conn.pollMs), 1);
+  let last: EvalReply | undefined;
   for (let poll = 0; poll < polls; poll += 1) {
     await conn.sleep(conn.pollMs);
-    const reply = await call(`${conn.baseUrl}/agents/evals/${id}`, { headers }, conn.sleep);
+    const { reply } = await call(`${conn.baseUrl}/agents/evals/${id}`, { headers }, conn.sleep);
     if (!reply.ok) refuse(reply);
     const body = EvalReply.safeParse(reply.json);
     if (!body.success || body.data.id !== id) throw new ReppoError('the Reppo reply did not match the evaluation shape', null);
     if (body.data.status === 'COMPLETED' || body.data.status === 'FAILED') return body.data;
+    last = body.data;
   }
-  throw new ReppoError('the Reppo evaluation did not finish in time', null);
+  return last as EvalReply;
 }
+
+const FINAL_STATUS: Record<EvalReply['status'], ReppoEval['status']> = {
+  COMPLETED: 'COMPLETED',
+  FAILED: 'FAILED',
+  QUEUED: 'UNFINISHED',
+  PROCESSING: 'UNFINISHED',
+};
 
 async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promise<ReppoEval> {
   // The key goes only into this header. Nothing here logs a request, and every error is words and a status (C40).
@@ -141,7 +169,7 @@ async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promi
   const body = await waitForEnd(id, conn, headers);
   return {
     id,
-    status: body.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED',
+    status: FINAL_STATUS[body.status],
     creditsCharged: body.creditsCharged,
     verdict: body.status === 'COMPLETED' ? parseVerdict(body.result) : null,
   };
@@ -155,12 +183,15 @@ async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promi
  * Every call has a 30 second timeout and a 1 MB reply cap (C41). An evaluation Reppo finished with a result out of shape
  * returns with verdict null, since it was still charged.
  *
- * Giving up on an evaluation still running does not stop it, and Reppo charges it when it finishes.
+ * Nothing that may already be paid for is sent twice (C23). A 409 after a submit try that got no reply or a 5xx means
+ * that try most likely landed, so the text is not sent again and this throws SUBMIT_MAY_HAVE_LANDED. When the wait runs
+ * out, the evaluation is still running and Reppo charges it when it finishes, so it returns as UNFINISHED with its id
+ * and verdict null instead of being sent again.
  *
  * @throws ReppoOutOfCredit on a 402.
- * @throws ReppoError on a 400, 401 or 404 at once, when the retries or the wait run out, and on a reply out of shape,
- * including an id that is not a short url-safe string, which is refused before it goes in a URL. No error holds the key
- * or the URL (C40).
+ * @throws ReppoError on a 400, 401 or 404 at once, on a 409 after a submit with no reply, when the retries run out, and
+ * on a reply out of shape, including an id that is not a short url-safe string, which is refused before it goes in a
+ * URL. No error holds the key or the URL (C40).
  * @throws RangeError when pollMs or timeoutMs is not above 0, before any call.
  */
 export async function evaluate(input: string, opts: ReppoOptions): Promise<ReppoEval> {

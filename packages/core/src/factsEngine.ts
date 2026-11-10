@@ -94,9 +94,18 @@ function incomingTo(address: string, data: AddressData): Transfer[] {
   );
 }
 
+/** Successful external transactions the address signed itself, of any value. */
+function ownSends(address: string, data: AddressData): Transfer[] {
+  return data.external.transfers.filter((t) => !t.failed && lower(t.from) === address);
+}
+
 /** External sends of real value the address signed itself. */
 function valueSendsFrom(address: string, data: AddressData): Transfer[] {
-  return data.external.transfers.filter((t) => !t.failed && lower(t.from) === address && wei(t) > 0n);
+  return ownSends(address, data).filter((t) => wei(t) > 0n);
+}
+
+function everythingRead(data: AddressData): boolean {
+  return data.external.complete && data.internal !== undefined && data.internal.complete;
 }
 
 /**
@@ -139,10 +148,8 @@ export function fundingTransfer(
 ): { status: 'found'; transfer: Transfer } | { status: 'none' } | { status: 'unknown' } {
   const self = lower(address);
   let firstOutBlock: number | undefined;
-  for (const t of data.external.transfers) {
-    if (!t.failed && lower(t.from) === self && (firstOutBlock === undefined || t.block < firstOutBlock)) {
-      firstOutBlock = t.block;
-    }
+  for (const t of ownSends(self, data)) {
+    if (firstOutBlock === undefined || t.block < firstOutBlock) firstOutBlock = t.block;
   }
   const candidates = incomingTo(self, data).filter((t) => firstOutBlock === undefined || t.block <= firstOutBlock);
   let best: Transfer | undefined;
@@ -150,8 +157,27 @@ export function fundingTransfer(
     if (best === undefined || outranks(t, best)) best = t;
   }
   if (best !== undefined) return { status: 'found', transfer: best };
-  const everythingRead = data.external.complete && data.internal !== undefined && data.internal.complete;
-  return everythingRead ? { status: 'none' } : { status: 'unknown' };
+  return everythingRead(data) ? { status: 'none' } : { status: 'unknown' };
+}
+
+/**
+ * Whole days from the wallet's first activity to the snapshot: the earliest successful transfer that moved value into
+ * the wallet or that the wallet sent itself, any value. Zero-value inbound transfers and failed transfers never count,
+ * because anyone can send them to any address, so a stranger cannot make a wallet look old (C15). The replay and the
+ * single-wallet collector both call this, so age means one thing (C20).
+ *
+ * Returns 0 for a wallet with no such transfer when every page was read, and null when a page may be missing one, or
+ * when the earliest one is dated after the snapshot.
+ */
+export function walletAgeDays(address: string, data: AddressData, snapshotTime: number): number | null {
+  const self = lower(address);
+  let earliest: number | undefined;
+  for (const t of [...ownSends(self, data), ...incomingTo(self, data)]) {
+    if (earliest === undefined || t.time < earliest) earliest = t.time;
+  }
+  if (earliest === undefined) return everythingRead(data) ? 0 : null;
+  if (earliest > snapshotTime) return null;
+  return Math.floor((snapshotTime - earliest) / SECONDS_PER_DAY);
 }
 
 /**
@@ -243,6 +269,11 @@ export function sharedDestinations(input: Pick<ReplayInput, 'wallets' | 'data'>)
     if (set.size < 2) senders.delete(dest);
   }
   return senders;
+}
+
+/** False when value the wallet received may be missing from what was read, so a send of its cannot be judged a sweep. */
+function inflowsRead(data: AddressData | undefined): boolean {
+  return data !== undefined && data.internal !== undefined && data.internal.complete;
 }
 
 /**
@@ -438,22 +469,14 @@ function directExchangeFundings(
   return candidates;
 }
 
-function walletAgeDays(data: AddressData | undefined, snapshotTime: number): number | null {
-  if (data === undefined) return null;
-  let earliest: number | undefined;
-  for (const t of allTransfers(data)) {
-    if (earliest === undefined || t.time < earliest) earliest = t.time;
-  }
-  if (earliest === undefined) return data.external.complete ? 0 : null;
-  return Math.floor((snapshotTime - earliest) / 86_400);
-}
-
 /**
  * Works out every rulebook fact for each claim wallet from data the runner already read (pure, no network). Wallets
  * are linked into groups by a shared funding root or a shared destination, but only through addresses that are
  * wallets or unknown: doubt should make a hold more likely, never less, and contracts and exchanges never link (C16).
  * A shared destination must also look private by senderListShareBps, so a bridge or a donation address links nobody;
- * one whose page could not be read leaves the group unread, so the wallet holds (C11). Funding roots take no such check.
+ * one whose page could not be read leaves the group unread, so the wallet holds (C11). So does a destination that a
+ * wallet whose internal transfers are missing or incomplete swept to, for every wallet that swept there, because the
+ * sweep may be a payment from money that was not read. Funding roots take no such check.
  * A funding burst is a pattern, not a link, so it is reported on its own and never joins wallets into a group (C45).
  * Each result goes through Facts.parse, so a bad fact throws instead of reaching a decision.
  */
@@ -488,8 +511,14 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     components.join([...members.map((m) => m.wallet), ...(claimWallets.has(root) ? [root] : [])]);
     for (const [wallet, fits] of sameFunderWindowCounts(members)) windowCounts.set(wallet, fits);
   }
+  // A payment from a wallet whose inflows were not all read can look like a sweep, so every count at that destination
+  // is in doubt, for the wallets whose own inflows were read too: a fifth doubtful sweeper is what lifts four to A3.
+  // The wallets are still joined, because leaving one out could raise another wallet's outcome (C11).
+  const sweptOnUnreadInflows = new Set<string>();
   for (const [dest, senders] of shared) {
-    if (linksWallets(dest)) components.join(senders);
+    if (!linksWallets(dest)) continue;
+    components.join(senders);
+    if ([...senders].some((sender) => !inflowsRead(data.get(sender)))) sweptOnUnreadInflows.add(dest);
   }
   const bursts = fundingBursts(directExchangeFundings(wallets, input, kindOf), settings);
 
@@ -525,6 +554,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
       // so the group stays unread.
       if (kindOf(dest) === 'unknown' || (linkable(dest) && !destinationPages.has(dest))) missing.add('group');
       if (!linksWallets(dest)) continue;
+      if (sweptOnUnreadInflows.has(dest)) missing.add('group');
       sendHashes.push(lower(send.hash));
       if (senders >= settings.groupMinSize) swept = true;
       else largestDeposit = Math.max(largestDeposit, senders);
@@ -546,7 +576,7 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
           }
         : null;
 
-    const age = walletAgeDays(walletData, snapshotTime);
+    const age = walletData === undefined ? null : walletAgeDays(wallet, walletData, snapshotTime);
     const txCount = state?.nonce ?? null;
     const accountType = state === undefined || state.code === null ? 'unknown' : accountTypeFromCode(state.code);
     if (age === null) missing.add('walletAgeDays');

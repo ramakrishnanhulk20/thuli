@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import { parseAddress } from '../src/address.ts';
 import { BURST_KEPT_CAUSE, FUNDER_KEPT_CAUSE, validateDecision, type DecisionContext } from '../src/decision.ts';
 import type { Facts } from '../src/facts.ts';
+import { decisionFromGraphAnswer } from '../src/graph.ts';
 import { DEFAULT_SETTINGS } from '../src/settings.ts';
 
 const OWN_TX = `0x${'a1'.repeat(32)}`;
@@ -104,6 +105,38 @@ describe('validateDecision: bad replies end in hold (C11, C13)', () => {
 
   it('rejects more paid hops than the settings allow', () => {
     expectRejected(validateDecision(reply({ paidHops: DEFAULT_SETTINGS.maxPaidHops + 1 }), ctx()));
+  });
+});
+
+describe('validateDecision: every hex run in a v2 reason is checked (C13)', () => {
+  const FULL_CTX = ctx({ facts: facts({ walletAgeDays: 400, txCountAtSnapshot: 120 }), ceiling: 'full', start: { outcome: 'full', rule: 'A9' } });
+  const v2 = (reason: string, cited: string[] = []) => {
+    const answer = decisionFromGraphAnswer(
+      { verdict: 'ordinary_user', action: 'full', rule: 'A9', reason, cited_tx_hashes: cited },
+      DEFAULT_SETTINGS,
+      0,
+    );
+    if (!answer.ok) throw new Error(answer.cause);
+    return validateDecision(answer.decision, FULL_CTX);
+  };
+
+  it('refuses a full answer whose reason names an address', () => {
+    const result = v2(`Old wallet funded by 0x${'de'.repeat(20)} long ago.`);
+    expectRejected(result);
+    expect(result.cause).toBe('the reason contains a malformed transaction hash');
+  });
+
+  it('refuses a made-up full hash in the reason', () => {
+    const result = v2(`Old wallet, see ${MADE_UP_TX}.`);
+    expectRejected(result);
+    expect(result.cause).toBe('the reason cited a transaction Thuli did not fetch for this wallet');
+  });
+
+  it('accepts an upper-case copy of a fetched hash and stores it lowercase', () => {
+    const upper = `0x${OWN_TX.slice(2).toUpperCase()}`;
+    const result = v2(`Old wallet, first funded in ${upper}.`, [upper, OWN_TX]);
+    expect(result.accepted).toBe(true);
+    expect(result.decision).toMatchObject({ action: 'full', citedTxs: [OWN_TX] });
   });
 });
 

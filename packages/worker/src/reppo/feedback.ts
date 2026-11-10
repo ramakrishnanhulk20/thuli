@@ -27,6 +27,11 @@ export const FeedbackEntry = z.strictObject({
   verdict: ReppoVerdict.nullable(),
   creditsCharged: z.int().min(0),
   disagrees: z.boolean(),
+  /**
+   * UNFINISHED: Reppo was still working when the wait ran out, so there is no verdict yet and evalId is the way to fetch
+   * it. Absent on entries stored before this field, every one of which finished.
+   */
+  status: z.enum(['COMPLETED', 'UNFINISHED']).optional(),
 });
 
 export type FeedbackEntry = z.infer<typeof FeedbackEntry>;
@@ -60,6 +65,8 @@ export interface FeedbackCounts {
   disagreed: number;
   /** Reppo failed these twice for free, so they are not stored and a rerun asks again. */
   failed: number;
+  /** Still running when the wait ran out. Stored with the eval id and no verdict, so a rerun does not pay for them again. */
+  unfinished: number;
   skipped: number;
   creditsCharged: number;
 }
@@ -107,8 +114,10 @@ export function namesOtherVersion(rulebook: string, useV2: boolean): boolean {
  *
  * Every payload is built and checked before the first call, so a refused payload stops the run with nothing spent (C35).
  * An evaluation Reppo finished is stored even when its result was out of shape, because it was paid for and asking again
- * would pay twice. A FAILED evaluation cost nothing and holds no verdict, so it is not stored. Log lines hold counts only
- * (C40). Any error stops the run, and everything finished before it is already on disk.
+ * would pay twice. One still running when the wait ran out is stored as UNFINISHED with its eval id and no verdict, and
+ * counted apart, because Reppo charges it when it ends: a rerun skips it, and the id is how its result is fetched (C23).
+ * A FAILED evaluation cost nothing and holds no verdict, so it is not stored. Log lines hold counts only (C40). Any error
+ * stops the run, and everything finished before it is already on disk.
  *
  * @returns Counts for this run.
  * @throws ReppoPayloadError before any call when a payload still holds an identifier.
@@ -130,7 +139,7 @@ export async function runFeedback(items: FeedbackItem[], deps: FeedbackDeps, opt
     input: reppoInput(item.record, item.action, item.reason),
   }));
 
-  const counts: FeedbackCounts = { sent: 0, disagreed: 0, failed: 0, skipped: items.length - waiting.size, creditsCharged: 0 };
+  const counts: FeedbackCounts = { sent: 0, disagreed: 0, failed: 0, unfinished: 0, skipped: items.length - waiting.size, creditsCharged: 0 };
   for (const { key, item, input } of work) {
     const result = await deps.evaluate(input);
     counts.sent += 1;
@@ -138,7 +147,9 @@ export async function runFeedback(items: FeedbackItem[], deps: FeedbackDeps, opt
     if (result.status === 'FAILED') {
       counts.failed += 1;
     } else {
-      const disagrees = result.verdict?.decision === 'reject';
+      const unfinished = result.status === 'UNFINISHED';
+      const disagrees = !unfinished && result.verdict?.decision === 'reject';
+      if (unfinished) counts.unfinished += 1;
       if (disagrees) counts.disagreed += 1;
       opts.cache.put(key, {
         wallet: item.wallet,
@@ -149,12 +160,13 @@ export async function runFeedback(items: FeedbackItem[], deps: FeedbackDeps, opt
         input,
         action: item.action,
         rule: item.rule,
-        verdict: result.verdict,
+        verdict: unfinished ? null : result.verdict,
         creditsCharged: result.creditsCharged,
         disagrees,
+        status: result.status,
       });
     }
-    opts.log(`feedback: ${counts.sent}/${work.length} sent, ${counts.disagreed} disagreed, ${counts.failed} failed`);
+    opts.log(`feedback: ${counts.sent}/${work.length} sent, ${counts.disagreed} disagreed, ${counts.failed} failed, ${counts.unfinished} unfinished`);
   }
   return counts;
 }

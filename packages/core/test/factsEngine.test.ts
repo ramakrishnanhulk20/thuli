@@ -17,6 +17,7 @@ import {
   senderListShareBps,
   sharedDestinations,
   traceFunding,
+  walletAgeDays,
   type AccountState,
   type AddressData,
   type ReplayInput,
@@ -201,6 +202,37 @@ describe('fundingTransfer', () => {
       status: 'unknown',
     });
     expect(fundingTransfer(wallet, { external, internal: { transfers: [], complete: true } })).toEqual({ status: 'none' });
+  });
+});
+
+describe('walletAgeDays (C20)', () => {
+  const wallet = synthetic('ab', 9);
+  const daysAgo = (days: number) => SNAPSHOT_TIME - days * SECONDS_PER_DAY - 60;
+  const at = (transfer: Transfer, days: number) => ({ ...transfer, time: daysAgo(days) });
+  const pages = (transfers: Transfer[], internalRead = true): AddressData => ({
+    external: { transfers: transfers.filter((t) => t.kind === 'external'), complete: true },
+    ...(internalRead ? { internal: { transfers: transfers.filter((t) => t.kind === 'internal'), complete: true } } : {}),
+  });
+
+  it('counts from the real funding, not a zero-value or failed transfer a stranger sent earlier', () => {
+    const transfers = [
+      at(send(STRANGER, wallet, 100, '0'), 400),
+      at({ ...send(STRANGER, wallet, 101, '1'), failed: true }, 300),
+      at(send(BINANCE_14, wallet, 200, '1'), 3),
+    ];
+    expect(walletAgeDays(wallet, pages(transfers), SNAPSHOT_TIME)).toBe(3);
+  });
+
+  it("counts the wallet's own send of any value, and value that reached it internally", () => {
+    expect(walletAgeDays(wallet, pages([at(send(wallet, STRANGER, 100, '0'), 50), at(send(ROOT, wallet, 200, '1'), 3)]), SNAPSHOT_TIME)).toBe(50);
+    expect(walletAgeDays(wallet, pages([at(send(COLLECTOR, wallet, 100, '1', 'internal'), 70), at(send(ROOT, wallet, 200, '1'), 3)]), SNAPSHOT_TIME)).toBe(70);
+  });
+
+  it('is 0 with nothing to count once every page is read, and null while one may hold it or when it postdates the snapshot', () => {
+    const strangerOnly = [at(send(STRANGER, wallet, 100, '0'), 400)];
+    expect(walletAgeDays(wallet, pages(strangerOnly), SNAPSHOT_TIME)).toBe(0);
+    expect(walletAgeDays(wallet, pages(strangerOnly, false), SNAPSHOT_TIME)).toBeNull();
+    expect(walletAgeDays(wallet, pages([at(send(ROOT, wallet, 100, '1'), -1)]), SNAPSHOT_TIME)).toBeNull();
   });
 });
 
@@ -677,6 +709,90 @@ describe('buildReplayFacts', () => {
         expect(f.group).toEqual(SELF_LINKED);
         expect(f.evidenceTxs).toHaveLength(2);
       }
+    });
+  });
+
+  describe('a payment judged against inflows that were not read (C11)', () => {
+    const PAYOUT = synthetic('cc', 7);
+    const PAYEE = synthetic('9a', 1);
+    const payers = Array.from({ length: 5 }, (_, i) => synthetic('a3', i));
+    // The reviewer's case: 0.1 ETH from an exchange, then 10 ETH paid out internally by a contract, then 1 ETH to a
+    // nonce-3 address. Against the 0.1 ETH alone the 1 ETH looks like a sweep.
+    const ledger = payers.flatMap((w, i) => [
+      send(BINANCE_14, w, OLD_BLOCK + 10 * i, '0.1'),
+      send(PAYOUT, w, OLD_BLOCK + 10 * i + 5, '10', 'internal'),
+      send(w, PAYEE, ANCHOR_BLOCK + i, '1'),
+    ]);
+    const states: [string, AccountState][] = [
+      [BINANCE_14, BINANCE_STATE],
+      [PAYOUT, CONTRACT_STATE],
+      [PAYEE, eoa(3)],
+      ...payers.map((w): [string, AccountState] => [w, eoa(120)]),
+    ];
+    const payeePage = (from: Transfer[]): PageEntry => [PAYEE, dataFor(PAYEE, from).external];
+
+    /** The replay as the runner sees it when some wallets' internal pages were not read in full. */
+    function asRead(from: Transfer[], internalFor: (wallet: string) => TransferPage | undefined, wallets = payers): ReplayInput {
+      const data = new Map(
+        wallets.map((w): [string, AddressData] => {
+          const { external } = dataFor(w, from);
+          const internal = internalFor(w);
+          return [w, internal === undefined ? { external } : { external, internal }];
+        }),
+      );
+      const lookup = (address: string) => data.get(address) ?? lookupFrom(from, { incomplete: [BINANCE_14] })(address);
+      const allStates: [string, AccountState][] = [...states, ...wallets.map((w): [string, AccountState] => [w, eoa(120)])];
+      return { ...replay(wallets, from, allStates, [payeePage(from)]), data, traces: new Map(wallets.map((w) => [w, traceFunding(w, lookup)])) };
+    }
+
+    it('does not count the payments as sweeps once the internal inflows are read', () => {
+      const input = replay(payers, ledger, states, [payeePage(ledger)]);
+      expect(sharedDestinations(input).size).toBe(0);
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.group).toBeNull();
+        expect(f.missing).toEqual([]);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+      }
+    });
+
+    it.each([
+      ['missing', () => undefined],
+      ['incomplete', () => ({ transfers: [], complete: false })],
+    ])('holds every wallet on A1, never A3, when the internal pages are %s', (_name, internal) => {
+      const input = asRead(ledger, internal);
+      expect(sharedDestinations(input).get(PAYEE)?.size).toBe(5);
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.missing).toEqual(['group']);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A1' });
+        expect(computeCeiling(f, DEFAULT_SETTINGS).ceiling).toBe('hold');
+      }
+    });
+
+    it('holds the four real sweepers too when the fifth sweep at their collector rests on unread inflows', () => {
+      const unread = payers[0] as string;
+      const mixed = payers.flatMap((w, i) => [
+        send(BINANCE_14, w, OLD_BLOCK + 10 * i, '0.1'),
+        ...(w === unread ? [send(PAYOUT, w, OLD_BLOCK + 10 * i + 5, '10', 'internal')] : []),
+        send(w, PAYEE, ANCHOR_BLOCK + i, w === unread ? '1' : '0.09'),
+      ]);
+      const input = asRead(mixed, (w) => (w === unread ? undefined : dataFor(w, mixed).internal));
+      for (const f of buildReplayFacts(input).values()) {
+        expect(f.missing).toEqual(['group']);
+        expect(computeStart(f, DEFAULT_SETTINGS)).toEqual({ outcome: 'hold', rule: 'A1' });
+      }
+    });
+
+    // Unread inflows can only make a sweep look like more than it was, so a send that is no sweep on external data is
+    // no sweep at all, and doubt at the collector is not this wallet's.
+    it('leaves a wallet that only paid the doubtful collector unaffected, with no internal page of its own', () => {
+      const shopper = synthetic('a4', 1);
+      const withShopper = [...ledger, send(BINANCE_14, shopper, OLD_BLOCK + 100, '1'), send(shopper, PAYEE, ANCHOR_BLOCK + 50, '0.1')];
+      const input = asRead(withShopper, () => undefined, [...payers, shopper]);
+      expect(sharedDestinations(input).get(PAYEE)?.has(shopper)).toBe(false);
+      const facts = buildReplayFacts(input);
+      expect(facts.get(shopper)).toMatchObject({ group: null, missing: [] });
+      expect(computeStart(facts.get(shopper) as Facts, DEFAULT_SETTINGS)).toEqual({ outcome: 'full', rule: 'A9' });
+      for (const wallet of payers) expect(facts.get(wallet)?.missing).toEqual(['group']);
     });
   });
 

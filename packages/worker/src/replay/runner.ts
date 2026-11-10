@@ -124,8 +124,9 @@ function wholeNumber(name: string, value: number, min: number): void {
  * Screens claim wallets with code alone, from chain data before the snapshot, and returns one row per distinct wallet
  * in input order: the fixed-check start, the ceiling and the facts.
  *
- * Reads each wallet's oldest transfers, then internal transfers only where no external funding was found, then walks
- * funding back through pass-through wallets one pass at a time, asking for each address once, then reads nonce and
+ * Reads each wallet's oldest transfers, then internal transfers where no external funding was found or where, on external
+ * data alone, the wallet swept to an address another claim wallet also swept to, then walks funding back through
+ * pass-through wallets one pass at a time, asking for each address once, then reads nonce and
  * code for every claim wallet, funding root and shared destination in one call, then the oldest transfers of each shared
  * destination that could link wallets. A read that fails leaves its facts missing, so the wallet starts on A1 and is
  * held, and the run goes on (C11). Resuming is the sources' job: the real explorer and account readers cache every page.
@@ -153,16 +154,20 @@ export async function runReplay(wallets: string[], opts: ReplayOptions, deps: Re
   });
   progress.end();
 
-  const fundingUnknown = claimWallets.filter((wallet) => {
+  // Judged on external data alone here. Internal inflows only raise what a wallet had received, so they can turn a sweep
+  // into a payment but never a payment into a sweep: only a wallet that looks like a sharing sweeper now can be wrong.
+  const sweepers = new Set([...sharedDestinations({ wallets: claimWallets, data }).values()].flatMap((senders) => [...senders]));
+  const needInternal = claimWallets.filter((wallet) => {
     const walletData = data.get(wallet);
-    return walletData !== undefined && walletData.internal === undefined && fundingTransfer(wallet, walletData).status === 'unknown';
+    if (walletData === undefined || walletData.internal !== undefined) return false;
+    return sweepers.has(wallet) || fundingTransfer(wallet, walletData).status === 'unknown';
   });
-  progress.begin('internal transfers', fundingUnknown.length);
-  await inFlight(fundingUnknown, async (wallet) => {
+  progress.begin('internal transfers', needInternal.length);
+  await inFlight(needInternal, async (wallet) => {
     const page = await pageOrNothing(() => deps.explorer.oldestInternalTransfers(wallet, snapshotBlock, walletLimit));
     progress.step(true);
     const walletData = data.get(wallet);
-    if (page === undefined) deps.log(`internal transfers: could not read ${wallet}, so its funding stays unknown`);
+    if (page === undefined) deps.log(`internal transfers: could not read ${wallet}, so its funding and its sweeps stay in doubt`);
     else if (walletData !== undefined) data.set(wallet, { ...walletData, internal: page });
   });
   progress.end();

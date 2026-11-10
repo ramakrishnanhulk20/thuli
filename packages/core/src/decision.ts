@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { inFundingBurst, meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
+import { FULL_HASH, HEX_RUN, MALFORMED_HASH_CAUSE } from './hex.ts';
+
+// index.ts re-exports this module and not hex.ts, so the scorecard and its tests reach the cause from here.
+export { MALFORMED_HASH_CAUSE };
 import { leastGenerous, OutcomeSchema, type Outcome } from './outcome.ts';
 import type { Settings } from './settings.ts';
 import { FIXED_RULES, type Start } from './start.ts';
@@ -37,6 +41,8 @@ export const BURST_KEPT_CAUSE = 'a funding burst keeps this wallet at partial';
 
 /** The cause on a hold or exclude the code replaced because a shared funder was all there was. The scorecard counts these on their own. */
 export const FUNDER_KEPT_CAUSE = 'a shared funder alone cannot hold this wallet';
+
+const NOT_FETCHED_CAUSE = 'the reason cited a transaction Thuli did not fetch for this wallet';
 
 // A real decision is well under 2 KB. Anything far larger is refused before JSON.parse ever sees it (C41).
 const MAX_RAW_TEXT_CHARS = 16_384;
@@ -147,7 +153,9 @@ function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDec
  * On a burst wallet whose start is partial, a parsed reply that moves the action, changes the rule or leaves the burst
  * out of its reason is replaced by the start with a code-written reason (C45). That replacement skips the final clamp,
  * so it only runs when the ceiling allows partial; a context with a lower ceiling takes the normal checks instead (C12).
- * Any other failed check gives a hold with rule A1 and accepted false (threat model C11, C13). After the output checks, a
+ * Any other failed check gives a hold with rule A1 and accepted false (threat model C11, C13). Those checks include the
+ * reason itself: every hex run of 16 or more characters in it must be a full transaction hash Thuli fetched for this
+ * wallet, so an address or a shortened or made-up hash in the text holds the wallet. After the output checks, a
  * hold or exclude on a wallet with no traced trail, no link of its own and no shared deposit is replaced by a start the
  * ceiling allows (C12). An exclude without the A3 self-linked group evidence becomes a hold (C15). The rule must fit the
  * code's start: a fixed rule must repeat it exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise
@@ -184,8 +192,14 @@ export function validateDecision(
     return holdForReview('the reason contained a link, markup or control characters');
   }
   const fetched = new Set([...ctx.facts.evidenceTxs, ...ctx.toolTxs].map((hash) => hash.toLowerCase()));
+  // The reason is scanned on every route, not only where the answer has no hash list: a v2 reason naming an address
+  // or a made-up hash would otherwise be stored and shown as if it were evidence.
+  for (const [run] of reply.reason.matchAll(HEX_RUN)) {
+    if (!FULL_HASH.test(run)) return holdForReview(MALFORMED_HASH_CAUSE);
+    if (!fetched.has(run.toLowerCase())) return holdForReview(NOT_FETCHED_CAUSE);
+  }
   if (reply.citedTxs.some((hash) => !fetched.has(hash.toLowerCase()))) {
-    return holdForReview('the reason cited a transaction Thuli did not fetch for this wallet');
+    return holdForReview(NOT_FETCHED_CAUSE);
   }
   if (reply.paidHops > ctx.settings.maxPaidHops) {
     return holdForReview('the model reported more paid lookups than the settings allow');

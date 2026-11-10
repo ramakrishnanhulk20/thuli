@@ -256,4 +256,12 @@ describe('parseVerdict', () => {
     expect(parseVerdict({ ...REAL_RESULT, reason: 'plain\u0000 te\u0007xt‮\n' })?.reason).toBe('plain text');
     expect(parseVerdict({ ...REAL_RESULT, reason: 'x'.repeat(5000) })?.reason).toHaveLength(2000);
   });
+
+  it.each([
+    ['markup and a markdown link', '<img src=x onerror=alert(1)> [claim](https://evil.example)'],
+    ['a bare link', 'Read more at https://evil.example today.'],
+    ['a link split by a format character', 'Read more at ht​tps://evil.example today.'],
+  ])('stores a reason with %s as null and keeps the rest of the verdict (C35)', (_name, reason) => {
+    expect(parseVerdict({ ...REAL_RESULT, reason })).toEqual({ score: 66, decision: 'reject', confidence: 'low', route: 'review', reason: null });
+  });
 });
