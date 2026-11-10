@@ -20,8 +20,10 @@
     "feedback:reppo": "node --env-file=.env --import tsx packages/worker/scripts/feedback-reppo.ts",
     "versions:score": "node --env-file=.env --import tsx packages/worker/scripts/versions-score.ts",
     "appeal:demo": "node --env-file=.env --import tsx packages/worker/scripts/appeal-demo.ts",
-    "api:dev": "node --env-file=.env --import tsx packages/api/src/server.ts",
-    "prove:paid": "node --env-file=.env --import tsx packages/api/scripts/prove-paid.ts"
+    "api:dev": "npm --prefix packages/api run dev",
+    "prove:paid": "node --env-file=.env.api --env-file=.env.payer --import tsx packages/api/scripts/prove-paid.ts",
+    "contracts:test": "forge test --root packages/contracts",
+    "contracts:lint": "npm run lint --prefix packages/contracts"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

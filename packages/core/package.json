@@ -7,6 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@openzeppelin/merkle-tree": "1.0.8",
     "viem": "2.57.11",
     "zod": "4.6.7"
   }

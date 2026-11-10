@@ -1,0 +1,15 @@
+{
+  "name": "@thuli/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "lint": "solhint \"src/**/*.sol\" \"test/**/*.sol\""
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.7.0",
+    "forge-std": "git+https://github.com/foundry-rs/forge-std.git#v1.17.0",
+    "solhint": "6.2.5"
+  }
+}

@@ -1,0 +1,29 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+cache_path = "cache"
+libs = ["node_modules"]
+solc_version = "0.8.38"
+# Base mainnet runs Prague since its Isthmus upgrade. Pinned so a newer compiler default cannot emit an opcode Base lacks.
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 200
+# The Merkle fixture is shared with packages/core/test/leaf.test.ts; nothing else on disk is reachable from tests.
+fs_permissions = [{ access = "read-write", path = "./test/fixtures" }]
+
+[fuzz]
+runs = 10000
+
+[invariant]
+runs = 256
+depth = 64
+# The handler catches the reverts it expects (a claim past the deposit, a cancel after the delay), so any other
+# revert is a bug in the vault or the handler and fails the run.
+fail_on_revert = true
+# Prints calls and reverts per handler action, so a run proves claims and withdrawals really happened.
+show_metrics = true
+
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"

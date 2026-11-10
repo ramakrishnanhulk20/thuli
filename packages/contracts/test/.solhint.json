@@ -1,0 +1,6 @@
+{
+  "rules": {
+    "use-natspec": "off",
+    "import-path-check": "off"
+  }
+}
