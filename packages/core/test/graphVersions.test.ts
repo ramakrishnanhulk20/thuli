@@ -206,6 +206,13 @@ describe('GRAPH_G1.toAnswer: the g1 reply is untrusted input (C13)', () => {
     });
   });
 
+  it('cites a hash glued to "tx", so validateDecision checks it like any other', () => {
+    expect(GRAPH_G1.toAnswer(g1Reply({ reason: `Swept in tx0x${'ab'.repeat(32)}s.` }), CLEAN)).toMatchObject({
+      ok: true,
+      answer: { cited_tx_hashes: [`0x${'ab'.repeat(32)}`] },
+    });
+  });
+
   it("accepts a real g1 writer answer as 'exclude' under rule A3", () => {
     expect(GRAPH_G1.toAnswer(REAL_G1_ANSWER, FARM)).toEqual({
       ok: true,
@@ -235,6 +242,7 @@ describe('GRAPH_G1.toAnswer: the g1 reply is untrusted input (C13)', () => {
       'the reason names a different rule than the outcome shows',
     ],
     ['an address the record never carried', g1Reply({ reason: `Funded by 0x${'d'.repeat(40)}.` }), MALFORMED],
+    ['an address with a letter right after it', g1Reply({ reason: `Funded by 0x${'de'.repeat(20)}s.` }), MALFORMED],
     ['text that is not one JSON object', `\`\`\`json\n${g1Reply()}\n\`\`\``, NOT_JSON],
     ['an otherwise valid reply over the 16,384 character cap', g1Reply({ reason: 'a'.repeat(16_384) }), TOO_LONG],
     ['an extra field', g1Reply({ rule: 'A9' }), WRONG_SHAPE],

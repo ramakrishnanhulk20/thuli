@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { GraphAnswer, GraphRecord, VERDICTS } from './graph.ts';
-import { FULL_HASH, HEX_RUN, MALFORMED_HASH_CAUSE } from './hex.ts';
+import { MALFORMED_HASH_CAUSE, reasonHashes } from './hex.ts';
 import { leastGenerous, type Outcome } from './outcome.ts';
 import type { FixedRule } from './start.ts';
 
@@ -137,12 +137,9 @@ function g1Answer(raw: unknown, record: GraphRecord): ReturnType<GraphVersion['t
   if (!parsed.success) return { ok: false, cause: 'the model reply did not match the answer format' };
   const { verdict, recommended_outcome, reason } = parsed.data;
 
-  // One scan both collects the hashes and refuses the malformed ones.
-  const cited = new Set<string>();
-  for (const [run] of reason.matchAll(HEX_RUN)) {
-    if (!FULL_HASH.test(run)) return { ok: false, cause: MALFORMED_HASH_CAUSE };
-    cited.add(`0x${run.slice(2).toLowerCase()}`);
-  }
+  // The same scan validateDecision runs on the reason, so the hashes cited here are the ones it then checks.
+  const cited = reasonHashes(reason);
+  if (!cited.ok) return { ok: false, cause: MALFORMED_HASH_CAUSE };
 
   const action = ACTION_FOR_G1[recommended_outcome];
   const rule = ruleFor(action, record);
@@ -152,7 +149,7 @@ function g1Answer(raw: unknown, record: GraphRecord): ReturnType<GraphVersion['t
   if (named.length > 0 && !named.includes(rule)) {
     return { ok: false, cause: 'the reason names a different rule than the outcome shows' };
   }
-  return { ok: true, answer: GraphAnswer.parse({ verdict, action, rule, reason, cited_tx_hashes: [...cited] }) };
+  return { ok: true, answer: GraphAnswer.parse({ verdict, action, rule, reason, cited_tx_hashes: cited.hashes }) };
 }
 
 /**

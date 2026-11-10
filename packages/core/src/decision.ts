@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { inFundingBurst, meetsGroupExcludeRule } from './ceiling.ts';
 import type { Facts } from './facts.ts';
-import { FULL_HASH, HEX_RUN, MALFORMED_HASH_CAUSE } from './hex.ts';
+import { MALFORMED_HASH_CAUSE, reasonHashes } from './hex.ts';
 
 // index.ts re-exports this module and not hex.ts, so the scorecard and its tests reach the cause from here.
 export { MALFORMED_HASH_CAUSE };
@@ -194,10 +194,9 @@ export function validateDecision(
   const fetched = new Set([...ctx.facts.evidenceTxs, ...ctx.toolTxs].map((hash) => hash.toLowerCase()));
   // The reason is scanned on every route, not only where the answer has no hash list: a v2 reason naming an address
   // or a made-up hash would otherwise be stored and shown as if it were evidence.
-  for (const [run] of reply.reason.matchAll(HEX_RUN)) {
-    if (!FULL_HASH.test(run)) return holdForReview(MALFORMED_HASH_CAUSE);
-    if (!fetched.has(run.toLowerCase())) return holdForReview(NOT_FETCHED_CAUSE);
-  }
+  const named = reasonHashes(reply.reason);
+  if (!named.ok) return holdForReview(MALFORMED_HASH_CAUSE);
+  if (named.hashes.some((hash) => !fetched.has(hash))) return holdForReview(NOT_FETCHED_CAUSE);
   if (reply.citedTxs.some((hash) => !fetched.has(hash.toLowerCase()))) {
     return holdForReview(NOT_FETCHED_CAUSE);
   }

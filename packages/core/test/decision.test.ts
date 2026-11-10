@@ -138,6 +138,32 @@ describe('validateDecision: every hex run in a v2 reason is checked (C13)', () =
     expect(result.accepted).toBe(true);
     expect(result.decision).toMatchObject({ action: 'full', citedTxs: [OWN_TX] });
   });
+
+  const MALFORMED = 'the reason contains a malformed transaction hash';
+  const NOT_FETCHED = 'the reason cited a transaction Thuli did not fetch for this wallet';
+
+  // A word boundary let each of these through as full: hex touching a letter on either side has no boundary to find.
+  it.each([
+    ['a made-up hash glued to "tx"', `Old wallet, see tx${MADE_UP_TX}.`, NOT_FETCHED],
+    ['a made-up hash with a letter after it', `Old wallet, see ${MADE_UP_TX}s.`, NOT_FETCHED],
+    ['an address with a letter after it', `Old wallet funded by 0x${'de'.repeat(20)}s.`, MALFORMED],
+    ['an all-digit address with digits written right before its 0x', `Old wallet, ref 1234567890123450x${'1'.repeat(40)}.`, MALFORMED],
+  ])('refuses %s', (_case, reason, cause) => {
+    const result = v2(reason);
+    expectRejected(result);
+    expect(result.cause).toBe(cause);
+  });
+
+  it('accepts a hash glued to "tx" only when Thuli fetched it', () => {
+    expect(v2(`Old wallet, first funded in tx${OWN_TX}.`).accepted).toBe(true);
+    expect(v2(`Old wallet, first funded in tx${OTHER_WALLET_TX}.`).cause).toBe(NOT_FETCHED);
+  });
+
+  it('accepts a long amount in wei, because digits alone are a number, not a hash', () => {
+    const result = v2('Old wallet that received 1234567890123456789 wei before the snapshot.');
+    expect(result.accepted).toBe(true);
+    expect(result.decision.action).toBe('full');
+  });
 });
 
 describe('validateDecision: answers that break the campaign or the run record end in hold', () => {
