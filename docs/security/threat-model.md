@@ -264,9 +264,10 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer
   of exactly the price from the payer to our payTo in the network's USDC; a used nonce alone is not proof, because a
   payer can cancel or spend it elsewhere. A timeout or error returns retry with the claim kept, so a header never pays
-  twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed. A claim is remembered for at most the
-  route's 300-second timeout; once forgotten, a copy of the header falls back to the on-chain nonce, which the
-  facilitator refuses because it is spent.
+  twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
+  route's timeout plus 30 seconds is refused, and a used claim is remembered until its validBefore, so no copy of a header
+  can outlive its claim. Non-goal: claims live in memory, so after a restart a copy sent inside its window
+  could still be answered from a facilitator's pending cache, until Postgres holds the claims.
   Non-goal: a facilitator that fails after broadcasting leaves a landed payment unserved until the buyer retries the same
   header and its settlement resolves.
 - **C26. The paid path cannot cost more than it earns.** The worst-case cost of one paid screening is a stated number
@@ -296,8 +297,9 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   Shown by: a withdrawal before the end reverts; a claim submitted by a third party pays the leaf's address; a pause of
   any length extends the end by that length.
 - **C32. The chain matches the public list.** Before signing, the server rebuilds the root from the published list and
-  refuses to submit if what the list still owes (each capped amount minus what that wallet already claimed) exceeds what
-  the pool still holds, or the root differs from the one anyone can rebuild. It also refuses a vault that did not come
+  refuses to submit if what the vault may still pay exceeds what the pool still holds. That counts both the active list,
+  which keeps paying through the new list's delay, and the new one: for each wallet, the larger capped amount minus what
+  it already claimed, or the root differs from the one anyone can rebuild. It also refuses a vault that did not come
   from the recorded factory, or whose token, owner, agent, cap, end or delay differ from the campaign record. Shown by: a
   script rebuilds the root from the public pages and it matches the on-chain root.
 
@@ -334,7 +336,8 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   appear in the database, logs, stored model requests, receipts, error responses or the client bundle. Stored model
   requests keep bodies, not headers. Shown by: after a full run, a search of a database dump, the logs and the client
   bundle for each secret's prefix finds nothing.
-- **C41. Every loop, call and payload has a limit.** Every external call has a timeout and every response a size cap.
+- **C41. Every loop, call and payload has a limit.** Every external call has a timeout and every response a size cap,
+  and requests to one provider run in bounded batches, one after another, never all at once.
   First-funder tracing follows at most 6 single-use pass-through wallets (one in, one out, so a cycle cannot form);
   money still passing through at the 6th hop is doubt, not a source. Transfers per wallet, CSV rows and bytes, rules length,
   appeal length and graph size all have stated caps. Hitting a cap means hold under C11. Shown by: a wallet fixture with

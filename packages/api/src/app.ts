@@ -23,7 +23,7 @@ export const HEALTH_PATH = '/api/x402/health';
 
 // A real request is about 60 bytes: {"wallet":"0x" plus 40 hex}. Anything near this is not a screening request (C41).
 const MAX_BODY_BYTES = 1024;
-// The library's own default, written out because the claim map's memory is sized from it.
+// The library's own default, written out because the longest validity the claim map accepts is built from it.
 const MAX_TIMEOUT_SECONDS = 300;
 // Kept under the 500 characters past which verify fails (x402 issue 2284), and written as a description, not an instruction.
 const DESCRIPTION =
@@ -74,7 +74,7 @@ const SettleReceipt = z.object({
   transaction: TxHashText,
 });
 
-const refuse = (reason: string) => ({ abort: true as const, reason });
+const refuse = (reason: string, message?: string) => ({ abort: true as const, reason, ...(message !== undefined && { message }) });
 
 // The same test the payment middleware uses to decide a request is paying, so the two never disagree about one request.
 const isPaying = (c: Context) => Boolean(c.req.header('payment-signature') || c.req.header('x-payment'));
@@ -173,8 +173,8 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  * unsettled authorization (C25). In order, before any payment is asked for: a client past its own limits gets 429
  * {busy: true}, a body over 1 KB gets 413, a body that is not exactly {wallet} or names a bad address gets 400, and a
  * full house gets 503 {busy: true} (C24, C42). Then the payment middleware answers 402 with the terms, or settles.
- * Before settling, an expired authorization is refused and the rest are claimed, so a copy is refused without reaching
- * the facilitator. After settling, the receipt is checked and kept for the reply. A settlement left pending is served
+ * Before settling, an authorization that has expired, or that stays valid longer than the route's 300 seconds plus a
+ * clock allowance, is refused with 402; the rest are claimed, so a copy is refused without reaching the facilitator. After settling, the receipt is checked and kept for the reply. A settlement left pending is served
  * only when its on-chain receipt proves this payment; any other unclear outcome answers 503 {retry: true} and keeps the
  * claim for a retry of the same header. The reply is the fixed PaidScreenResponse and nothing else (C34).
  *
@@ -216,6 +216,9 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     const nowSeconds = BigInt(Math.floor(now().getTime() / 1000));
     const claimed = claims.claim(terms.key, terms.validBefore, request, nowSeconds);
     if (claimed === 'expired') return refuse('payment_expired');
+    if (claimed === 'too-long') {
+      return refuse('payment_valid_too_long', `Sign a fresh payment for these terms, valid for at most ${MAX_TIMEOUT_SECONDS} seconds.`);
+    }
     if (claimed === 'in-use') return refuse('payment_already_used');
     if (claimed === 'full') {
       request.answer = 'busy';

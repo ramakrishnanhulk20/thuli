@@ -23,7 +23,7 @@ import { heldScreen, SCREEN_CAUSES, type SingleScreen } from '@thuli/worker/src/
 import { createApp, HEALTH_PATH, SCREEN_PATH } from '../src/app.ts';
 import { loadApiConfig, PRICE_UNITS, type ApiConfig } from '../src/config.ts';
 import { MAX_PER_DAY, MAX_RUNNING, ScreenGuard } from '../src/guard.ts';
-import { MAX_CLAIMS, PaymentClaims } from '../src/claims.ts';
+import { CLOCK_ALLOWANCE_SECONDS, MAX_CLAIMS, PaymentClaims } from '../src/claims.ts';
 import {
   canonicalClient,
   CLIENT_MAX_FAILED_PER_HOUR,
@@ -517,13 +517,87 @@ describe('settlement with no clear answer (C25)', () => {
   });
 });
 
+/**
+ * A facilitator that behaves like the reference one: a payload it left pending is answered from the old transaction when
+ * the same signature comes back, with no new check. The first answer and the library's one immediate retry stay pending.
+ */
+function cachingPendingFacilitator(): StubFacilitator {
+  const facilitator = new StubFacilitator('eip155:84532');
+  const seen = new Map<string, number>();
+  facilitator.respond = async (payload, requirements) => {
+    const signature = (payload.payload as { signature: string }).signature;
+    const count = (seen.get(signature) ?? 0) + 1;
+    seen.set(signature, count);
+    if (count <= 2) return pendingAnswer(payload, requirements);
+    return { success: true, transaction: PENDING_TX, network: requirements.network, payer: authorizationFrom(payload).from };
+  };
+  return facilitator;
+}
+
+const provingReceipt = (facilitator: StubFacilitator) =>
+  receiptOf(facilitator, ({ from, nonce }) => [
+    authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce),
+    transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE),
+  ]);
+
+describe('a payment signed to outlive its claim (C25)', () => {
+  it('refuses an authorization signed with maxTimeoutSeconds raised to 864000, before claiming or settling it', async () => {
+    const facilitator = cachingPendingFacilitator();
+    const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt: provingReceipt(facilitator).read });
+    const unpaid = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }));
+    const required = decodePaymentRequiredHeader(unpaid.headers.get('payment-required') as string);
+    const raised = structuredClone(required);
+    (raised.accepts[0] as { maxTimeoutSeconds: number }).maxTimeoutSeconds = 864_000;
+    const http = new x402HTTPClient(client);
+    const signed = await http.createPaymentPayload(raised);
+    expect(Number(authorizationFrom(signed).validBefore)).toBeGreaterThan(Date.now() / 1000 + 863_000);
+
+    // As signed, it names terms the route does not offer, so the library refuses it.
+    const asSigned = await fetchAs('198.51.100.1')(url(SCREEN_PATH), post({ wallet: WALLET }, http.encodePaymentSignatureHeader(signed)));
+    expect(asSigned.status).toBe(402);
+    // The terms are not signed, so the route's own can be pasted back: then only the validity check stands in the way.
+    const disguised = { ...signed, accepted: required.accepts[0] as PaymentRequirements };
+    const reply = await fetchAs('198.51.100.2')(url(SCREEN_PATH), post({ wallet: WALLET }, http.encodePaymentSignatureHeader(disguised)));
+    expect(reply.status).toBe(402);
+    expect(decodePaymentResponseHeader(reply.headers.get('payment-response') as string)).toMatchObject({
+      success: false,
+      errorReason: 'payment_valid_too_long',
+      errorMessage: expect.stringContaining('Sign a fresh payment'),
+    });
+    expect(facilitator.settled).toHaveLength(0);
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it('gives no second screening to a payment settled pending, proven by receipt, then replayed 301 s later from a new address', async () => {
+    let clock = new Date();
+    const facilitator = cachingPendingFacilitator();
+    const receipt = provingReceipt(facilitator);
+    const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt: receipt.read, now: () => clock });
+    // A buyer whose clock runs 20 seconds fast signs a validBefore 320 seconds out: inside the allowance, past 300.
+    const realNow = Date.now();
+    const fastClock = vi.spyOn(Date, 'now').mockReturnValue(realNow + 20_000);
+    const header = await signedHeader(appFetch, client);
+    fastClock.mockRestore();
+
+    clock = new Date(realNow);
+    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(first.status).toBe(200);
+    expect(receipt.reads).toEqual([PENDING_TX]);
+
+    clock = new Date(realNow + 301_000);
+    const replay = await fetchAs('198.51.100.77')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(replay.status).toBe(402);
+    expect(decodePaymentResponseHeader(replay.headers.get('payment-response') as string)).toMatchObject({ errorReason: 'payment_already_used' });
+    expect(facilitator.settled).toHaveLength(2);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('POST /api/x402/screen refusals before payment', () => {
   it('refuses an authorization once its validBefore has passed, before claiming or settling it, so a forgotten claim reopens nothing', async () => {
     let clock = new Date();
     const { appFetch, fetchAs, client, screen, facilitator } = setup({ now: () => clock });
     const header = await signedHeader(appFetch, client);
-    // Read after signing, so the claim's memory runs to validBefore here and not a second short of it.
-    clock = new Date();
     expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(200);
     const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
 
@@ -766,19 +840,26 @@ describe('PaymentClaims', () => {
 });
 
 describe('PaymentClaims memory', () => {
-  it('forgets a used claim maxTimeoutSeconds after it was taken, however far away its validBefore, so such claims cannot fill the map', () => {
+  it('refuses a validBefore past maxTimeoutSeconds plus the clock allowance, and remembers every claim until its validBefore', () => {
     const claims = new PaymentClaims(300n);
     const now = 1_000n;
-    const yearsAway = now + 10n * 365n * 86_400n;
-    const owner = {};
-    for (let index = 0; index < MAX_CLAIMS; index += 1) {
-      claims.claim(`far-${index}`, yearsAway, owner, now);
-      claims.markUsed(`far-${index}`, owner);
-    }
-    expect(claims.claim('new', yearsAway, {}, now + 299n)).toBe('full');
-    expect(claims.claim('far-0', yearsAway, {}, now + 299n)).toBe('in-use');
-    expect(claims.claim('new', yearsAway, {}, now + 300n)).toBe('taken');
-    expect(claims.size).toBe(1);
+    const latest = now + 300n + CLOCK_ALLOWANCE_SECONDS;
+    expect(claims.claim('years', now + 10n * 365n * 86_400n, {}, now)).toBe('too-long');
+    expect(claims.claim('just-over', latest + 1n, {}, now)).toBe('too-long');
+    expect(claims.size).toBe(0);
+
+    const payer = {};
+    expect(claims.claim('used', latest, payer, now)).toBe('taken');
+    claims.markUsed('used', payer);
+    const retrier = {};
+    expect(claims.claim('unsure', latest, retrier, now)).toBe('taken');
+    claims.keepUnsure('unsure', retrier);
+    expect(claims.claim('used', latest, {}, latest - 1n)).toBe('in-use');
+    const late = {};
+    expect(claims.claim('unsure', latest, late, latest - 1n)).toBe('taken');
+    claims.keepUnsure('unsure', late);
+    expect(claims.claim('used', latest, {}, latest)).toBe('expired');
+    expect(claims.claim('unsure', latest, {}, latest)).toBe('expired');
   });
 });
 

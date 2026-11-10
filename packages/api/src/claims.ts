@@ -2,8 +2,15 @@ import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
 import { PRICE_UNITS, type NetworkId } from './config.ts';
 
-/** Claims remembered at once (C41). Past this, with none due to be forgotten, a new payment is refused as busy. */
+/** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
 export const MAX_CLAIMS = 100_000;
+
+/**
+ * How far a buyer's clock may run ahead of ours. The x402 client signs validBefore as its own clock plus the route's
+ * maxTimeoutSeconds, so a buyer whose clock is up to this fast still pays; anything further out was signed to outlive
+ * the claim that guards it, and is refused.
+ */
+export const CLOCK_ALLOWANCE_SECONDS = 30n;
 
 /** An authorization at or past its validBefore can never settle on chain, so it is refused before it is claimed. */
 export function hasExpired(validBefore: bigint, nowSeconds: bigint): boolean {
@@ -15,10 +22,10 @@ type State = 'held' | 'unsure' | 'used';
 interface Claim {
   owner: object | null;
   state: State;
-  forgetAt: bigint;
+  validBefore: bigint;
 }
 
-export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'full';
+export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
 /**
  * One payment authorization buys one screening (threat model C25). A claim is taken before the facilitator is asked to
@@ -29,25 +36,31 @@ export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'full';
  * it pending without proof), it stays as unsure: owned by no request, it lets the same authorization come back and try
  * again through the facilitator, one copy at a time, and it is never served on a guess.
  *
- * Memory only, in this process, at most MAX_CLAIMS entries. A claim no request holds is forgotten at the earlier of its
- * validBefore and rememberSeconds (the route's maxTimeoutSeconds) after it was taken, so an authorization signed to stay
- * valid for years cannot hold a place in the map. Before its validBefore, a forgotten authorization can come back: it
- * goes to the facilitator again, where its nonce, already spent on chain, makes the settle fail. After its validBefore
- * it is refused here. A restart forgets every claim, with the same two guards left.
+ * Memory only, in this process, at most MAX_CLAIMS entries. Only an authorization valid for at most maxTimeoutSeconds
+ * plus CLOCK_ALLOWANCE_SECONDS is claimed, and its claim is remembered until its validBefore, after which the expiry
+ * check refuses every copy. So no copy of an accepted authorization is ever let through by forgetting, and a claim lives
+ * about 330 seconds at most. A full map refuses new payments as busy; it never forgets a claim still in its window.
+ *
+ * A restart forgets every claim. A copy sent after a restart but inside its window reaches the facilitator again, and a
+ * facilitator that still holds the payment as pending can answer it from the old transaction. This class does not close
+ * that gap.
  */
 export class PaymentClaims {
   readonly #claims = new Map<string, Claim>();
-  readonly #rememberSeconds: bigint;
+  readonly #latestSeconds: bigint;
 
-  constructor(rememberSeconds: bigint) {
-    this.#rememberSeconds = rememberSeconds;
+  /** maxTimeoutSeconds is the route's own, the window the x402 client signs for. */
+  constructor(maxTimeoutSeconds: bigint) {
+    this.#latestSeconds = maxTimeoutSeconds + CLOCK_ALLOWANCE_SECONDS;
   }
 
-  /** Takes the key for owner. Refuses an expired authorization, a key another request holds or used, and a full map. */
+  /**
+   * Takes the key for owner. Refuses an expired authorization, one valid for longer than the route allows, a key another
+   * request holds or used, and a full map.
+   */
   claim(key: string, validBefore: bigint, owner: object, nowSeconds: bigint): ClaimResult {
     if (hasExpired(validBefore, nowSeconds)) return 'expired';
-    const latest = nowSeconds + this.#rememberSeconds;
-    const forgetAt = validBefore < latest ? validBefore : latest;
+    if (validBefore > nowSeconds + this.#latestSeconds) return 'too-long';
     let entry = this.#claims.get(key);
     if (entry !== undefined && this.#due(entry, nowSeconds)) {
       this.#claims.delete(key);
@@ -57,12 +70,12 @@ export class PaymentClaims {
       if (entry.state !== 'unsure') return 'in-use';
       entry.owner = owner;
       entry.state = 'held';
-      entry.forgetAt = forgetAt;
+      if (validBefore > entry.validBefore) entry.validBefore = validBefore;
       return 'taken';
     }
     if (this.#claims.size >= MAX_CLAIMS) this.#forgetDue(nowSeconds);
     if (this.#claims.size >= MAX_CLAIMS) return 'full';
-    this.#claims.set(key, { owner, state: 'held', forgetAt });
+    this.#claims.set(key, { owner, state: 'held', validBefore });
     return 'taken';
   }
 
@@ -97,9 +110,10 @@ export class PaymentClaims {
     return entry !== undefined && entry.state === 'held' && entry.owner === owner ? entry : undefined;
   }
 
-  // A held claim belongs to a request in flight and is never forgotten under it.
+  // A held claim belongs to a request in flight and is never forgotten under it. Any other is forgotten only once its
+  // authorization has expired, by the same comparison that refuses the authorization itself.
   #due(entry: Claim, nowSeconds: bigint): boolean {
-    return entry.state !== 'held' && entry.forgetAt <= nowSeconds;
+    return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds);
   }
 
   // Runs only when the map is full, so its cost is paid once per wave of new claims, not on every request.
