@@ -680,6 +680,25 @@ export const VAULT_ABI = [
   },
   {
     "type": "event",
+    "name": "RootDelayed",
+    "inputs": [
+      {
+        "name": "root",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "claimableAt",
+        "type": "uint64",
+        "indexed": false,
+        "internalType": "uint64"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "RootPosted",
     "inputs": [
       {
@@ -917,6 +936,22 @@ export const VAULT_ABI = [
         "name": "rootDelay",
         "type": "uint32",
         "internalType": "uint32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "RootWouldNotActivate",
+    "inputs": [
+      {
+        "name": "claimableAt",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "endTime",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ]
   },

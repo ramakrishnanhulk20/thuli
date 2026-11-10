@@ -294,6 +294,116 @@ contract ThuliVaultTest is VaultTestBase {
         vm.stopPrank();
     }
 
+    /// C30 and C31, ported from review: an owner with a sock agent posts a list of mules, then pauses through the
+    /// delay. The delay must still run for its full length of unpaused time, cancellable, with the old root paying.
+    function testPauseNeverRunsOutARootDelay() public {
+        _deposit(300e6);
+        bytes32[] memory honest = _three(100e6, 100e6, 100e6);
+        _postAndWait(honest, 300e6);
+        address[] memory mules = new address[](3);
+        (mules[0], mules[1], mules[2]) = (makeAddr("m0"), makeAddr("m1"), makeAddr("m2"));
+        uint256[] memory amounts = new uint256[](3);
+        (amounts[0], amounts[1], amounts[2]) = (100e6, 100e6, 100e6);
+        bytes32[] memory bad = _tree(mules, amounts);
+
+        address sock = makeAddr("sock");
+        vm.prank(owner);
+        vault.setAgent(sock);
+        vm.prank(sock);
+        vault.postRoot(StandardTree.root(bad), 300e6);
+        uint64 postedAt = uint64(vm.getBlockTimestamp());
+        vm.prank(owner);
+        vault.pause();
+        skip(DELAY);
+        vm.prank(owner);
+        vault.unpause();
+
+        ThuliVault.VaultState memory s = vault.state();
+        assertEq(s.activeRoot, StandardTree.root(honest));
+        assertEq(s.pendingRoot, StandardTree.root(bad));
+        assertEq(s.pendingClaimableAt, postedAt + 2 * DELAY);
+        _claim(honest, alice, 100e6);
+        assertEq(usd.balanceOf(alice), 100e6);
+        skip(DELAY - 1);
+        vm.expectRevert(ThuliVault.InvalidProof.selector);
+        _claim(bad, mules[0], 100e6);
+        vm.prank(owner);
+        vault.cancelRoot();
+        skip(DELAY);
+        vm.expectRevert(ThuliVault.InvalidProof.selector);
+        _claim(bad, mules[0], 100e6);
+        assertEq(vault.state().activeRoot, StandardTree.root(honest));
+    }
+
+    function testPostRootRevertsWhilePaused() public {
+        vm.prank(owner);
+        vault.pause();
+        vm.prank(agent);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vault.postRoot(bytes32(uint256(1)), 0);
+    }
+
+    function testPostRootRefusesARootThatCouldNotPayBeforeTheEnd() public {
+        vm.warp(end - DELAY);
+        vm.prank(agent);
+        vm.expectRevert(abi.encodeWithSelector(ThuliVault.RootWouldNotActivate.selector, end, end));
+        vault.postRoot(bytes32(uint256(1)), 0);
+        vm.warp(end - DELAY - 1);
+        vm.prank(agent);
+        vault.postRoot(bytes32(uint256(1)), 0);
+        assertEq(vault.state().pendingClaimableAt, end - 1);
+    }
+
+    function testPauseRecordsARootWhoseDelayFinishedFirst() public {
+        _deposit(30e6);
+        bytes32[] memory tree = _three(10e6, 10e6, 10e6);
+        _postAndWait(tree, 30e6);
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit ThuliVault.RootActivated(StandardTree.root(tree));
+        vm.startPrank(owner);
+        vault.pause();
+        vault.setAgent(makeAddr("newAgent"));
+        vault.unpause();
+        vm.stopPrank();
+        assertEq(vault.state().activeRoot, StandardTree.root(tree));
+        _claim(tree, alice, 10e6);
+        assertEq(usd.balanceOf(alice), 10e6);
+    }
+
+    function testUnpauseMovesThePendingRootByTheTimePaused() public {
+        bytes32[] memory tree = _three(10e6, 10e6, 10e6);
+        _post(tree, 0);
+        uint64 postedAt = uint64(vm.getBlockTimestamp());
+        skip(10 minutes);
+        vm.prank(owner);
+        vault.pause();
+        skip(1 days);
+        ThuliVault.VaultState memory s = vault.state();
+        assertEq(s.pendingRoot, StandardTree.root(tree));
+        assertEq(s.pendingClaimableAt, postedAt + DELAY + 1 days);
+        assertEq(vault.claimable(alice, 10e6), 0);
+
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit ThuliVault.RootDelayed(StandardTree.root(tree), postedAt + DELAY + 1 days);
+        vm.prank(owner);
+        vault.unpause();
+        assertEq(vault.state().pendingClaimableAt, postedAt + DELAY + 1 days);
+        skip(DELAY - 10 minutes - 1);
+        assertEq(vault.state().activeRoot, bytes32(0));
+        skip(1);
+        assertEq(vault.state().activeRoot, StandardTree.root(tree));
+    }
+
+    function testStateWhilePausedWithNoPendingRoot() public {
+        vm.prank(owner);
+        vault.pause();
+        skip(1 days);
+        assertEq(vault.state().pendingClaimableAt, 0);
+        vm.prank(owner);
+        vm.expectRevert(ThuliVault.NoPendingRoot.selector);
+        vault.cancelRoot();
+    }
+
     function testExtendEndMovesTheEndLater() public {
         vm.expectEmit(false, false, false, true, address(vault));
         emit ThuliVault.EndExtended(end, end + 1 days);

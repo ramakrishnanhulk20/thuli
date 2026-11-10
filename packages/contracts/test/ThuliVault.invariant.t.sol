@@ -111,4 +111,10 @@ contract ThuliVaultInvariantTest is Test {
         assertEq(s.pendingClaimableAt, pendingAt);
         assertEq(s.agent, handler.currentAgent());
     }
+
+    /// C30 and C31: a root never becomes active without rootDelay of unpaused time since it was posted, so no pause
+    /// can shorten the window in which the owner can cancel it and claimants can still claim under the old root.
+    function invariantNoRootActiveBeforeItsUnpausedDelay() public view {
+        assertFalse(handler.rootActivatedEarly());
+    }
 }

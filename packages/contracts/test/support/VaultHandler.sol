@@ -4,6 +4,7 @@ pragma solidity 0.8.38;
 import {CommonBase} from "forge-std/Base.sol";
 import {StdCheats} from "forge-std/StdCheats.sol";
 import {StdUtils} from "forge-std/StdUtils.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ThuliVault} from "../../src/ThuliVault.sol";
 import {StandardTree} from "./StandardTree.sol";
 import {TestToken} from "./TestToken.sol";
@@ -16,6 +17,17 @@ import {TestToken} from "./TestToken.sol";
 /// or an early withdrawal, or refuses a claim claimable() promised, fails the run on the spot.
 contract VaultHandler is CommonBase, StdCheats, StdUtils {
     error WrongPayout(uint256 expected, uint256 paid);
+
+    /// @dev The roots as the vault should hold them. `pendingAt` runs on the unpaused clock and moves at each unpause.
+    struct RootModel {
+        bytes32 active;
+        bytes32 pending;
+        uint64 pendingAt;
+        uint64 pausedAt;
+        bytes32 tracked;
+        uint64 trackedUnpaused;
+        bytes32 lastSeenActive;
+    }
 
     struct Setup {
         ThuliVault vault;
@@ -40,14 +52,13 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
     mapping(bytes32 root => bytes32[] tree) internal _treeOf;
     mapping(bytes32 root => uint256[] amounts) internal _amountsOf;
 
-    bytes32 public ghostActive;
-    bytes32 public ghostPending;
-    uint64 public ghostPendingAt;
+    RootModel internal _model;
     uint256 public ghostWithdrawn;
     uint256 public ghostDonated;
     uint64 public lastEnd;
 
     bool public endWentBack;
+    bool public rootActivatedEarly;
 
     constructor(Setup memory s) {
         vault = s.vault;
@@ -74,15 +85,24 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         _afterEach();
     }
 
+    /// @dev Refused while paused, and when the delay would end at or after the end, since such a root never pays.
     function postRoot(uint256 seed) external {
-        if (block.timestamp < vault.endTime()) {
+        uint64 end = vault.endTime();
+        if (block.timestamp < end) {
             (bytes32 root, uint256 sum) = _storeList(seed);
             uint256 declared = sum < vault.deposited() ? sum : vault.deposited();
+            uint64 claimableAt = uint64(block.timestamp) + delay;
+            bool paused = vault.paused();
+            bool accepted = !paused && claimableAt < end;
+            if (paused) vm.expectRevert(Pausable.EnforcedPause.selector);
+            else if (!accepted) vm.expectRevert(abi.encodeWithSelector(ThuliVault.RootWouldNotActivate.selector, claimableAt, end));
             vm.prank(currentAgent);
             vault.postRoot(root, declared);
-            _matureGhost();
-            ghostPending = root;
-            ghostPendingAt = uint64(block.timestamp) + delay;
+            if (accepted) {
+                _matureGhost();
+                (_model.pending, _model.pendingAt) = (root, claimableAt);
+                (_model.tracked, _model.trackedUnpaused) = (root, 0);
+            }
         }
         _afterEach();
     }
@@ -125,10 +145,7 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         if (!cancellable) vm.expectRevert();
         vm.prank(owner);
         vault.cancelRoot();
-        if (cancellable) {
-            ghostPending = bytes32(0);
-            ghostPendingAt = 0;
-        }
+        if (cancellable) (_model.pending, _model.pendingAt) = (bytes32(0), 0);
         _afterEach();
     }
 
@@ -137,8 +154,7 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(owner);
         vault.setAgent(next);
         _matureGhost();
-        ghostPending = bytes32(0);
-        ghostPendingAt = 0;
+        (_model.pending, _model.pendingAt) = (bytes32(0), 0);
         currentAgent = next;
         _afterEach();
     }
@@ -154,22 +170,31 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
     }
 
     function wait(uint256 secondsToSkip) external {
-        skip(bound(secondsToSkip, 0, 3 days));
+        _advance(bound(secondsToSkip, 0, 3 days));
         _afterEach();
     }
 
     /// @dev Extensions and pauses keep moving the end out, so plain waits alone almost never reach a withdrawal.
     function jumpPastEnd(uint256 extra) external {
         uint256 from = block.timestamp > vault.endTime() ? block.timestamp : vault.endTime();
-        vm.warp(from + bound(extra, 0, 1 days));
+        _advance(from + bound(extra, 0, 1 days) - block.timestamp);
         _afterEach();
     }
 
+    /// @dev Pausing records a root that was already due; unpausing moves a pending root by the time paused.
     function togglePause() external {
         bool paused = vault.paused();
         vm.prank(owner);
-        if (paused) vault.unpause();
-        else vault.pause();
+        if (paused) {
+            vault.unpause();
+            uint64 pausedFor = uint64(block.timestamp) - _model.pausedAt;
+            if (_model.pending != bytes32(0)) _model.pendingAt += pausedFor;
+            _model.pausedAt = 0;
+        } else {
+            vault.pause();
+            _matureGhost();
+            _model.pausedAt = uint64(block.timestamp);
+        }
         _afterEach();
     }
 
@@ -211,10 +236,14 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
         return _actors[i];
     }
 
-    /// @dev The model's roots as the vault should report them right now, a finished delay counting as active.
+    /// @dev The model's roots as the vault should report them right now, a finished delay counting as active and a
+    /// pause holding the pending root's claimable time that far from now.
     function expectedRoots() external view returns (bytes32 active, bytes32 pending, uint64 pendingAt) {
-        if (ghostPending != bytes32(0) && block.timestamp >= ghostPendingAt) return (ghostPending, bytes32(0), 0);
-        return (ghostActive, ghostPending, ghostPendingAt);
+        RootModel memory m = _model;
+        bool paused = m.pausedAt != 0;
+        if (m.pending != bytes32(0) && !paused && block.timestamp >= m.pendingAt) return (m.pending, bytes32(0), 0);
+        pendingAt = m.pending != bytes32(0) && paused ? m.pendingAt + uint64(block.timestamp) - m.pausedAt : m.pendingAt;
+        return (m.active, m.pending, pendingAt);
     }
 
     function _storeList(uint256 seed) internal returns (bytes32 root, uint256 sum) {
@@ -246,16 +275,25 @@ contract VaultHandler is CommonBase, StdCheats, StdUtils {
     }
 
     function _matureGhost() internal {
-        if (ghostPending != bytes32(0) && block.timestamp >= ghostPendingAt) {
-            ghostActive = ghostPending;
-            ghostPending = bytes32(0);
-            ghostPendingAt = 0;
+        if (_model.pausedAt == 0 && _model.pending != bytes32(0) && block.timestamp >= _model.pendingAt) {
+            (_model.active, _model.pending, _model.pendingAt) = (_model.pending, bytes32(0), 0);
         }
+    }
+
+    /// @dev Time only moves here, so the unpaused seconds since the last post are counted exactly.
+    function _advance(uint256 secondsToSkip) internal {
+        if (!vault.paused()) _model.trackedUnpaused += uint64(secondsToSkip);
+        skip(secondsToSkip);
     }
 
     function _afterEach() internal {
         uint64 currentEnd = vault.endTime();
         if (currentEnd < lastEnd) endWentBack = true;
         lastEnd = currentEnd;
+        bytes32 active = vault.state().activeRoot;
+        if (active != _model.lastSeenActive) {
+            if (active == _model.tracked && _model.trackedUnpaused < delay) rootActivatedEarly = true;
+            _model.lastSeenActive = active;
+        }
     }
 }

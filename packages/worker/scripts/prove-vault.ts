@@ -18,7 +18,7 @@ import { parseAddress, proofFor } from '@thuli/core';
 import { FACTORY_ABI, VAULT_ABI } from '../src/vault/abi.ts';
 import { addressLink, BASE_SEPOLIA, ChainCallError, confirm, connectBaseSepolia, revertName, txLink, vaultPort, type Sent, type Wallet } from '../src/vault/chain.ts';
 import { claimants, Deployment, loadProofEnv, newSeed, PROOF_TERMS, ProofSetupError, ProofState } from '../src/vault/proof.ts';
-import { buildRoot, postRoot, readPublishedList, RootError } from '../src/vault/root.ts';
+import { buildRoot, postRoot, readPublishedList, RootError, type CampaignRecord } from '../src/vault/root.ts';
 
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEFAULT_DEPLOYMENT = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia.json');
@@ -123,7 +123,21 @@ async function setup(client: Client, owner: Wallet, agent: Wallet, deploymentFil
   });
   transactions.push({ label: 'deposit', ...(await confirm(client, await owner.writeContract(deposit.request), ownerAddress)) });
 
-  const posted = await postRoot(vaultPort(client, agent), vault, [{ account: a, cumulativeAmount: PROOF_TERMS.approvedAmount }]);
+  // The record of what this run asked the factory for; the signer refuses unless the factory's log says the same.
+  const campaign: CampaignRecord = {
+    factory,
+    vault,
+    createdAtBlock: receipt.blockNumber,
+    token,
+    owner: ownerAddress,
+    agent: agentAddress,
+    perWalletCap: PROOF_TERMS.perWalletCap,
+    endTime,
+    rootDelay: BigInt(PROOF_TERMS.rootDelay),
+  };
+  const posted = await postRoot(vaultPort(client, agent), campaign, [
+    { account: a, cumulativeAmount: PROOF_TERMS.approvedAmount },
+  ]);
   transactions.push({ label: 'postRoot', hash: posted.hash, gasUsed: posted.gasUsed, from: agentAddress });
   const { pendingClaimableAt } = await client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'state' });
 
@@ -136,6 +150,8 @@ async function setup(client: Client, owner: Wallet, agent: Wallet, deploymentFil
     seed,
     root: posted.root,
     published: posted.published,
+    createdAtBlock: Number(receipt.blockNumber),
+    endTime: Number(endTime),
     claimableAt: Number(pendingClaimableAt),
     transactions: transactions.map((tx) => ({ label: tx.label, hash: tx.hash, from: tx.from, gasUsed: tx.gasUsed.toString() })),
   };

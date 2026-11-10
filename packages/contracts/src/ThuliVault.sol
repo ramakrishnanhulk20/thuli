@@ -19,7 +19,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// only post roots, and every root waits `rootDelay` before it pays, during which the owner can cancel it (C30).
 /// Leaves carry cumulative entitlements and the vault pays only the difference from what was already claimed (C27).
 /// A pending root whose delay has passed counts as active everywhere, even before a claim records it, so nothing
-/// can cancel or replace a root once its delay is over.
+/// can cancel or replace a root once its delay is over. The delay is counted in unpaused time only: a pause stops the
+/// root clock along with claims and the end time, so pausing can never run out the window in which claimants can
+/// still claim under the old root and the owner can still cancel the new one (C30, C31).
 contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -86,6 +88,10 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice A pending root finished its delay and was recorded as the root claims prove against.
     /// @param root The root now active.
     event RootActivated(bytes32 indexed root);
+    /// @notice A pending root's claimable time moved later by the time the vault spent paused.
+    /// @param root The pending root.
+    /// @param claimableAt When it now becomes claimable.
+    event RootDelayed(bytes32 indexed root, uint64 claimableAt);
     /// @notice The root-posting key changed. Emitted at creation with a zero previous agent.
     /// @param previousAgent The key rotated out.
     /// @param newAgent The key now allowed to post roots.
@@ -123,6 +129,7 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     error DeclaredTotalAboveDeposit(uint256 declaredTotal, uint256 deposited);
     error NoPendingRoot();
     error RootAlreadyClaimable(uint64 claimableAt);
+    error RootWouldNotActivate(uint64 claimableAt, uint64 endTime);
     error NoClaimableRoot();
     error InvalidProof();
     error NothingToClaim(address account);
@@ -184,36 +191,42 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     /// @notice Posts a new list root. It pays only after `rootDelay` seconds, and the owner can cancel it until then.
-    /// @dev Agent only, before the end. Replaces a pending root that has not finished its delay, emitting
-    /// RootCancelled for it. A pending root whose delay is over becomes active first, so it is never thrown away.
-    /// `declaredTotal` is the sum of the list's amounts; refusing one above the deposit catches a list the deposit
-    /// cannot cover (C32), while the deposit check in claim is what actually limits payouts (C29).
-    /// Reverts with NotAgent, ZeroRoot, CampaignEnded or DeclaredTotalAboveDeposit. Emits RootPosted.
+    /// @dev Agent only, not while paused, and only when the root's delay ends before the campaign does, because a root
+    /// claimable at or after the end could never pay. Replaces a pending root that has not finished its delay,
+    /// emitting RootCancelled for it. A pending root whose delay is over becomes active first, so it is never thrown
+    /// away. `declaredTotal` is the sum of the list's capped amounts; refusing one above the deposit catches a list the
+    /// deposit cannot cover (C32), while the deposit check in claim is what actually limits payouts (C29).
+    /// Reverts with NotAgent, EnforcedPause, ZeroRoot, CampaignEnded, DeclaredTotalAboveDeposit or
+    /// RootWouldNotActivate. Emits RootPosted.
     /// @param root The Merkle root of the published list.
-    /// @param declaredTotal The sum of every cumulative amount in the list.
+    /// @param declaredTotal The sum of every capped cumulative amount in the list.
     function postRoot(bytes32 root, uint256 declaredTotal) external {
         if (msg.sender != agent) revert NotAgent(msg.sender);
+        _requireNotPaused();
         if (root == bytes32(0)) revert ZeroRoot();
-        if (block.timestamp >= endTime) revert CampaignEnded();
+        uint64 end = endTime;
+        if (block.timestamp >= end) revert CampaignEnded();
         if (declaredTotal > deposited) revert DeclaredTotalAboveDeposit(declaredTotal, deposited);
+        uint64 claimableAt = SafeCast.toUint64(block.timestamp) + rootDelay;
+        if (claimableAt >= end) revert RootWouldNotActivate(claimableAt, end);
 
         _activatePendingRoot();
         bytes32 replaced = _pendingRoot;
         if (replaced != bytes32(0)) emit RootCancelled(replaced);
 
-        uint64 claimableAt = SafeCast.toUint64(block.timestamp) + rootDelay;
         _pendingRoot = root;
         _pendingClaimableAt = claimableAt;
         emit RootPosted(root, declaredTotal, claimableAt);
     }
 
     /// @notice Cancels the pending root while it is still inside its delay.
-    /// @dev Owner only. This is the owner's defence against a stolen agent key (C30).
+    /// @dev Owner only. This is the owner's defence against a stolen agent key (C30). The delay is read on the
+    /// pause-aware clock, so a pending root is always cancellable while the vault is paused.
     /// Reverts with NoPendingRoot or RootAlreadyClaimable. Emits RootCancelled.
     function cancelRoot() external onlyOwner {
         bytes32 pending = _pendingRoot;
         if (pending == bytes32(0)) revert NoPendingRoot();
-        uint64 claimableAt = _pendingClaimableAt;
+        uint64 claimableAt = _pendingClaimableTime();
         if (block.timestamp >= claimableAt) revert RootAlreadyClaimable(claimableAt);
         _clearPendingRoot(pending);
     }
@@ -252,22 +265,33 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
         emit EndExtended(previous, newEnd);
     }
 
-    /// @notice Stops claims and withdrawal until unpaused.
-    /// @dev Owner only. Reverts with EnforcedPause when already paused. Emits Paused.
+    /// @notice Stops claims, withdrawal, new roots and the pending root's clock until unpaused.
+    /// @dev Owner only. A pending root whose delay already finished is recorded as active first, since its delay ran
+    /// in unpaused time; any root still pending stays pending for the whole pause. Reverts with EnforcedPause when
+    /// already paused. Emits RootActivated when it records a root, and Paused.
     function pause() external onlyOwner {
+        _activatePendingRoot();
         _pause();
         _pausedAt = SafeCast.toUint64(block.timestamp);
     }
 
-    /// @notice Resumes claims and moves the end later by exactly the time spent paused.
-    /// @dev Owner only. Without the extension an owner could pause until the end and then withdraw, running out the
-    /// claim window (C31). Reverts with ExpectedPause when not paused. Emits Unpaused, and EndExtended when any time
-    /// passed while paused.
+    /// @notice Resumes claims and moves the end, and any pending root's claimable time, later by exactly the time
+    /// spent paused.
+    /// @dev Owner only. Without these an owner could pause until the end and then withdraw, or pause through a root's
+    /// delay so a list nobody could cancel or claim around activates the moment the vault resumes (C30, C31).
+    /// Reverts with ExpectedPause when not paused. Emits Unpaused, and when any time passed while paused, RootDelayed
+    /// for a pending root and EndExtended.
     function unpause() external onlyOwner {
         _unpause();
         uint64 pausedFor = SafeCast.toUint64(block.timestamp) - _pausedAt;
         _pausedAt = 0;
         if (pausedFor != 0) {
+            bytes32 pending = _pendingRoot;
+            if (pending != bytes32(0)) {
+                uint64 claimableAt = _pendingClaimableAt + pausedFor;
+                _pendingClaimableAt = claimableAt;
+                emit RootDelayed(pending, claimableAt);
+            }
             uint64 previous = endTime;
             uint64 newEnd = previous + pausedFor;
             endTime = newEnd;
@@ -356,7 +380,8 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice The vault's full state in one read, with a root whose delay is over shown as the active root.
     /// @return s Token, owner, agent, cap, end time, delay, deposited, paid, active and pending roots, when the
-    /// pending root becomes claimable (zero when there is none), and whether the vault is paused.
+    /// pending root becomes claimable (zero when there is none), and whether the vault is paused. While paused, the
+    /// claimable time is the one the pending root would have if the vault were unpaused now.
     function state() external view returns (VaultState memory s) {
         (bytes32 active, bytes32 pending, uint64 pendingAt) = _effectiveRoots();
         s = VaultState({
@@ -401,7 +426,7 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
 
     function _activatePendingRoot() private {
         bytes32 pending = _pendingRoot;
-        if (pending != bytes32(0) && block.timestamp >= _pendingClaimableAt) {
+        if (pending != bytes32(0) && !paused() && block.timestamp >= _pendingClaimableAt) {
             _activeRoot = pending;
             _pendingRoot = bytes32(0);
             _pendingClaimableAt = 0;
@@ -418,10 +443,18 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     function _effectiveRoots() private view returns (bytes32 active, bytes32 pending, uint64 pendingClaimableAt) {
         active = _activeRoot;
         pending = _pendingRoot;
-        pendingClaimableAt = _pendingClaimableAt;
+        pendingClaimableAt = _pendingClaimableTime();
         if (pending != bytes32(0) && block.timestamp >= pendingClaimableAt) {
             (active, pending, pendingClaimableAt) = (pending, bytes32(0), 0);
         }
+    }
+
+    /// @dev The one root clock. While paused it adds the time paused so far, which keeps a pending root out of reach
+    /// for the whole pause: pause() records any root that was already due, so a root pending in a pause is never due.
+    function _pendingClaimableTime() private view returns (uint64) {
+        uint64 claimableAt = _pendingClaimableAt;
+        if (claimableAt != 0 && paused()) claimableAt += SafeCast.toUint64(block.timestamp) - _pausedAt;
+        return claimableAt;
     }
 
     function _leaf(address account, uint256 cumulativeAmount) private view returns (bytes32) {

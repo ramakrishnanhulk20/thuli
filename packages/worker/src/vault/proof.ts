@@ -94,6 +94,8 @@ export const ProofState = z.strictObject({
   seed: Hash32,
   root: Hash32,
   published: z.string().max(10_000),
+  createdAtBlock: z.int().positive(),
+  endTime: z.int().positive(),
   claimableAt: z.int().positive(),
   transactions: z
     .array(z.strictObject({ label: z.string().max(64), hash: Hash32, from: AddressField, gasUsed: z.string().regex(/^[0-9]+$/) }))

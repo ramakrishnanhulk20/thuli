@@ -4,6 +4,7 @@ import {
   createPublicClient,
   createWalletClient,
   defineChain,
+  getAbiItem,
   http,
   type Account,
   type Address,
@@ -15,12 +16,15 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { CHAINS, parseAddress } from '@thuli/core';
-import { VAULT_ABI } from './abi.ts';
+import { FACTORY_ABI, VAULT_ABI } from './abi.ts';
 import type { VaultPort } from './root.ts';
 
 export const BASE_SEPOLIA = CHAINS['base-sepolia'];
 const RPC_TIMEOUT_MS = 30_000;
 const RECEIPT_TIMEOUT_MS = 180_000;
+// Multicall3 sits at this address on Base Sepolia, as on most chains; it lets every snapshot read share one block.
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const VAULT_CREATED = getAbiItem({ abi: FACTORY_ABI, name: 'VaultCreated' });
 
 export class ChainCallError extends Error {
   override name = 'ChainCallError';
@@ -45,6 +49,7 @@ export async function connectBaseSepolia(rpcUrl: string): Promise<Connection> {
     name: 'Base Sepolia',
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
     rpcUrls: { default: { http: [rpcUrl] } },
+    contracts: { multicall3: { address: MULTICALL3 } },
   });
   const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2 });
   const publicClient = createPublicClient({ chain, transport });
@@ -91,14 +96,57 @@ export function vaultPort(publicClient: PublicClient<Transport, Chain>, agent: W
   return {
     signer: agent.account.address,
     chainId: () => publicClient.getChainId(),
-    async readState(vault) {
-      const state = await publicClient.readContract({ address: vault, abi: VAULT_ABI, functionName: 'state' });
+    async readSnapshot(vault, accounts) {
+      const block = await publicClient.getBlock({ blockTag: 'latest' });
+      const blockNumber = block.number;
+      const [state, claimed] = await Promise.all([
+        publicClient.readContract({ address: vault, abi: VAULT_ABI, functionName: 'state', blockNumber }),
+        accounts.length === 0
+          ? Promise.resolve([] as bigint[])
+          : publicClient.multicall({
+              contracts: accounts.map((account) => ({
+                address: vault,
+                abi: VAULT_ABI,
+                functionName: 'claimed' as const,
+                args: [account] as const,
+              })),
+              allowFailure: false,
+              blockNumber,
+            }),
+      ]);
       return {
+        blockNumber,
+        timestamp: block.timestamp,
         agent: parseAddress(state.agent),
         deposited: state.deposited,
+        totalPaid: state.totalPaid,
         perWalletCap: state.perWalletCap,
+        endTime: state.endTime,
+        rootDelay: BigInt(state.rootDelay),
+        paused: state.paused,
         pendingRoot: state.pendingRoot,
+        claimed: new Map(accounts.map((account, i) => [account, claimed[i] as bigint])),
       };
+    },
+    async findVaultCreated(factory, vault, block) {
+      const logs = await publicClient.getLogs({
+        address: factory,
+        event: VAULT_CREATED,
+        args: { vault },
+        fromBlock: block,
+        toBlock: block,
+        strict: true,
+      });
+      return logs
+        .filter((log) => parseAddress(log.address) === factory && parseAddress(log.args.vault) === vault)
+        .map((log) => ({
+          token: parseAddress(log.args.token),
+          owner: parseAddress(log.args.owner),
+          agent: parseAddress(log.args.agent),
+          perWalletCap: log.args.perWalletCap,
+          endTime: log.args.endTime,
+          rootDelay: BigInt(log.args.rootDelay),
+        }));
     },
     async sendPostRoot(vault, root, declaredTotal) {
       const { request } = await publicClient.simulateContract({
