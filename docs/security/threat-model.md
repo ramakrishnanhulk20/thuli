@@ -264,7 +264,9 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer
   of exactly the price from the payer to our payTo in the network's USDC; a used nonce alone is not proof, because a
   payer can cancel or spend it elsewhere. A timeout or error returns retry with the claim kept, so a header never pays
-  twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed.
+  twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed. A claim is remembered for at most the
+  route's 300-second timeout; once forgotten, a copy of the header falls back to the on-chain nonce, which the
+  facilitator refuses because it is spent.
   Non-goal: a facilitator that fails after broadcasting leaves a landed payment unserved until the buyer retries the same
   header and its settlement resolves.
 - **C26. The paid path cannot cost more than it earns.** The worst-case cost of one paid screening is a stated number
@@ -281,16 +283,22 @@ or attack that demonstrates it. A work order that carries an invariant also carr
 - **C29. Campaigns are separate accounts.** Claims for one campaign never draw on another's deposit, and total paid
   never exceeds the deposit. Shown by: a fuzz test of these invariants over deposits and claims.
 - **C30. A stolen agent key has a stated maximum loss.** The agent key can post roots and nothing else. The contract
-  enforces a per-wallet cap the owner sets at deposit, and every root the agent posts waits a delay the owner can cancel
-  during. Shown by: every owner-only function called from the agent key reverts; a leaf above the cap cannot be claimed
-  past the cap; a root cancelled inside its delay never becomes claimable.
+  enforces a per-wallet cap the owner sets when the vault is created, and every root the agent posts waits a delay the
+  owner can cancel during; a pause freezes that delay. Stated loss: if nobody cancels inside the delay, a stolen key can
+  direct whatever the deposit has not yet paid out, at most the cap per wallet. Every root is public through RootPosted.
+  Known gap: no watcher yet rebuilds each posted root from the published list and alerts the owner inside the delay.
+  Shown by: every owner-only function called from the agent key reverts; a leaf above the cap cannot be claimed past the
+  cap; a root cancelled inside its delay never becomes claimable; a pause of any length leaves a pending root the full
+  delay of unpaused time.
 - **C31. The owner cannot pull funds out from under claimants.** Only the owner can withdraw, only after the campaign
   ends, and the end time can never move earlier. A pause moves the end later by exactly the time spent paused, and no
   withdrawal runs while paused, so pausing cannot run out the claim window. Claims pay only the address in the leaf.
   Shown by: a withdrawal before the end reverts; a claim submitted by a third party pays the leaf's address; a pause of
   any length extends the end by that length.
 - **C32. The chain matches the public list.** Before signing, the server rebuilds the root from the published list and
-  refuses to submit if leaf amounts exceed the deposit or the root differs from the one anyone can rebuild. Shown by: a
+  refuses to submit if what the list still owes (each capped amount minus what that wallet already claimed) exceeds what
+  the pool still holds, or the root differs from the one anyone can rebuild. It also refuses a vault that did not come
+  from the recorded factory, or whose token, owner, agent, cap, end or delay differ from the campaign record. Shown by: a
   script rebuilds the root from the public pages and it matches the on-chain root.
 
 **Outputs**

@@ -6,7 +6,10 @@ export const CLIENT_MAX_RUNNING = 1;
 export const CLIENT_MAX_PER_MINUTE = 20;
 /** Paid requests one client may make in any hour that end without a settled payment. */
 export const CLIENT_MAX_FAILED_PER_HOUR = 5;
-/** Clients remembered at once. Past this, a client not yet known is refused rather than letting the map grow (C41). */
+/**
+ * Clients remembered at once (C41). A new client past this makes room by forgetting the least recently seen client with
+ * nothing running. Only when every tracked client has a request in flight is a new one refused as busy.
+ */
 export const MAX_CLIENTS_TRACKED = 100_000;
 
 const MINUTE_MS = 60_000;
@@ -74,7 +77,10 @@ export function canonicalClient(value: string | undefined): string | null {
  * address or the platform's trusted header, never a header the client writes itself.
  *
  * Memory only, in this process. Each client keeps at most 20 request times and 5 failure times, and a client idle for an
- * hour with nothing running is forgotten, oldest first, as new requests arrive.
+ * hour with nothing running is forgotten, oldest first, as new requests arrive. When the table is full, the least
+ * recently seen idle client is forgotten early, so a flood of addresses can never shut out a new caller. The price: a
+ * caller cycling more than 100,000 addresses within the hour starts the oldest of them fresh, which fresh addresses would
+ * give it anyway.
  */
 export class ClientLimits {
   readonly #clients = new Map<string, Client>();
@@ -94,7 +100,7 @@ export class ClientLimits {
     this.#forgetIdle(now);
     let state = this.#clients.get(client);
     if (state === undefined) {
-      if (this.#clients.size >= MAX_CLIENTS_TRACKED) return { refused: 'clients' };
+      if (this.#clients.size >= MAX_CLIENTS_TRACKED && !this.#forgetLeastRecentIdle()) return { refused: 'clients' };
       state = { running: 0, requests: [], failed: [], lastSeen: now, passes: new WeakSet() };
     }
     dropBefore(state.requests, now - MINUTE_MS);
@@ -136,5 +142,16 @@ export class ClientLimits {
       if (now - state.lastSeen < HOUR_MS) return;
       if (state.running === 0) this.#clients.delete(client);
     }
+  }
+
+  // Skips only clients with a request in flight, each of which costs its caller an open connection.
+  #forgetLeastRecentIdle(): boolean {
+    for (const [client, state] of this.#clients) {
+      if (state.running === 0) {
+        this.#clients.delete(client);
+        return true;
+      }
+    }
+    return false;
   }
 }

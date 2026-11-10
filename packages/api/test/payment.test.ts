@@ -24,7 +24,14 @@ import { createApp, HEALTH_PATH, SCREEN_PATH } from '../src/app.ts';
 import { loadApiConfig, PRICE_UNITS, type ApiConfig } from '../src/config.ts';
 import { MAX_PER_DAY, MAX_RUNNING, ScreenGuard } from '../src/guard.ts';
 import { MAX_CLAIMS, PaymentClaims } from '../src/claims.ts';
-import { canonicalClient, CLIENT_MAX_FAILED_PER_HOUR, CLIENT_MAX_PER_MINUTE, ClientLimits, type Pass } from '../src/limits.ts';
+import {
+  canonicalClient,
+  CLIENT_MAX_FAILED_PER_HOUR,
+  CLIENT_MAX_PER_MINUTE,
+  ClientLimits,
+  MAX_CLIENTS_TRACKED,
+  type Pass,
+} from '../src/limits.ts';
 import type { ReadReceipt, Receipt } from '../src/receipt.ts';
 import { OUTPUT_CHECK_CAUSE, PaidScreenResponse } from '../src/schema.ts';
 
@@ -515,6 +522,8 @@ describe('POST /api/x402/screen refusals before payment', () => {
     let clock = new Date();
     const { appFetch, fetchAs, client, screen, facilitator } = setup({ now: () => clock });
     const header = await signedHeader(appFetch, client);
+    // Read after signing, so the claim's memory runs to validBefore here and not a second short of it.
+    clock = new Date();
     expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(200);
     const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
 
@@ -660,7 +669,7 @@ describe('per-client limits on the paid route (C24, C42)', () => {
     for (let index = 0; index <= CLIENT_MAX_PER_MINUTE; index += 1) {
       const reply = await fetchAs(`10.0.0.${index + 1}`)(
         url(SCREEN_PATH),
-        post({ wallet: WALLET }, { 'x-vercel-forwarded-for': `${ATTACKER}, 10.9.9.9`, 'x-forwarded-for': `198.51.100.${index + 1}` }),
+        post({ wallet: WALLET }, { 'x-vercel-forwarded-for': ATTACKER, 'x-forwarded-for': `198.51.100.${index + 1}` }),
       );
       statuses.push(reply.status);
     }
@@ -672,6 +681,12 @@ describe('per-client limits on the paid route (C24, C42)', () => {
     const missing = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-forwarded-for': HONEST }));
     expect(missing.status).toBe(400);
     expect(missing.headers.get('payment-required')).toBeNull();
+    // Behind a proxy that appends, the first value of a list is whatever the client wrote, so a list is refused.
+    for (const list of [`198.51.100.250, ${ATTACKER}`, `${HONEST},${HONEST}`]) {
+      const listed = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-vercel-forwarded-for': list }));
+      expect(listed.status, list).toBe(400);
+      expect(listed.headers.get('payment-required'), list).toBeNull();
+    }
 
     // Moving around inside one IPv6 /64 is still one client.
     const fromNetwork: number[] = [];
@@ -680,6 +695,21 @@ describe('per-client limits on the paid route (C24, C42)', () => {
       fromNetwork.push(reply.status);
     }
     expect(fromNetwork).toEqual([...Array(CLIENT_MAX_PER_MINUTE).fill(402), 429]);
+    warn.mockRestore();
+  });
+
+  it('still answers a new client with the 402 terms after 100,000 other clients inside one hour', { timeout: 120_000 }, async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const clock = new Date('2026-11-10T08:00:00.000Z');
+    const { fetchAs } = setup({ now: () => clock });
+    for (let index = 0; index < MAX_CLIENTS_TRACKED; index += 1) {
+      const address = `10.${(index >> 16) & 255}.${(index >> 8) & 255}.${index & 255}`;
+      const reply = await fetchAs(address)(url(SCREEN_PATH), post({}));
+      if (reply.status !== 400) throw new Error(`client ${address} got ${reply.status}`);
+    }
+    const fresh = await fetchAs(HONEST)(url(SCREEN_PATH), post({ wallet: WALLET }));
+    expect(fresh.status).toBe(402);
+    expect(fresh.headers.get('payment-required')).not.toBeNull();
     warn.mockRestore();
   });
 
@@ -706,7 +736,7 @@ describe('per-client limits on the paid route (C24, C42)', () => {
 
 describe('PaymentClaims', () => {
   it('holds at most MAX_CLAIMS, forgets only expired claims no request holds, and lets an unsure claim pass to one retry', () => {
-    const claims = new PaymentClaims();
+    const claims = new PaymentClaims(300n);
     const now = 1_000n;
     const owner = {};
     for (let index = 0; index < MAX_CLAIMS - 1; index += 1) {
@@ -732,6 +762,23 @@ describe('PaymentClaims', () => {
     claims.markUsed('unsure', second);
     claims.release('unsure', second);
     expect(claims.claim('unsure', now + 50n, {}, now)).toBe('in-use');
+  });
+});
+
+describe('PaymentClaims memory', () => {
+  it('forgets a used claim maxTimeoutSeconds after it was taken, however far away its validBefore, so such claims cannot fill the map', () => {
+    const claims = new PaymentClaims(300n);
+    const now = 1_000n;
+    const yearsAway = now + 10n * 365n * 86_400n;
+    const owner = {};
+    for (let index = 0; index < MAX_CLAIMS; index += 1) {
+      claims.claim(`far-${index}`, yearsAway, owner, now);
+      claims.markUsed(`far-${index}`, owner);
+    }
+    expect(claims.claim('new', yearsAway, {}, now + 299n)).toBe('full');
+    expect(claims.claim('far-0', yearsAway, {}, now + 299n)).toBe('in-use');
+    expect(claims.claim('new', yearsAway, {}, now + 300n)).toBe('taken');
+    expect(claims.size).toBe(1);
   });
 });
 
@@ -786,6 +833,23 @@ describe('ClientLimits', () => {
     later(3_600_000);
     admitted('c', false);
     expect(limits.size).toBe(1);
+  });
+
+  it('refuses a new client as busy only while every tracked client has a request in flight', () => {
+    const clock = new Date('2026-11-10T08:00:00.000Z');
+    const limits = new ClientLimits(() => clock);
+    const passes: Pass[] = [];
+    for (let index = 0; index < MAX_CLIENTS_TRACKED; index += 1) {
+      const pass = limits.enter(`running-${index}`, true);
+      if ('refused' in pass) throw new Error(`refused for ${pass.refused}`);
+      passes.push(pass);
+    }
+    expect(limits.enter('newcomer', false)).toEqual({ refused: 'clients' });
+    limits.leave(passes[500] as Pass);
+    const admitted = limits.enter('newcomer', false);
+    expect('refused' in admitted).toBe(false);
+    expect(limits.size).toBe(MAX_CLIENTS_TRACKED);
+    expect(limits.enter('running-500', true)).not.toEqual({ refused: 'running' });
   });
 });
 

@@ -23,6 +23,8 @@ export const HEALTH_PATH = '/api/x402/health';
 
 // A real request is about 60 bytes: {"wallet":"0x" plus 40 hex}. Anything near this is not a screening request (C41).
 const MAX_BODY_BYTES = 1024;
+// The library's own default, written out because the claim map's memory is sized from it.
+const MAX_TIMEOUT_SECONDS = 300;
 // Kept under the 500 characters past which verify fails (x402 issue 2284), and written as a description, not an instruction.
 const DESCRIPTION =
   "Screens one Ethereum wallet with Thuli's airdrop rulebook v2 and returns a decision (full, partial, hold or exclude) " +
@@ -78,11 +80,16 @@ const refuse = (reason: string) => ({ abort: true as const, reason });
 const isPaying = (c: Context) => Boolean(c.req.header('payment-signature') || c.req.header('x-payment'));
 
 /**
- * The caller's address: the first value of the configured trusted header when one is set, otherwise the socket's peer
- * address. X-Forwarded-For is never read unless it is the configured name. Null when neither can be read.
+ * The caller's address: the configured trusted header when one is set, otherwise the socket's peer address.
+ * X-Forwarded-For is never read unless it is the configured name. Null when the address cannot be read, or when the
+ * trusted header holds a list: behind a proxy that appends, the first value is the one the client wrote, and a header
+ * sent twice arrives as a list too.
  */
 function clientOf(c: Context, trustedHeader: string | null): string | null {
-  if (trustedHeader !== null) return canonicalClient(c.req.header(trustedHeader)?.split(',')[0]);
+  if (trustedHeader !== null) {
+    const value = c.req.header(trustedHeader);
+    return value === undefined || value.includes(',') ? null : canonicalClient(value);
+  }
   try {
     return canonicalClient(getConnInfo(c).remote.address);
   } catch {
@@ -132,6 +139,7 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
           price: PRICE,
           network: config.networkId,
           payTo: config.payTo,
+          maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
           extra: { paymentFlow: 'upfront' },
         },
       ],
@@ -176,7 +184,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   const now = deps.now ?? (() => new Date());
   const guard = new ScreenGuard(now);
   const limits = new ClientLimits(now);
-  const claims = new PaymentClaims();
+  const claims = new PaymentClaims(BigInt(MAX_TIMEOUT_SECONDS));
   const paidRequests = new AsyncLocalStorage<PaidRequest>();
   const readReceipt = deps.readReceipt ?? receiptReader(config.settlementRpcUrl, config.chainId);
 

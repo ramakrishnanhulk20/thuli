@@ -2,13 +2,10 @@ import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
 import { PRICE_UNITS, type NetworkId } from './config.ts';
 
-/** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
+/** Claims remembered at once (C41). Past this, with none due to be forgotten, a new payment is refused as busy. */
 export const MAX_CLAIMS = 100_000;
 
-/**
- * An authorization at or past its validBefore can never settle on chain. The one comparison decides both that such an
- * authorization is refused and that its claim may be forgotten, so forgetting a claim can never let it back in.
- */
+/** An authorization at or past its validBefore can never settle on chain, so it is refused before it is claimed. */
 export function hasExpired(validBefore: bigint, nowSeconds: bigint): boolean {
   return validBefore <= nowSeconds;
 }
@@ -18,7 +15,7 @@ type State = 'held' | 'unsure' | 'used';
 interface Claim {
   owner: object | null;
   state: State;
-  validBefore: bigint;
+  forgetAt: bigint;
 }
 
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'full';
@@ -32,26 +29,40 @@ export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'full';
  * it pending without proof), it stays as unsure: owned by no request, it lets the same authorization come back and try
  * again through the facilitator, one copy at a time, and it is never served on a guess.
  *
- * Memory only, in this process, at most MAX_CLAIMS entries, each forgotten once its authorization has expired. A restart
- * forgets every claim; then the on-chain nonce and the expiry check are the guards.
+ * Memory only, in this process, at most MAX_CLAIMS entries. A claim no request holds is forgotten at the earlier of its
+ * validBefore and rememberSeconds (the route's maxTimeoutSeconds) after it was taken, so an authorization signed to stay
+ * valid for years cannot hold a place in the map. Before its validBefore, a forgotten authorization can come back: it
+ * goes to the facilitator again, where its nonce, already spent on chain, makes the settle fail. After its validBefore
+ * it is refused here. A restart forgets every claim, with the same two guards left.
  */
 export class PaymentClaims {
   readonly #claims = new Map<string, Claim>();
+  readonly #rememberSeconds: bigint;
+
+  constructor(rememberSeconds: bigint) {
+    this.#rememberSeconds = rememberSeconds;
+  }
 
   /** Takes the key for owner. Refuses an expired authorization, a key another request holds or used, and a full map. */
   claim(key: string, validBefore: bigint, owner: object, nowSeconds: bigint): ClaimResult {
     if (hasExpired(validBefore, nowSeconds)) return 'expired';
-    const entry = this.#claims.get(key);
+    const latest = nowSeconds + this.#rememberSeconds;
+    const forgetAt = validBefore < latest ? validBefore : latest;
+    let entry = this.#claims.get(key);
+    if (entry !== undefined && this.#due(entry, nowSeconds)) {
+      this.#claims.delete(key);
+      entry = undefined;
+    }
     if (entry !== undefined) {
       if (entry.state !== 'unsure') return 'in-use';
       entry.owner = owner;
       entry.state = 'held';
-      if (validBefore > entry.validBefore) entry.validBefore = validBefore;
+      entry.forgetAt = forgetAt;
       return 'taken';
     }
-    if (this.#claims.size >= MAX_CLAIMS) this.#forgetExpired(nowSeconds);
+    if (this.#claims.size >= MAX_CLAIMS) this.#forgetDue(nowSeconds);
     if (this.#claims.size >= MAX_CLAIMS) return 'full';
-    this.#claims.set(key, { owner, state: 'held', validBefore });
+    this.#claims.set(key, { owner, state: 'held', forgetAt });
     return 'taken';
   }
 
@@ -86,10 +97,15 @@ export class PaymentClaims {
     return entry !== undefined && entry.state === 'held' && entry.owner === owner ? entry : undefined;
   }
 
+  // A held claim belongs to a request in flight and is never forgotten under it.
+  #due(entry: Claim, nowSeconds: bigint): boolean {
+    return entry.state !== 'held' && entry.forgetAt <= nowSeconds;
+  }
+
   // Runs only when the map is full, so its cost is paid once per wave of new claims, not on every request.
-  #forgetExpired(nowSeconds: bigint): void {
+  #forgetDue(nowSeconds: bigint): void {
     for (const [key, entry] of this.#claims) {
-      if (entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds)) this.#claims.delete(key);
+      if (this.#due(entry, nowSeconds)) this.#claims.delete(key);
     }
   }
 }
