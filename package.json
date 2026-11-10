@@ -4,21 +4,24 @@
   "type": "module",
   "workspaces": [
     "packages/core",
-    "packages/worker"
+    "packages/worker",
+    "packages/api"
   ],
   "engines": {
     "node": ">=26"
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc -p packages/core/tsconfig.json && tsc -p packages/worker/tsconfig.json",
+    "typecheck": "tsc -p packages/core/tsconfig.json && tsc -p packages/worker/tsconfig.json && tsc -p packages/api/tsconfig.json",
     "prove:slice": "node --env-file=.env --import tsx packages/worker/scripts/prove-slice.ts",
     "replay:robo": "node --env-file=.env --import tsx packages/worker/scripts/replay-robo.ts",
     "replay:hop": "node --env-file=.env --import tsx packages/worker/scripts/replay-hop.ts",
     "decide:robo": "node --env-file=.env --import tsx packages/worker/scripts/decide-robo.ts",
     "feedback:reppo": "node --env-file=.env --import tsx packages/worker/scripts/feedback-reppo.ts",
     "versions:score": "node --env-file=.env --import tsx packages/worker/scripts/versions-score.ts",
-    "appeal:demo": "node --env-file=.env --import tsx packages/worker/scripts/appeal-demo.ts"
+    "appeal:demo": "node --env-file=.env --import tsx packages/worker/scripts/appeal-demo.ts",
+    "api:dev": "node --env-file=.env --import tsx packages/api/src/server.ts",
+    "prove:paid": "node --env-file=.env --import tsx packages/api/scripts/prove-paid.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

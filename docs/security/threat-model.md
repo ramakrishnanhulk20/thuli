@@ -248,12 +248,14 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   without sign-in or payment has a per-client and a global daily ceiling; at the ceiling the endpoint says it is busy
   and returns no decision. Results are cached by canonical address, chain and rule version. Shown by: all spellings of
   one address cost one model run between them, and a client past its ceiling is refused.
-- **C25. No paid result goes out without a settled payment for that exact request.** The price is computed from the
-  body of the request that carries the payment. The payment must be on Base mainnet, in the canonical Base USDC
-  contract, to our payTo, at least the price, inside its validity window, with a never-used nonce. The result leaves
-  only after settlement succeeds; a failed screening is not settled; one authorization buys one result under concurrent
-  retries; testnet networks are refused unless a default-off flag allows them. Shown by: one `X-PAYMENT` replayed in 10
-  parallel requests yields one result, and a Base Sepolia payment to production is refused.
+- **C25. No paid result goes out without a settled payment for that exact request.** The route uses x402's upfront
+  flow: the facilitator settles the signed payment before the screening runs, so a result never goes out on an unsettled
+  authorization, and a second copy of one `PAYMENT-SIGNATURE` fails at settlement because its nonce is spent. The
+  payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
+  price (the exact scheme needs strict equality), inside its validity window. Production runs on Base mainnet; Base
+  Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
+  (hold, with the cause), so a settled payment always buys a result. Shown by: one payment header replayed in 10 parallel
+  requests yields one result, and a Base Sepolia payment to a mainnet route is refused.
 - **C26. The paid path cannot cost more than it earns.** The worst-case cost of one paid screening is a stated number
   below the price, enforced by a per-request spend cap. Shown by: the cap holds for a wallet that triggers all four hops.
 
