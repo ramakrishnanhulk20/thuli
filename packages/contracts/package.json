@@ -5,7 +5,9 @@
   "scripts": {
     "build": "forge build",
     "test": "forge test",
-    "lint": "solhint \"src/**/*.sol\" \"test/**/*.sol\""
+    "lint": "solhint \"src/**/*.sol\" \"test/**/*.sol\" \"script/**/*.sol\"",
+    "deploy": "node --env-file=../../.env script/deploy.mjs",
+    "rehearse": "node --env-file=../../.env script/rehearse.mjs"
   },
   "devDependencies": {
     "@openzeppelin/contracts": "5.7.0",

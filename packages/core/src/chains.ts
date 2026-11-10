@@ -1,6 +1,12 @@
 export const CHAINS = {
   ethereum: { id: 1 },
   base: { id: 8453 },
+  // The vault's testnet: Circle's test USDC there, and the explorer every printed transaction link points to.
+  'base-sepolia': {
+    id: 84532,
+    usdc: '0x036CbD53842c5426634e7929541eC2318f3dCF7e',
+    explorer: 'https://sepolia.basescan.org',
+  },
 } as const;
 
 export type ChainName = keyof typeof CHAINS;

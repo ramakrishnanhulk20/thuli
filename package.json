@@ -23,7 +23,9 @@
     "api:dev": "npm --prefix packages/api run dev",
     "prove:paid": "node --env-file=.env.api --env-file=.env.payer --import tsx packages/api/scripts/prove-paid.ts",
     "contracts:test": "forge test --root packages/contracts",
-    "contracts:lint": "npm run lint --prefix packages/contracts"
+    "contracts:lint": "npm run lint --prefix packages/contracts",
+    "vault:deploy": "node --env-file=.env packages/contracts/script/deploy.mjs",
+    "prove:vault": "node --env-file=.env --import tsx packages/worker/scripts/prove-vault.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
