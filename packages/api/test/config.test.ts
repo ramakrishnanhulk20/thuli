@@ -3,7 +3,8 @@
 import { HTTPFacilitatorClient } from '@x402/core/server';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, DEFAULT_PORT, loadApiConfig } from '../src/config.ts';
+import { PayerKeyError, takePayerAccount } from '../scripts/payer-key.ts';
+import { BASE_SEPOLIA_RPC, ConfigError, DEFAULT_PORT, loadApiConfig } from '../src/config.ts';
 
 const PAY_TO = '0x1111111111111111111111111111111111111111';
 const WORKER_KEY = generatePrivateKey();
@@ -13,8 +14,6 @@ const CDP_SECRET = 'cdp-secret-that-must-never-print';
 const testnet = (extra: Record<string, string | undefined> = {}) => ({
   X402_NETWORK: 'base-sepolia',
   PAYTO_ADDRESS_TESTNET: PAY_TO,
-  WORKER_PRIVATE_KEY: WORKER_KEY,
-  PAYER_PRIVATE_KEY: PAYER_KEY,
   ...extra,
 });
 
@@ -24,6 +23,7 @@ const mainnet = (extra: Record<string, string | undefined> = {}) => ({
   CDP_API_KEY_ID: 'cdp-key-id',
   CDP_API_KEY_SECRET: CDP_SECRET,
   PUBLIC_ORIGIN: 'https://api.thuli.example',
+  BASE_RPC_URL: 'https://mainnet.base.org',
   ...extra,
 });
 
@@ -80,21 +80,39 @@ describe('loadApiConfig', () => {
     expect(error.message).toContain('CDP_API_KEY_SECRET');
   });
 
-  it('refuses a payTo that is the address of a key on this machine (C39)', () => {
-    const workerAddress = privateKeyToAccount(WORKER_KEY).address;
-    const payerAddress = privateKeyToAccount(PAYER_KEY).address;
-    const asWorker = configError(testnet({ PAYTO_ADDRESS_TESTNET: workerAddress.toLowerCase() }));
-    expect(asWorker.message).toContain('WORKER_PRIVATE_KEY');
-    expect(asWorker.message).not.toContain(WORKER_KEY);
-    expect(configError(mainnet({ PAYTO_ADDRESS: payerAddress, PAYER_PRIVATE_KEY: PAYER_KEY.slice(2) })).message).toContain(
-      'PAYER_PRIVATE_KEY',
-    );
+  it('refuses to start while any private key is in its environment, naming it and never printing it (C39)', () => {
+    const worker = configError(testnet({ WORKER_PRIVATE_KEY: WORKER_KEY }));
+    expect(worker.message).toContain('WORKER_PRIVATE_KEY');
+    expect(worker.message).not.toContain(WORKER_KEY.slice(2));
+    // Checked before the network, so even a half-written env file with a key in it refuses for the key.
+    const several = configError({ vault_agent_private_key: 'not-even-hex', PRIVATE_KEY: PAYER_KEY });
+    expect(several.message).toContain('PRIVATE_KEY, vault_agent_private_key');
+    expect(several.message).not.toContain('not-even-hex');
+    expect(several.message).not.toContain(PAYER_KEY.slice(2));
+    expect(configError(mainnet({ PAYER_PRIVATE_KEY: PAYER_KEY })).message).toContain('PAYER_PRIVATE_KEY');
+    expect(loadApiConfig(testnet({ WORKER_PRIVATE_KEY: '  ', PRIVATE_KEY_PATH: '/keys/x' })).network).toBe('base-sepolia');
   });
 
-  it('refuses a key it cannot read, because the payTo check would then pass blind', () => {
-    const error = configError(testnet({ WORKER_PRIVATE_KEY: 'not-a-key' }));
-    expect(error.message).toContain('WORKER_PRIVATE_KEY');
-    expect(error.message).not.toContain('not-a-key');
+  it('takes the payer key out of the environment, so the API started next in the same process sees none (C39)', () => {
+    const env: Record<string, string | undefined> = testnet({ PAYER_PRIVATE_KEY: PAYER_KEY.slice(2) });
+    expect(configError(env).message).toContain('PAYER_PRIVATE_KEY');
+    expect(takePayerAccount(env).address).toBe(privateKeyToAccount(PAYER_KEY).address);
+    expect('PAYER_PRIVATE_KEY' in env).toBe(false);
+    expect(loadApiConfig(env).network).toBe('base-sepolia');
+
+    const unreadable: Record<string, string | undefined> = { PAYER_PRIVATE_KEY: 'not-a-key' };
+    const error = (() => {
+      try {
+        takePayerAccount(unreadable);
+      } catch (caught) {
+        return caught;
+      }
+      throw new Error('expected a PayerKeyError');
+    })();
+    expect(error).toBeInstanceOf(PayerKeyError);
+    expect((error as PayerKeyError).message).toContain('PAYER_PRIVATE_KEY');
+    expect((error as PayerKeyError).message).not.toContain('not-a-key');
+    expect('PAYER_PRIVATE_KEY' in unreadable).toBe(false);
   });
 
   it('needs an https PUBLIC_ORIGIN with no path on mainnet, and makes it optional on Base Sepolia', () => {
@@ -105,6 +123,13 @@ describe('loadApiConfig', () => {
     }
     expect(loadApiConfig(testnet()).publicOrigin).toBeNull();
     expect(loadApiConfig(testnet({ PUBLIC_ORIGIN: 'https://test.thuli.example' })).publicOrigin).toBe('https://test.thuli.example');
+  });
+
+  it('reads pending settlements from BASE_RPC_URL on mainnet, which is required and https, and from the public RPC on Sepolia', () => {
+    expect(loadApiConfig(mainnet()).settlementRpcUrl).toBe('https://mainnet.base.org');
+    expect(configError(mainnet({ BASE_RPC_URL: undefined })).message).toContain('BASE_RPC_URL');
+    expect(configError(mainnet({ BASE_RPC_URL: 'http://mainnet.base.org' })).message).toContain('BASE_RPC_URL');
+    expect(loadApiConfig(testnet({ BASE_RPC_URL: 'https://elsewhere.example' })).settlementRpcUrl).toBe(BASE_SEPOLIA_RPC);
   });
 
   it('refuses a facilitator that is not https and a port out of range', () => {

@@ -1,17 +1,21 @@
 // Not covered here: a real facilitator or a real chain (the facilitator is a stub that never checks signatures and,
 // on purpose, answers success to every settle, even a repeat, which is the worst case for replay), the CDP facilitator's
-// authentication, the live screening (the screen is a stand-in), and limits across several processes.
+// authentication, the live screening (the screen is a stand-in), limits across several processes, a real proxy
+// writing the trusted client header (the tests write it themselves), and a real receipt read (the reader is a stub, so
+// the RPC's timeout, size cap and chain check in receipt.ts are not run here). Most tests name the client by handing the app a
+// socket address the way @hono/node-server does; one test runs a real server to show the real socket is what counts.
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { isIP, type AddressInfo } from 'node:net';
 import { serve } from '@hono/node-server';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader } from '@x402/core/http';
-import type { FacilitatorClient } from '@x402/core/server';
+import { FacilitatorTimeoutError, type FacilitatorClient } from '@x402/core/server';
 import type { PaymentPayload, PaymentRequirements, SettleResponse, SupportedResponse, VerifyResponse } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { validateDiscoveryExtension, type DiscoveryExtension } from '@x402/extensions/bazaar';
 import { wrapFetchWithPayment } from '@x402/fetch';
+import { encodeAbiParameters, encodeEventTopics, parseAbi, type Hex, type Log } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it, vi } from 'vitest';
 import { parseAddress, type Address } from '@thuli/core';
@@ -19,22 +23,32 @@ import { heldScreen, SCREEN_CAUSES, type SingleScreen } from '@thuli/worker/src/
 import { createApp, HEALTH_PATH, SCREEN_PATH } from '../src/app.ts';
 import { loadApiConfig, PRICE_UNITS, type ApiConfig } from '../src/config.ts';
 import { MAX_PER_DAY, MAX_RUNNING, ScreenGuard } from '../src/guard.ts';
+import { MAX_CLAIMS, PaymentClaims } from '../src/claims.ts';
+import { canonicalClient, CLIENT_MAX_FAILED_PER_HOUR, CLIENT_MAX_PER_MINUTE, ClientLimits, type Pass } from '../src/limits.ts';
+import type { ReadReceipt, Receipt } from '../src/receipt.ts';
 import { OUTPUT_CHECK_CAUSE, PaidScreenResponse } from '../src/schema.ts';
 
 const ORIGIN = 'http://thuli.test';
+const CLIENT = '192.0.2.10';
 const PAY_TO = parseAddress('0x2222222222222222222222222222222222222222');
 const WALLET = parseAddress('0x041f77015fe51c51ae49a7f2f3ff86c641fa190a');
 const HASH = `0x${'ab'.repeat(32)}`;
 const SETTLE_TX = `0x${'5e'.repeat(32)}`;
 
-function authorizationFrom(payload: PaymentPayload): { from: string; nonce: string } {
-  return (payload.payload as { authorization: { from: string; nonce: string } }).authorization;
+function authorizationFrom(payload: PaymentPayload): { from: string; nonce: string; validBefore: string } {
+  return (payload.payload as { authorization: { from: string; nonce: string; validBefore: string } }).authorization;
 }
 
 class StubFacilitator implements FacilitatorClient {
   readonly settled: PaymentPayload[] = [];
   verified = 0;
   failSettle = false;
+  /** Lowercase payers whose settles fail for want of funds. */
+  readonly unfunded = new Set<string>();
+  /** While set, settles for unfunded payers wait on it, as a slow facilitator would, each holding a place meanwhile. */
+  holdUnfunded: Promise<void> | null = null;
+  /** When set, every settle answers with this instead, so a test can script a pending, a throw or a refusal. */
+  respond: ((payload: PaymentPayload, requirements: PaymentRequirements) => Promise<SettleResponse>) | null = null;
   readonly #network: string;
 
   constructor(network: string) {
@@ -56,9 +70,12 @@ class StubFacilitator implements FacilitatorClient {
 
   async settle(payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> {
     this.settled.push(payload);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (this.respond !== null) return this.respond(payload, requirements);
     const payer = authorizationFrom(payload).from;
-    if (this.failSettle) {
+    const broke = this.unfunded.has(payer.toLowerCase());
+    if (broke && this.holdUnfunded !== null) await this.holdUnfunded;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (this.failSettle || broke) {
       return { success: false, errorReason: 'insufficient_funds', transaction: '', network: requirements.network, payer };
     }
     return { success: true, transaction: SETTLE_TX, network: requirements.network, payer };
@@ -89,21 +106,46 @@ function testnetConfig(facilitator: FacilitatorClient): ApiConfig {
   return { ...loadApiConfig({ X402_NETWORK: 'base-sepolia', PAYTO_ADDRESS_TESTNET: PAY_TO }), facilitator };
 }
 
-function setup(options: { screen?: (wallet: Address) => Promise<SingleScreen>; config?: ApiConfig; facilitator?: StubFacilitator } = {}) {
+/** What @hono/node-server hands the app for a request that arrived on a socket from this address. */
+function socketFrom(address: string) {
+  return { incoming: { socket: { remoteAddress: address, remotePort: 40_000, remoteFamily: isIP(address) === 6 ? 'IPv6' : 'IPv4' } } };
+}
+
+interface SetupOptions {
+  screen?: (wallet: Address) => Promise<SingleScreen>;
+  config?: ApiConfig;
+  facilitator?: StubFacilitator;
+  now?: () => Date;
+  readReceipt?: ReadReceipt;
+}
+
+const noChain: ReadReceipt = async () => {
+  throw new Error('these tests read no chain unless they say so');
+};
+
+function setup(options: SetupOptions = {}) {
   const facilitator = options.facilitator ?? new StubFacilitator('eip155:84532');
   const screen = vi.fn(options.screen ?? (async (wallet: Address) => screenResult(wallet)));
-  const app = createApp(options.config ?? testnetConfig(facilitator), { screen });
+  const app = createApp(options.config ?? testnetConfig(facilitator), {
+    screen,
+    readReceipt: options.readReceipt ?? noChain,
+    ...(options.now !== undefined && { now: options.now }),
+  });
   const sentSignatures: string[] = [];
-  const appFetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-    const request = new Request(input, init);
-    const signature = request.headers.get('payment-signature');
-    if (signature !== null) sentSignatures.push(signature);
-    return app.fetch(request);
-  };
+  const fetchAs =
+    (address: string) =>
+    async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const request = new Request(input, init);
+      const signature = request.headers.get('payment-signature');
+      if (signature !== null) sentSignatures.push(signature);
+      return app.fetch(request, socketFrom(address));
+    };
+  const appFetch = fetchAs(CLIENT);
   const account = privateKeyToAccount(generatePrivateKey());
   const client = new x402Client().register('eip155:84532', new ExactEvmScheme(account));
-  const pay = wrapFetchWithPayment(appFetch, client);
-  return { app, facilitator, screen, appFetch, pay, client, account, sentSignatures };
+  const payAs = (address: string) => wrapFetchWithPayment(fetchAs(address), client);
+  const pay = payAs(CLIENT);
+  return { app, facilitator, screen, appFetch, fetchAs, pay, payAs, client, account, sentSignatures };
 }
 
 const post = (body: unknown, headers: Record<string, string> = {}): RequestInit => ({
@@ -225,10 +267,11 @@ describe('POST /api/x402/screen with a payment', () => {
   });
 
   it('gives one result for one payment header sent 10 times at once, and none when it is sent again later', async () => {
-    const { appFetch, client, screen, facilitator } = setup();
+    const { appFetch, fetchAs, client, screen, facilitator } = setup();
     const header = await signedHeader(appFetch, client);
+    // Ten different clients, so the per-client limits stay out of the way and the claim alone is what refuses copies.
     const replies = await Promise.all(
-      Array.from({ length: 10 }, () => appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))),
+      Array.from({ length: 10 }, (_, index) => fetchAs(`198.51.100.${index + 1}`)(url(SCREEN_PATH), post({ wallet: WALLET }, header))),
     );
     const statuses = replies.map((reply) => reply.status);
     expect(statuses.filter((status) => status === 200)).toHaveLength(1);
@@ -254,6 +297,7 @@ describe('POST /api/x402/screen with a payment', () => {
         CDP_API_KEY_ID: 'id',
         CDP_API_KEY_SECRET: 'secret',
         PUBLIC_ORIGIN: 'https://api.thuli.example',
+        BASE_RPC_URL: 'https://mainnet.base.org',
       }),
       facilitator: mainnetFacilitator,
     };
@@ -294,7 +338,201 @@ describe('POST /api/x402/screen with a payment', () => {
   });
 });
 
+const USDC_SEPOLIA = parseAddress('0x036CbD53842c5426634e7929541eC2318f3dCF7e');
+const LOOK_ALIKE_TOKEN = parseAddress('0x3333333333333333333333333333333333333333');
+const ELSEWHERE = parseAddress('0x4444444444444444444444444444444444444444');
+const PENDING_TX = `0x${'7a'.repeat(32)}` as const;
+const PRICE = BigInt(PRICE_UNITS);
+const TOKEN_EVENTS = parseAbi([
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+  'event AuthorizationUsed(address indexed authorizer, bytes32 indexed nonce)',
+  'event AuthorizationCanceled(address indexed authorizer, bytes32 indexed nonce)',
+]);
+
+function tokenLog(token: string, topics: unknown, data: Hex = '0x'): Log {
+  return {
+    address: token as Hex,
+    topics: topics as Log['topics'],
+    data,
+    blockHash: `0x${'01'.repeat(32)}`,
+    blockNumber: 1n,
+    logIndex: 0,
+    transactionHash: PENDING_TX,
+    transactionIndex: 0,
+    removed: false,
+  };
+}
+
+const transferLog = (token: string, from: string, to: string, value: bigint) =>
+  tokenLog(
+    token,
+    encodeEventTopics({ abi: TOKEN_EVENTS, eventName: 'Transfer', args: { from: from as Hex, to: to as Hex } }),
+    encodeAbiParameters([{ type: 'uint256' }], [value]),
+  );
+
+const authorizationLog = (eventName: 'AuthorizationUsed' | 'AuthorizationCanceled', token: string, authorizer: string, nonce: string) =>
+  tokenLog(token, encodeEventTopics({ abi: TOKEN_EVENTS, eventName, args: { authorizer: authorizer as Hex, nonce: nonce as Hex } }));
+
+type Signed = { from: string; nonce: string };
+
+/** A facilitator answer saying the transaction went out but its outcome is not known yet. */
+const pendingAnswer = async (payload: PaymentPayload, requirements: PaymentRequirements): Promise<SettleResponse> => ({
+  success: false,
+  errorReason: 'settlement_pending',
+  transaction: PENDING_TX,
+  network: requirements.network,
+  payer: authorizationFrom(payload).from,
+});
+
+/** Answers every receipt read with these logs, built for the authorization the facilitator was handed. */
+function receiptOf(facilitator: StubFacilitator, logs: (signed: Signed) => Log[], status: Receipt['status'] = 'success') {
+  const reads: string[] = [];
+  const read: ReadReceipt = async (hash) => {
+    reads.push(hash);
+    return { status, logs: logs(authorizationFrom(facilitator.settled[0] as PaymentPayload)) };
+  };
+  return { read, reads };
+}
+
+describe('settlement with no clear answer (C25)', () => {
+  it('serves a settlement left pending once its receipt proves this exact payment, and only once', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    const receipt = receiptOf(facilitator, ({ from, nonce }) => [
+      authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce),
+      transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE),
+    ]);
+    const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt: receipt.read });
+    const header = await signedHeader(appFetch, client);
+    const paid = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(paid.status).toBe(200);
+    expect(PaidScreenResponse.parse(await paid.json()).payment.transaction).toBe(PENDING_TX);
+    expect(decodePaymentResponseHeader(paid.headers.get('payment-response') as string)).toMatchObject({ success: true, transaction: PENDING_TX });
+    expect(receipt.reads).toEqual([PENDING_TX]);
+
+    const replay = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(replay.status).toBe(402);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not serve a pending settlement whose receipt pays elsewhere, pays another amount, is another token, reverted, or cannot be read', async () => {
+    const cases: Record<string, { logs: (signed: Signed) => Log[]; status?: Receipt['status']; unreadable?: true }> = {
+      'pays another address': { logs: ({ from, nonce }) => [authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce), transferLog(USDC_SEPOLIA, from, ELSEWHERE, PRICE)] },
+      'pays another amount': { logs: ({ from, nonce }) => [authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce), transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE - 1n)] },
+      'comes from another token contract': {
+        logs: ({ from, nonce }) => [authorizationLog('AuthorizationUsed', LOOK_ALIKE_TOKEN, from, nonce), transferLog(LOOK_ALIKE_TOKEN, from, PAY_TO, PRICE)],
+      },
+      'marks another nonce used': {
+        logs: ({ from }) => [authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, `0x${'9'.repeat(64)}`), transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE)],
+      },
+      reverted: {
+        status: 'reverted',
+        logs: ({ from, nonce }) => [authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce), transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE)],
+      },
+      'cannot be read': { logs: () => [], unreadable: true },
+    };
+    for (const [name, shape] of Object.entries(cases)) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = pendingAnswer;
+      const receipt = receiptOf(facilitator, shape.logs, shape.status);
+      const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt: shape.unreadable ? noChain : receipt.read });
+      const header = await signedHeader(appFetch, client);
+      const reply = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(reply.status, name).toBe(503);
+      expect(await reply.json(), name).toEqual({ retry: true });
+      expect(reply.headers.get('payment-required'), name).toBeNull();
+      expect(reply.headers.get('payment-response'), name).toBeNull();
+      // The claim is kept, not marked used: the same header comes back, is tried again, and is still not served.
+      const again = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(again.status, name).toBe(503);
+      expect(screen, name).not.toHaveBeenCalled();
+    }
+  });
+
+  it('answers 503 retry with no chain read when settle throws or times out, and serves a retry of the same header once', async () => {
+    for (const failure of [new Error('socket hang up'), new FacilitatorTimeoutError('settle', 90_000)]) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = async () => {
+        throw failure;
+      };
+      const readReceipt = vi.fn(noChain);
+      const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt });
+      const header = await signedHeader(appFetch, client);
+      const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(first.status, failure.name).toBe(503);
+      expect(await first.json()).toEqual({ retry: true });
+      expect(first.headers.get('payment-response')).toBeNull();
+      expect(screen).not.toHaveBeenCalled();
+
+      // The facilitator answers again, and this stub answers success even to a repeat: the worst case for serving twice.
+      facilitator.respond = null;
+      const retries = await Promise.all(
+        [1, 2, 3].map((index) => fetchAs(`198.51.100.${index}`)(url(SCREEN_PATH), post({ wallet: WALLET }, header))),
+      );
+      expect(retries.map((reply) => reply.status).sort()).toEqual([200, 402, 402]);
+      const later = await fetchAs('198.51.100.9')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(later.status).toBe(402);
+      expect(screen).toHaveBeenCalledTimes(1);
+      expect(readReceipt).not.toHaveBeenCalled();
+    }
+  });
+
+  it('never serves an authorization whose nonce was spent without paying us, by a cancel or by paying the payer itself', async () => {
+    const spent: Record<string, (signed: Signed) => Log[]> = {
+      cancelled: ({ from, nonce }) => [authorizationLog('AuthorizationCanceled', USDC_SEPOLIA, from, nonce)],
+      'paid to the payer itself': ({ from, nonce }) => [
+        authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce),
+        transferLog(USDC_SEPOLIA, from, from, PRICE),
+      ],
+    };
+    for (const [name, logs] of Object.entries(spent)) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = pendingAnswer;
+      const { appFetch, fetchAs, client, screen } = setup({ facilitator, readReceipt: receiptOf(facilitator, logs).read });
+      const header = await signedHeader(appFetch, client);
+      expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status, name).toBe(503);
+
+      facilitator.respond = async (payload, requirements) => ({
+        success: false,
+        errorReason: 'invalid_exact_evm_nonce_already_used',
+        transaction: '',
+        network: requirements.network,
+        payer: authorizationFrom(payload).from,
+      });
+      const refused = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(refused.status, name).toBe(402);
+      expect(decodePaymentResponseHeader(refused.headers.get('payment-response') as string)).toMatchObject({
+        success: false,
+        errorReason: 'invalid_exact_evm_nonce_already_used',
+      });
+      expect(screen, name).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('POST /api/x402/screen refusals before payment', () => {
+  it('refuses an authorization once its validBefore has passed, before claiming or settling it, so a forgotten claim reopens nothing', async () => {
+    let clock = new Date();
+    const { appFetch, fetchAs, client, screen, facilitator } = setup({ now: () => clock });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(200);
+    const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
+
+    clock = new Date((validBefore - 1) * 1000);
+    const used = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(decodePaymentResponseHeader(used.headers.get('payment-response') as string)).toMatchObject({ errorReason: 'payment_already_used' });
+
+    clock = new Date(validBefore * 1000);
+    const expired = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(expired.status).toBe(402);
+    expect(decodePaymentResponseHeader(expired.headers.get('payment-response') as string)).toMatchObject({
+      success: false,
+      errorReason: 'payment_expired',
+    });
+    expect(facilitator.settled).toHaveLength(1);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
   it('answers a bad body with 400 and never asks for or takes payment', async () => {
     const { appFetch, client, screen, facilitator } = setup();
     const header = await signedHeader(appFetch, client);
@@ -323,13 +561,15 @@ describe('POST /api/x402/screen refusals before payment', () => {
   it('answers busy with 503 before asking for payment while four paid screenings run, whatever X-Forwarded-For says', async () => {
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => (release = resolve));
-    const { pay, appFetch, screen, facilitator } = setup({
+    const { payAs, appFetch, screen, facilitator } = setup({
       screen: async (wallet) => {
         await gate;
         return screenResult(wallet);
       },
     });
-    const running = Array.from({ length: MAX_RUNNING }, () => pay(url(SCREEN_PATH), post({ wallet: WALLET })));
+    const running = Array.from({ length: MAX_RUNNING }, (_, index) =>
+      payAs(`198.51.100.${index + 1}`)(url(SCREEN_PATH), post({ wallet: WALLET })),
+    );
     await vi.waitFor(() => expect(screen).toHaveBeenCalledTimes(MAX_RUNNING));
 
     for (const forwarded of ['203.0.113.1', '198.51.100.2', '192.0.2.3']) {
@@ -345,6 +585,207 @@ describe('POST /api/x402/screen refusals before payment', () => {
     expect(done.map((reply) => reply.status)).toEqual(Array(MAX_RUNNING).fill(200));
     const after = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }));
     expect(after.status).toBe(402);
+  });
+});
+
+describe('per-client limits on the paid route (C24, C42)', () => {
+  const ATTACKER = '203.0.113.9';
+  const HONEST = '198.51.100.7';
+
+  it('keeps the route open to a second client while one client floods it from 4 loops with unfunded payments', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const facilitator = new StubFacilitator('eip155:84532');
+    let release: () => void = () => undefined;
+    facilitator.holdUnfunded = new Promise<void>((resolve) => (release = resolve));
+    const { fetchAs, payAs } = setup({ facilitator });
+    const attacker = privateKeyToAccount(generatePrivateKey());
+    facilitator.unfunded.add(attacker.address.toLowerCase());
+    const terms = decodePaymentRequiredHeader(
+      (await fetchAs('192.0.2.200')(url(SCREEN_PATH), post({ wallet: WALLET }))).headers.get('payment-required') as string,
+    );
+    const signer = new x402HTTPClient(new x402Client().register('eip155:84532', new ExactEvmScheme(attacker)));
+    const fromAttacker = async (forwarded: string) =>
+      fetchAs(ATTACKER)(
+        url(SCREEN_PATH),
+        post(
+          { wallet: WALLET },
+          { ...signer.encodePaymentSignatureHeader(await signer.createPaymentPayload(terms)), 'x-forwarded-for': forwarded },
+        ),
+      );
+    const attackerSettles = () =>
+      facilitator.settled.filter((payload) => authorizationFrom(payload).from.toLowerCase() === attacker.address.toLowerCase()).length;
+
+    const statuses: number[] = [];
+    const loop = async (loopIndex: number) => {
+      for (let round = 0; round < 8; round += 1) {
+        const reply = await fromAttacker(`10.${loopIndex}.${round}.1`);
+        statuses.push(reply.status);
+        if (reply.status === 429) {
+          expect(await reply.json()).toEqual({ busy: true });
+          expect(reply.headers.get('payment-required')).toBeNull();
+        }
+      }
+    };
+    const loops = Promise.all([0, 1, 2, 3].map(loop));
+    // Every loop has had time to reach the facilitator, where an unlimited client would now hold all four places.
+    await vi.waitFor(() => expect(attackerSettles()).toBeGreaterThan(0));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const honest = await payAs(HONEST)(url(SCREEN_PATH), post({ wallet: WALLET }));
+    expect(honest.status).toBe(200);
+
+    release();
+    await loops;
+    expect(statuses).toHaveLength(32);
+    expect(statuses).not.toContain(200);
+    expect(attackerSettles()).toBeLessThanOrEqual(CLIENT_MAX_FAILED_PER_HOUR);
+    expect(statuses.filter((status) => status === 429).length).toBeGreaterThanOrEqual(32 - CLIENT_MAX_FAILED_PER_HOUR);
+
+    for (const forwarded of ['198.51.100.250', '2001:db8::7', HONEST]) {
+      expect((await fromAttacker(forwarded)).status).toBe(429);
+    }
+    const unpaid = await fetchAs(ATTACKER)(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-forwarded-for': '192.0.2.99' }));
+    expect(unpaid.status).toBe(429);
+    expect((await payAs(HONEST)(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(200);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('limit'));
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(ATTACKER);
+    warn.mockRestore();
+  });
+
+  it('names the client by the trusted header when one is configured, never by X-Forwarded-For or the proxy socket', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { fetchAs } = setup({ config: { ...testnetConfig(facilitator), trustedClientHeader: 'x-vercel-forwarded-for' }, facilitator });
+    const statuses: number[] = [];
+    for (let index = 0; index <= CLIENT_MAX_PER_MINUTE; index += 1) {
+      const reply = await fetchAs(`10.0.0.${index + 1}`)(
+        url(SCREEN_PATH),
+        post({ wallet: WALLET }, { 'x-vercel-forwarded-for': `${ATTACKER}, 10.9.9.9`, 'x-forwarded-for': `198.51.100.${index + 1}` }),
+      );
+      statuses.push(reply.status);
+    }
+    expect(statuses).toEqual([...Array(CLIENT_MAX_PER_MINUTE).fill(402), 429]);
+    const sameAddressInIpv6 = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-vercel-forwarded-for': `::ffff:${ATTACKER}` }));
+    expect(sameAddressInIpv6.status).toBe(429);
+    const other = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-vercel-forwarded-for': HONEST }));
+    expect(other.status).toBe(402);
+    const missing = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-forwarded-for': HONEST }));
+    expect(missing.status).toBe(400);
+    expect(missing.headers.get('payment-required')).toBeNull();
+
+    // Moving around inside one IPv6 /64 is still one client.
+    const fromNetwork: number[] = [];
+    for (let index = 0; index <= CLIENT_MAX_PER_MINUTE; index += 1) {
+      const reply = await fetchAs('10.0.0.99')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'x-vercel-forwarded-for': `2001:db8:7:7::${index + 1}` }));
+      fromNetwork.push(reply.status);
+    }
+    expect(fromNetwork).toEqual([...Array(CLIENT_MAX_PER_MINUTE).fill(402), 429]);
+    warn.mockRestore();
+  });
+
+  it('counts the real socket address on a real server, whatever X-Forwarded-For says', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { app } = setup();
+    const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' });
+    await once(server, 'listening');
+    try {
+      const { port } = server.address() as AddressInfo;
+      const statuses: number[] = [];
+      for (let index = 0; index <= CLIENT_MAX_PER_MINUTE; index += 1) {
+        const reply = await fetch(`http://127.0.0.1:${port}${SCREEN_PATH}`, post({ wallet: WALLET }, { 'x-forwarded-for': `203.0.113.${index + 1}` }));
+        await reply.arrayBuffer();
+        statuses.push(reply.status);
+      }
+      expect(statuses).toEqual([...Array(CLIENT_MAX_PER_MINUTE).fill(402), 429]);
+    } finally {
+      server.close();
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('PaymentClaims', () => {
+  it('holds at most MAX_CLAIMS, forgets only expired claims no request holds, and lets an unsure claim pass to one retry', () => {
+    const claims = new PaymentClaims();
+    const now = 1_000n;
+    const owner = {};
+    for (let index = 0; index < MAX_CLAIMS - 1; index += 1) {
+      claims.claim(`used-${index}`, now + 10n, owner, now);
+      claims.markUsed(`used-${index}`, owner);
+    }
+    const holder = {};
+    expect(claims.claim('held', now + 10n, holder, now)).toBe('taken');
+    expect(claims.size).toBe(MAX_CLAIMS);
+    expect(claims.claim('one-more', now + 100n, {}, now)).toBe('full');
+    expect(claims.claim('late', now + 100n, {}, now + 10n)).toBe('taken');
+    expect(claims.size).toBe(2);
+    expect(claims.claim('expired', now + 10n, {}, now + 10n)).toBe('expired');
+
+    const first = {};
+    const second = {};
+    expect(claims.claim('unsure', now + 50n, first, now)).toBe('taken');
+    expect(claims.claim('unsure', now + 50n, second, now)).toBe('in-use');
+    claims.keepUnsure('unsure', first);
+    expect(claims.claim('unsure', now + 50n, second, now)).toBe('taken');
+    expect(claims.claim('unsure', now + 50n, {}, now)).toBe('in-use');
+    claims.release('unsure', first);
+    claims.markUsed('unsure', second);
+    claims.release('unsure', second);
+    expect(claims.claim('unsure', now + 50n, {}, now)).toBe('in-use');
+  });
+});
+
+describe('canonicalClient', () => {
+  it('names a client in one spelling: IPv4 as itself, IPv4 inside IPv6 as IPv4, any other IPv6 by its /64', () => {
+    expect(canonicalClient(' 203.0.113.9 ')).toBe('203.0.113.9');
+    expect(canonicalClient('::ffff:203.0.113.9')).toBe('203.0.113.9');
+    expect(canonicalClient('2001:DB8:1:2::5')).toBe('2001:db8:1:2::/64');
+    expect(canonicalClient('2001:0db8:0001:0002:ffff:1:2:3')).toBe('2001:db8:1:2::/64');
+    expect(canonicalClient('2001:db8:1:3::5')).toBe('2001:db8:1:3::/64');
+    expect(canonicalClient('::1')).toBe('0:0:0:0::/64');
+    for (const bad of [undefined, '', 'evil.example', '203.0.113.256', '01.2.3.4', 'fe80::1%eth0']) {
+      expect(canonicalClient(bad)).toBeNull();
+    }
+  });
+});
+
+describe('ClientLimits', () => {
+  it('reopens each window as it ages out, allows one paid request at a time, and forgets a client idle for an hour', () => {
+    let clock = new Date('2026-11-10T08:00:00.000Z');
+    const later = (ms: number) => (clock = new Date(clock.getTime() + ms));
+    const limits = new ClientLimits(() => clock);
+    const admitted = (client: string, paying: boolean): Pass => {
+      const pass = limits.enter(client, paying);
+      if ('refused' in pass) throw new Error(`refused for ${pass.refused}`);
+      return pass;
+    };
+
+    const first = admitted('a', true);
+    expect(limits.enter('a', true)).toEqual({ refused: 'running' });
+    admitted('a', false);
+    first.paymentFailed = true;
+    limits.leave(first);
+    limits.leave(first);
+    for (let index = 1; index < CLIENT_MAX_FAILED_PER_HOUR; index += 1) {
+      const pass = admitted('a', true);
+      pass.paymentFailed = true;
+      limits.leave(pass);
+    }
+    expect(limits.enter('a', false)).toEqual({ refused: 'failed' });
+    expect(limits.enter('a', true)).toEqual({ refused: 'failed' });
+    later(3_600_001);
+    limits.leave(admitted('a', true));
+
+    for (let index = 1; index < CLIENT_MAX_PER_MINUTE; index += 1) admitted('b', false);
+    admitted('b', false);
+    expect(limits.enter('b', false)).toEqual({ refused: 'minute' });
+    later(60_001);
+    admitted('b', false);
+
+    expect(limits.size).toBe(2);
+    later(3_600_000);
+    admitted('c', false);
+    expect(limits.size).toBe(1);
   });
 });
 

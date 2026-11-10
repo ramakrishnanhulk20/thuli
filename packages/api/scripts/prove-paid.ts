@@ -12,6 +12,7 @@ import { createApp, SCREEN_PATH } from '../src/app.ts';
 import { ConfigError, loadApiConfig, PRICE_UNITS, type ApiConfig } from '../src/config.ts';
 import { liveScreen } from '../src/live.ts';
 import { PaidScreenResponse } from '../src/schema.ts';
+import { PayerKeyError, takePayerAccount } from './payer-key.ts';
 
 const ROBO_FARM_WALLET = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
 const USAGE = 'Usage: npm run prove:paid -- [--wallet <address>]';
@@ -20,7 +21,6 @@ const RPC_TIMEOUT_MS = 15_000;
 // The screening's own limit is 2 minutes; settlement and the reply fit in the rest (C41).
 const REQUEST_TIMEOUT_MS = 180_000;
 const BALANCE_WAIT_MS = 15_000;
-const SEPOLIA_RPC = 'https://sepolia.base.org';
 
 class UsageError extends Error {
   override name = 'UsageError';
@@ -40,13 +40,6 @@ function readWallet(): Address {
   }
 }
 
-function payerAccount() {
-  const value = process.env.PAYER_PRIVATE_KEY?.trim();
-  if (value === undefined || value === '') throw new UsageError('PAYER_PRIVATE_KEY is missing. Set it in .env (see .env.example).');
-  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(value)) throw new UsageError('PAYER_PRIVATE_KEY is set but is not a 32-byte hex private key.');
-  return privateKeyToAccount((value.startsWith('0x') ? value : `0x${value}`) as `0x${string}`);
-}
-
 function usdc(units: bigint): string {
   const sign = units < 0n ? '-' : '';
   const whole = units < 0n ? -units : units;
@@ -58,10 +51,8 @@ function usdc(units: bigint): string {
  * An RPC that answers for any other chain is refused before anything is paid (C2).
  */
 async function balanceReader(config: ApiConfig, payer: Address): Promise<() => Promise<bigint>> {
-  const rpcName = config.network === 'base' ? 'BASE_RPC_URL' : SEPOLIA_RPC;
-  const rpcUrl = config.network === 'base' ? process.env.BASE_RPC_URL?.trim() : SEPOLIA_RPC;
-  if (rpcUrl === undefined || rpcUrl === '') throw new UsageError('BASE_RPC_URL is missing. Set it to a Base mainnet RPC in .env.');
-  const client = createPublicClient({ transport: http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 1 }), ccipRead: false });
+  const rpcName = config.network === 'base' ? 'BASE_RPC_URL' : config.settlementRpcUrl;
+  const client = createPublicClient({ transport: http(config.settlementRpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 1 }), ccipRead: false });
   const chainId = await client.getChainId();
   if (chainId !== config.chainId) {
     throw new UsageError(`${rpcName} answers for chain ${chainId}, but X402_NETWORK is ${config.network} (chain ${config.chainId}).`);
@@ -115,8 +106,9 @@ async function waitForChange(read: () => Promise<bigint>, before: bigint): Promi
 
 async function main(): Promise<number> {
   const wallet = readWallet();
+  // The API runs in this process, so the payer key leaves the environment before the API reads it (C39).
+  const account = takePayerAccount(process.env);
   const config = loadApiConfig(process.env);
-  const account = payerAccount();
   const payer = parseAddress(account.address);
   const readBalance = await balanceReader(config, payer);
   const before = await readBalance();
@@ -192,7 +184,7 @@ main().then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    if (error instanceof UsageError || error instanceof ConfigError || error instanceof EnvError) {
+    if (error instanceof UsageError || error instanceof PayerKeyError || error instanceof ConfigError || error instanceof EnvError) {
       console.error(error.message);
       process.exitCode = 2;
       return;

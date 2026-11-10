@@ -1,6 +1,5 @@
 import { createCdpFacilitatorClient } from '@coinbase/cdp-sdk/x402';
 import { HTTPFacilitatorClient, type FacilitatorClient } from '@x402/core/server';
-import { privateKeyToAccount } from 'viem/accounts';
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
 
@@ -10,6 +9,8 @@ export const PRICE = '$0.05';
 export const PRICE_UNITS = '50000';
 export const DEFAULT_PORT = 8787;
 export const DEFAULT_TESTNET_FACILITATOR = 'https://x402.org/facilitator';
+/** Base Sepolia's public RPC. Base mainnet has no default: BASE_RPC_URL must name one. */
+export const BASE_SEPOLIA_RPC = 'https://sepolia.base.org';
 
 /** The only two networks the paid route can run on, with each one's canonical USDC contract and explorer. */
 export const NETWORKS = Object.freeze({
@@ -45,6 +46,13 @@ export interface ApiConfig {
   /** The CDP facilitator on Base, the configured URL on Base Sepolia. Holds the CDP credentials inside, never as fields. */
   facilitator: FacilitatorClient;
   port: number;
+  /**
+   * The lowercase name of the header the hosting platform writes the client's address into, such as
+   * x-vercel-forwarded-for. Null means the socket address is the client, which is right only with no proxy in front.
+   */
+  trustedClientHeader: string | null;
+  /** An https RPC on the payment's own chain, read only to check a settlement the facilitator left pending. */
+  settlementRpcUrl: string;
 }
 
 export class ConfigError extends Error {
@@ -74,16 +82,29 @@ function addressFrom(env: Env, name: string): Address {
   }
 }
 
-const PrivateKey = z.string().regex(/^(0x)?[0-9a-fA-F]{64}$/);
+// A rule on the name, not a list of the keys we know today, so a key added to the worker later is caught too. It covers
+// every name ending in PRIVATE_KEY, in any letter case, whatever the value looks like. It does not catch a key or a seed
+// phrase stored under some other name.
+const PRIVATE_KEY_NAME = /(^|_)PRIVATE_KEY$/i;
 
-function keyAddress(env: Env, name: string): Address | undefined {
-  const value = read(env, name);
-  if (value === undefined) return undefined;
-  const parsed = PrivateKey.safeParse(value);
-  // An unreadable key cannot be compared with payTo, so the check below would pass blind. Refuse instead.
-  if (!parsed.success) throw new ConfigError(`${name} is set but is not a 32-byte hex private key.`);
-  const hex = parsed.data.startsWith('0x') ? parsed.data : `0x${parsed.data}`;
-  return parseAddress(privateKeyToAccount(hex as `0x${string}`).address);
+function refusePrivateKeys(env: Env): void {
+  const held = Object.keys(env)
+    .filter((name) => PRIVATE_KEY_NAME.test(name) && read(env, name) !== undefined)
+    .sort();
+  if (held.length === 0) return;
+  throw new ConfigError(
+    `${held.join(', ')} ${held.length === 1 ? 'is' : 'are'} set, and the paid API must hold no private key. Start it with its own env file (.env.api, see .env.api.example), which names no key.`,
+  );
+}
+
+// A header name as HTTP defines one, so a typo or a pasted value cannot become the identity source.
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+function trustedClientHeader(env: Env): string | null {
+  const value = read(env, 'TRUSTED_CLIENT_HEADER');
+  if (value === undefined) return null;
+  if (!HEADER_NAME.test(value)) throw new ConfigError('TRUSTED_CLIENT_HEADER must be a header name such as x-vercel-forwarded-for.');
+  return value.toLowerCase();
 }
 
 const HttpsUrl = z.url({ protocol: /^https$/ });
@@ -91,6 +112,13 @@ const HttpsUrl = z.url({ protocol: /^https$/ });
 function facilitatorUrl(env: Env): string {
   const value = read(env, 'FACILITATOR_URL') ?? DEFAULT_TESTNET_FACILITATOR;
   if (!HttpsUrl.safeParse(value).success) throw new ConfigError('FACILITATOR_URL must be an https URL.');
+  return value;
+}
+
+function settlementRpcUrl(env: Env, network: NetworkName): string {
+  if (network === 'base-sepolia') return BASE_SEPOLIA_RPC;
+  const value = required(env, 'BASE_RPC_URL');
+  if (!HttpsUrl.safeParse(value).success) throw new ConfigError('BASE_RPC_URL must be an https URL.');
   return value;
 }
 
@@ -121,15 +149,18 @@ function port(env: Env): number {
 
 /**
  * Reads and checks the paid API's settings. X402_NETWORK has no default, so testnet payments are off unless chosen.
- * Base needs PAYTO_ADDRESS, the CDP keys and PUBLIC_ORIGIN; Base Sepolia needs PAYTO_ADDRESS_TESTNET and may name a
- * FACILITATOR_URL and a PUBLIC_ORIGIN.
+ * Base needs PAYTO_ADDRESS, the CDP keys, PUBLIC_ORIGIN and BASE_RPC_URL; Base Sepolia needs PAYTO_ADDRESS_TESTNET,
+ * may name a FACILITATOR_URL and a PUBLIC_ORIGIN, and reads its receipts from the public Sepolia RPC.
+ * TRUSTED_CLIENT_HEADER is optional on both.
  *
- * Refuses to start when payTo is the address of WORKER_PRIVATE_KEY or PAYER_PRIVATE_KEY, because a payTo key held by a
- * server is a key an attacker can reach (C39). A key that is set but unreadable is refused too, rather than skipped.
+ * Refuses to start while any variable named like a private key is set, because a key held by an internet-facing server
+ * is a key an attacker can reach (C39). This runs first, before any other setting is read.
  *
- * @throws ConfigError naming the first missing or bad variable. The message never holds a value (C40).
+ * @throws ConfigError naming the first missing or bad variable, or every private key variable that is set. The message
+ * never holds a value (C40).
  */
 export function loadApiConfig(env: Env): ApiConfig {
+  refusePrivateKeys(env);
   const network = read(env, 'X402_NETWORK');
   if (network !== 'base' && network !== 'base-sepolia') {
     throw new ConfigError('X402_NETWORK must be base or base-sepolia.');
@@ -137,14 +168,6 @@ export function loadApiConfig(env: Env): ApiConfig {
   const chain = NETWORKS[network];
   const payToName = network === 'base' ? 'PAYTO_ADDRESS' : 'PAYTO_ADDRESS_TESTNET';
   const payTo = addressFrom(env, payToName);
-
-  for (const keyName of ['WORKER_PRIVATE_KEY', 'PAYER_PRIVATE_KEY']) {
-    if (keyAddress(env, keyName) === payTo) {
-      throw new ConfigError(
-        `${payToName} is the address of ${keyName}. The payTo key must live on no server: use an address from a wallet that stays off this machine's .env.`,
-      );
-    }
-  }
 
   let facilitator: FacilitatorClient;
   if (network === 'base') {
@@ -166,5 +189,7 @@ export function loadApiConfig(env: Env): ApiConfig {
     publicOrigin: publicOrigin(env, network === 'base'),
     facilitator,
     port: port(env),
+    trustedClientHeader: trustedClientHeader(env),
+    settlementRpcUrl: settlementRpcUrl(env, network),
   };
 }
