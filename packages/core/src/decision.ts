@@ -48,10 +48,10 @@ const NOT_FETCHED_CAUSE = 'the reason cited a transaction Thuli did not fetch fo
 const MAX_RAW_TEXT_CHARS = 16_384;
 
 // Plain text only: no links, no markup, no markdown links (C13, C33). Checked on the lowercased reason.
-const FORBIDDEN_IN_REASON = ['http', 'www.', '<', '>', ']('];
+export const FORBIDDEN_IN_REASON: readonly string[] = ['http', 'www.', '<', '>', ']('];
 // Control characters other than tab and newline, and every invisible format character (\p{Cf}): the bidirectional
 // overrides, and the zero-width ones that can split a made-up hash into pieces the hash scan does not see (C13).
-const NON_PLAIN_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}]/u;
+export const NON_PLAIN_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}]/u;
 
 /** The only share that matches each action, in basis points. */
 export function shareFor(action: Outcome, settings: Settings): number {

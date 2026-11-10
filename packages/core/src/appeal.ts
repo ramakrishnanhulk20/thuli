@@ -1,7 +1,7 @@
 import { sha256, stringToBytes, verifyMessage, type Hex } from 'viem';
 import { z } from 'zod';
 import { parseAddress, type Address } from './address.ts';
-import { DECISION_RULES, MAX_REASON_CHARS } from './decision.ts';
+import { DECISION_RULES, FORBIDDEN_IN_REASON, MAX_REASON_CHARS, NON_PLAIN_CHARACTERS } from './decision.ts';
 import { CanonicalAddress } from './facts.ts';
 import { leastGenerous, OutcomeSchema, type Outcome } from './outcome.ts';
 
@@ -21,9 +21,8 @@ const TEXT_HASH = /^0x[0-9a-f]{64}$/;
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
 const MAX_REQUEST_ID_CHARS = 128;
 
-// decision.ts keeps its reason checks private. appeal.test.ts runs both over the same strings, so the two cannot drift.
-const FORBIDDEN_IN_TEXT = ['http', 'www.', '<', '>', ']('];
-const NON_PLAIN_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
+// One plain-text rule for model reasons and appeal text, so the two can never drift apart.
+const FORBIDDEN_IN_TEXT = FORBIDDEN_IN_REASON;
 
 const SIGNATURE_CAUSE = 'the signature does not match this appeal';
 
