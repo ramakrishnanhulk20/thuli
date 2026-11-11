@@ -8,157 +8,225 @@ exact reads and writes the UI makes) as the backend lands.
 
 ## 1. System overview
 
+What runs today, drawn from the code on 11 Nov 2026. Solid lines are built. Every dashed line leads into the planned
+box, and nothing in that box is built yet.
+
 ```mermaid
-flowchart LR
-  subgraph Public
-    V[Visitor or judge]
-    C[Claimant wallet]
-    A[Paying agent]
-  end
-  O[Campaign owner]
-
-  subgraph Vercel["Web app on Vercel (no money keys)"]
-    UI[Pages: landing, replay, check a wallet, wallet page, appeal, docs]
-    API[API routes]
-    X402[Paid screen route, x402 receive]
+flowchart TB
+  subgraph People["Who comes in"]
+    VIS["Visitor or judge"]
+    AGT["Paying agent"]
+    WAL["Wallet"]
   end
 
-  subgraph Worker["Screening worker (holds spending power)"]
-    Q[Job queue reader]
-    F[Facts engine: chain reads, funding and sweep graph, clusters]
-    G[Rules graph on SERV: script nodes, Jev decision nodes, agent node]
-    P[Paid data through Kite Passport]
-    S[Dolphin summaries]
-    R[Reppo second opinion]
-    K[Root signer]
+  subgraph Web["Web app on Next.js, holds no private key"]
+    PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
+    FILES["Static replay files"]
+    ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
   end
 
-  DB[(Postgres)]
-  CH[(Public RPC: Ethereum, Base)]
-  N[Nansen and Allium x402]
-  SERV[SERV Reasoning]
-  DOL[Dolphin API]
-  REP[Reppo Eval API]
-  KITE[Kite Agent Passport]
-  VAULT[[Reward vault on Base, one per campaign, from a factory]]
+  API["API package: free check, paid screen, campaign routes"]
+  FAC["x402 facilitator"]
+  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays")]
 
-  V --> UI
-  C --> UI
-  O --> UI
-  A --> X402
-  UI --> API
+  subgraph Worker["Worker, run as scripts"]
+    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims"]
+    SCRIPTS["Replay, scoring and export scripts"]
+  end
+
+  subgraph Screening["Screening code"]
+    FACTS["Facts from public Ethereum reads"]
+    LIMITS["Start and ceiling set in code"]
+    ASK["Ask SERV with the rules graph or the rulebook"]
+    CHECKS["Output checks in code"]
+  end
+
+  ETH["Ethereum RPC and Blockscout"]
+  SERV["SERV Reasoning"]
+  REPPO["Reppo evaluation API"]
+
+  subgraph Base["Base Sepolia"]
+    FACTORY["ThuliVaultFactory"]
+    VAULT["ThuliVault, one per campaign"]
+  end
+
+  subgraph Planned["Planned, not built"]
+    P1["Planned: paid data through Kite Passport, Nansen and Allium"]
+    P2["Planned: Dolphin summaries"]
+    P3["Planned: owner sign-in and campaign upload"]
+    P4["Planned: public appeal routes"]
+    P5["Planned: hosted worker and database"]
+    P6["Planned: Base mainnet"]
+  end
+
+  VIS --> PAGES
+  AGT -->|"pays 0.05 USDC over x402"| ROUTES
+  WAL -->|"signed ask, ticket"| ROUTES
+  PAGES -->|"reads"| FILES
+  PAGES -->|"free check"| ROUTES
+  ROUTES -->|"all but /api/search"| API
+  API -->|"settles payments"| FAC
   API --> DB
-  X402 --> DB
-  DB --> Q
-  Q --> F
-  F --> CH
-  F --> P
-  P --> KITE
-  KITE --> N
-  F --> S
-  S --> DOL
-  F --> G
-  G --> SERV
-  G --> R
-  R --> REP
-  G --> DB
-  K --> VAULT
-  C --> VAULT
-  O --> VAULT
+  API -->|"screens one wallet"| FACTS
+  API -->|"claimed, claimable"| VAULT
+  DB <-->|"asks, decisions, lists, relays"| LOOP
+  DB ~~~ SCRIPTS
+  LOOP -->|"screens each ask"| FACTS
+  LOOP -->|"VaultCreated log"| FACTORY
+  LOOP -->|"postRoot, claim"| VAULT
+  FACTORY -->|"creates"| VAULT
+  VAULT -->|"pays"| WAL
+  SCRIPTS -->|"replays a claim list"| FACTS
+  SCRIPTS -->|"writes"| FILES
+  SCRIPTS -->|"feedback"| REPPO
+  FACTS -->|"public reads"| ETH
+  FACTS --> LIMITS
+  LIMITS --> ASK
+  ASK <--> SERV
+  ASK --> CHECKS
+
+  FACTS -.-> P1
+  FACTS -.-> P2
+  API -.-> P3
+  API -.-> P4
+  LOOP -.-> P5
+  VAULT -.-> P6
+
+  classDef planned stroke-dasharray: 5 5
+  class P1,P2,P3,P4,P5,P6 planned
 ```
 
-## 2. Main sequence: one campaign, from upload to a claim
+## 2. Main sequence: one wallet through an open campaign
+
+One wallet from its signed ask to its payout, as the API, the store and the worker do it today. Every step here is in
+the code; the worker runs as a script on one machine, and hosting it is planned (section 1).
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant O as Owner
-  participant W as Web app
-  participant DB as Postgres
+  participant W as Wallet
+  participant API as Campaign routes
+  participant DB as Postgres store
   participant K as Worker
-  participant Kite as Kite Passport
-  participant N as Nansen (x402)
-  participant SV as SERV
-  participant RP as Reppo
-  participant V as Vault (Base)
-  participant C as Claimant
+  participant ETH as Ethereum RPC and Blockscout
+  participant SV as SERV Reasoning
+  participant V as Vault on Base Sepolia
 
-  O->>W: Sign in with wallet, create campaign, write rules, upload claim list
-  O->>W: Prepay per wallet (x402, USDC on Base)
-  W->>DB: Store campaign, rules version, wallets, payment receipt
-  O->>V: Deploy vault from factory, deposit USDC, set per-wallet cap, end time, root delay
-  W->>DB: Queue screening job
-  K->>DB: Take job
-  loop each wallet
-    K->>K: Free chain reads, facts in code, ceiling set by code (C12)
-    K->>Kite: kpass session execute (first funder), inside campaign budget (C21)
-    Kite->>N: Pay and call
-    N-->>K: Funder address and label
-    K->>SV: Rules (system) + facts (user), Prompt Guard on stranger text
-    SV-->>K: Action, share, reason, cited tx hashes
-    K->>K: Check output like input (C13), never above ceiling (C12)
-    K->>DB: Decision, reason, receipts, request ids
-  end
-  K->>RP: Held clusters, addresses and hashes stripped (C35)
-  RP-->>K: Score, accept or revise or reject, critique
-  O->>W: Review held wallets, publish
-  W->>DB: Freeze list version, queue root job
-  K->>K: Rebuild root from the public list (C32)
-  K->>V: Post root (agent key can only post roots)
-  Note over V: Root waits the owner-set delay, owner can cancel (C30)
-  C->>W: Open wallet page, see decision and reason
-  C->>V: Claim with Merkle proof, paid the difference from what was already claimed (C27)
+  W->>W: Sign the ask text as a personal message
+  W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
+  API->>API: checkAsk: a valid address, signed in the last 600 seconds
+  API->>ETH: Read the wallet's code, a contract cannot ask yet
+  API->>API: The signature must match the rebuilt ask text
+  API->>DB: Store the ask as queued, the first ask per wallet stands
+  API-->>W: 202 queued
+  K->>DB: Take the oldest queued ask, leased for 300 seconds
+  K->>ETH: Read the wallet's facts at the latest finalized block
+  K->>DB: Read the first funders of the campaign's other asks
+  K->>K: Link asks that share a funder, set start and ceiling in code
+  K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
+  SV-->>K: Action, rule, reason, cited transactions
+  K->>K: Output checks, never above the ceiling
+  K->>DB: Store the decision, an approved wallet takes the next free slot
+  K->>DB: Build the list from the slot holders, store it as a new list version
+  K->>K: Read the stored text back and rebuild the root from it
+  K->>V: Check the vault against the factory log, then postRoot
+  K->>DB: Mark the version posted with its transaction
+  V->>V: The root waits out its delay, and the owner can cancel it
+  K->>V: Read state, and claimable for every listed wallet
+  K->>DB: Mark the version active, queue a relay for each wallet still owed
+  K->>DB: Take the oldest waiting relay
+  K->>V: Simulate, then send claim(account, cumulativeAmount, proof) from the agent key
+  V-->>W: Pay the capped leaf amount minus what this wallet already received
+  K->>DB: Mark the relay confirmed
+  W->>API: GET /api/campaigns/:id/asks/:wallet
+  API-->>W: The decision, and a claim ticket once the list is active
 ```
 
 ## 3. Module dependency graph
 
+The packages and their main modules. An arrow points from a module to one it imports, and only the main imports are
+drawn. The one dashed line is not an import: core's leaf and the vault hash a claim the same way.
+
 ```mermaid
 flowchart TB
-  subgraph contracts["packages/contracts"]
-    VF["ThuliVaultFactory"]
-    VA["ThuliVault: deposit, postRoot, cancelRoot, claim, withdrawAfterEnd"]
-    VF --> VA
-    VA --> OZ["OpenZeppelin: MerkleProof, SafeERC20, ReentrancyGuard, Ownable2Step"]
+  subgraph web["packages/web"]
+    PAGES["pages and components"]
+    THULIAPI["lib/server/thuliApi"]
+    RFILES["public/replay files"]
   end
 
-  subgraph core["packages/core, shared TypeScript"]
-    ADDR["address: one canonical parser, C1"]
-    CHAIN["chains: config map, C2"]
-    MONEY["money: shares to base units, round down, C3"]
-    LEAF["leaf: Merkle leaf encoding shared with the contract, C28"]
-    SCHEMA["schemas: request, decision, API response, C13 and C34"]
+  subgraph api["packages/api"]
+    SITE["site, server, live"]
+    APP["app, schema, receipt"]
+    ACAMP["campaigns"]
+    AREST["stores, claims, limits, guard, config"]
   end
 
   subgraph worker["packages/worker"]
-    FACTS["facts: chain reads, graph, clusters, fan-out rule, C15 and C16"]
-    PAY["paid data: kpass wrapper, argument array, price and payee checks, C22 C23 C37"]
-    DOLC["dolphin client"]
-    SERVC["serv client: rules graph, ceilings, C12 and C14"]
-    REPC["reppo client: payload stripper, C35"]
-    ROOT["root signer, C32 and C39"]
+    CAMPW["campaign: loop, screen, facts, publish, relay, vault"]
+    SINGLE["screen/single"]
+    REPLAY["replay: decide, runner, scoring, export"]
+    REPPO["reppo: client, feedback"]
+    SERVC["serv/client"]
+    READ["facts/basic and chain readers"]
+    VAULTW["vault: root, claimList, proof, chain, abi"]
   end
 
-  subgraph web["packages/web"]
-    PAGES["pages and components, text-only rendering, C33"]
-    ROUTES["api routes: auth, campaigns, check, appeals, publish"]
-    X4["x402 receive: settle before return, C25"]
+  subgraph store["packages/store"]
+    SCAMP["campaigns"]
+    SROWS["paymentClaims, limits, checkCache, sweep"]
+    SDB["db, migrate"]
   end
 
+  subgraph core["packages/core"]
+    SIGN["ask, appeal"]
+    DEC["start, ceiling, decision, graph"]
+    FACTS["facts, factsEngine, settings"]
+    LEAF["leaf"]
+    MONEY["money"]
+    ADDR["address, chains"]
+  end
+
+  subgraph contracts["packages/contracts"]
+    VF["ThuliVaultFactory"]
+    VA["ThuliVault"]
+    OZ["OpenZeppelin: Ownable2Step, Pausable, ReentrancyGuard, SafeERC20, MerkleProof, Math, SafeCast"]
+  end
+
+  PAGES --> RFILES
+  THULIAPI --> SITE
+  SITE --> APP
+  SITE --> SINGLE
+  APP --> ACAMP
+  APP --> AREST
+  AREST --> SROWS
+  ACAMP --> SCAMP
+  ACAMP --> SIGN
+  ACAMP --> VAULTW
+  CAMPW --> SINGLE
+  CAMPW --> REPLAY
+  CAMPW --> VAULTW
+  CAMPW --> SCAMP
+  SINGLE --> READ
+  SINGLE --> REPLAY
+  REPLAY --> SERVC
+  REPLAY --> READ
+  REPLAY --> DEC
+  REPPO --> REPLAY
+  READ --> FACTS
+  SERVC --> DEC
+  VAULTW --> LEAF
+  VAULTW --> MONEY
+  SCAMP --> SDB
+  SROWS --> SDB
+  SCAMP --> DEC
+  SIGN --> DEC
+  DEC --> FACTS
   FACTS --> ADDR
-  FACTS --> CHAIN
-  PAY --> ADDR
-  SERVC --> SCHEMA
-  SERVC --> FACTS
-  SERVC --> DOLC
-  SERVC --> PAY
-  REPC --> SCHEMA
-  ROOT --> LEAF
-  ROOT --> MONEY
-  ROUTES --> ADDR
-  ROUTES --> SCHEMA
-  X4 --> SCHEMA
-  PAGES --> ROUTES
-  LEAF -.same encoding.- VA
+  LEAF --> ADDR
+  VF --> VA
+  VA --> OZ
+  LEAF -.-|"same encoding"| VA
 ```
 
 ## 4. Interface for the frontend
@@ -185,7 +253,10 @@ chain but Base Sepolia.
 | Check the record yourself | `npm run prove:vault -- verify` checks the committed record against Base Sepolia line by line (each of the five receipts with its block, sender and gas, the VaultCreated, RootPosted, Claimed and USDC Transfer events in them, and the vault's `state()` and `claimed()` today), and needs only the two committed records and an RPC URL, the public `https://sepolia.base.org` when `BASE_SEPOLIA_RPC_URL` is unset. |
 
 The proof vault pays Base Sepolia test USDC, caps each wallet at 1 USDC, holds 2 USDC, delays every root by one hour,
-and takes claims until unix `1794976286` (18 Nov 2026, 04:31:26 UTC). Its first root lists one wallet at 1 USDC and
+and was created to take claims until unix `1794976286` (18 Nov 2026, 04:31:26 UTC). On 11 Nov 2026 the owner moved
+the end to unix `1804756909` (11 Mar 2027, 09:21:49 UTC) with `extendEnd`, in transaction
+`0x37f8a85af0c454c01a1477dca238edc05ffe4e5a2e75ab410998f0a566459dd6`, so the attack page keeps reading a vault that is
+still open. Its first root lists one wallet at 1 USDC and
 became claimable at unix `1794375097` (11 Nov 2026, 05:31:37 UTC). The record holds five transactions: the four setup
 ones (createVault, approve, deposit, postRoot) and the claim.
 Show live values from `state()` (4.2), never from these notes: the end time moves when the owner extends it or pauses.
@@ -729,8 +800,6 @@ searching the code.
 - A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
   one machine.
 - Base mainnet contracts. Only the Base Sepolia record exists (4.1).
-- Half-built: the root signer. `postRoot` in `packages/worker/src/vault/root.ts` runs every check before it posts, but
-  only the vault proof script calls it. No service takes a published list and posts its root.
 - Half-built: appeals. The checks, the record, the store and the advice exist; the public route, owner sign-in and
   rate limit do not (4.6).
 
@@ -753,7 +822,7 @@ Rules every route keeps:
 | Route | Answer |
 | --- | --- |
 | `GET /api/campaigns/:id` | 200 with the campaign below |
-| `GET /api/campaigns/:id/board?before=<ISO time>` | 200 `{"asks": [...]}`: up to 50 decided or failed asks, newest decision first, decided strictly before `before` when it is given; 400 for a time that is not ISO 8601 |
+| `GET /api/campaigns/:id/board?before=<ISO time>` | 200 `{"asks": [...]}`: 50 decided or failed asks, newest decision first, plus every further ask decided at the same instant as the 50th (at most 100 more), decided strictly before `before` when it is given. Walk the board with `before` set to the last ask's `decidedAt` and no ask is skipped; 400 for a time that is not ISO 8601 |
 | `POST /api/campaigns/:id/asks` | the ask answers below |
 | `GET /api/campaigns/:id/asks/:wallet` | 200 `{"ask": ..., "ticket": ...}`, with `ticket` only for a wallet on the active list; 400 `{"error": "the wallet is not a valid address"}`; 404 `{"error": "no ask from this wallet"}` |
 | `GET /api/campaigns/:id/lists/:version` | 200 with the list's published text exactly as stored, as `application/json`, so anyone can rebuild its root; 404 `{"error": "no such list version"}` |
@@ -770,7 +839,7 @@ The campaign:
 | `status` | `"open"` or `"closed"` |
 | `opensAt`, `closesAt` | ISO 8601; asks are taken from `opensAt` up to, not including, `closesAt` |
 | `counts` | `asked`, `queued` (screening included), `decided` (failed included), `held` (failed included), `slotsTaken`, `slotsLeft` |
-| `lists` | one entry per list version, oldest first: `version`, `root`, `status` (`built`, `posted`, `active`, `superseded` or `cancelled`), `postTx` and `claimableAt` (Unix seconds), both null until posted |
+| `lists` | one entry per list version, oldest first: `version`, `root`, `status` (`built`, `posted`, `active`, `superseded` or `cancelled`), `claimableAt` (Unix seconds), null until posted, and `postTx`, null until posted and still null for a root found pending on the vault whose transaction the worker did not see |
 
 One ask, as `ask` in the answers above and as each entry of the board:
 
@@ -831,16 +900,23 @@ answers, in the order the route checks for them:
 The check is `checkAsk` in `packages/core/src/ask.ts`. It stops at the first failure, in this order: "the wallet is
 not a valid address", "the signing time is not a whole number of seconds", "the signature is too old" (signed more
 than 600 seconds ago), "the signature is dated in the future" (more than 60 seconds ahead), "contract wallets cannot
-ask yet", "the wallet type could not be checked", "the signature does not match this ask". A signature made over an
-appeal, or over another campaign's ask, fails the last check.
+ask yet" (contract code on Ethereum or on the campaign's own chain), "the wallet type could not be checked", "the
+signature does not match this ask". A signature made over an appeal, or over another campaign's ask, fails the last
+check.
 
-Readers. The wallet type is read from its code on `ETH_RPC_URL`, by the facts' rule: a delegated EOA (EIP-7702)
-keeps its own key and counts as a wallet. Vault amounts are read on Base Sepolia's public RPC for chain 84532, and for
+Readers. The wallet type is read from its code on `ETH_RPC_URL` and on the campaign's own chain (once for a campaign
+on Ethereum), by the facts' rule: a delegated EOA (EIP-7702) keeps its own key and counts as a wallet. Code on either
+chain refuses the ask as a contract wallet. A failed read, or a campaign chain with no reader (Base with
+`BASE_RPC_URL` unset, or any chain but Base and Base Sepolia), refuses it with "the wallet type could not be checked".
+Vault amounts are read on Base Sepolia's public RPC for chain 84532, and for
 Base (8453) on `BASE_RPC_URL` when it is set; a `BASE_RPC_URL` that is set but not https stops the API from mounting.
 A campaign on any other chain gets tickets without `claimed` and `claimable`.
 
-Storage, in `packages/store/src/campaigns.ts` (migration `002_campaigns.sql`): `campaigns` holds the terms, among them
-`settings`, only the screening settings this campaign changes from the defaults, checked by core's `Settings` schema;
-`asks` holds one row per wallet, its signature kept as the proof it asked and returned by no route; `list_versions`
-holds each list exactly as published; `claim_relays` holds the claims the worker submits for wallets, at most 5
-attempts each. Campaigns are created with `createCampaign`, which refuses different terms for an existing id.
+Storage, in `packages/store/src/campaigns.ts` (migrations `002_campaigns.sql` and `003_retries_and_vault_block.sql`):
+`campaigns` holds the terms, among them `settings`, only the screening settings this campaign changes from the
+defaults, checked by core's `Settings` schema, and `vault_block`, the block the vault was created in; `asks` holds one
+row per wallet, its signature kept as the proof it asked and returned by no route; `list_versions` holds each list
+exactly as published; `claim_relays` holds the claims the worker submits for wallets, at most 10 attempts each. An ask
+or a relay whose try failed waits out the retry time the worker sets before it is handed out again, so an outage
+cannot use up every attempt in seconds. Campaigns are created with `createCampaign`, which refuses different terms for
+an existing id.
