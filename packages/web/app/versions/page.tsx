@@ -8,9 +8,14 @@ import { NotCovered } from '@/components/versions/NotCovered';
 import { Scorecard } from '@/components/versions/Scorecard';
 import styles from '@/components/versions/versions.module.css';
 import { loadHop, loadScorecard, loadVersions } from '@/lib/replay/load';
+import { SHARE_IMAGE } from '@/lib/siteUrl';
+
+const DESCRIPTION = 'Each Thuli rulebook version scored the same way, with what changed and what the numbers do not cover.';
 
 export const metadata: Metadata = {
   title: 'Versions',
+  description: DESCRIPTION,
+  openGraph: { title: 'Versions', description: DESCRIPTION, images: [SHARE_IMAGE] },
 };
 
 export default function VersionsPage() {

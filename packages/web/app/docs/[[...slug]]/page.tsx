@@ -3,6 +3,7 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { source } from '@/lib/source';
 import { getMDXComponents } from '@/mdx-components';
+import { SHARE_IMAGE } from '@/lib/siteUrl';
 
 interface DocsPageProps {
   params: Promise<{ slug?: string[] }>;
@@ -33,7 +34,8 @@ export async function generateMetadata({ params }: DocsPageProps): Promise<Metad
   const { slug } = await params;
   const page = source.getPage(slug);
   if (page === undefined) notFound();
-  return { title: page.data.title, description: page.data.description };
+  const { title, description } = page.data;
+  return { title, description, openGraph: { title, description, images: [SHARE_IMAGE] } };
 }
 
 export const dynamicParams = false;

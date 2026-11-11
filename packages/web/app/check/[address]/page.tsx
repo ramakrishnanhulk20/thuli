@@ -13,6 +13,7 @@ export async function generateMetadata({ params }: RouteProps): Promise<Metadata
   const address = addressFromRoute((await params).address);
   return {
     title: address === null ? 'Check a wallet' : `Check ${shortAddress(address)}`,
+    description: "Thuli's decision for this wallet, with its reason and what a single check cannot see.",
     robots: { index: false, follow: false },
   };
 }

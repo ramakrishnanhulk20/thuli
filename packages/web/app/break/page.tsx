@@ -6,9 +6,14 @@ import styles from '@/components/break/break.module.css';
 import { SiteNav } from '@/components/site/SiteNav';
 import { settlementUrl, type ProofFacts } from '@/lib/attacks';
 import { loadVaultProof } from '@/lib/vaultProof';
+import { SHARE_IMAGE } from '@/lib/siteUrl';
+
+const DESCRIPTION = "Ten real attacks against Thuli's vault and routes, run live from your browser, each one refused.";
 
 export const metadata: Metadata = {
   title: 'Try to break it',
+  description: DESCRIPTION,
+  openGraph: { title: 'Try to break it', description: DESCRIPTION, images: [SHARE_IMAGE] },
 };
 
 /** The settlement of the paid example, read at build from the API's captured answer. */

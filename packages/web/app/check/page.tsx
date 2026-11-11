@@ -4,9 +4,14 @@ import { ArrowLink } from '@/components/check/CheckStates';
 import styles from '@/components/check/check.module.css';
 import { Drop } from '@/components/Drop';
 import { SiteNav } from '@/components/site/SiteNav';
+import { SHARE_IMAGE } from '@/lib/siteUrl';
+
+const DESCRIPTION = "Paste any Ethereum address and get Thuli's decision for that one wallet, free, with no sign-in.";
 
 export const metadata: Metadata = {
   title: 'Check a wallet',
+  description: DESCRIPTION,
+  openGraph: { title: 'Check a wallet', description: DESCRIPTION, images: [SHARE_IMAGE] },
 };
 
 const CANNOT_SEE = [

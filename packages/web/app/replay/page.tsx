@@ -6,9 +6,14 @@ import { ReplayExplorer } from '@/components/replay/ReplayExplorer';
 import styles from '@/components/replay/replay.module.css';
 import { SiteNav } from '@/components/site/SiteNav';
 import type { ReplaySummary } from '@/lib/replay/replayTypes';
+import { SHARE_IMAGE } from '@/lib/siteUrl';
+
+const DESCRIPTION = "Every wallet that claimed the ROBO airdrop, with Thuli's decision, its reason and the transactions behind it.";
 
 export const metadata: Metadata = {
   title: 'Replay',
+  description: DESCRIPTION,
+  openGraph: { title: 'Replay', description: DESCRIPTION, images: [SHARE_IMAGE] },
 };
 
 const summary: ReplaySummary = summaryFile;

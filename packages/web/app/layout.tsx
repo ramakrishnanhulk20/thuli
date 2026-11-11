@@ -5,8 +5,10 @@ import { display, body, mono } from './fonts';
 import { SmoothScroll } from '@/components/SmoothScroll';
 import { Grain } from '@/components/Grain';
 import { SiteFooter } from '@/components/site/SiteFooter';
+import { siteUrl } from '@/lib/siteUrl';
 
 export const metadata: Metadata = {
+  metadataBase: new URL(siteUrl()),
   title: { default: 'Thuli', template: '%s · Thuli' },
   description: 'Thuli screens an airdrop claim list, holds back farm wallets, and gives a reason for every wallet it holds.',
 };

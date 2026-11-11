@@ -1,0 +1,161 @@
+/* The block shared by the not-found page and the error page. */
+.page {
+  --pad: clamp(20px, 3vw, 48px);
+
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 70svh;
+  padding: 72px var(--pad);
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.labelMark {
+  color: var(--color-accent);
+}
+
+.numeral {
+  margin-top: 28px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 125, 'wght' 800;
+  font-weight: 800;
+  font-size: min(28vw, 18rem);
+  line-height: 0.85;
+  color: var(--color-ink);
+}
+
+.drop {
+  display: inline-block;
+  height: 0.5em;
+  margin-left: 0.06em;
+  color: var(--color-accent);
+  animation: fall 600ms var(--ease-out-expo) 300ms both;
+}
+
+.line {
+  margin-top: 28px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wght' 500;
+  font-weight: 500;
+  font-size: clamp(1.5rem, 2.6vw, 2.5rem);
+  line-height: 1.15;
+  color: var(--color-ink);
+}
+
+.heading {
+  margin-top: 28px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(2.25rem, 5vw, 4.5rem);
+  line-height: 1.05;
+  color: var(--color-ink);
+}
+
+.body {
+  max-width: 52ch;
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px 32px;
+  margin-top: 32px;
+}
+
+.primary {
+  display: inline-flex;
+  align-items: center;
+  height: 52px;
+  padding: 0 22px;
+  border-radius: 8px;
+  background: var(--color-accent);
+  color: var(--color-night);
+  font-family: var(--font-body);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.primary:hover {
+  background: color-mix(in srgb, var(--color-accent) 82%, white);
+}
+
+.primary:active {
+  transform: scale(0.98);
+}
+
+/* The text links take the look of the links in the home page sections. */
+.link {
+  composes: link from '../landing/landing.module.css';
+}
+
+.linkLabel {
+  composes: linkLabel from '../landing/landing.module.css';
+}
+
+.linkArrow {
+  composes: linkArrow from '../landing/landing.module.css';
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 32px;
+  margin-top: 32px;
+}
+
+@media (max-width: 767px) {
+  .page {
+    padding-top: 48px;
+    padding-bottom: 56px;
+  }
+
+  .body {
+    font-size: 16px;
+  }
+}
+
+@keyframes fall {
+  from {
+    opacity: 0;
+    transform: translateY(-40px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* The drop is already at rest, and the block holds still. */
+@media (prefers-reduced-motion: reduce) {
+  .drop {
+    animation: none;
+  }
+
+  .primary {
+    transition: none;
+  }
+}
