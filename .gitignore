@@ -33,6 +33,7 @@ broadcast/
 *.log
 .DS_Store
 .vercel/
+.railway/
 
 # Replay data and caches (large, rebuilt by scripts)
 data/

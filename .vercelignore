@@ -1,0 +1,28 @@
+# An allow-list: nothing at the top of the repository is uploaded unless it is named below, so a new file there can
+# never go up by accident. The site builds from packages/web and reads the packages it imports, the rulebook, the
+# store's migrations, the API's captured examples and the public deployment records.
+/*
+!/package.json
+!/package-lock.json
+!/tsconfig.base.json
+!/packages
+/packages/*
+!/packages/web
+!/packages/api
+!/packages/store
+!/packages/core
+!/packages/worker
+!/packages/rulebook
+!/packages/contracts
+/packages/contracts/*
+!/packages/contracts/deployments
+
+# Never uploaded, wherever they sit inside the folders above: settings files, installed packages, build and test output.
+.env
+.env.*
+node_modules
+.next
+.next-*
+*.tsbuildinfo
+coverage
+test-results

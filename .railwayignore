@@ -1,0 +1,5 @@
+# Railway's upload already leaves out everything .gitignore lists. The worker also never reads the site's static
+# replay files or the documentation, so those stay behind too. The rest of packages/web must go up: it is a declared
+# workspace, and the install expects its folder and package.json.
+packages/web/public/replay/
+docs/
