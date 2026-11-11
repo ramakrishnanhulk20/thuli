@@ -37,7 +37,7 @@ const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1']);
 
 // The advisory lock namespaces written into each module's SQL as the first of the two keys, kept apart so two kinds of
 // decision never wait on each other by chance: 1000 migrations, 1001 one payment claim key, 1002 the payment claim
-// cap, 1003 one lease pool, 1004 one rate bucket and client.
+// cap, 1003 one lease pool, 1004 one rate bucket and client, 1005 one campaign.
 
 /**
  * The caller's moment as an ISO instant, the only way time reaches a query, so two callers that pass the same moment

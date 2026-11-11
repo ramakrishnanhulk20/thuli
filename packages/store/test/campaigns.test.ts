@@ -1,0 +1,681 @@
+// Not covered here: truly parallel connections. PGlite runs one statement at a time, so the calls started together
+// with Promise.all interleave transaction by transaction on one connection; they prove each slot, ask and list is
+// decided inside one transaction under the campaign's lock or inside one statement, not that the advisory lock and
+// SKIP LOCKED hold between two connections. Set STORE_TEST_URL to a throwaway Postgres database to run every test
+// below there too, with ten connections; that run empties every Thuli table in it. Without it, that run is skipped.
+// An ask's signature is stored as given: checking it is core's job. The worker that screens, posts and relays, the
+// API that serves these rows, and the vault itself are not here.
+import { AddressError, parseAddress, type Outcome } from '@thuli/core';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import {
+  activeList,
+  addAsk,
+  addListVersion,
+  board,
+  counts,
+  createCampaign,
+  decideAsk,
+  funderLinks,
+  getAsk,
+  getCampaign,
+  latestList,
+  listText,
+  listVersions,
+  markListActive,
+  markListCancelled,
+  markListPosted,
+  markRelay,
+  queueRelays,
+  releaseAsk,
+  slotHolders,
+  takeAsk,
+  takeRelay,
+  type AskDecision,
+  type AskFactsInput,
+  type CampaignInput,
+} from '../src/campaigns.ts';
+import { connectPostgres, openMemoryDb, StoreError, type Db } from '../src/db.ts';
+import { migrate } from '../src/migrate.ts';
+
+const REAL_URL = process.env.STORE_TEST_URL;
+const TARGETS = [
+  { name: 'in-memory PGlite', open: openMemoryDb },
+  {
+    name: 'Postgres at STORE_TEST_URL',
+    open: REAL_URL === undefined || REAL_URL === '' ? undefined : async () => connectPostgres(REAL_URL, { max: 10 }),
+  },
+];
+
+const NOW = new Date('2026-11-11T12:00:00.000Z');
+const CAMPAIGN = 'demo';
+const VAULT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const WRONG_CHECKSUM = '0x833589FCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const SIGNATURE = `0x${'ab'.repeat(65)}`;
+const OTHER_SIGNATURE = `0x${'cd'.repeat(65)}`;
+const HASH = `0x${'1f'.repeat(32)}`;
+const PUBLIC_KEYS = [
+  'action',
+  'askedAt',
+  'campaignId',
+  'citedTxs',
+  'decidedAt',
+  'facts',
+  'notChecked',
+  'reason',
+  'rule',
+  'servRequestId',
+  'shareBps',
+  'slot',
+  'status',
+  'wallet',
+];
+// The same hostile strings injection.test.ts stores (C43).
+const UNICODE_RUN = ['a', 'é', 'ß', 'Ж', '漢', '🙂', 'ש', 'ا', '́', '€'].join('').repeat(15);
+const FIXTURES = ["'; drop table payment_claims; --", '%00', UNICODE_RUN, '$1'];
+
+function plus(seconds: number, from: Date = NOW): Date {
+  return new Date(from.getTime() + seconds * 1000);
+}
+
+function wallet(n: number): string {
+  return parseAddress(`0x${'abcdef'.repeat(6)}${n.toString(16).padStart(4, '0')}`);
+}
+
+function root(n: number): string {
+  return `0x${n.toString(16).padStart(64, '0')}`;
+}
+
+const FUNDER = wallet(7000);
+const FACTS: AskFactsInput = {
+  ageDays: 400,
+  txCount: 120,
+  accountType: 'eoa',
+  funder: { address: FUNDER, kind: 'wallet', fanout: 3, hops: 1 },
+  burstWallets: null,
+  groupSize: null,
+  missing: ['sharedDepositAddress'],
+};
+
+function terms(overrides: Partial<CampaignInput> = {}): CampaignInput {
+  return {
+    id: CAMPAIGN,
+    name: 'Thuli demo',
+    chain: 84532,
+    vault: VAULT,
+    token: wallet(9001),
+    owner: wallet(9002),
+    agent: wallet(9003),
+    rewardPerWallet: '1000000',
+    perWalletCap: '1000000',
+    partialShareBps: 5000,
+    maxSlots: 20,
+    rulebook: 2,
+    status: 'open',
+    opensAt: plus(-3_600),
+    closesAt: plus(86_400),
+    createdAt: plus(-7_200),
+    ...overrides,
+  };
+}
+
+function decision(who: string, action: Outcome, overrides: Partial<AskDecision> = {}): AskDecision {
+  return {
+    campaignId: CAMPAIGN,
+    wallet: who,
+    action,
+    shareBps: { full: 10_000, partial: 5_000, hold: 0, exclude: 0 }[action],
+    rule: action === 'exclude' ? 'A3' : 'A9',
+    reason: 'No shared funder, deposit or sweep links this wallet to another.',
+    citedTxs: [HASH],
+    notChecked: ['sharedDepositAddress', 'claimPaidToOtherAddress'],
+    facts: FACTS,
+    servRequestId: 'run-1',
+    ...overrides,
+  };
+}
+
+for (const { name, open } of TARGETS) {
+  describe.skipIf(open === undefined)(`campaigns on ${name}`, () => {
+    let db: Db;
+    beforeAll(async () => {
+      db = await (open ?? openMemoryDb)();
+      await migrate(db);
+    });
+    beforeEach(async () => {
+      await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns');
+    });
+    afterAll(async () => {
+      await db.close();
+    });
+
+    async function ask(n: number, at: Date = NOW, campaignId: string = CAMPAIGN): Promise<string> {
+      return addAsk(db, { campaignId, wallet: wallet(n), signedAt: 1_800_000_000, signature: SIGNATURE }, at);
+    }
+
+    async function screenAll(howMany: number, at: Date = NOW): Promise<void> {
+      for (let index = 0; index < howMany; index += 1) expect(await takeAsk(db, at, 60, 3)).not.toBeNull();
+    }
+
+    async function row(n: number): Promise<Record<string, unknown> | undefined> {
+      const [found] = await db.query(
+        `SELECT status, attempts, lease_until, action, share_bps, rule, reason, cited_txs, not_checked, facts, serv_request_id,
+                decided_at, slot, signed_at::text AS signed_at, signature
+           FROM asks WHERE campaign_id = $1 AND wallet = $2`,
+        [CAMPAIGN, wallet(n)],
+      );
+      return found;
+    }
+
+    async function activeVersion(version: number, at: Date = NOW): Promise<void> {
+      expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(version), publishedList: '[]', declaredTotal: '0' }, at)).toBe(
+        version,
+      );
+      expect(await markListPosted(db, CAMPAIGN, version, { postTx: HASH, claimableAt: 1_800_000_000 })).toBe(true);
+      expect(await markListActive(db, CAMPAIGN, version)).toBe(true);
+    }
+
+    it('C44: with max_slots 3, five approved asks decided together get slots 1, 2 and 3 and two get none', async () => {
+      await createCampaign(db, terms({ maxSlots: 3 }));
+      for (let n = 1; n <= 7; n += 1) expect(await ask(n)).toBe('queued');
+      await screenAll(7);
+      // The hold and the exclude are decided first, while every slot is free, and still take none.
+      expect(await decideAsk(db, decision(wallet(6), 'hold'), NOW)).toEqual({ slot: null });
+      expect(await decideAsk(db, decision(wallet(7), 'exclude'), NOW)).toEqual({ slot: null });
+      const actions: Outcome[] = ['full', 'partial', 'full', 'partial', 'full'];
+      const results = await Promise.all(actions.map((action, index) => decideAsk(db, decision(wallet(index + 1), action), plus(1))));
+      const slots = results.map((result) => result?.slot ?? null);
+      expect(slots.filter((slot) => slot !== null).sort()).toEqual([1, 2, 3]);
+      expect(slots.filter((slot) => slot === null)).toHaveLength(2);
+
+      const holders = await slotHolders(db, CAMPAIGN);
+      expect(holders.map((holder) => holder.slot)).toEqual([1, 2, 3]);
+      for (const holder of holders) {
+        const index = slots.indexOf(holder.slot);
+        expect(holder).toEqual({ wallet: wallet(index + 1), action: actions[index], shareBps: actions[index] === 'full' ? 10_000 : 5_000, slot: holder.slot });
+      }
+      expect((await getAsk(db, CAMPAIGN, wallet(6)))?.slot).toBeNull();
+      expect((await getAsk(db, CAMPAIGN, wallet(7)))?.slot).toBeNull();
+      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 7, queued: 0, decided: 7, held: 1, slotsTaken: 3, slotsLeft: 0 });
+
+      // A full campaign gives a later approval no slot, and nothing moves a slot once given.
+      expect(await ask(8)).toBe('queued');
+      await screenAll(1);
+      expect(await decideAsk(db, decision(wallet(8), 'full'), plus(2))).toEqual({ slot: null });
+      expect(await decideAsk(db, decision(holders[0]?.wallet as string, 'hold'), plus(3))).toBeNull();
+      expect(await releaseAsk(db, CAMPAIGN, holders[0]?.wallet as string, plus(3), 3)).toBeNull();
+      expect((await slotHolders(db, CAMPAIGN)).map((holder) => holder.wallet)).toEqual(holders.map((holder) => holder.wallet));
+      const unslotted = wallet(slots.indexOf(null) + 1);
+      await expect(db.query('UPDATE asks SET slot = 1 WHERE campaign_id = $1 AND wallet = $2', [CAMPAIGN, unslotted])).rejects.toThrow(
+        StoreError,
+      );
+      await expect(db.query('UPDATE asks SET slot = 4 WHERE campaign_id = $1 AND wallet = $2', [CAMPAIGN, wallet(6)])).rejects.toThrow(
+        StoreError,
+      );
+    });
+
+    it('C1, C42: the same wallet in two spellings is one ask, and 20 asks started together give one queued', async () => {
+      await createCampaign(db, terms());
+      const first = { campaignId: CAMPAIGN, wallet: wallet(1).toLowerCase(), signedAt: 1_800_000_000, signature: SIGNATURE };
+      expect(await addAsk(db, first, NOW)).toBe('queued');
+      expect(await addAsk(db, { ...first, wallet: wallet(1), signedAt: 1_800_000_500, signature: OTHER_SIGNATURE }, plus(5))).toBe(
+        'exists',
+      );
+      expect(await row(1)).toMatchObject({ status: 'queued', signed_at: '1800000000', signature: SIGNATURE, attempts: 0 });
+      expect((await getAsk(db, CAMPAIGN, wallet(1).toUpperCase().replace('0X', '0x')))?.wallet).toBe(wallet(1));
+
+      const spellings = [wallet(2), wallet(2).toLowerCase(), ` ${wallet(2)}\r\n`];
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, index) =>
+          addAsk(db, { ...first, wallet: spellings[index % 3] as string, signedAt: 1_800_000_000 + index }, NOW),
+        ),
+      );
+      expect(results.filter((result) => result === 'queued')).toHaveLength(1);
+      expect(results.filter((result) => result === 'exists')).toHaveLength(19);
+      const [stored] = await db.query<{ asks: number }>('SELECT count(*)::int AS asks FROM asks WHERE wallet = $1', [wallet(2)]);
+      expect(stored?.asks).toBe(1);
+      await expect(addAsk(db, { ...first, wallet: WRONG_CHECKSUM }, NOW)).rejects.toThrow(AddressError);
+      await expect(addAsk(db, { ...first, wallet: wallet(3), signature: '0x1234' }, NOW)).rejects.toThrow(StoreError);
+      await expect(addAsk(db, { ...first, wallet: wallet(3), signedAt: 1.5 }, NOW)).rejects.toThrow(StoreError);
+    });
+
+    it('takeAsk never hands one ask to two workers, and takes an expired lease again with one more attempt', async () => {
+      await createCampaign(db, terms());
+      for (let n = 1; n <= 4; n += 1) expect(await ask(n, plus(n))).toBe('queued');
+      const taken = await Promise.all(Array.from({ length: 10 }, () => takeAsk(db, plus(10), 60, 3)));
+      const asks = taken.filter((item) => item !== null);
+      expect(asks).toHaveLength(4);
+      expect(new Set(asks.map((item) => item.wallet))).toEqual(new Set([1, 2, 3, 4].map(wallet)));
+      expect(asks.every((item) => item.attempts === 1 && item.leaseUntil.getTime() === plus(70).getTime())).toBe(true);
+      expect(await takeAsk(db, plus(69.999), 60, 3)).toBeNull();
+
+      const again = await takeAsk(db, plus(70), 60, 3);
+      expect(again).toEqual({ campaignId: CAMPAIGN, wallet: wallet(1), askedAt: plus(1), attempts: 2, leaseUntil: plus(130) });
+      expect(await row(1)).toMatchObject({ status: 'screening', attempts: 2 });
+      await expect(takeAsk(db, NOW, 0, 3)).rejects.toThrow(StoreError);
+      await expect(takeAsk(db, NOW, 60, 0)).rejects.toThrow(StoreError);
+    });
+
+    it('takeAsk never hands out an ask at maxAttempts: it ends failed with the A1 hold and the next ask is handed out', async () => {
+      await createCampaign(db, terms());
+      expect(await ask(1)).toBe('queued');
+      // The worker takes it three times and dies each time, so releaseAsk is never called.
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        expect((await takeAsk(db, plus((attempt - 1) * 60), 60, 3))?.attempts).toBe(attempt);
+      }
+      expect(await ask(2, plus(130))).toBe('queued');
+      expect(await takeAsk(db, plus(180), 60, 3)).toMatchObject({ wallet: wallet(2), attempts: 1 });
+      expect(await getAsk(db, CAMPAIGN, wallet(1))).toMatchObject({
+        status: 'failed',
+        action: 'hold',
+        shareBps: 0,
+        rule: 'A1',
+        reason: 'Held for review: the screening could not finish.',
+        citedTxs: [],
+        notChecked: [],
+        facts: null,
+        servRequestId: null,
+        decidedAt: plus(180),
+        slot: null,
+      });
+      expect(await row(1)).toMatchObject({ attempts: 3, lease_until: null });
+
+      // A queued ask already at the limit, here from a release that allowed more attempts, ends the same way.
+      expect(await releaseAsk(db, CAMPAIGN, wallet(2), plus(181), 10)).toBe('queued');
+      expect(await takeAsk(db, plus(182), 60, 1)).toBeNull();
+      expect(await getAsk(db, CAMPAIGN, wallet(2))).toMatchObject({ status: 'failed', action: 'hold', rule: 'A1', decidedAt: plus(182) });
+    });
+
+    it('releaseAsk queues again below the limit and at the limit ends failed with the A1 hold', async () => {
+      await createCampaign(db, terms());
+      expect(await ask(1)).toBe('queued');
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        expect((await takeAsk(db, plus(attempt), 60, 3))?.attempts).toBe(attempt);
+        expect(await releaseAsk(db, CAMPAIGN, wallet(1).toLowerCase(), plus(attempt), 3)).toBe('queued');
+        expect(await row(1)).toMatchObject({ status: 'queued', lease_until: null, action: null, decided_at: null });
+      }
+      expect((await takeAsk(db, plus(3), 60, 3))?.attempts).toBe(3);
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(4), 3)).toBe('failed');
+      expect(await getAsk(db, CAMPAIGN, wallet(1))).toEqual({
+        campaignId: CAMPAIGN,
+        wallet: wallet(1),
+        askedAt: NOW,
+        status: 'failed',
+        action: 'hold',
+        shareBps: 0,
+        rule: 'A1',
+        reason: 'Held for review: the screening could not finish.',
+        citedTxs: [],
+        notChecked: [],
+        facts: null,
+        servRequestId: null,
+        decidedAt: plus(4),
+        slot: null,
+      });
+      expect(await takeAsk(db, plus(1_000), 60, 3)).toBeNull();
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(5), 3)).toBeNull();
+    });
+
+    it('decideAsk acts only on a screening ask: queued, decided and failed asks are left alone and give null', async () => {
+      await createCampaign(db, terms());
+      expect(await ask(1)).toBe('queued');
+      const queued = await row(1);
+      expect(await decideAsk(db, decision(wallet(1), 'full'), NOW)).toBeNull();
+      expect(await row(1)).toEqual(queued);
+
+      await screenAll(1);
+      expect(await decideAsk(db, decision(wallet(1), 'partial'), NOW)).toEqual({ slot: 1 });
+      const decided = await row(1);
+      expect(await decideAsk(db, decision(wallet(1), 'full', { reason: 'A second reason.' }), plus(1))).toBeNull();
+      expect(await row(1)).toEqual(decided);
+
+      expect(await ask(2)).toBe('queued');
+      await screenAll(1);
+      expect(await releaseAsk(db, CAMPAIGN, wallet(2), NOW, 1)).toBe('failed');
+      const failed = await row(2);
+      expect(await decideAsk(db, decision(wallet(2), 'full'), plus(1))).toBeNull();
+      expect(await row(2)).toEqual(failed);
+      expect(await decideAsk(db, decision(wallet(3), 'full'), plus(1))).toBeNull();
+      expect(await decideAsk(db, decision(wallet(1), 'full', { campaignId: 'other' }), plus(1))).toBeNull();
+    });
+
+    it('C13, C33: decideAsk refuses a reason with a link or markup, a bad hash, a wrong share or rule, and writes nothing', async () => {
+      await createCampaign(db, terms());
+      expect(await ask(1)).toBe('queued');
+      await screenAll(1);
+      const before = await row(1);
+      const refused: Partial<AskDecision>[] = [
+        { reason: 'See https://evil.example for proof.' },
+        { reason: '<img src=x onerror=alert(1)>' },
+        { reason: '[claim](evil.example)' },
+        { reason: 'Hidden‮right to left' },
+        { reason: 'x'.repeat(401) },
+        { reason: '' },
+        { reason: 'Broken \uD800 text' },
+        { citedTxs: [HASH.toUpperCase().replace('0X', '0x')] },
+        { citedTxs: [HASH.slice(0, 40)] },
+        { citedTxs: Array.from({ length: 257 }, () => HASH) },
+        { notChecked: ['x'.repeat(65)] },
+        { notChecked: Array.from({ length: 17 }, () => 'group') },
+        { shareBps: 9_999 },
+        { rule: 'Z9' },
+        { servRequestId: 'run 1' },
+      ];
+      for (const overrides of refused) {
+        await expect(decideAsk(db, decision(wallet(1), 'partial', overrides), NOW)).rejects.toThrow(StoreError);
+      }
+      await expect(decideAsk(db, decision(wallet(1), 'full', { shareBps: 5_000 }), NOW)).rejects.toThrow(StoreError);
+      await expect(decideAsk(db, decision(wallet(1), 'hold', { shareBps: 10_000 }), NOW)).rejects.toThrow(StoreError);
+      await expect(decideAsk(db, decision(wallet(1), 'maybe' as Outcome), NOW)).rejects.toThrow(StoreError);
+      expect(await row(1)).toEqual(before);
+      expect(await decideAsk(db, decision(wallet(1), 'partial', { reason: 'x'.repeat(400), servRequestId: null }), NOW)).toEqual({
+        slot: 1,
+      });
+    });
+
+    it('decideAsk keeps the facts a decision rested on in one exact shape, and funderLinks lists funded asks oldest first', async () => {
+      await createCampaign(db, terms());
+      for (let n = 1; n <= 4; n += 1) expect(await ask(n, plus(n))).toBe('queued');
+      await screenAll(4, plus(5));
+      const before = await row(1);
+      const funder = FACTS.funder as NonNullable<AskFactsInput['funder']>;
+      const refused: unknown[] = [
+        { ...FACTS, extra: 1 },
+        Object.fromEntries(Object.entries(FACTS).filter(([key]) => key !== 'groupSize')),
+        { ...FACTS, funder: { ...funder, address: WRONG_CHECKSUM } },
+        { ...FACTS, funder: { ...funder, address: '0x1234' } },
+        { ...FACTS, funder: { ...funder, label: 'Binance 14' } },
+        { ...FACTS, funder: { ...funder, hops: null } },
+        { ...FACTS, missing: ['x'.repeat(65)] },
+        { ...FACTS, missing: Array.from({ length: 17 }, () => 'group') },
+        { ...FACTS, accountType: 'e'.repeat(33) },
+        { ...FACTS, accountType: '<b>eoa</b>' },
+        { ...FACTS, ageDays: -1 },
+        { ...FACTS, txCount: 1.5 },
+        null,
+      ];
+      for (const facts of refused) {
+        await expect(decideAsk(db, decision(wallet(1), 'full', { facts: facts as AskFactsInput }), NOW)).rejects.toThrow(StoreError);
+      }
+      expect(await row(1)).toEqual(before);
+
+      const lowered = { ...FACTS, funder: { ...funder, address: FUNDER.toLowerCase() } };
+      expect(await decideAsk(db, decision(wallet(1), 'full', { facts: lowered }), plus(10))).toEqual({ slot: 1 });
+      expect(await decideAsk(db, decision(wallet(2), 'hold', { facts: { ...FACTS, funder: null } }), plus(20))).toEqual({ slot: null });
+      expect(await decideAsk(db, decision(wallet(3), 'partial'), plus(30))).toEqual({ slot: 2 });
+      expect(await releaseAsk(db, CAMPAIGN, wallet(4), plus(40), 1)).toBe('failed');
+      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.facts).toEqual({ ...FACTS, funder: { ...funder, address: FUNDER } });
+      expect((await getAsk(db, CAMPAIGN, wallet(2)))?.facts?.funder).toBeNull();
+      expect((await getAsk(db, CAMPAIGN, wallet(4)))?.facts).toBeNull();
+      const stored = await db.query<{ address: string }>(
+        "SELECT DISTINCT facts -> 'funder' ->> 'address' AS address FROM asks WHERE facts -> 'funder' ->> 'address' IS NOT NULL",
+      );
+      expect(stored).toEqual([{ address: FUNDER }]);
+      expect(await funderLinks(db, CAMPAIGN)).toEqual([
+        { wallet: wallet(1), funderAddress: FUNDER, funderKind: 'wallet', decidedAt: plus(10) },
+        { wallet: wallet(3), funderAddress: FUNDER, funderKind: 'wallet', decidedAt: plus(30) },
+      ]);
+      expect(await funderLinks(db, 'missing')).toEqual([]);
+    });
+
+    it('a second createCampaign with different terms throws StoreError, and identical terms are a no-op', async () => {
+      expect(await createCampaign(db, terms())).toBe('created');
+      const stored = await getCampaign(db, CAMPAIGN);
+      const respelled = terms({ vault: VAULT.toLowerCase(), owner: wallet(9002).toLowerCase(), createdAt: plus(100) });
+      expect(await createCampaign(db, respelled)).toBe('unchanged');
+      for (const change of [
+        { rewardPerWallet: '999999' },
+        { maxSlots: 21 },
+        { agent: wallet(9004) },
+        { status: 'closed' as const },
+        { closesAt: plus(86_401) },
+        { name: 'Thuli demo 2' },
+      ]) {
+        await expect(createCampaign(db, terms(change))).rejects.toThrow(StoreError);
+      }
+      expect(await getCampaign(db, CAMPAIGN)).toEqual(stored);
+      expect(stored).toMatchObject({ vault: VAULT, owner: wallet(9002), rewardPerWallet: '1000000', maxSlots: 20 });
+      expect(await getCampaign(db, 'missing')).toBeNull();
+      expect(await getCampaign(db, 'not an id')).toBeNull();
+    });
+
+    it('amounts are plain decimal digits, refused by the code and by the table alike', async () => {
+      for (const rewardPerWallet of ['01000000', '1e6', '-1', '1.5', ' 1', '0', '1000001']) {
+        await expect(createCampaign(db, terms({ rewardPerWallet }))).rejects.toThrow(StoreError);
+      }
+      await expect(createCampaign(db, terms({ perWalletCap: (1n << 256n).toString() }))).rejects.toThrow(StoreError);
+      await expect(createCampaign(db, terms({ partialShareBps: 10_000 }))).rejects.toThrow(StoreError);
+      await expect(createCampaign(db, terms({ closesAt: plus(-3_600) }))).rejects.toThrow(StoreError);
+      await expect(createCampaign(db, terms({ name: '<b>demo</b>' }))).rejects.toThrow(StoreError);
+      await expect(
+        db.query(
+          `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap,
+                                  partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at)
+           VALUES ('raw', 'raw', 1, $1, $1, $1, $1, '1.5', '2', 5000, 3, 2, 'open', $2::timestamptz, $3::timestamptz, $2::timestamptz)`,
+          [VAULT, NOW.toISOString(), plus(60).toISOString()],
+        ),
+      ).rejects.toThrow(StoreError);
+      expect(await db.query('SELECT id FROM campaigns')).toEqual([]);
+    });
+
+    it("addAsk answers closed outside opens_at to closes_at and on a closed campaign, and unknown for an unknown id", async () => {
+      await createCampaign(db, terms({ opensAt: NOW, closesAt: plus(60) }));
+      await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
+      expect(await ask(1, plus(-0.001))).toBe('closed');
+      expect(await ask(1, NOW)).toBe('queued');
+      expect(await ask(2, plus(59.999))).toBe('queued');
+      expect(await ask(3, plus(60))).toBe('closed');
+      expect(await ask(3, NOW, 'shut')).toBe('closed');
+      expect(await ask(3, NOW, 'missing')).toBe('unknown');
+      expect(await ask(3, NOW, "'; drop table asks; --")).toBe('unknown');
+      // A wallet that asked in time is told its ask stands, even after the campaign closes.
+      expect(await ask(1, plus(120))).toBe('exists');
+      const [stored] = await db.query<{ asks: number }>('SELECT count(*)::int AS asks FROM asks');
+      expect(stored?.asks).toBe(2);
+    });
+
+    it('list versions number 1, 2, 3, refuse the newest root again, keep one active and give the text back exactly', async () => {
+      await createCampaign(db, terms());
+      const text = `[ {"account":"${wallet(1)}","cumulativeAmount":"1000000"},\n  {"account":"${wallet(2)}","cumulativeAmount":"500000"} ]`;
+      expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(1), publishedList: text, declaredTotal: '1500000' }, NOW)).toBe(1);
+      await expect(
+        addListVersion(db, { campaignId: CAMPAIGN, root: root(1), publishedList: '[]', declaredTotal: '0' }, plus(1)),
+      ).rejects.toThrow(StoreError);
+      expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(2), publishedList: '["Ж 🙂"]', declaredTotal: '0' }, plus(2))).toBe(2);
+      expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(1), publishedList: '[]', declaredTotal: '0' }, plus(3))).toBe(3);
+      for (const bad of [
+        { root: root(0xabc).toUpperCase().replace('0X', '0x') },
+        { publishedList: '{"not":"a list"}' },
+        { publishedList: '[' },
+        { declaredTotal: '-1' },
+        { campaignId: 'missing' },
+      ]) {
+        const list = { campaignId: CAMPAIGN, root: root(4), publishedList: '[]', declaredTotal: '0', ...bad };
+        await expect(addListVersion(db, list, plus(4))).rejects.toThrow(StoreError);
+      }
+
+      expect(await markListActive(db, CAMPAIGN, 1)).toBe(false);
+      expect(await markListPosted(db, CAMPAIGN, 1, { postTx: HASH, claimableAt: 1_800_000_000 })).toBe(true);
+      expect(await markListPosted(db, CAMPAIGN, 1, { postTx: HASH, claimableAt: 1_800_000_001 })).toBe(false);
+      expect(await markListActive(db, CAMPAIGN, 1)).toBe(true);
+      expect(await markListPosted(db, CAMPAIGN, 2, { postTx: HASH, claimableAt: 1_800_003_600 })).toBe(true);
+      expect(await markListActive(db, CAMPAIGN, 2)).toBe(true);
+      expect(await markListCancelled(db, CAMPAIGN, 2)).toBe(false);
+      expect(await markListCancelled(db, CAMPAIGN, 3)).toBe(true);
+      expect(await markListActive(db, CAMPAIGN, 3)).toBe(false);
+
+      const versions = await listVersions(db, CAMPAIGN);
+      expect(versions.map((version) => [version.version, version.status])).toEqual([
+        [1, 'superseded'],
+        [2, 'active'],
+        [3, 'cancelled'],
+      ]);
+      for (const version of versions) {
+        expect(Object.keys(version).sort()).toEqual(
+          ['campaignId', 'claimableAt', 'createdAt', 'declaredTotal', 'postTx', 'root', 'status', 'version'],
+        );
+      }
+      expect(versions[1]).toEqual({
+        campaignId: CAMPAIGN,
+        version: 2,
+        root: root(2),
+        declaredTotal: '0',
+        status: 'active',
+        postTx: HASH,
+        claimableAt: 1_800_003_600,
+        createdAt: plus(2),
+      });
+      expect(await activeList(db, CAMPAIGN)).toEqual(versions[1]);
+      expect(await latestList(db, CAMPAIGN)).toEqual(versions[2]);
+      expect(await listText(db, CAMPAIGN, 1)).toBe(text);
+      expect(await listText(db, CAMPAIGN, 2)).toBe('["Ж 🙂"]');
+      expect(await listText(db, CAMPAIGN, 9)).toBeNull();
+      await expect(
+        db.query("UPDATE list_versions SET status = 'active' WHERE campaign_id = $1 AND version = 1", [CAMPAIGN]),
+      ).rejects.toThrow(StoreError);
+    });
+
+    it('relays: one row per wallet and version however often queued, and takeRelay never hands one to two workers', async () => {
+      await createCampaign(db, terms());
+      await expect(queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(1), amount: '1000000' }], NOW)).rejects.toThrow(StoreError);
+      await activeVersion(1);
+      const entries = [1, 2, 3, 4].map((n) => ({ wallet: wallet(n), amount: '1000000' }));
+      expect(await queueRelays(db, CAMPAIGN, 1, [...entries, { wallet: wallet(4).toLowerCase(), amount: '1000000' }], NOW)).toBe(4);
+      expect(await queueRelays(db, CAMPAIGN, 1, entries, plus(1))).toBe(0);
+      expect(await Promise.all([1, 2, 3].map(() => queueRelays(db, CAMPAIGN, 1, entries, plus(2))))).toEqual([0, 0, 0]);
+      await expect(
+        queueRelays(db, CAMPAIGN, 1, [entries[0] as { wallet: string; amount: string }, { wallet: wallet(1), amount: '2' }], NOW),
+      ).rejects.toThrow(StoreError);
+      await expect(queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(5), amount: '0' }], NOW)).rejects.toThrow(StoreError);
+      const [stored] = await db.query<{ relays: number }>('SELECT count(*)::int AS relays FROM claim_relays');
+      expect(stored?.relays).toBe(4);
+
+      const taken = await Promise.all(Array.from({ length: 10 }, () => takeRelay(db, plus(10), 60)));
+      const relays = taken.filter((relay) => relay !== null);
+      expect(relays).toHaveLength(4);
+      expect(new Set(relays.map((relay) => relay.wallet))).toEqual(new Set([1, 2, 3, 4].map(wallet)));
+      expect(relays.every((relay) => relay.status === 'sent' && relay.attempts === 1 && relay.version === 1)).toBe(true);
+      expect(await takeRelay(db, plus(69.999), 60)).toBeNull();
+
+      const key = { campaignId: CAMPAIGN, wallet: wallet(1).toLowerCase(), version: 1 };
+      expect(await markRelay(db, key, { status: 'sent', tx: HASH }, plus(30))).toBe('sent');
+      expect(await markRelay(db, key, { status: 'confirmed' }, plus(31))).toBe('confirmed');
+      expect(await markRelay(db, key, { status: 'pending' }, plus(32))).toBeNull();
+      const [confirmed] = await db.query<{ tx: string; status: string }>(
+        'SELECT tx, status FROM claim_relays WHERE wallet = $1',
+        [wallet(1)],
+      );
+      expect(confirmed).toEqual({ tx: HASH, status: 'confirmed' });
+      await expect(markRelay(db, key, { status: 'done' as 'sent' }, plus(33))).rejects.toThrow(StoreError);
+
+      // A newer active version is a new key, so the same wallets get one more row each, and only one.
+      await activeVersion(2, plus(40));
+      expect(await queueRelays(db, CAMPAIGN, 2, entries, plus(41))).toBe(4);
+      await expect(queueRelays(db, CAMPAIGN, 1, entries, plus(41))).rejects.toThrow(StoreError);
+      const [after] = await db.query<{ relays: number }>('SELECT count(*)::int AS relays FROM claim_relays');
+      expect(after?.relays).toBe(8);
+    });
+
+    it('a relay is failed after 5 attempts, whether each one is given back or its lease runs out', async () => {
+      await createCampaign(db, terms());
+      await activeVersion(1);
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(1), amount: '1000000' }], NOW)).toBe(1);
+      const key = { campaignId: CAMPAIGN, wallet: wallet(1), version: 1 };
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        expect((await takeRelay(db, plus(attempt), 60))?.attempts).toBe(attempt);
+        expect(await markRelay(db, key, { status: 'pending' }, plus(attempt))).toBe(attempt < 5 ? 'pending' : 'failed');
+      }
+      expect(await takeRelay(db, plus(10), 60)).toBeNull();
+
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(2), amount: '500000' }], NOW)).toBe(1);
+      expect((await takeRelay(db, NOW, 60))?.attempts).toBe(1);
+      for (let attempt = 2; attempt <= 5; attempt += 1) {
+        const leaseEnds = (attempt - 1) * 60;
+        expect(await takeRelay(db, plus(leaseEnds - 0.001), 60)).toBeNull();
+        expect((await takeRelay(db, plus(leaseEnds), 60))?.attempts).toBe(attempt);
+      }
+      expect(await takeRelay(db, plus(299.999), 60)).toBeNull();
+      expect(await takeRelay(db, plus(300), 60)).toBeNull();
+      const rows = await db.query<{ wallet: string; status: string; attempts: number }>(
+        'SELECT wallet, status, attempts FROM claim_relays',
+      );
+      expect(new Map(rows.map((relay) => [relay.wallet, [relay.status, relay.attempts]]))).toEqual(
+        new Map([
+          [wallet(1), ['failed', 5]],
+          [wallet(2), ['failed', 5]],
+        ]),
+      );
+    });
+
+    it('board pages decided and failed asks newest first, and counts adds them up', async () => {
+      await createCampaign(db, terms());
+      for (let n = 1; n <= 4; n += 1) expect(await ask(n, plus(n))).toBe('queued');
+      await screenAll(3, plus(5));
+      expect(await decideAsk(db, decision(wallet(1), 'full'), plus(10))).toEqual({ slot: 1 });
+      expect(await decideAsk(db, decision(wallet(2), 'hold'), plus(20))).toEqual({ slot: null });
+      expect(await releaseAsk(db, CAMPAIGN, wallet(3), plus(30), 1)).toBe('failed');
+      expect((await board(db, CAMPAIGN, 2)).map((item) => item.wallet)).toEqual([wallet(3), wallet(2)]);
+      expect((await board(db, CAMPAIGN, 2, plus(20))).map((item) => item.wallet)).toEqual([wallet(1)]);
+      expect(await board(db, CAMPAIGN, 100, plus(10))).toEqual([]);
+      expect(await board(db, 'missing', 10)).toEqual([]);
+      await expect(board(db, CAMPAIGN, 101)).rejects.toThrow(StoreError);
+      await expect(board(db, CAMPAIGN, 0)).rejects.toThrow(StoreError);
+      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 4, queued: 1, decided: 3, held: 2, slotsTaken: 1, slotsLeft: 19 });
+      expect(await counts(db, 'missing')).toBeNull();
+    });
+
+    it('C43: hostile strings are stored as campaign name and reason where their checks allow, and read back unchanged', async () => {
+      expect([...UNICODE_RUN]).toHaveLength(150);
+      for (const [index, fixture] of FIXTURES.entries()) {
+        const named = terms({ id: `named-${index}`, name: fixture });
+        if ([...fixture].length <= 80) {
+          expect(await createCampaign(db, named)).toBe('created');
+          expect((await getCampaign(db, named.id))?.name).toBe(fixture);
+        } else {
+          await expect(createCampaign(db, named)).rejects.toThrow(StoreError);
+        }
+      }
+      expect(await db.query<{ id: string }>('SELECT id FROM campaigns ORDER BY id')).toEqual([
+        { id: 'named-0' },
+        { id: 'named-1' },
+        { id: 'named-3' },
+      ]);
+
+      await createCampaign(db, terms());
+      for (const [index, fixture] of FIXTURES.entries()) {
+        expect(await ask(index + 1)).toBe('queued');
+        await screenAll(1);
+        expect(await decideAsk(db, decision(wallet(index + 1), 'hold', { reason: fixture, notChecked: [fixture.slice(0, 8)] }), NOW)).toEqual({
+          slot: null,
+        });
+        const stored = await getAsk(db, CAMPAIGN, wallet(index + 1));
+        expect(stored?.reason).toBe(fixture);
+        expect(stored?.notChecked).toEqual([fixture.slice(0, 8)]);
+      }
+      for (const table of ['campaigns', 'asks', 'list_versions', 'claim_relays', 'payment_claims']) {
+        const [present] = await db.query<{ present: boolean }>('SELECT to_regclass($1) IS NOT NULL AS present', [table]);
+        expect({ table, present: present?.present }).toEqual({ table, present: true });
+      }
+    });
+
+    it('C40: the public ask view has exactly the listed keys, so the signature and lease cannot leave through it', async () => {
+      await createCampaign(db, terms());
+      for (let n = 1; n <= 3; n += 1) expect(await ask(n, plus(n))).toBe('queued');
+      await screenAll(2, plus(5));
+      expect(await decideAsk(db, decision(wallet(1), 'full'), plus(6))).toEqual({ slot: 1 });
+      expect(await releaseAsk(db, CAMPAIGN, wallet(2), plus(7), 1)).toBe('failed');
+      const views = [
+        await getAsk(db, CAMPAIGN, wallet(1)),
+        await getAsk(db, CAMPAIGN, wallet(2)),
+        await getAsk(db, CAMPAIGN, wallet(3)),
+        ...(await board(db, CAMPAIGN, 10)),
+      ];
+      expect(views.map((view) => view?.status)).toEqual(['decided', 'failed', 'queued', 'failed', 'decided']);
+      for (const view of views) {
+        expect(Object.keys(view ?? {}).sort()).toEqual(PUBLIC_KEYS);
+        expect(JSON.stringify(view)).not.toContain(SIGNATURE.slice(2));
+      }
+      expect(await getAsk(db, CAMPAIGN, wallet(4))).toBeNull();
+      expect(await getAsk(db, 'missing', wallet(1))).toBeNull();
+    });
+  });
+}

@@ -158,7 +158,7 @@ describe('C43 source scan', () => {
 
   it('C43: every query text in packages/store/src is one literal, and values travel only as parameters', async () => {
     const files = (await readdir(SOURCE)).filter((file) => file.endsWith('.ts'));
-    expect(files.sort()).toEqual(['checkCache.ts', 'db.ts', 'index.ts', 'limits.ts', 'migrate.ts', 'paymentClaims.ts', 'sweep.ts']);
+    expect(files.sort()).toEqual(['campaigns.ts', 'checkCache.ts', 'db.ts', 'index.ts', 'limits.ts', 'migrate.ts', 'paymentClaims.ts', 'sweep.ts']);
     let sites = 0;
     const problems: string[] = [];
     for (const file of files) {

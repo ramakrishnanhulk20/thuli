@@ -4,3 +4,4 @@ export * from './paymentClaims.ts';
 export * from './limits.ts';
 export * from './checkCache.ts';
 export * from './sweep.ts';
+export * from './campaigns.ts';

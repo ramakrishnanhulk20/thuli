@@ -81,7 +81,7 @@ describe('sweep', () => {
     expect(await sweep(db, new Date('2100-01-01T00:00:00.000Z'))).toEqual({ claims: 3, leases: 1, events: 2, checks: 1 });
     for (const table of SWEPT) expect({ table, rows: await rows(table) }).toEqual({ table, rows: 0 });
     expect(await rows('day_counts')).toBe(1);
-    expect(await rows('schema_migrations')).toBe(1);
+    expect(await rows('schema_migrations')).toBe(2);
   });
 
   it('C41: the length checks refuse an over-long key, pool, bucket, client and counter name', async () => {

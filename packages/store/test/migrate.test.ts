@@ -35,10 +35,10 @@ describe('migrate', () => {
   }
 
   it('applies each file once, even when two runs start together', async () => {
-    const [first, second] = await Promise.all([migrate(db), migrate(db)]);
+    const [first, second] = await Promise.all([migrate(db, directory), migrate(db, directory)]);
     expect([first, second]).toContainEqual({ applied: ['001_init.sql'], alreadyApplied: [] });
     expect([first, second]).toContainEqual({ applied: [], alreadyApplied: ['001_init.sql'] });
-    expect(await migrate(db)).toEqual({ applied: [], alreadyApplied: ['001_init.sql'] });
+    expect(await migrate(db, directory)).toEqual({ applied: [], alreadyApplied: ['001_init.sql'] });
     const text = (await readFile(INIT, 'utf8')).replaceAll('\r\n', '\n');
     const rows = await db.query<{ name: string; sha256: string }>('SELECT name, sha256 FROM schema_migrations');
     expect(rows).toEqual([{ name: '001_init.sql', sha256: createHash('sha256').update(text).digest('hex') }]);
@@ -86,6 +86,16 @@ describe('migrate', () => {
       rate_events: ['id', 'bucket', 'client', 'at'],
       day_counts: ['day', 'name', 'count'],
       check_cache: ['address', 'chain', 'rulebook', 'body', 'checked_at', 'expires_at'],
+      campaigns: [
+        'id', 'name', 'chain', 'vault', 'token', 'owner', 'agent', 'reward_per_wallet', 'per_wallet_cap', 'partial_share_bps',
+        'max_slots', 'rulebook', 'status', 'opens_at', 'closes_at', 'created_at',
+      ],
+      asks: [
+        'campaign_id', 'wallet', 'signed_at', 'signature', 'asked_at', 'status', 'lease_until', 'attempts', 'action', 'share_bps',
+        'rule', 'reason', 'cited_txs', 'not_checked', 'facts', 'serv_request_id', 'decided_at', 'slot',
+      ],
+      list_versions: ['campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at'],
+      claim_relays: ['campaign_id', 'wallet', 'version', 'amount', 'status', 'tx', 'attempts', 'updated_at'],
     });
   });
 });
