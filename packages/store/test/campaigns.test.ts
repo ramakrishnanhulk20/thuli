@@ -343,14 +343,14 @@ for (const { name, open } of TARGETS) {
       expect(await ask(4, plus(15))).toBe('queued');
 
       const untouched = await Promise.all([2, 3, 4, 5].map((n) => row(n)));
-      for (const n of [2, 3, 4, 5]) expect(await requeueFailedAsk(db, CAMPAIGN, wallet(n), plus(100))).toBe(false);
+      for (const n of [2, 3, 4, 5]) expect(await requeueFailedAsk(db, CAMPAIGN, wallet(n), plus(100))).toEqual({ requeued: false, cause: 'no failed ask from this wallet' });
       expect(await Promise.all([2, 3, 4, 5].map((n) => row(n)))).toEqual(untouched);
-      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(9), plus(100))).toBe(false);
-      expect(await requeueFailedAsk(db, 'missing', wallet(1), plus(100))).toBe(false);
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(9), plus(100))).toEqual({ requeued: false, cause: 'no failed ask from this wallet' });
+      expect(await requeueFailedAsk(db, 'missing', wallet(1), plus(100))).toEqual({ requeued: false, cause: 'no failed ask from this wallet' });
       await expect(requeueFailedAsk(db, CAMPAIGN, wallet(1), new Date(Number.NaN))).rejects.toThrow(StoreError);
 
       const signed = await row(1);
-      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1).toLowerCase(), plus(100))).toBe(true);
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1).toLowerCase(), plus(100))).toEqual({ requeued: true });
       expect(await getAsk(db, CAMPAIGN, wallet(1))).toMatchObject({
         status: 'queued',
         action: null,
@@ -365,7 +365,7 @@ for (const { name, open } of TARGETS) {
         slot: null,
       });
       expect(await row(1)).toMatchObject({ attempts: 0, lease_until: null, signed_at: signed?.signed_at, signature: signed?.signature });
-      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1), plus(101))).toBe(false);
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1), plus(101))).toEqual({ requeued: false, cause: 'no failed ask from this wallet' });
       // It waits its turn by when it first asked, so it is the next ask handed out.
       expect(await takeAsk(db, plus(102), 60, 3)).toMatchObject({ wallet: wallet(1), attempts: 1 });
     });

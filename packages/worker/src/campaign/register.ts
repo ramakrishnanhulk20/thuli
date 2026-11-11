@@ -551,7 +551,7 @@ export async function requeueAsk(
   }
   if (!write) return { ok: true, lines: [...lines, 'it would be queued again from the start, with no attempts; add --write to do it'] };
   const moved = await requeueFailedAsk(db, campaignId, ask.wallet, now);
-  return moved
+  return moved.requeued
     ? { ok: true, lines: [...lines, 'queued again from the start'] }
-    : { ok: false, lines: [...lines, 'it changed before it could be moved, so nothing changed'] };
+    : { ok: false, lines: [...lines, `not queued again: ${moved.cause}, so nothing changed`] };
 }

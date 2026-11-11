@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appealTextHash, parseAddress } from '@thuli/core';
-import { addAppeal, getAppeal, ownerAppeals, recordAppealCheck, takeAppeal } from '../src/appeals.ts';
+import { addAppeal, getAppeal, markAppealSubmitting, ownerAppeals, recordAppealCheck, takeAppeal } from '../src/appeals.ts';
 import { counts, getAsk, getCampaign, listVersions, markListResent, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
@@ -324,7 +324,7 @@ describe('migrate', () => {
 
     const upgraded = await migrate(db);
     expect(upgraded.alreadyApplied).toHaveLength(8);
-    expect(upgraded.applied).toEqual(['009_reppo_verdict.sql']);
+    expect(upgraded.applied).toContain('009_reppo_verdict.sql');
     expect(await getAppeal(db, 'old', checked)).toMatchObject({ checkStatus: 'checked', reppoRoute: 'block', reppoNote: 'A count alone.', reppoEvalId: 'eval_1' });
     expect(await getAppeal(db, 'old', waiting)).toMatchObject({ checkStatus: 'queued', reppoRoute: null });
     expect((await ownerAppeals(db, 'old')).map((row) => [row.checkStatus, row.reppoRoute, row.reppoScore, row.reppoDecision, row.reppoConfidence])).toEqual([
@@ -343,6 +343,64 @@ describe('migrate', () => {
       StoreError,
     );
     await expect(db.query('UPDATE appeals SET reppo_score = 101 WHERE wallet = $1', [checked])).rejects.toThrow(StoreError);
+  });
+
+  it('a database made through 009, holding a checking and a checked appeal, migrates on to 010 with every row readable', async () => {
+    const before = [
+      '002_campaigns.sql', '003_retries_and_vault_block.sql', '004_paid_results.sql', '005_list_sending.sql', '006_appeals.sql',
+      '007_screening_tries.sql', '008_post_nonce.sql', '009_reppo_verdict.sql',
+    ];
+    for (const name of before) {
+      await writeFile(path.join(directory, name), await readFile(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url))));
+    }
+    expect((await migrate(db, directory)).applied).toHaveLength(9);
+    const at = '2026-11-11T12:00:00.000Z';
+    const checking = parseAddress('0x00000000000000000000000000000000000000b2');
+    const checked = parseAddress('0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a');
+    const signature = `0x${'ab'.repeat(65)}`;
+    const text = 'My wallet is my own.';
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+       VALUES ('old', 'Before the submit mark', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{}', 'open',
+               $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz)`,
+      ['0x00000000000000000000000000000000000a11ce', at],
+    );
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts, action, share_bps, rule, reason,
+                         cited_txs, not_checked, facts, decided_at)
+       SELECT 'old', w, 1800000000, $2, $3::timestamptz, 'decided', 1, 'hold', 0, 'A9', 'Held while the funder is checked.',
+              '[]', '[]', $4::jsonb, $3::timestamptz
+         FROM unnest(ARRAY[$1::text, $5::text]) AS w`,
+      [checking, signature, at, '{"ageDays":3,"txCount":1,"accountType":"eoa","funder":null,"burstWallets":null,"groupSize":null,"missing":[]}', checked],
+    );
+    // Written the way the code before this migration wrote them: one held by a worker whose lease has run out, one
+    // checked with Reppo's verdict.
+    await db.query(
+      `INSERT INTO appeals (campaign_id, wallet, text, text_hash, signed_at, signature, appealed_action, appealed_rule, filed_at,
+                            check_status, lease_until, attempts, reppo_eval_id, reppo_route, reppo_note, credits_charged, checked_at,
+                            outcome, reppo_score, reppo_decision, reppo_confidence)
+       VALUES ('old', $1, $3, $4, 1800000000, $5, 'hold', 'A9', $6::timestamptz, 'checking', $6::timestamptz, 1, NULL, NULL, NULL,
+               NULL, NULL, 'open', NULL, NULL, NULL),
+              ('old', $2, $3, $4, 1800000000, $5, 'hold', 'A9', $6::timestamptz, 'checked', NULL, 1, 'eval_1', 'block', NULL, 4,
+               $6::timestamptz, 'open', 30, 'reject', 'high')`,
+      [checking, checked, text, appealTextHash(text), signature, at],
+    );
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toHaveLength(9);
+    expect(upgraded.applied).toEqual(['010_appeal_submit_mark.sql']);
+    expect((await ownerAppeals(db, 'old')).map((row) => [row.wallet, row.checkStatus, row.reppoScore, row.submitStartedAt, row.checkNote])).toEqual([
+      [checking, 'checking', null, null, null],
+      [checked, 'checked', 30, null, null],
+    ]);
+    expect(await getAppeal(db, 'old', checked)).toMatchObject({ checkStatus: 'checked', reppoRoute: 'block' });
+    // The appeal a dead worker held is taken again with no mark, so it may be submitted, and marked first.
+    const now = new Date('2026-11-11T12:10:00.000Z');
+    expect(await takeAppeal(db, now, 300, 6)).toMatchObject({ wallet: checking, attempts: 2, submitStarted: false });
+    expect(await markAppealSubmitting(db, { campaignId: 'old', wallet: checking }, now)).toBe(true);
+    // A cause on an appeal that is not unchecked is refused by the table itself.
+    await expect(db.query("UPDATE appeals SET check_note = 'a cause' WHERE wallet = $1", [checked])).rejects.toThrow(StoreError);
   });
 
   it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {
@@ -375,6 +433,7 @@ describe('migrate', () => {
         'campaign_id', 'wallet', 'text', 'text_hash', 'signed_at', 'signature', 'appealed_action', 'appealed_rule', 'filed_at',
         'check_status', 'lease_until', 'attempts', 'retry_at', 'reppo_eval_id', 'reppo_route', 'reppo_note', 'credits_charged',
         'checked_at', 'outcome', 'new_action', 'owner_note', 'settled_at', 'reppo_score', 'reppo_decision', 'reppo_confidence',
+        'submit_started_at', 'check_note',
       ],
       list_versions: [
         'campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at',

@@ -1009,22 +1009,31 @@ export async function releaseAsk(
   return row?.status ?? null;
 }
 
+export type RequeueRefusal = 'no failed ask from this wallet' | 'the ask has an appeal';
+/** Whether requeueFailedAsk moved the ask, and when it did not, the fixed cause. */
+export type RequeueResult = { requeued: true } | { requeued: false; cause: RequeueRefusal };
+
 /**
  * Puts an ask that failed, because every try at screening it ran out during an outage, back in the queue to be
  * screened again from the start: status queued, no attempts, no retry time, and the A1 hold cleared. It keeps its
  * signature and its place by when it asked. For an operator's command once the outage is over. A decided ask is never
  * re-screened this way, a decided hold included: only a failed ask, which never took a slot, moves, so no command can
- * approve a wallet (C11). One row, in one statement under the campaign's lock (C41). now is checked like every caller's
- * time; the ask keeps no requeue time of its own.
- * @returns true when the ask was failed and is now queued; false, changing nothing, for any other ask or none.
+ * approve a wallet (C11). A failed ask that has an appeal never moves either, so the appeal and the outside check always
+ * judge the decision that was appealed (C11, C17). Under the campaign's lock, which addAppeal takes too, so no appeal
+ * can be filed between the check and the move; one row (C41). now is checked like every caller's time; the ask keeps
+ * no requeue time of its own.
+ * @returns { requeued: true } when the ask was failed and is now queued; otherwise, changing nothing, { requeued: false }
+ *   with 'the ask has an appeal' or, for any other ask or none, 'no failed ask from this wallet'.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when now is not a valid Date.
  */
-export async function requeueFailedAsk(db: Db, campaignId: string, wallet: string, now: Date): Promise<boolean> {
+export async function requeueFailedAsk(db: Db, campaignId: string, wallet: string, now: Date): Promise<RequeueResult> {
   instant(now);
   const canonical = parseAddress(wallet);
-  if (!isCampaignId(campaignId)) return false;
-  return db.transaction(async (tx) => {
+  if (!isCampaignId(campaignId)) return { requeued: false, cause: 'no failed ask from this wallet' };
+  return db.transaction(async (tx): Promise<RequeueResult> => {
     await lockCampaign(tx, campaignId);
+    const [appealed] = await tx.query('SELECT 1 AS found FROM appeals WHERE campaign_id = $1 AND wallet = $2', [campaignId, canonical]);
+    if (appealed !== undefined) return { requeued: false, cause: 'the ask has an appeal' };
     const rows = await tx.query(
       `UPDATE asks
           SET status = 'queued', attempts = 0, retry_at = NULL, lease_until = NULL, action = NULL, share_bps = NULL,
@@ -1034,7 +1043,7 @@ export async function requeueFailedAsk(db: Db, campaignId: string, wallet: strin
        RETURNING wallet`,
       [campaignId, canonical],
     );
-    return rows.length === 1;
+    return rows.length === 1 ? { requeued: true } : { requeued: false, cause: 'no failed ask from this wallet' };
   });
 }
 
