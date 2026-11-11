@@ -36,7 +36,9 @@ Unrealised, replay only: nothing was sold or paid. Dollars use the claim-day val
 
 ### The model's answers
 
-Each wallet's facts went to SERV Reasoning, and every answer was checked in code. After the stored answers were checked again under rulebook version 2, 35,259 were accepted as given. The checks refused 1,679 first answers, and a second ask fixed 1,651 of them. Separately, 19 final answers stayed refused by a check and were held. The first count is about first answers and the second about final answers, so they do not add up.
+Each wallet's facts went to SERV Reasoning, and every answer was checked in code. After the stored answers were checked again under rulebook version 2, 35,259 of the 35,323 were accepted as given. The checks refused 1,679 first answers, and each was asked a second time. In words: the first answers refused equal the second answers that fixed the problem, plus the ones still refused after the second ask, plus the second answers the code replaced with its own decision. In numbers, 1,679 equals 1,651 plus 17 plus 11. The 11 were replaced because a shared funder alone cannot hold a wallet.
+
+Two more answers were never asked a second time, and today's checks refuse them. Those 2 and the 17 still refused are the 19 wallets held because an answer failed a check. Counting every wallet, 35,259 were accepted, 19 are held for that reason, and the code's own decision replaced the other 45.
 
 SERV Reasoning was reached two ways. 13,488 wallets went through a decision graph built from the rulebook, and 21,835 through the route that sends the rulebook text directly. Burst-funded wallets go to the second route by design, as do wallets whose graph call failed.
 

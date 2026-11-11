@@ -37,6 +37,28 @@ Wallet `0xFE2B7D1707A725E2D8D6040506D26a28A98a5CdD` was on the list at 1 USDC an
 
 Wallet `0xb2864c5C992f22E6d8A6A47945c0E897C440DAf7` was left off the list. A call to `claim` for it, using the first wallet's proof, reverts with `InvalidProof`. That refusal is a simulated call, not a transaction, so it has no hash on the explorer. The record keeps only the error name. Both wallets were made for this proof.
 
+## Check the record yourself
+
+Anyone with the repository can check the committed record against the chain. It needs Node 26 or newer, `npm install`, and the two committed files in `packages/contracts/deployments`. It loads no key and sends nothing:
+
+```bash
+npm run prove:vault -- verify
+```
+
+It reads Base Sepolia through the address in `BASE_SEPOLIA_RPC_URL` when that is set to an https address, and through the public endpoint `https://sepolia.base.org` when it is not. The public endpoint is rate limited, so if it refuses, set an https address of your own. The command prints one line per check, 14 in all, and exits with an error if any check fails:
+
+- the record names the factory in `base-sepolia.json`
+- each of the five transactions succeeded in the recorded block, was sent by the recorded owner (create, approve, deposit) or agent (post, claim), and used the recorded gas
+- the factory logged `VaultCreated` for the recorded vault, owner, agent, token and cap
+- the vault logged `RootPosted` for the recorded root and claimable time
+- the vault logged `Claimed`, paying the paid wallet the recorded amount
+- one USDC `Transfer` of that amount went from the vault to the paid wallet, and the record's token is Base Sepolia USDC
+- the vault's `state()` today shows the recorded token, owner, agent, cap and delay
+- total paid and what the paid wallet has claimed are each at least the recorded amount, because later claims can raise them
+- the refused wallet has claimed nothing
+
+`verify` does not check that the refused wallet's claim reverts. That check needs the private claim list behind the root, so only `record` repeats it. You can watch a refusal like it on [/break](/break), where a wallet that is not on the list asks the vault for the 1 USDC.
+
 ## Rebuild the record from the chain
 
 `npm run prove:vault -- record` reads the saved proof run back from Base Sepolia. It loads no key and sends nothing. It writes the public record only when every check agrees:
@@ -50,4 +72,4 @@ Wallet `0xb2864c5C992f22E6d8A6A47945c0E897C440DAf7` was left off the list. A cal
 - the vault's total paid and the paid wallet's claimed amount both equal that 1 USDC
 - a fresh simulated claim for the refused wallet, with the paid wallet's proof, reverts with `InvalidProof`
 
-The command needs the saved run file from the setup step, which is not stored in the repository, so only the machine that ran the proof can repeat it. Anyone else can check the same facts from the table above on the explorer.
+`record` needs the saved run file from the setup step. That file is private and not in the repository, so only the machine that ran the proof can repeat `record`, and it is not for strangers. Anyone else can run `verify` above, or check the same facts from the tables on the explorer.

@@ -33,7 +33,7 @@ No rate limit was reached at 40 v2 calls and 32 graph calls at once. A v2 call t
 
 ## Output discipline
 
-Of 35,323 first answers, 1,679 were refused by Thuli's checks. A second ask on the same route fixed 1,651 of them. 19 answers stayed refused, and those wallets are held. In the first pass the checks caught answers citing a transaction Thuli never fetched and answers with malformed hashes. Thuli accepts a cited hash only if it fetched that transaction for that wallet, and an answer that fails a check never raises a wallet.
+Across 35,323 wallets, 1,679 first answers were refused by Thuli's checks. A second ask on the same route fixed 1,651 of them. Of the other 28, 17 stayed refused, and the code replaced 11 with its own decision, because a shared funder alone cannot hold a wallet. Two more answers, never asked a second time, are refused by today's checks. The 17 and the 2 are 19 wallets, and they are held. Most of the 1,679 first refusals, 1,509, were reasons over the 280 character cap. The checks also caught 60 answers citing a transaction Thuli never fetched and 44 with malformed hashes. Thuli accepts a cited hash only if it fetched that transaction for that wallet, and an answer that fails a check never raises a wallet.
 
 ## Judgement
 

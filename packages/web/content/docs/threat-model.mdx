@@ -3,7 +3,7 @@ title: Threat model
 description: The 47 rules Thuli is built against, what shows each one, and the known gaps.
 ---
 
-An independent review pass wrote this threat model on 27 October 2026, before any code, working only from a plain description of the system. It is the definition of done, not a status report: the build counts as finished only when every rule below is upheld and shown by its test. Each rule has a code (C1 to C47), a statement and a "Shown by" line that names the test or attack that demonstrates it. A change that touches a rule must carry its test.
+An independent review pass wrote this threat model on 27 October 2026, before any code, working only from a plain description of the system. It held rules C1 to C44. Three more, C45 to C47, were added on 6 November, after the replays and the outside feedback showed what was missing. It is the definition of done, not a status report: the build counts as finished only when every rule below is upheld and shown by its test. Each rule has a code (C1 to C47), a statement and a "Shown by" line that names the test or attack that demonstrates it. A change that touches a rule must carry its test.
 
 Where a rule covers a feature that is not built yet, the rule says so. A rule can also be only partly built, so [limits](/docs/limits) has the full list of what is not built. These notes describe the code on 11 November 2026. The attacker goals are summarised on [security](/docs/security), and the full text, including the risk profile, is in `docs/security/threat-model.md` in the repository.
 
@@ -37,7 +37,7 @@ Shown by: owner B calls each owner route with owner A's id, gets not-found every
 
 ### C5. Unpublished means unreachable
 
-Before publish, no public route, page, cache, sitemap, link-preview tag or error message reveals a campaign's claim list, rules, decisions, held wallets or appeals, or whether an address is on the list. Not built yet: there are no campaigns or publishing.
+Before publish, no public route, page, cache, sitemap, link-preview tag or error message reveals a campaign's claim list, rules, decisions, held wallets or appeals, or whether an address is on the list. Not built yet: there are no campaign routes and no publishing.
 
 Shown by: public responses for an unpublished campaign and for a random id match, apart from request ids.
 
@@ -61,7 +61,7 @@ Shown by: a valid signature submitted with different message text is rejected.
 
 ### C9. Contract wallets get one rule
 
-EIP-1271 and EIP-7702 signatures are verified by the same verifier for sign-in and appeals, or rejected on both with a clear message. A verification error is a rejection. Built for appeals only: contract wallets are refused with a clear message. Sign-in is not built yet.
+EIP-1271 and EIP-7702 signatures are verified by the same verifier for sign-in and appeals, or rejected on both with a clear message. A verification error is a rejection. Built for appeals and for the signed ask to join a campaign: both refuse contract wallets with a clear message, and both refuse a wallet whose type could not be read. Sign-in is not built yet.
 
 Shown by: fork fixtures for a Safe and a delegated EOA on both endpoints.
 
@@ -119,13 +119,13 @@ Shown by: an appeal whose model answer is "reverse" changes nothing until the ow
 
 ### C18. Every decision is traceable, and a published list is frozen
 
-Each decision records its rule version, facts snapshot, model request ids and data receipts. Publish is refused while any wallet is queued or any decision was made under an older rule version. After publish, changes come only through C17, each creating a new public list version shown beside the old one. Not built yet: there is no publishing and no job queue.
+Each decision records its rule version, facts snapshot, model request ids and data receipts. Publish is refused while any wallet is queued or any decision was made under an older rule version. After publish, changes come only through C17, each creating a new public list version shown beside the old one. Not built yet: nothing publishes a list and no worker takes jobs. The store has tables for list versions and for a queue of asks, and no route or worker reads or writes them.
 
 Shown by: editing the rules mid-run, then trying to publish; publish is refused.
 
 ### C19. Campaigns do not leak into each other
 
-A decision in campaign A depends only on A's own list, rules and settings, the chain, and purchased data about the chain. Cached provider data is shared only as facts about an address, never as list membership. Not built yet: campaigns are not stored.
+A decision in campaign A depends only on A's own list, rules and settings, the chain, and purchased data about the chain. Cached provider data is shared only as facts about an address, never as list membership. Not built yet: no route stores a campaign. The store has campaign tables, and no route or worker reads or writes them.
 
 Shown by: adding a wallet to private campaign B changes no output of A or of the public check.
 
@@ -139,7 +139,7 @@ Shown by: fork fixtures for an EOA, a Safe and a delegated EOA.
 
 ### C21. Spending never exceeds what the operator approved
 
-Total spend on a campaign never exceeds the budget the operator allocated to it. The Kite session total enforces it and the worker checks before each call. An owner cannot set a budget above their allocation. A cancelled or edited campaign spends nothing more. Not built yet: there are no Kite sessions and no stored campaigns.
+Total spend on a campaign never exceeds the budget the operator allocated to it. The Kite session total enforces it and the worker checks before each call. An owner cannot set a budget above their allocation. A cancelled or edited campaign spends nothing more. Not built yet: there are no Kite sessions, and no route stores a campaign.
 
 Shown by: a campaign with a 10 cent budget and 100 wallets stops buying at 10 cents and the rest land in hold.
 
@@ -173,7 +173,7 @@ Non-goal: a facilitator that fails after broadcasting leaves a landed payment un
 
 Non-goal: when a settlement's outcome is unknown and recording the claim as unsure fails as well, the claim stays held by a request that is gone, so the same header cannot retry before its validBefore. That takes two failures at once.
 
-Shown by: one payment header replayed in 10 parallel requests yields one result, and a Base Sepolia payment to a mainnet route is refused; one header sent 10 times at once to two copies over one database is settled and served once.
+Shown by: one payment header replayed in 10 parallel requests yields one result, and a Base Sepolia payment to a mainnet route is refused; one header sent 10 times at once to two copies over one database is settled and served once. A live run on Base Sepolia with test USDC settled one payment in [one transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1), and ten replays of its header bought nothing.
 
 ### C26. The paid path cannot cost more than it earns
 
@@ -323,7 +323,7 @@ Shown by: stand-in replies of hold, exclude and full on a burst wallet all end p
 
 ### C44. The demo pays at most 20 USDC, 1 USDC each, only to wallets that proved control
 
-A slot is taken only by a wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at 1 USDC and the vault holds only the demo deposit. The vault side is tested on a fork. The signed ask that decides who takes a slot is not built yet.
+A slot is taken only by a wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at 1 USDC and the vault holds only the demo deposit. The vault side is tested on a fork. The signed ask message and its check are built and tested, and the store has a slot column for approved asks. No route takes an ask and no worker decides one, so nothing hands out a slot yet.
 
 Shown by: 30 signed asks from farm wallets on a fork; no more than 20 USDC leaves the vault and no address gets more than 1 USDC.
 

@@ -61,3 +61,9 @@ Gas units for the proof vault's five transactions. The record has no gas price, 
 The vault protects claimants from a hacked Thuli server and from early withdrawal. It does not protect them from the project that funds it. The owner may name a new agent, and a list that agent posts replaces the old one after the delay. Every agent change and every list is public on chain, so claimants get that delay as notice.
 
 There is one vault per campaign and no upgrade path. A fresh vault keeps each deposit in its own account, so claims draw only on their own campaign's money. A code change means a new factory for new campaigns, not an admin swapping code under a live vault. Addresses are on [contracts](/docs/contracts); what is not built is on [limits](/docs/limits).
+
+## Attack it yourself
+
+[/break](/break) runs five attacks against the proof vault on Base Sepolia from your browser. A wallet that is not on the list asks for the 1 USDC. The wallet that was already paid asks again. The listed wallet asks for double its amount. Thuli's own agent key tries to withdraw the vault's money. A stranger posts a new list that pays itself. Each one is a simulated call that sends nothing and needs no wallet, and the page shows the vault's answer beside it. The page also rebuilds the list root in your browser and checks it against the root in the proof record, and switches the vault rows off if the two differ. After the proof vault's campaign has ended, the vault refuses every claim with `CampaignEnded`, and the page says so beside the answer.
+
+To check the proof record itself against the chain, run `npm run prove:vault -- verify`. The steps are on [contracts](/docs/contracts).

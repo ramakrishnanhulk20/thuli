@@ -31,6 +31,10 @@ The vault contract holds it, not Thuli. The project deposits into its own vault,
 
 The free check costs a visitor nothing, up to 5 new checks an hour per caller. The paid route costs $0.05 per wallet in USDC over x402. The vault contract takes no fee, and the project pays gas. Thuli's own realised cost in the ROBO replay was $17.51 of SERV credit for 35,323 wallets, which is 0.050 cents a wallet.
 
+## Can I check one wallet myself?
+
+Yes, at [/check](/check), or with the box on the home page. Paste an Ethereum address and read the decision, the rule and the transactions behind it. It is free, with up to 5 new checks an hour for each visitor. One wallet on its own has no list around it, so the check cannot see linked groups, shared deposit addresses, funding bursts or a claim paid elsewhere, and the page says so. Its answer can differ from the replay: a wallet held there as part of a group can come back partial when checked alone.
+
 ## Which chains does it use?
 
 Screening reads Ethereum mainnet only. The paid route takes USDC on Base or on Base Sepolia, the test network. The vault is deployed on Base Sepolia only, and Base mainnet is not deployed yet. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
@@ -41,11 +45,15 @@ It is public, and you can read it on [the rulebook page](/docs/rulebook). It is 
 
 ## What is not built yet?
 
-As of 11 November 2026: owner sign-in, campaigns, publishing, a job queue, paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The check page at /check, the front end of the free check, is not built yet. The full list is on [limits](/docs/limits).
+As of 11 November 2026: owner sign-in, campaigns, publishing, a job queue that runs, paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The store has tables for campaigns and the code has the signed message a wallet would sign to join one, but no route or worker uses them. The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
 
 ## Is it audited?
 
 No outside firm has audited Thuli. It is self-audited: a threat model written before the code, three internal review rounds, and fuzz, invariant and fork tests on the vault. See [security](/docs/security).
+
+## Can I try to break it?
+
+Yes. [/break](/break) runs ten attacks live from your browser: five against the proof vault on Base Sepolia, as simulated calls that send nothing, four against this site's own routes, and one against how a reason is shown. It cannot show a replayed payment, which needs a funded wallet, or a forged appeal, because no public route takes appeals yet. To check the vault's proof record against the chain, run `npm run prove:vault -- verify`. The steps are on [contracts](/docs/contracts).
 
 ## Are the dollar figures real money?
 

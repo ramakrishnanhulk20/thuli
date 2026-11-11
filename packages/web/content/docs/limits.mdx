@@ -33,19 +33,18 @@ It can also be wrong the other way:
 - A stolen claimant key. Whoever holds it can appeal and claim as that wallet.
 - Verdicts about people and scraping. A decision assesses on-chain behaviour from evidence and is not an accusation. Published decisions are public by design.
 - Farmers reading the rulebook. It is public so the process is fair and appealable. Farmers reading it is a stated non-goal.
-- Payment edge cases. Without a database, a restart can let a copy inside its window be answered from a facilitator's pending cache. A facilitator that fails after broadcasting leaves a payment unserved until the buyer retries.
+- Payment edge cases. Without a database, a restart can let a copy inside its window be answered from a facilitator's pending cache. A facilitator that fails after broadcasting leaves a payment unserved until the buyer retries. If the server copy screening a wallet stops part way, that wallet answers `202` for up to 330 seconds, until its place frees itself.
 
 ## What Thuli has not built
 
-- Owner sign-in, campaigns, publishing and an owner dashboard. There are no owner routes.
-- A database for campaigns, decisions, wallets or appeals. Postgres holds only payment claims, rate limits and the free-check cache. Appeals and run state are local files.
-- A job queue. The paid route screens inside the request.
+- Owner sign-in, campaigns, publishing and an owner dashboard. There are no owner routes and no campaign routes. The store has tables and queries for campaigns, asks, list versions and claim submissions, and the signed message a wallet would sign to ask to join a campaign exists in code. No route and no worker reads or writes those tables or runs that check.
+- A database that holds campaigns, decisions, wallets or appeals. The paid and free routes keep payment claims, rate limits and cached checks in Postgres when a database is configured, and in memory when it is not. No route saves a campaign, a decision, a wallet or an appeal. Appeals and run state are local files. No database is hosted for Thuli yet.
+- A job queue that runs. Nothing queues or takes a job: the paid route screens inside the request, and the replays run as scripts.
 - Paid data through Kite Passport, Nansen or Allium, and Dolphin summaries. No code calls them.
 - A deployed worker host.
 - Base mainnet contracts. The paid route has been proven only on Base Sepolia with test USDC.
 - A service that turns decisions into a posted list. The code that builds claim lists and claim tickets has tests, but only the vault proof script posts a root, from a hand-written list. Nothing serves a claimant its proof.
-- The check page at `/check`, the front end of the free check.
-- Appeals in public. The checks, record, store and advice exist; the public route, owner sign-in and rate limit do not. Contract wallets cannot appeal. A reversal does not change the claim list or the vault root.
+- Appeals in public. The checks, record, local file store and advice exist; the public route, owner sign-in and rate limit do not. Contract wallets cannot appeal, and neither can a wallet whose type could not be read. A reversal does not change the claim list or the vault root.
 - An external audit.
 
 ## What Thuli has not measured

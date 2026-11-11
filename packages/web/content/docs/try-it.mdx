@@ -5,11 +5,12 @@ description: What to do on the website, and the commands to run if you have the 
 
 ## On the website
 
-You need nothing installed for these three.
+You need nothing installed for these four.
 
 1. Open [the replay](/replay). Pick a family of wallets, then open one wallet. You will see its outcome, the rule that decided it, the reason in plain words, and the transactions the reason cites.
-2. Check a wallet. The home page has a box for it, and the free check route behind it is built, but the [/check](/check) page is not built yet.
+2. Check a wallet at [/check](/check), or with the box on the home page. Paste any Ethereum address. Thuli reads its public history and applies the same rulebook to that one wallet, with no sign-in. You get the outcome, the rule, the reason, the transactions it cites and a list of what one wallet on its own cannot show. A new check can take up to two minutes. Each visitor gets 5 new checks an hour, and a result is kept for a day, so checking the same wallet again costs nothing.
 3. Read [the versions page](/versions). It shows the rulebook before and after the one change outside feedback led to, scored on the same stored answers.
+4. Attack the system at [/break](/break). It has ten rows, each a real attack: five against the proof vault on Base Sepolia, four against this site's own routes, and one against how a reason is shown. A vault attack is a simulated call, so it sends nothing and needs no wallet. Press "Run all 10 attacks", or run one row, and read the answer. The four rows against the site meet the same per-caller limits as any visitor, and a row that meets one shows 429 and counts as refused. Once the proof vault's campaign has ended, the vault refuses every claim for that reason, and the page says so beside the answer.
 
 ## With the repository
 
@@ -21,7 +22,7 @@ npx vitest run
 npm run typecheck
 ```
 
-`npx vitest run` runs every test under the packages folders. That covers the fixed checks, the facts engine, the output checks on model answers, claim lists and Merkle leaves, the replay scoring, the paid and free API routes with their limits, the store, and the web app's data loading. It does not run the Solidity contracts, and it is not the proof against live networks. The contract tests and the proof commands below cover those.
+`npx vitest run` runs every test under the packages folders. That covers the fixed checks, the facts engine, the output checks on model answers, claim lists and Merkle leaves, the appeal and ask checks, the replay scoring, the paid and free API routes with their limits, the store, and the web app's data loading. It does not run the Solidity contracts, and it is not the proof against live networks. The contract tests and the proof commands below cover those.
 
 `npm run typecheck` runs the TypeScript compiler over the shared code, the worker, the API, the store and the web app, and writes no files.
 
@@ -32,7 +33,22 @@ npm install --prefix packages/contracts
 npm run contracts:test
 ```
 
-That runs unit, fuzz and invariant tests on the vault. The fuzz tests run 10,000 cases each and the invariant tests 256 runs of depth 64. The tests that fork Base are skipped unless `BASE_RPC_URL` is set.
+On 11 November 2026 `forge test` reported 79 tests passed and none failed. They are 64 unit tests, 1 demo test, 1 leaf fixture test, 11 fuzz tests at 10,000 runs each, 1 fork test against real Base USDC, and one invariant suite holding 7 invariants at 256 runs of depth 64. The demo test and the fork test run on a local copy of Base and are skipped unless `BASE_RPC_URL` is set.
+
+## Run the site yourself
+
+The site serves the pages, these docs, the free check and the paid route. Copy `.env.web.example` to `packages/web/.env.local`, fill in the empty values, then run `npm run web:dev` and open `http://localhost:3000`. The values, by name:
+
+- `X402_NETWORK`: `base` for real USDC or `base-sepolia` for test USDC. It has no default, so testnet is a choice.
+- The address that receives payments: `PAYTO_ADDRESS_TESTNET` on Base Sepolia, `PAYTO_ADDRESS` on Base. It is an address, never a key.
+- `SERV_API_KEY`, `SERV_BASE_URL` and `SERV_GRAPH_ID`, from the SERV console. Every screening calls SERV with them.
+- `ETH_RPC_URL` and `BLOCKSCOUT_ETH_API`, where a screening reads the wallet's history.
+- On Base only: `CDP_API_KEY_ID`, `CDP_API_KEY_SECRET`, `PUBLIC_ORIGIN` and `BASE_RPC_URL`. On Base Sepolia, `PUBLIC_ORIGIN` is optional, and `FACILITATOR_URL` left empty means `https://x402.org/facilitator`.
+- `DATABASE_URL` and `TRUSTED_CLIENT_HEADER`, which a production server must have. Locally, leave `DATABASE_URL` empty and the site runs an in-process database whose contents are lost on restart.
+
+No variable whose name ends in `PRIVATE_KEY` may be set in the site's environment. If one is, the standalone API refuses to start, and the site answers 503 to every request under `/api/check` and `/api/x402`, logging the variable's name and never its value. The refusal reads `NAME is set, and this process must hold no private key, because it serves the paid API to the internet. Start it without NAME.`, with the variable names where it says NAME. Keep test keys in the files at the repository root, `.env` and `.env.payer`, never in `packages/web/.env.local` or `.env.api`.
+
+To run the paid and free API on its own, copy `.env.api.example` to `.env.api` and run `npm run api:dev`. It listens on port 8787 unless `PORT` is set, and it takes the same network, payment, SERV and RPC settings. The scripts for the replay, the scoring and the vault proof read `.env` at the repository root, copied from `.env.example`.
 
 ## Proof commands
 
@@ -40,13 +56,14 @@ These commands produce the numbers this documentation quotes. Some need data or 
 
 | Command | What it does | What it needs |
 | --- | --- | --- |
-| `npm run prove:vault -- record` | Reads the vault proof run back from Base Sepolia. Loads no key and sends nothing. Writes the public proof record only if every receipt, event and vault read agrees. | An https Base Sepolia RPC URL in `BASE_SEPOLIA_RPC_URL`, and the saved state file of the setup run. That file stays on the machine that ran the setup, so a stranger cannot run `record` without running `setup` and `claim` first. |
-| `npm run versions:score` | Scores rulebook version 1 against version 2 on the stored model answers. Refuses all network access. | The stored replay data, described below. The script starts with `--env-file=.env`, so copy `.env.example` to `.env` first. No value in it is used. |
-| `npm run export:replay -- --spent-cents N --run-date YYYY-MM-DD [--out DIR]` | Rebuilds the replay offline, checks the stored answers under the current rulebook, and writes the files the site reads. | The stored replay data, and a finished `versions:score` run. |
-| `npm run prove:paid -- [--wallet ADDRESS]` | Pays for one screening of one wallet, by default a ROBO farm wallet, replays that payment 10 times and expects every copy to fail, then checks that exactly 5 cents left the paying wallet. | A test wallet with at least 5 cents of Base Sepolia USDC, its key in `.env.payer`, and the paid API settings in `.env.api`, including a SERV key. |
+| `npm run prove:vault -- verify` | Checks the committed vault proof record against Base Sepolia, line by line, in 14 checks. Sends nothing and loads no key. The checks are listed on [Contracts and addresses](/docs/contracts). | `npm install`, the two committed files in `packages/contracts/deployments`, and a Base Sepolia RPC URL. With `BASE_SEPOLIA_RPC_URL` unset it uses the public `https://sepolia.base.org`, which is rate limited. It does not check that the refused wallet's claim reverts, because that needs a private claim list. |
+| `npm run prove:vault -- record` | Reads the vault proof run back from Base Sepolia. Loads no key and sends nothing. Writes the public proof record only if every receipt, event and vault read agrees. Not for strangers. | An https Base Sepolia RPC URL in `BASE_SEPOLIA_RPC_URL`, and the saved state file of the setup run. That file is private and stays on the machine that ran the setup, so nobody else can run `record` without running `setup` and `claim` first. |
+| `npm run versions:score` | Scores rulebook version 1 against version 2 on the stored model answers. Refuses all network access. Stamps the scorecard with the day it ran, today in UTC unless `--run-date YYYY-MM-DD` is given. | The stored replay data, described below. The script starts with `--env-file=.env`, so copy `.env.example` to `.env` first. No value in it is used. |
+| `npm run export:replay -- --spent-cents N --run-date YYYY-MM-DD [--out DIR]` | Rebuilds the replay offline, checks the stored answers under the current rulebook, and writes the files the site reads. The scorecard keeps the run date `versions:score` gave it. | The stored replay data, and a finished `versions:score` run. |
+| `npm run prove:paid -- [--wallet ADDRESS] [--url ORIGIN] [--save FILE]` | Pays for one screening of one wallet, by default a ROBO farm wallet, replays that payment 10 times and expects every copy to fail, then checks that exactly 5 cents left the paying wallet. With `--url` it pays a site that is already running instead of starting the API in its own process, and `--save` writes the answer to a file. | A test wallet with at least 5 cents of Base Sepolia USDC, its key in `.env.payer`, and the paid API settings in `.env.api`, including a SERV key. A site named with `--url` must use the same network and payment address. |
 
 The stored replay data is the ROBO and Hop replay rows, the stored SERV answers, the saved Reppo results and the answer key files. It is not in the repository, because the source lists carry no licence that lets us republish them. The repository does contain what the export wrote: the published files under `packages/web/public/replay`, which hold the replay, scorecard and Hop numbers quoted in these pages.
 
-You can check the vault proof without any of this. The record is in `packages/contracts/deployments/base-sepolia-proof.json`, and the transactions are on the Base Sepolia explorer.
+You can check the vault proof without any keys or stored data. Run `npm run prove:vault -- verify`, or read the record in `packages/contracts/deployments/base-sepolia-proof.json` and look the transactions up on the Base Sepolia explorer.
 
-`prove:vault` takes three phases: `setup`, `claim` and `record`. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.
+`prove:vault` takes four phases: `setup`, `claim`, `record` and `verify`. Only `verify` is for strangers. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.
