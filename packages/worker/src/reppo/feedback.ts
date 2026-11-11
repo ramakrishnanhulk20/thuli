@@ -71,6 +71,50 @@ export interface FeedbackCounts {
   creditsCharged: number;
 }
 
+const MONTHS = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+const NUMBER = String.raw`\d[\d,]*(?:\.\d+)?`;
+
+// What a text bound for Reppo's public pages must never hold, by kind (C35). The hex rule is the same definition as
+// core's last check on a payload, so an address and a transaction hash are caught alike in both places.
+const IDENTIFYING: readonly { kind: string; patterns: readonly RegExp[] }[] = [
+  { kind: 'an address or a transaction hash', patterns: [/0x[0-9a-f]{4,}|[0-9a-f]{16,}/i] },
+  {
+    kind: 'an amount',
+    patterns: [
+      new RegExp(String.raw`\p{Sc}\s?\d`, 'u'),
+      new RegExp(String.raw`\b${NUMBER}\s?(?:eth|ether|wei|gwei|usdc|usdt|dai|tokens?)\b`, 'i'),
+      // All capitals after a number reads as a ticker; EOA is the one capital word a count is ever followed by.
+      new RegExp(String.raw`\b${NUMBER}\s?(?!EOAS?\b)[A-Z][A-Z0-9]{1,9}\b`),
+    ],
+  },
+  {
+    kind: 'a date or a time',
+    patterns: [
+      /\b\d{4}-\d{2}-\d{2}\b/,
+      /\b\d{1,2}:\d{2}\b/,
+      new RegExp(String.raw`\b(?:${MONTHS})\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:${MONTHS})\.?,?\s+\d{4}\b`, 'i'),
+    ],
+  },
+];
+
+// Seven digits or more once separators go: a Unix time, or an amount in base units such as a reward of 1,000,000. Every
+// count the facts give, days, transactions or wallets, is far shorter.
+const LONG_NUMBER = /\d{7,}/;
+
+/**
+ * The kind of thing in a text bound for Reppo that could tie it to one wallet or one moment, or null when there is none:
+ * an address or a transaction hash, an amount in a currency or a token, a date or a clock time, or a number of seven
+ * digits or more. Read after the same normalising core's stripIdentifiers does, so a full-width digit or a zero-width
+ * character cannot split a run past it. It does not catch a name, such as an ENS name, which no fact or stored reason
+ * holds. Pure.
+ */
+export function identifyingPart(text: string): string | null {
+  const normal = text.normalize('NFKC').replace(/\p{Cf}/gu, '');
+  const found = IDENTIFYING.find(({ patterns }) => patterns.some((pattern) => pattern.test(normal)));
+  if (found !== undefined) return found.kind;
+  return LONG_NUMBER.test(normal.replace(/(?<=\d)[,._](?=\d)/g, '')) ? 'a number long enough to be a time or an amount' : null;
+}
+
 // 12 wallets sit in both replay sets, and a new rulebook is a new decision, so the wallet alone would skip real work.
 const feedbackKey = (item: FeedbackItem, rulebook: string) => `${rulebook}:${item.set}:${item.wallet}`;
 

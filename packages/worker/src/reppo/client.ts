@@ -162,17 +162,43 @@ const FINAL_STATUS: Record<EvalReply['status'], ReppoEval['status']> = {
   PROCESSING: 'UNFINISHED',
 };
 
-async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promise<ReppoEval> {
-  // The key goes only into this header. Nothing here logs a request, and every error is words and a status (C40).
-  const headers = { authorization: `Bearer ${conn.apiKey}`, 'content-type': 'application/json', accept: 'application/json' };
-  const id = await submit(input, conn, headers);
-  const body = await waitForEnd(id, conn, headers);
+// The key goes only into this header. Nothing here logs a request, and every error is words and a status (C40).
+function headersFor(conn: Required<ReppoOptions>): Record<string, string> {
+  return { authorization: `Bearer ${conn.apiKey}`, 'content-type': 'application/json', accept: 'application/json' };
+}
+
+function asEval(id: string, body: EvalReply): ReppoEval {
   return {
     id,
     status: FINAL_STATUS[body.status],
     creditsCharged: body.creditsCharged,
     verdict: body.status === 'COMPLETED' ? parseVerdict(body.result) : null,
   };
+}
+
+async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promise<ReppoEval> {
+  const headers = headersFor(conn);
+  const id = await submit(input, conn, headers);
+  return asEval(id, await waitForEnd(id, conn, headers));
+}
+
+function withDefaults(opts: ReppoOptions): Required<ReppoOptions> {
+  const conn: Required<ReppoOptions> = {
+    pollMs: DEFAULT_POLL_MS,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    sleep: async (ms) => {
+      await wait(ms);
+    },
+    ...opts,
+  };
+  if (!(conn.pollMs > 0) || !(conn.timeoutMs > 0)) throw new RangeError('pollMs and timeoutMs must be above 0');
+  return conn;
+}
+
+function checkInput(input: string): void {
+  if (input === '' || Buffer.byteLength(input) > MAX_INPUT_BYTES) {
+    throw new ReppoError(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
+  }
 }
 
 /**
@@ -195,18 +221,35 @@ async function submitAndWait(input: string, conn: Required<ReppoOptions>): Promi
  * @throws RangeError when pollMs or timeoutMs is not above 0, before any call.
  */
 export async function evaluate(input: string, opts: ReppoOptions): Promise<ReppoEval> {
-  const conn: Required<ReppoOptions> = {
-    pollMs: DEFAULT_POLL_MS,
-    timeoutMs: DEFAULT_TIMEOUT_MS,
-    sleep: async (ms) => {
-      await wait(ms);
-    },
-    ...opts,
-  };
-  if (!(conn.pollMs > 0) || !(conn.timeoutMs > 0)) throw new RangeError('pollMs and timeoutMs must be above 0');
-  if (input === '' || Buffer.byteLength(input) > MAX_INPUT_BYTES) {
-    throw new ReppoError(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
-  }
+  const conn = withDefaults(opts);
+  checkInput(input);
   const first = await submitAndWait(input, conn);
   return first.status === 'FAILED' ? submitAndWait(input, conn) : first;
+}
+
+/**
+ * Submits one text as a 'response' evaluation and answers with its id at once, without waiting for the result, so the
+ * caller can keep the id before any wait and every later try looks it up instead of paying again (C23). The input, 409,
+ * retry and id rules are evaluate's.
+ *
+ * @throws ReppoOutOfCredit on a 402; ReppoError as evaluate throws it before its wait; RangeError as evaluate does.
+ */
+export async function submitEvaluation(input: string, opts: ReppoOptions): Promise<string> {
+  const conn = withDefaults(opts);
+  checkInput(input);
+  return submit(input, conn, headersFor(conn));
+}
+
+/**
+ * Waits for one evaluation by its id with evaluate's polling, timeouts and reply checks, and submits nothing (C23): the
+ * look-up for an evaluation an earlier try submitted. The id is checked before it goes into a URL.
+ *
+ * @returns COMPLETED, FAILED or UNFINISHED, as evaluate returns them.
+ * @throws ReppoOutOfCredit on a 402; ReppoError on an id that is not safe to use, any other refusal or a reply out of
+ *   shape; RangeError as evaluate does.
+ */
+export async function lookUpEvaluation(id: string, opts: ReppoOptions): Promise<ReppoEval> {
+  const conn = withDefaults(opts);
+  if (!EVAL_ID.test(id)) throw new ReppoError('the evaluation id is not safe to use', null);
+  return asEval(id, await waitForEnd(id, conn, headersFor(conn)));
 }

@@ -73,8 +73,42 @@ describe('loadWorkerConfig without campaign settings', () => {
     };
     const config = loadWorkerConfig(only);
     expect(Object.keys(config).sort()).toEqual(
-      ['blockscoutApi', 'chainRpcUrl', 'databaseUrl', 'ethRpcUrl', 'servApiKey', 'servBaseUrl', 'servGraphId', 'workerKey'].sort(),
+      ['blockscoutApi', 'chainRpcUrl', 'databaseUrl', 'ethRpcUrl', 'reppo', 'servApiKey', 'servBaseUrl', 'servGraphId', 'workerKey'].sort(),
     );
+    expect(config.reppo).toBeNull();
+  });
+});
+
+describe('loadWorkerConfig and the outside check', () => {
+  const REPPO_KEY = 'reppo-key-not-real-0123456789';
+  const REPPO_URL = 'https://eval.reppo.xyz/api/v1';
+
+  it('reads the Reppo key and base URL when the key is set, and leaves the appeal step off without it', () => {
+    expect(loadWorkerConfig({ ...GOOD, REPPO_BASE_URL: REPPO_URL }).reppo).toBeNull();
+    expect(loadWorkerConfig({ ...GOOD, REPPO_API_KEY: '  ', REPPO_BASE_URL: REPPO_URL }).reppo).toBeNull();
+    expect(loadWorkerConfig({ ...GOOD, REPPO_API_KEY: REPPO_KEY, REPPO_BASE_URL: `${REPPO_URL}/` }).reppo).toEqual({ apiKey: REPPO_KEY, baseUrl: REPPO_URL });
+  });
+
+  it('refuses a Reppo key with no https base URL, naming the variable and never the key', () => {
+    for (const [base, words] of [
+      [undefined, 'REPPO_BASE_URL is missing'],
+      ['http://eval.reppo.xyz/api/v1', 'REPPO_BASE_URL is not valid'],
+    ] as const) {
+      let message = '';
+      try {
+        loadWorkerConfig({ ...GOOD, REPPO_API_KEY: REPPO_KEY, ...(base === undefined ? {} : { REPPO_BASE_URL: base }) });
+      } catch (error) {
+        expect(error).toBeInstanceOf(WorkerConfigError);
+        message = (error as Error).message;
+      }
+      expect(message).toContain(words);
+      expect(message).not.toContain(REPPO_KEY);
+    }
+  });
+
+  it('blanks the Reppo key from every log line', () => {
+    const clean = scrubber(secretsOf(loadWorkerConfig({ ...GOOD, REPPO_API_KEY: REPPO_KEY, REPPO_BASE_URL: REPPO_URL })));
+    expect(clean(`appeal failed: Bearer ${REPPO_KEY}`)).toBe('appeal failed: Bearer [hidden]');
   });
 });
 

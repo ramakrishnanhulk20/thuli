@@ -17,6 +17,8 @@ export interface WorkerConfig {
   blockscoutApi: string;
   /** The campaign chain's RPC: Base Sepolia, where every campaign vault lives today. */
   chainRpcUrl: string;
+  /** The outside check for appeals; null when REPPO_API_KEY is not set, and the appeal step is then skipped. */
+  reppo: { apiKey: string; baseUrl: string } | null;
 }
 
 /** The factory every campaign vault comes from and the block it was deployed in, from the deployment record. */
@@ -59,17 +61,22 @@ const RULES: readonly { name: string; valid(value: string): boolean; needs: stri
   },
 ];
 
+// Read only when REPPO_API_KEY is set: https only, because the key travels as a bearer header.
+const REPPO_BASE_URL = { name: 'REPPO_BASE_URL', valid: isHttps, needs: 'an https URL, since REPPO_API_KEY is set' };
+
 /**
  * Reads and checks every variable the worker needs before anything connects, so a missing one stops it at start rather
- * than at its first screening. Base URLs lose any trailing slash, as env.ts does.
+ * than at its first screening. Base URLs lose any trailing slash, as env.ts does. REPPO_API_KEY is optional: without it
+ * the appeal step is skipped; with it, REPPO_BASE_URL must be an https URL.
  *
  * @throws WorkerConfigError naming each missing or invalid variable on its own line, with what it must be. No value is
  *   ever part of the message (C40).
  */
 export function loadWorkerConfig(source: Record<string, string | undefined>): WorkerConfig {
   const read = (name: string) => (source[name] ?? '').trim();
+  const reppoKey = read('REPPO_API_KEY');
   const problems: string[] = [];
-  for (const rule of RULES) {
+  for (const rule of reppoKey === '' ? RULES : [...RULES, REPPO_BASE_URL]) {
     const value = read(rule.name);
     if (value === '') problems.push(`${rule.name} is missing: it must be ${rule.needs}`);
     else if (!rule.valid(value)) problems.push(`${rule.name} is not valid: it must be ${rule.needs}`);
@@ -89,6 +96,7 @@ export function loadWorkerConfig(source: Record<string, string | undefined>): Wo
     ethRpcUrl: url('ETH_RPC_URL'),
     blockscoutApi: url('BLOCKSCOUT_ETH_API'),
     chainRpcUrl: url('BASE_SEPOLIA_RPC_URL'),
+    reppo: reppoKey === '' ? null : { apiKey: reppoKey, baseUrl: url('REPPO_BASE_URL') },
   };
 }
 
@@ -123,10 +131,11 @@ export function scrubber(secrets: readonly string[]): (line: string) => string {
   return (line) => patterns.reduce((clean, pattern) => clean.replace(pattern, '[hidden]'), line);
 }
 
-/** The values of a worker config that must never reach a log: the key in both spellings, the SERV key and every URL. */
+/** The values of a worker config that must never reach a log: the key in both spellings, the SERV and Reppo keys and every URL. */
 export function secretsOf(config: WorkerConfig): string[] {
   const secrets = [config.workerKey, config.workerKey.slice(2), config.servApiKey, config.databaseUrl];
   secrets.push(config.ethRpcUrl, config.blockscoutApi, config.chainRpcUrl);
+  if (config.reppo !== null) secrets.push(config.reppo.apiKey);
   try {
     const password = decodeURIComponent(new URL(config.databaseUrl).password);
     if (password !== '') secrets.push(password);

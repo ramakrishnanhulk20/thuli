@@ -1,5 +1,6 @@
 import { setTimeout as wait } from 'node:timers/promises';
 import { openCampaigns, type Campaign } from '@thuli/store';
+import { appealNext, NO_REPPO_KEY, type AppealOutcome, type AppealReppo, type AppealSpend } from './appeals.ts';
 import { publishCheck, reconcileCheck, type PublishOutcome, type ReconcileOutcome } from './publish.ts';
 import { activateCheck, relayNext, type ActivateOutcome, type RelayOutcome } from './relay.ts';
 import { screenNextAsk, type ScreenDeps, type ScreenOutcome } from './screen.ts';
@@ -10,7 +11,8 @@ export const LOOP_INTERVAL_MS = 5_000;
 
 /**
  * The longest the loop waits for one step (C41). Each is above the limits inside the step: a screening stops itself at
- * 120 seconds, a post and a claim each wait at most 180 seconds for a receipt, and every RPC call times out at 30.
+ * 120 seconds, a post and a claim each wait at most 180 seconds for a receipt, every RPC call times out at 30, and an
+ * appeal's look-up waits at most APPEAL_REPPO_WAIT_MS, 150 seconds, inside its 300 second lease.
  */
 export const STEP_TIMEOUTS_MS = Object.freeze({
   screen: 180_000,
@@ -19,6 +21,7 @@ export const STEP_TIMEOUTS_MS = Object.freeze({
   activate: 120_000,
   publish: 300_000,
   relay: 300_000,
+  appeal: 240_000,
 });
 
 export { NO_VAULT_BLOCK };
@@ -30,6 +33,8 @@ export type StepFailure = { kind: 'failed'; cause: string } | { kind: 'timed-out
 export interface WorkerDeps extends ScreenDeps, ChainDeps {
   /** Shorter limits, for tests. Left out, every step has its STEP_TIMEOUTS_MS. */
   timeouts?: Partial<Record<StepName, number>>;
+  /** Reppo for the appeal step and the credits it has spent. Left out, as with no REPPO_API_KEY, the step is skipped. */
+  appeals?: { reppo: AppealReppo; spend: AppealSpend };
 }
 
 /** What the chain steps did for one open campaign. Steps after a failed or skipped reconcile are not-run. */
@@ -45,6 +50,7 @@ export interface RunReport {
   screen: ScreenOutcome | StepFailure;
   campaigns: CampaignReport[] | StepFailure;
   relay: RelayOutcome | StepFailure;
+  appeal: AppealOutcome | StepFailure;
 }
 
 const NOT_RUN: StepFailure = { kind: 'not-run' };
@@ -126,9 +132,20 @@ async function campaignSteps(deps: WorkerDeps, campaign: Campaign): Promise<Camp
   return report;
 }
 
+// Without Reppo the step is skipped and said once, so appeals stay queued until a key is set and the worker restarts.
+async function appealStep(deps: WorkerDeps): Promise<AppealOutcome | StepFailure> {
+  const appeals = deps.appeals;
+  if (appeals === undefined) {
+    if (waitNoted(deps.memory.waiting, 'appeal', NO_REPPO_KEY)) deps.log(`appeal: waiting, ${NO_REPPO_KEY}`);
+    return { kind: 'skipped', reason: NO_REPPO_KEY };
+  }
+  return bounded(deps, 'appeal', 'appeal', (signal) => appealNext({ ...deps, ...appeals }, signal));
+}
+
 /**
  * One run of the campaign worker: at most one screening; then, for every campaign openCampaigns returns, at most 100 in
- * id order, a reconcile, an activate check and a publish check; then at most one relay. Every step is held to its
+ * id order, a reconcile, an activate check and a publish check; then at most one relay; then at most one appeal's
+ * outside check, skipped when no Reppo key is set. Every step is held to its
  * STEP_TIMEOUTS_MS, so a run is bounded per campaign and by the store's cap on open campaigns (C41), and one campaign's
  * failure is reported for it and never stops the next. Reconcile comes first, so a list a stopped worker posted but never
  * recorded is recorded before anything is built on it; activating comes before publishing, so a list whose delay just
@@ -143,7 +160,7 @@ async function campaignSteps(deps: WorkerDeps, campaign: Campaign): Promise<Camp
  * reads, SERV calls and gas the other had already spent.
  */
 export async function runOnce(deps: WorkerDeps, signal?: AbortSignal): Promise<RunReport> {
-  const report: RunReport = { screen: NOT_RUN, campaigns: NOT_RUN, relay: NOT_RUN };
+  const report: RunReport = { screen: NOT_RUN, campaigns: NOT_RUN, relay: NOT_RUN, appeal: NOT_RUN };
   report.screen = await bounded(deps, 'screen', 'screen', (signal) => screenNextAsk(deps, signal));
   if (stopped(signal)) return report;
   const open = await bounded(deps, 'campaigns', 'campaigns', () => openCampaigns(deps.db, deps.now()));
@@ -159,6 +176,8 @@ export async function runOnce(deps: WorkerDeps, signal?: AbortSignal): Promise<R
   }
   if (stopped(signal)) return report;
   report.relay = await bounded(deps, 'relay', 'relay', (signal) => relayNext(deps, signal));
+  if (stopped(signal)) return report;
+  report.appeal = await appealStep(deps);
   return report;
 }
 

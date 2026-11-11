@@ -8,13 +8,15 @@
 // Reads DATABASE_URL, WORKER_PRIVATE_KEY, SERV_API_KEY, SERV_BASE_URL, SERV_GRAPH_ID, ETH_RPC_URL, BLOCKSCOUT_ETH_API
 // and BASE_SEPOLIA_RPC_URL from .env, and the factory from packages/contracts/deployments/base-sepolia.json. It serves
 // every open campaign in the store, so starting a campaign needs no change here. The database must be migrated first
-// (npm run db:migrate).
+// (npm run db:migrate). REPPO_API_KEY and REPPO_BASE_URL are optional: with them, each appeal gets Reppo's outside
+// check; without them, appeals wait in the queue.
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { connectPostgres, openCampaigns } from '@thuli/store';
+import { reppoForAppeals } from '../src/campaign/appeals.ts';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
 import { runLoop } from '../src/campaign/loop.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
@@ -71,6 +73,7 @@ async function main(): Promise<number> {
         now: () => new Date(),
         log,
         memory: emptyChainMemory(),
+        ...(config.reppo === null ? {} : { appeals: { reppo: reppoForAppeals(config.reppo), spend: { credits: 0 } } }),
       },
       { once: values.once, signal: stop.signal },
     );
