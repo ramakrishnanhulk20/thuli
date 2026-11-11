@@ -37,6 +37,7 @@
     "vault:verify": "node --env-file-if-exists=.env packages/contracts/script/verify.mjs",
     "vault:create": "node --env-file-if-exists=.env --env-file-if-exists=.env.payer --import tsx packages/worker/scripts/create-vault.ts",
     "campaign:create": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/create-campaign.ts",
+    "campaign:requeue": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/requeue-ask.ts",
     "prove:vault": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/prove-vault.ts",
     "db:migrate": "node --env-file-if-exists=.env --import tsx packages/store/scripts/migrate.ts",
     "worker": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/worker.ts",

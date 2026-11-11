@@ -163,7 +163,7 @@ async function main(): Promise<number> {
   console.log(`Deposited      ${usdc(state.deposited)}`);
   console.log('Next, register the campaign (pick its id and name; add --write to store it):');
   console.log(
-    `  npm run campaign:create -- --id <campaign-id> --name "<campaign name>" --vault-tx ${sent.hash} --reward ${formatUsdc(state.perWalletCap)} --slots ${slots > 0n ? slots : 1n}`,
+    `  npm run campaign:create -- --id <campaign-id> --name "<campaign name>" --agent ${state.agent} --vault-tx ${sent.hash} --reward ${formatUsdc(state.perWalletCap)} --slots ${slots > 0n ? slots : 1n}`,
   );
   return 0;
 }

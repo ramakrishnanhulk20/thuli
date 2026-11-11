@@ -1,9 +1,10 @@
 // Registers a campaign from its vault's creation transaction, so no vault term is ever typed by hand:
 //
-//   npm run campaign:create -- --id ID --name NAME --vault-tx HASH --reward USDC --slots N
+//   npm run campaign:create -- --id ID --name NAME --agent ADDRESS --vault-tx HASH --reward USDC --slots N
 //                              [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]
 //
-// It reads the receipt and the vault's state() from Base Sepolia, checks they agree, and prints the campaign. Without
+// It reads the receipt and the vault's state() from Base Sepolia, checks they agree, that --agent is the vault's agent
+// and that the vault holds reward times slots, and prints the campaign. Without
 // --write nothing is written. With --write it records the campaign through the store (DATABASE_URL). No code here reads
 // a private key: registering a campaign signs nothing (C39).
 import path from 'node:path';
@@ -30,7 +31,7 @@ import { Deployment, ProofRecordFile, ProofSetupError, readJson } from '../src/v
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEPLOYMENTS = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments');
 const USAGE =
-  'Usage: npm run campaign:create -- --id ID --name NAME --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]';
+  'Usage: npm run campaign:create -- --id ID --name NAME --agent ADDRESS --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]';
 
 class Refused extends Error {
   override name = 'Refused';
@@ -58,11 +59,6 @@ function printSummary(registration: Registration): void {
   console.log(`Settings       ${JSON.stringify(campaign.settings)}`);
   console.log(`Opens          ${campaign.opensAt.toISOString()}`);
   console.log(`Closes         ${campaign.closesAt.toISOString()} (latest allowed ${latestClose.toISOString()})`);
-  if (promised > holds) {
-    console.log(
-      `WARNING: reward times slots (${usdc(promised)}) is above what the vault still holds (${usdc(holds)}). The vault refuses a list above its deposit, so deposit more before that many wallets are paid.`,
-    );
-  }
   console.log(`Agent ${created.agent}: the worker must run with this key`);
 }
 
@@ -83,6 +79,7 @@ async function main(): Promise<number> {
       options: {
         id: { type: 'string' },
         name: { type: 'string' },
+        agent: { type: 'string' },
         'vault-tx': { type: 'string' },
         reward: { type: 'string' },
         slots: { type: 'string' },

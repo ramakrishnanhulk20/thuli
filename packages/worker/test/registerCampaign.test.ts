@@ -4,7 +4,7 @@
 import { encodeAbiParameters, encodeEventTopics, type Hex } from 'viem';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CHAINS, CURRENT_RULEBOOK, DEFAULT_SETTINGS, parseAddress, type Address } from '@thuli/core';
-import { createCampaign, getCampaign, migrate, openMemoryDb, type Db } from '@thuli/store';
+import { addAsk, createCampaign, getAsk, getCampaign, migrate, openMemoryDb, releaseAsk, takeAsk, type Db } from '@thuli/store';
 import {
   campaignEnv,
   campaignFromVault,
@@ -12,6 +12,7 @@ import {
   checkCampaignArgs,
   checkVaultArgs,
   needsMigration,
+  requeueAsk,
   usdcFromRecord,
   VAULT_LIMITS,
   vaultCreatedIn,
@@ -73,13 +74,13 @@ function onChain(change: Partial<VaultOnChain> = {}, state: Partial<VaultOnChain
     factory: FACTORY,
     usdc: USDC,
     receipt: receipt(),
-    state: { token: USDC, owner: OWNER, agent: AGENT, perWalletCap: CAP, rootDelay: DELAY, deposited: 2n * CAP, totalPaid: CAP, ...state },
+    state: { token: USDC, owner: OWNER, agent: AGENT, perWalletCap: CAP, rootDelay: DELAY, deposited: 3n * CAP, totalPaid: CAP, ...state },
     minClaimWindow: VAULT_LIMITS.minClaimWindow,
     ...change,
   };
 }
 
-const RAW_CAMPAIGN = { id: 'proof-vault-dry-run', name: 'Dry run', 'vault-tx': VAULT_TX, reward: '1', slots: '2' };
+const RAW_CAMPAIGN = { id: 'proof-vault-dry-run', name: 'Dry run', 'vault-tx': VAULT_TX, reward: '1', slots: '2', agent: AGENT };
 
 function campaignArgs(change: Record<string, string | boolean> = {}): CampaignArgs {
   const checked = checkCampaignArgs({ ...RAW_CAMPAIGN, ...change });
@@ -189,6 +190,7 @@ describe('campaign:create arguments', () => {
       value: {
         id: 'proof-vault-dry-run',
         name: 'Dry run',
+        agent: AGENT,
         vaultTx: VAULT_TX,
         reward: 1_000_000n,
         slots: 2,
@@ -216,6 +218,8 @@ describe('campaign:create arguments', () => {
     ['an unknown setting', { settings: '{"payEveryone":true}' }, '--settings holds a setting or value the campaign settings check refuses'],
     ['a setting out of range', { settings: '{"groupMinSize":1}' }, '--settings holds a setting or value the campaign settings check refuses'],
     ['a second partial share in the settings', { settings: '{"partialShareBps":2500}' }, '--settings may name partialShareBps only as the same value as --partial-share-bps'],
+    ['no --agent', { agent: undefined }, '--agent must be the address of the worker that will serve this campaign'],
+    ['an --agent that is not an address', { agent: '0x1234' }, '--agent must be the address of the worker that will serve this campaign'],
   ])('refuses %s', (_what, change, cause) => {
     expect(checkCampaignArgs({ ...RAW_CAMPAIGN, ...change })).toEqual({ ok: false, cause });
   });
@@ -287,8 +291,8 @@ describe('campaignFromVault', () => {
           vaultBlock: 57_248_098n,
         },
         created: { vault: VAULT, owner: OWNER, agent: AGENT, token: USDC, perWalletCap: CAP, endTime: END, rootDelay: DELAY, block: 57_248_098n },
-        deposited: 2n * CAP,
-        holds: CAP,
+        deposited: 3n * CAP,
+        holds: 2n * CAP,
         promised: 2n * CAP,
         latestClose: LATEST_CLOSE,
       },
@@ -338,9 +342,21 @@ describe('campaignFromVault', () => {
     });
   });
 
-  it('counts what the vault still holds, deposited less paid, against reward times slots', () => {
-    const result = campaignFromVault(campaignArgs({ slots: '3' }), onChain({}, { deposited: 5n * CAP, totalPaid: 3n * CAP }), NOW);
-    expect(result).toMatchObject({ ok: true, value: { holds: 2n * CAP, promised: 3n * CAP } });
+  it('counts what the vault still holds, deposited less paid, against reward times slots, and refuses when it is short', () => {
+    const exact = campaignFromVault(campaignArgs({ slots: '2' }), onChain({}, { deposited: 5n * CAP, totalPaid: 3n * CAP }), NOW);
+    expect(exact).toMatchObject({ ok: true, value: { holds: 2n * CAP, promised: 2n * CAP } });
+    expect(campaignFromVault(campaignArgs({ slots: '3' }), onChain({}, { deposited: 5n * CAP, totalPaid: 3n * CAP }), NOW)).toEqual({
+      ok: false,
+      cause: 'reward times slots, 3 USDC, is more than the vault still holds, 2 USDC; deposit more or register fewer slots',
+    });
+  });
+
+  it("refuses an --agent that is not the vault's agent, in any spelling of the right one accepting it (C1)", () => {
+    expect(campaignFromVault(campaignArgs({ agent: OWNER }), onChain(), NOW)).toEqual({
+      ok: false,
+      cause: "--agent is not the vault's agent, so that worker could not post this campaign's lists",
+    });
+    expect(campaignFromVault(campaignArgs({ agent: AGENT.toLowerCase() }), onChain(), NOW).ok).toBe(true);
   });
 });
 
@@ -378,9 +394,33 @@ describe('the store takes what campaignFromVault builds', () => {
   });
 
   it("takes the store's most slots, which the argument check allows", async () => {
-    const result = campaignFromVault(campaignArgs({ id: 'most-slots', slots: '100000' }), onChain(), NOW);
+    const result = campaignFromVault(campaignArgs({ id: 'most-slots', slots: '100000' }), onChain({}, { deposited: 100_000n * CAP, totalPaid: 0n }), NOW);
     if (!result.ok) throw new Error(result.cause);
     expect(await createCampaign(db, result.value.campaign)).toBe('created');
+  });
+
+  it('puts only a failed ask back in the queue, and only with --write', async () => {
+    const result = campaignFromVault(campaignArgs({ id: 'requeue' }), onChain(), NOW);
+    if (!result.ok) throw new Error(result.cause);
+    await createCampaign(db, result.value.campaign);
+    const wallet = address('c7');
+    await addAsk(db, { campaignId: 'requeue', wallet, signedAt: Number(NOW_SECONDS), signature: `0x${'ab'.repeat(65)}` }, NOW);
+    const queued = await requeueAsk(db, 'requeue', wallet, true, NOW);
+    expect(queued.ok).toBe(false);
+    expect(queued.lines.at(-1)).toBe('only a failed ask can be put back in the queue; this one is queued, so nothing changed');
+
+    await takeAsk(db, NOW, 300, 1);
+    await releaseAsk(db, 'requeue', wallet, NOW, 1);
+    expect(await getAsk(db, 'requeue', wallet)).toMatchObject({ status: 'failed', rule: 'A1' });
+    const dry = await requeueAsk(db, 'requeue', wallet.toLowerCase(), false, NOW);
+    expect(dry).toEqual({
+      ok: true,
+      lines: [`ask requeue ${wallet}: failed under A1`, 'it would be queued again from the start, with no attempts; add --write to do it'],
+    });
+    expect(await getAsk(db, 'requeue', wallet)).toMatchObject({ status: 'failed' });
+    expect(await requeueAsk(db, 'requeue', wallet, true, NOW)).toMatchObject({ ok: true, lines: [expect.any(String), 'queued again from the start'] });
+    expect(await getAsk(db, 'requeue', wallet)).toMatchObject({ status: 'queued', rule: null });
+    expect(await requeueAsk(db, 'requeue', address('c8'), true, NOW)).toEqual({ ok: false, lines: [`no ask from ${address('c8')} in campaign requeue`] });
   });
 
   it('names the migration when the table or column is missing', () => {

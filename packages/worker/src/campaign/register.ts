@@ -11,7 +11,7 @@ import {
   Settings,
   type Address,
 } from '@thuli/core';
-import type { Campaign, CampaignInput } from '@thuli/store';
+import { getAsk, requeueFailedAsk, type Campaign, type CampaignInput, type Db } from '@thuli/store';
 import { FACTORY_ABI } from '../vault/abi.ts';
 import { loadVerifyRpc, ProofSetupError, type ProofReceipt } from '../vault/proof.ts';
 import { campaignSettings } from './facts.ts';
@@ -191,6 +191,8 @@ export function vaultEnv(env: Record<string, string | undefined>): Checked<{ pay
 export interface CampaignArgs {
   id: string;
   name: string;
+  /** The worker that will serve the campaign, stated by the operator and checked against the vault's agent. */
+  agent: Address;
   vaultTx: `0x${string}`;
   reward: bigint;
   slots: number;
@@ -234,13 +236,14 @@ function settingsOf(text: string | undefined, partialShareBps: number): Checked<
 
 /**
  * Checks campaign:create's flags against the store's own ranges, so a refusal names the flag: the id and name rules,
- * --vault-tx a transaction hash, --reward a USDC amount above zero, --slots 1 to 100,000, --partial-share-bps 1 to
+ * --agent an address, --vault-tx a transaction hash, --reward a USDC amount above zero, --slots 1 to 100,000, --partial-share-bps 1 to
  * 9,999 (the rulebook default when left out), --opens and --closes ISO 8601 times with a zone, and --settings a JSON
  * object the campaign settings check accepts.
  */
 export function checkCampaignArgs(raw: {
   id?: string;
   name?: string;
+  agent?: string;
   'vault-tx'?: string;
   reward?: string;
   slots?: string;
@@ -255,6 +258,12 @@ export function checkCampaignArgs(raw: {
   const name = raw.name ?? '';
   if (name.length === 0 || [...name].length > MAX_NAME_CHARS || !isPlainText(name)) {
     return refuse(`--name must be plain text of 1 to ${MAX_NAME_CHARS} characters`);
+  }
+  let agent: Address;
+  try {
+    agent = parseAddress(raw.agent ?? '');
+  } catch {
+    return refuse('--agent must be the address of the worker that will serve this campaign');
   }
   const vaultTx = raw['vault-tx'] ?? '';
   if (!TX_HASH.test(vaultTx)) return refuse('--vault-tx must be 0x and 64 hex characters');
@@ -279,6 +288,7 @@ export function checkCampaignArgs(raw: {
     value: {
       id,
       name,
+      agent,
       vaultTx: vaultTx.toLowerCase() as `0x${string}`,
       reward: reward.value,
       slots,
@@ -402,8 +412,9 @@ export interface Registration {
  * address compared through parseAddress (C1). Any refusal writes nothing (fail closed).
  *
  * Refuses a token that is not the chain's USDC, because the money code assumes 6 decimals; a MIN_CLAIM_WINDOW or an
- * end time no deployed vault could have; a state() paying more than was deposited; a reward above the cap; a vault
- * that has ended; closes after the end less the root delay less MIN_CLAIM_WINDOW, the latest moment a list posted
+ * end time no deployed vault could have; a state() paying more than was deposited; an --agent that is not the vault's
+ * agent, so the operator states which worker will serve the campaign; a reward above the cap; reward times slots
+ * above what the vault still holds, because the vault refuses a list it cannot cover; a vault that has ended; closes after the end less the root delay less MIN_CLAIM_WINDOW, the latest moment a list posted
  * then could still pay; and opens at or after closes.
  *
  * Defaults: opens `now`, closes at that latest moment, chain 84532, status open, the current rulebook, vaultBlock from
@@ -434,7 +445,15 @@ export function campaignFromVault(args: CampaignArgs, onChain: VaultOnChain, now
   // No vault can end more than MAX_END_AHEAD after it was made, which was before now.
   if (created.endTime > nowSeconds + BigInt(VAULT_LIMITS.maxEndAhead)) return refuse('the VaultCreated log holds terms outside what the contract allows');
   if (state.totalPaid < 0n || state.totalPaid > state.deposited) return refuse("the vault's state() reports more paid than deposited");
+  if (!sameAddress(args.agent, created.agent)) return refuse("--agent is not the vault's agent, so that worker could not post this campaign's lists");
   if (args.reward > created.perWalletCap) return refuse('--reward is above the vault per-wallet cap, so the vault could never pay it in full');
+  const holds = state.deposited - state.totalPaid;
+  const promised = args.reward * BigInt(args.slots);
+  if (promised > holds) {
+    return refuse(
+      `reward times slots, ${formatUsdc(promised)} USDC, is more than the vault still holds, ${formatUsdc(holds)} USDC; deposit more or register fewer slots`,
+    );
+  }
   if (created.endTime <= nowSeconds) return refuse('the vault has ended, so it can pay nothing more');
 
   const latestClose = new Date(Number(created.endTime - BigInt(created.rootDelay) - BigInt(window)) * 1000);
@@ -470,8 +489,8 @@ export function campaignFromVault(args: CampaignArgs, onChain: VaultOnChain, now
       },
       created,
       deposited: state.deposited,
-      holds: state.deposited - state.totalPaid,
-      promised: args.reward * BigInt(args.slots),
+      holds,
+      promised,
       latestClose,
     },
   };
@@ -507,4 +526,32 @@ export function campaignLines(campaign: Campaign): string[] {
 /** True for the store's message when the campaigns table or one of its columns is missing: the schema is behind. */
 export function needsMigration(message: string): boolean {
   return /\((42P01|42703)\)$/.test(message);
+}
+
+/**
+ * campaign:requeue for one ask: the ask's status and rule, then, for a failed ask only, what would happen or, with
+ * write, the store's requeueFailedAsk, which puts it back in the queue from the start. Any other ask is refused and left
+ * as it is, so no command can move a decided ask or give a slot (C11). The wallet goes through the store's parseAddress.
+ *
+ * @returns ok with the lines to print, or not ok with the reason nothing changed.
+ * @throws AddressError when the wallet is not an address. StoreError when the store cannot be read.
+ */
+export async function requeueAsk(
+  db: Db,
+  campaignId: string,
+  wallet: string,
+  write: boolean,
+  now: Date,
+): Promise<{ ok: boolean; lines: string[] }> {
+  const ask = await getAsk(db, campaignId, wallet);
+  if (ask === null) return { ok: false, lines: [`no ask from ${wallet} in campaign ${campaignId}`] };
+  const lines = [`ask ${campaignId} ${ask.wallet}: ${ask.status}${ask.rule === null ? '' : ` under ${ask.rule}`}`];
+  if (ask.status !== 'failed') {
+    return { ok: false, lines: [...lines, `only a failed ask can be put back in the queue; this one is ${ask.status}, so nothing changed`] };
+  }
+  if (!write) return { ok: true, lines: [...lines, 'it would be queued again from the start, with no attempts; add --write to do it'] };
+  const moved = await requeueFailedAsk(db, campaignId, ask.wallet, now);
+  return moved
+    ? { ok: true, lines: [...lines, 'queued again from the start'] }
+    : { ok: false, lines: [...lines, 'it changed before it could be moved, so nothing changed'] };
 }
