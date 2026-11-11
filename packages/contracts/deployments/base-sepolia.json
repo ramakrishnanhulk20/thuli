@@ -1,0 +1,11 @@
+{
+  "network": "base-sepolia",
+  "chainId": 84532,
+  "factory": "0xbd2c20d2a068fe6d5052efca910d1cba44638b56",
+  "deployer": "0xbedcf312f0070295c73bff4de974f372aa03dee6",
+  "txHash": "0x5019bb52542ab56a619a0512a97fe1ad9bec61635025871b11fca532224df7f7",
+  "block": 57247894,
+  "verifiedOn": "blockscout",
+  "explorer": "https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56",
+  "recordedAt": "2026-11-11T04:31:02.879Z"
+}
