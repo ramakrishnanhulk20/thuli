@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "runDate": "2026-11-10",
+  "probablyReal": {
+    "screened": 21174,
+    "noHistory": 754,
+    "counted": 20420,
+    "held": 119,
+    "heldLow": 0.004872544924996248,
+    "heldHigh": 0.0069685898247178945,
+    "excluded": 1,
+    "partial": 1518,
+    "full": 18783
+  },
+  "eliminated": {
+    "screened": 14195,
+    "noHistory": 5426,
+    "counted": 8769,
+    "held": 5078,
+    "heldLow": 0.5687196339731639,
+    "heldHigh": 0.5893819351148577,
+    "excluded": 93,
+    "partial": 1373,
+    "full": 2318
+  },
+  "clusters": {
+    "total": 501,
+    "touched": 287,
+    "fullyHeld": 80,
+    "uncounted": 25
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "runDate": "2026-11-10",
+  "v1": {
+    "name": "v1",
+    "catchRate": {
+      "held": 11173,
+      "wallets": 11282,
+      "rate": 0.9903385924481475
+    },
+    "falseHold": {
+      "held": 38,
+      "wallets": 1500,
+      "rate": 0.025333333333333333,
+      "low": 0.01851196864747831,
+      "high": 0.034579704249547316
+    },
+    "feedback": {
+      "right": 0,
+      "total": 11
+    }
+  },
+  "v2": {
+    "name": "v2",
+    "catchRate": {
+      "held": 11173,
+      "wallets": 11282,
+      "rate": 0.9903385924481475
+    },
+    "falseHold": {
+      "held": 15,
+      "wallets": 1500,
+      "rate": 0.01,
+      "low": 0.006069437504076523,
+      "high": 0.016433904601701334
+    },
+    "feedback": {
+      "right": 10,
+      "total": 11
+    }
+  },
+  "eliminatedHeld": {
+    "v1": {
+      "held": 56,
+      "wallets": 500,
+      "rate": 0.112
+    },
+    "v2": {
+      "held": 15,
+      "wallets": 500,
+      "rate": 0.03
+    }
+  },
+  "verdicts": [
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 38,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 43,
+      "route": "block",
+      "confidence": "high",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 53,
+      "route": "block",
+      "confidence": "high",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 53,
+      "route": "block",
+      "confidence": "high",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 50,
+      "route": "block",
+      "confidence": "high",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "contract-hold",
+      "storedAction": "hold",
+      "score": 50,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "real-contract-hold",
+      "storedAction": "hold",
+      "score": 44,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "eliminated-hold",
+      "storedAction": "hold",
+      "score": 51,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "real-contract-hold",
+      "storedAction": "hold",
+      "score": 43,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "hold"
+    },
+    {
+      "group": "real-contract-hold",
+      "storedAction": "hold",
+      "score": 49,
+      "route": "block",
+      "confidence": "high",
+      "v1Action": "hold",
+      "v2Action": "full"
+    },
+    {
+      "group": "eliminated-hold",
+      "storedAction": "hold",
+      "score": 43,
+      "route": "block",
+      "confidence": "medium",
+      "v1Action": "hold",
+      "v2Action": "full"
+    }
+  ],
+  "routes": {
+    "ship": 3,
+    "review": 35,
+    "block": 11,
+    "unread": 0
+  },
+  "appeals": [
+    {
+      "campaignId": "thuli-appeal-proof",
+      "status": "reversed",
+      "appealedAction": "hold",
+      "newAction": "full",
+      "testWallet": true
+    }
+  ],
+  "testWalletAppeals": 1,
+  "noReply": {
+    "robo": 3,
+    "hopSample": 9,
+    "hopEliminated": 9
+  }
+}
