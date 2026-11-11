@@ -44,11 +44,13 @@ export function askMessage(a: { campaignId: string; wallet: string; signedAt: nu
  * appeals follow; isContract must reflect accountType 'contract' only, so a delegated EOA still counts as a wallet (C20).
  *
  * The first failed check in this order gives the cause, always a fixed text: address, campaign, signing time, age, future
- * date, contract wallet, signature. Anything that throws is a refusal, and so is any isContract answer but true or false.
+ * date, signature, contract wallet. Anything that throws is a refusal, and so is any isContract answer but true or false.
+ * The signature is checked before the account type because it costs nothing, so a request nobody signed can never make
+ * the server read the chain.
  *
  * @param ctx.expectedCampaignId The campaign this request is for, taken from the server's route and never from the body.
  * @param ctx.now The current time in unix seconds, from the server's clock.
- * @param ctx.isContract Reads the wallet's account type. Runs only after every free check has passed.
+ * @param ctx.isContract Reads the wallet's account type. Runs only after every free check, the signature included, has passed.
  * @returns The canonical wallet, or a fixed cause. Never throws.
  */
 export async function checkAsk(
@@ -71,6 +73,15 @@ export async function checkAsk(
   if (!(age <= ASK_WINDOW_SECONDS)) return refuse('the signature is too old');
   if (!(age >= -FUTURE_SKEW_SECONDS)) return refuse('the signature is dated in the future');
 
+  if (typeof input.signature !== 'string' || !SIGNATURE.test(input.signature)) return refuse(SIGNATURE_CAUSE);
+  try {
+    const message = askMessage({ campaignId: ctx.expectedCampaignId, wallet, signedAt: input.signedAt });
+    const signer = parseAddress(await recoverMessageAddress({ message, signature: input.signature as Hex }));
+    if (signer !== wallet) return refuse(SIGNATURE_CAUSE);
+  } catch {
+    return refuse(SIGNATURE_CAUSE);
+  }
+
   let contract: unknown;
   try {
     contract = await ctx.isContract(wallet);
@@ -80,13 +91,5 @@ export async function checkAsk(
   if (contract === true) return refuse('contract wallets cannot ask yet');
   // Only a plain false lets the wallet on, so a reader that answers null for "unknown" fails closed.
   if (contract !== false) return refuse('the wallet type could not be checked');
-
-  if (typeof input.signature !== 'string' || !SIGNATURE.test(input.signature)) return refuse(SIGNATURE_CAUSE);
-  try {
-    const message = askMessage({ campaignId: ctx.expectedCampaignId, wallet, signedAt: input.signedAt });
-    const signer = parseAddress(await recoverMessageAddress({ message, signature: input.signature as Hex }));
-    return signer === wallet ? { ok: true, wallet } : refuse(SIGNATURE_CAUSE);
-  } catch {
-    return refuse(SIGNATURE_CAUSE);
-  }
+  return { ok: true, wallet };
 }

@@ -282,6 +282,14 @@ describe('checkAppeal', () => {
     };
     await checkAppeal(await signed({ signedAt: NOW - 7_200 }), options({ isContract: counting }));
     expect(calls).toBe(0);
+    // The signature is a free check too, so a bad one is refused before any chain read.
+    for (const signature of [`0x${'ff'.repeat(65)}`, '0x1234', '']) {
+      expect(await checkAppeal({ ...(await signed()), signature }, options({ isContract: counting }))).toEqual(refusedWith(SIGNATURE_CAUSE));
+    }
+    expect(await checkAppeal(await signed({ signer: stranger }), options({ isContract: counting }))).toEqual(refusedWith(SIGNATURE_CAUSE));
+    expect(calls).toBe(0);
+    expect((await checkAppeal(await signed(), options({ isContract: counting }))).ok).toBe(true);
+    expect(calls).toBe(1);
   });
 
   it('refuses when the account reader throws (C9)', async () => {
@@ -357,6 +365,7 @@ describe('checkAppeal', () => {
       { text: input.text },
       { campaignId: CAMPAIGN },
       { signedAt: NOW },
+      { signature: input.signature },
     ]) {
       Object.assign(worst, fix);
       const result = await checkAppeal(worst, worstOptions);
@@ -368,9 +377,10 @@ describe('checkAppeal', () => {
       LINK_CAUSE,
       'this appeal is for a different campaign',
       'the signing time is not a whole number of seconds',
+      SIGNATURE_CAUSE,
       CONTRACT_CAUSE,
     ]);
-    expect(await checkAppeal(worst, options())).toEqual(refusedWith(SIGNATURE_CAUSE));
+    expect((await checkAppeal(worst, options())).ok).toBe(true);
   });
 });
 

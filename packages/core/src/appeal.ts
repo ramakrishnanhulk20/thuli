@@ -88,10 +88,11 @@ export function appealMessage(a: { campaignId: string; wallet: string; textHash:
  * and so is any isContract answer but true or false.
  *
  * The first failed check in this order gives the cause, always a fixed text: address, text length, text content, campaign,
- * signing time, contract wallet, signature.
+ * signing time, signature, contract wallet. The signature is checked before the account type because it costs nothing,
+ * so a request nobody signed can never make the server read the chain.
  *
  * @param opts.now The current time in unix seconds, from the server's clock.
- * @param opts.isContract Reads the wallet's account type. Runs only after every free check has passed.
+ * @param opts.isContract Reads the wallet's account type. Runs only after every free check, the signature included, has passed.
  * @returns The canonical wallet and our own text hash, or a fixed cause. Never throws.
  */
 export async function checkAppeal(
@@ -118,6 +119,15 @@ export async function checkAppeal(
   if (!(age <= APPEAL_WINDOW_SECONDS)) return refuse('the signature is too old');
   if (!(age >= -FUTURE_SKEW_SECONDS)) return refuse('the signature is dated in the future');
 
+  if (typeof input.signature !== 'string' || !SIGNATURE.test(input.signature)) return refuse(SIGNATURE_CAUSE);
+  const textHash = appealTextHash(text);
+  try {
+    const message = appealMessage({ campaignId: opts.expectedCampaignId, wallet, textHash, signedAt: input.signedAt });
+    if (!(await verifyMessage({ address: wallet, message, signature: input.signature as Hex }))) return refuse(SIGNATURE_CAUSE);
+  } catch {
+    return refuse(SIGNATURE_CAUSE);
+  }
+
   let contract: unknown;
   try {
     contract = await opts.isContract(wallet);
@@ -127,16 +137,7 @@ export async function checkAppeal(
   if (contract === true) return refuse('contract wallets cannot appeal yet');
   // Only a plain false lets the wallet on, so a reader that answers null for "unknown" fails closed (C11).
   if (contract !== false) return refuse('the wallet type could not be checked');
-
-  if (typeof input.signature !== 'string' || !SIGNATURE.test(input.signature)) return refuse(SIGNATURE_CAUSE);
-  const textHash = appealTextHash(text);
-  try {
-    const message = appealMessage({ campaignId: opts.expectedCampaignId, wallet, textHash, signedAt: input.signedAt });
-    const matches = await verifyMessage({ address: wallet, message, signature: input.signature as Hex });
-    return matches ? { ok: true, wallet, textHash } : refuse(SIGNATURE_CAUSE);
-  } catch {
-    return refuse(SIGNATURE_CAUSE);
-  }
+  return { ok: true, wallet, textHash };
 }
 
 /**

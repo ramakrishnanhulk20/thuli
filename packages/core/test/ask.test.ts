@@ -210,8 +210,29 @@ describe('checkAsk', () => {
     expect(staleContract).toEqual(refusedWith('the signature is too old'));
     expect(reads).toBe(0);
 
+    // The signature is a free check too, so a stranger's signature is refused before any chain read.
     const contractStranger = await checkAsk(await signed({ signer: stranger }), context({ isContract: contractWallet }));
-    expect(contractStranger).toEqual(refusedWith(CONTRACT_CAUSE));
+    expect(contractStranger).toEqual(refusedWith(SIGNATURE_CAUSE));
+    expect(reads).toBe(0);
+
+    expect(await checkAsk(await signed(), context({ isContract: contractWallet }))).toEqual(refusedWith(CONTRACT_CAUSE));
+    expect(reads).toBe(1);
+  });
+
+  it('never calls the account reader for a signature that does not match, of any shape', async () => {
+    let reads = 0;
+    const counting = async () => {
+      reads += 1;
+      return false;
+    };
+    const input = await signed();
+    const bad = [`0x${'ff'.repeat(65)}`, '0x1234', '', input.signature.slice(0, -2) + (input.signature.endsWith('1b') ? '1c' : '1b')];
+    for (const signature of bad) {
+      expect(await checkAsk({ ...input, signature }, context({ isContract: counting }))).toEqual(refusedWith(SIGNATURE_CAUSE));
+    }
+    expect(await checkAsk(await signed({ signer: stranger }), context({ isContract: counting }))).toEqual(refusedWith(SIGNATURE_CAUSE));
+    expect(reads).toBe(0);
+    expect((await checkAsk(input, context({ isContract: counting }))).ok).toBe(true);
     expect(reads).toBe(1);
   });
 
