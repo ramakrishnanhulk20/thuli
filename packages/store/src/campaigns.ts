@@ -16,12 +16,21 @@ import { instant, shifted, StoreError, wholeNumber, type Db, type Queryable } fr
 // asks, slots and list versions holds it, so two server copies or two workers never decide on the same stale count.
 // Campaign rows are records, not caches, so sweep leaves them alone (see 002_campaigns.sql).
 
-/** Attempts one relay gets before it is marked failed. */
-export const MAX_RELAY_ATTEMPTS = 5;
+/**
+ * Attempts one relay gets before it is marked failed. Ten, because the worker waits longer after each failed try: ten
+ * tries then span about an hour of a chain outage before a claim is left for the wallet to submit itself.
+ */
+export const MAX_RELAY_ATTEMPTS = 10;
 /** The most asks board returns in one call. */
 export const MAX_BOARD_PAGE = 100;
+/** The most asks board adds past its limit so a page never ends between two asks decided at the same instant. */
+export const MAX_BOARD_TIES = 100;
 /** The longest reason an ask may store, in characters. Longer than a model reason so a code-written hold always fits. */
 export const MAX_ASK_REASON_CHARS = 400;
+/** The longest an ask or a relay may be told to wait before its next try: a day, so no retry is put off for ever (C41). */
+export const MAX_RETRY_SECONDS = 86_400;
+/** The most campaigns openCampaigns returns, so one worker pass reads a bounded list (C41). */
+export const MAX_OPEN_CAMPAIGNS = 100;
 
 const MAX_NAME_CHARS = 80;
 const MAX_NOT_CHECKED = 16;
@@ -33,6 +42,7 @@ const MAX_SLOTS = 100_000;
 const MAX_INTEGER = 2_147_483_647;
 const MAX_LEASE_SECONDS = 86_400;
 const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_BIGINT_COLUMN = (1n << 63n) - 1n;
 const MAX_AMOUNT_DIGITS = 78;
 
 // The appeal message's rule for a campaign id, so an id stored here can always be signed over.
@@ -83,14 +93,20 @@ export interface Campaign {
   opensAt: Date;
   closesAt: Date;
   createdAt: Date;
+  /** The block of the transaction that created the vault, where its history starts; null when it was not recorded. */
+  vaultBlock: bigint | null;
 }
 
-/** What createCampaign takes: a Campaign whose four addresses may be in any spelling parseAddress accepts. */
-export type CampaignInput = Omit<Campaign, 'vault' | 'token' | 'owner' | 'agent'> & {
+/**
+ * What createCampaign takes: a Campaign whose four addresses may be in any spelling parseAddress accepts, and whose
+ * vaultBlock may be left out, which records none.
+ */
+export type CampaignInput = Omit<Campaign, 'vault' | 'token' | 'owner' | 'agent' | 'vaultBlock'> & {
   vault: string;
   token: string;
   owner: string;
   agent: string;
+  vaultBlock?: bigint | null;
 };
 
 /** The first funder a decision saw: its canonical address, its kind, how many wallets it funded and the hops traced. */
@@ -235,6 +251,7 @@ interface CampaignRow {
   opens_at: unknown;
   closes_at: unknown;
   created_at: unknown;
+  vault_block: string | null;
 }
 
 interface AskRow {
@@ -445,6 +462,11 @@ function campaignTerms(input: CampaignInput): Campaign {
   const closesAt = new Date(timeOf(input.closesAt, 'closesAt'));
   const createdAt = new Date(timeOf(input.createdAt, 'createdAt'));
   if (closesAt.getTime() <= opensAt.getTime()) throw new StoreError('closesAt must be after opensAt');
+  const vaultBlock = input.vaultBlock ?? null;
+  // A bigint only, as viem hands block numbers over, so a float or a text spelling can never become a different block.
+  if (vaultBlock !== null && (typeof vaultBlock !== 'bigint' || vaultBlock < 1n || vaultBlock > MAX_BIGINT_COLUMN)) {
+    throw new StoreError('vaultBlock must be a bigint from 1, or null');
+  }
   return {
     id,
     name,
@@ -463,6 +485,7 @@ function campaignTerms(input: CampaignInput): Campaign {
     opensAt,
     closesAt,
     createdAt,
+    vaultBlock,
   };
 }
 
@@ -492,6 +515,7 @@ function readCampaign(row: CampaignRow): Campaign {
     opensAt: readTime(row.opens_at),
     closesAt: readTime(row.closes_at),
     createdAt: readTime(row.created_at),
+    vaultBlock: row.vault_block === null ? null : BigInt(row.vault_block),
   };
 }
 
@@ -512,7 +536,8 @@ function sameTerms(a: Campaign, b: Campaign): boolean {
     settingsKey(a.settings) === settingsKey(b.settings) &&
     a.status === b.status &&
     a.opensAt.getTime() === b.opensAt.getTime() &&
-    a.closesAt.getTime() === b.closesAt.getTime()
+    a.closesAt.getTime() === b.closesAt.getTime() &&
+    a.vaultBlock === b.vaultBlock
   );
 }
 
@@ -568,7 +593,7 @@ async function lockCampaign(tx: Queryable, id: string): Promise<void> {
 async function findCampaign(q: Queryable, id: string): Promise<Campaign | null> {
   const [row] = await q.query<CampaignRow>(
     `SELECT id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps, max_slots,
-            rulebook, settings, status, opens_at, closes_at, created_at
+            rulebook, settings, status, opens_at, closes_at, created_at, vault_block::text AS vault_block
        FROM campaigns WHERE id = $1`,
     [id],
   );
@@ -584,7 +609,9 @@ async function findCampaign(q: Queryable, id: string): Promise<Campaign | null> 
  *   that is not plain text of 1 to 80 characters, an amount that is not positive decimal digits within 256 bits, a
  *   reward above the cap, a partial share outside 1 to 9,999, max slots outside 1 to 100,000, settings that are not an
  *   object of known screening settings with valid values (an empty object is fine) or that give a partialShareBps other
- *   than the campaign's, a status other than open or closed, or closesAt not after opensAt.
+ *   than the campaign's, a status other than open or closed, closesAt not after opensAt, or a vaultBlock that is
+ *   neither left out, null, nor a bigint from 1 up to what a Postgres bigint holds. Every check runs before anything is
+ *   written. vaultBlock is a term: left out it is null, and null differs from any block.
  */
 export async function createCampaign(db: Db, campaign: CampaignInput): Promise<CreateCampaignResult> {
   const terms = campaignTerms(campaign);
@@ -597,9 +624,10 @@ export async function createCampaign(db: Db, campaign: CampaignInput): Promise<C
     }
     await tx.query(
       `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap,
-                              partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at, settings)
+                              partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at, settings,
+                              vault_block)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz, $16::timestamptz,
-               $17::jsonb)`,
+               $17::jsonb, $18::bigint)`,
       [
         terms.id,
         terms.name,
@@ -618,6 +646,7 @@ export async function createCampaign(db: Db, campaign: CampaignInput): Promise<C
         terms.closesAt.toISOString(),
         terms.createdAt.toISOString(),
         JSON.stringify(terms.settings),
+        terms.vaultBlock === null ? null : terms.vaultBlock.toString(),
       ],
     );
     return 'created';
@@ -628,6 +657,25 @@ export async function createCampaign(db: Db, campaign: CampaignInput): Promise<C
 export async function getCampaign(db: Db, id: string): Promise<Campaign | null> {
   if (!isCampaignId(id)) return null;
   return findCampaign(db, id);
+}
+
+/**
+ * Every campaign whose status is open, whatever its opens_at and closes_at, because the worker keeps posting lists and
+ * paying claims after asks close. In id order by byte value, at most MAX_OPEN_CAMPAIGNS.
+ * @param now checked like every caller's time, and not used to filter: only the status decides.
+ * @throws StoreError when now is not a valid Date.
+ */
+export async function openCampaigns(db: Db, now: Date): Promise<Campaign[]> {
+  instant(now);
+  const rows = await db.query<CampaignRow>(
+    `SELECT id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps, max_slots,
+            rulebook, settings, status, opens_at, closes_at, created_at, vault_block::text AS vault_block
+       FROM campaigns WHERE status = 'open'
+      ORDER BY id COLLATE "C"
+      LIMIT $1`,
+    [MAX_OPEN_CAMPAIGNS],
+  );
+  return rows.map(readCampaign);
 }
 
 /**
@@ -676,8 +724,9 @@ export async function addAsk(
 }
 
 /**
- * Hands the oldest waiting ask, from any campaign, to one worker: an ask that is queued, or screening with a lease at
- * or before now. It is marked screening with lease_until now plus leaseSeconds and one more attempt. A waiting ask
+ * Hands the oldest ready ask, from any campaign, to one worker: an ask that is queued with no retry time or one at or
+ * before now, or screening with a lease at or before now. An ask still waiting out its retry time never holds back the
+ * asks behind it. The ask taken is marked screening with lease_until now plus leaseSeconds and one more attempt. A waiting ask
  * that has already had maxAttempts is never handed out again: in the same transaction it ends failed with the hold
  * releaseAsk gives, so a worker that dies on one ask every time cannot keep it in the queue for ever (C11, C41). The
  * take itself is one statement that skips rows another caller has locked, so two workers calling at once never get
@@ -694,8 +743,8 @@ export async function takeAsk(db: Db, now: Date, leaseSeconds: number, maxAttemp
   const row = await db.transaction(async (tx) => {
     await tx.query(
       `UPDATE asks
-          SET status = 'failed', lease_until = NULL, action = 'hold', share_bps = 0, rule = 'A1', reason = $3::text,
-              cited_txs = '[]'::jsonb, not_checked = '[]'::jsonb, facts = NULL, serv_request_id = NULL,
+          SET status = 'failed', lease_until = NULL, retry_at = NULL, action = 'hold', share_bps = 0, rule = 'A1',
+              reason = $3::text, cited_txs = '[]'::jsonb, not_checked = '[]'::jsonb, facts = NULL, serv_request_id = NULL,
               decided_at = $1::timestamptz
         WHERE attempts >= $2::int AND (status = 'queued' OR (status = 'screening' AND lease_until <= $1::timestamptz))`,
       [nowAt, maxAttempts, HELD_REASON],
@@ -703,12 +752,14 @@ export async function takeAsk(db: Db, now: Date, leaseSeconds: number, maxAttemp
     const [taken] = await tx.query<{ campaign_id: string; wallet: string; asked_at: unknown; attempts: number; lease_until: unknown }>(
       `WITH next AS (
          SELECT campaign_id, wallet FROM asks
-          WHERE attempts < $3::int AND (status = 'queued' OR (status = 'screening' AND lease_until <= $1::timestamptz))
+          WHERE attempts < $3::int
+            AND ((status = 'queued' AND (retry_at IS NULL OR retry_at <= $1::timestamptz))
+                 OR (status = 'screening' AND lease_until <= $1::timestamptz))
           ORDER BY asked_at, campaign_id, wallet
           LIMIT 1
           FOR UPDATE SKIP LOCKED
        )
-       UPDATE asks SET status = 'screening', lease_until = $2::timestamptz, attempts = asks.attempts + 1
+       UPDATE asks SET status = 'screening', lease_until = $2::timestamptz, retry_at = NULL, attempts = asks.attempts + 1
          FROM next
         WHERE asks.campaign_id = next.campaign_id AND asks.wallet = next.wallet
        RETURNING asks.campaign_id, asks.wallet, asks.asked_at, asks.attempts, asks.lease_until`,
@@ -815,13 +866,17 @@ export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promi
 }
 
 /**
- * Gives back an ask whose screening could not finish. Below maxAttempts it is queued again; at or past it, it ends
- * failed with the hold every doubt ends in (C11): action hold, share 0, rule A1, the fixed reason "Held for review: the
- * screening could not finish.", no cited transactions, no facts and decided_at now. A failed ask never takes a slot. One
- * statement, and only on an ask that is screening.
+ * Gives back an ask whose screening could not finish. Below maxAttempts it is queued again, and takeAsk leaves it be
+ * until now plus retryAfterSeconds, so an outage of the screening service is waited out instead of burning every
+ * attempt in seconds; asks that are ready are taken meanwhile. At or past maxAttempts, it ends failed with the hold
+ * every doubt ends in (C11): action hold, share 0, rule A1, the fixed reason "Held for review: the screening could not
+ * finish.", no cited transactions, no facts and decided_at now. A failed ask never takes a slot. One statement, and
+ * only on an ask that is screening.
+ * @param retryAfterSeconds 0, the default, queues it ready at once; at most 86,400, so no ask waits more than a day (C41).
  * @returns 'queued' or 'failed', or null when there is no such ask or it is not screening, in which case nothing changes.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when maxAttempts is not a whole
- *   number from 1 to 100 or now is not a valid Date.
+ *   number from 1 to 100, retryAfterSeconds not a whole number from 0 to 86,400, or now is not a valid Date, each before
+ *   anything is written.
  */
 export async function releaseAsk(
   db: Db,
@@ -829,15 +884,18 @@ export async function releaseAsk(
   wallet: string,
   now: Date,
   maxAttempts: number,
+  retryAfterSeconds = 0,
 ): Promise<ReleaseAskResult | null> {
   const nowAt = instant(now);
   const canonical = parseAddress(wallet);
   wholeNumber(maxAttempts, 'maxAttempts', 1, 100);
+  const retryAt = shifted(now, wholeNumber(retryAfterSeconds, 'retryAfterSeconds', 0, MAX_RETRY_SECONDS));
   if (!isCampaignId(campaignId)) return null;
   const [row] = await db.query<{ status: ReleaseAskResult }>(
     `UPDATE asks
         SET status = CASE WHEN attempts < $3::int THEN 'queued' ELSE 'failed' END,
             lease_until = NULL,
+            retry_at = CASE WHEN attempts < $3::int THEN $6::timestamptz ELSE NULL END,
             action = CASE WHEN attempts < $3::int THEN NULL ELSE 'hold' END,
             share_bps = CASE WHEN attempts < $3::int THEN NULL ELSE 0 END,
             rule = CASE WHEN attempts < $3::int THEN NULL ELSE 'A1' END,
@@ -848,7 +906,7 @@ export async function releaseAsk(
             decided_at = CASE WHEN attempts < $3::int THEN NULL ELSE $5::timestamptz END
       WHERE campaign_id = $1 AND wallet = $2 AND status = 'screening'
      RETURNING status`,
-    [campaignId, canonical, maxAttempts, HELD_REASON, nowAt],
+    [campaignId, canonical, maxAttempts, HELD_REASON, nowAt, retryAt],
   );
   return row?.status ?? null;
 }
@@ -872,9 +930,12 @@ export async function getAsk(db: Db, campaignId: string, wallet: string): Promis
 }
 
 /**
- * A campaign's decided and failed asks, newest decision first, in the public view. Asks decided at the same instant
- * come in wallet order, and one at exactly beforeDecidedAt is left out, so a page that ends inside such a tie skips
- * the rest of it.
+ * A campaign's decided and failed asks, newest decision first, in the public view, one page at a time. A page ends
+ * only between two different decided_at values: it holds the newest limit asks plus every other ask decided at the
+ * same instant as the last of them, so the next page, asked for with beforeDecidedAt set to that instant, misses
+ * nothing. Asks decided at the same instant come in wallet order. One statement, so a page is read from one snapshot.
+ * Not covered: a page holds at most limit plus MAX_BOARD_TIES asks, so more than 100 further asks decided in the same
+ * millisecond would still be cut. One worker decides one ask at a time, so that needs many workers on one clock tick.
  * @param limit 1 to 100.
  * @param beforeDecidedAt when given, only asks decided strictly before it.
  * @throws StoreError when limit is not a whole number from 1 to 100 or beforeDecidedAt is not a valid Date.
@@ -883,14 +944,22 @@ export async function board(db: Db, campaignId: string, limit: number, beforeDec
   wholeNumber(limit, 'limit', 1, MAX_BOARD_PAGE);
   const before = beforeDecidedAt === undefined ? null : timeOf(beforeDecidedAt, 'beforeDecidedAt');
   if (!isCampaignId(campaignId)) return [];
+  // The limit-th newest decision sets the page's floor; every ask at or after it, before the cursor, is on the page.
   const rows = await db.query<AskRow>(
-    `SELECT campaign_id, wallet, asked_at, status, action, share_bps, rule, reason, cited_txs, not_checked, facts,
+    `WITH newest AS (
+       SELECT decided_at FROM asks
+        WHERE campaign_id = $1 AND status IN ('decided', 'failed') AND ($2::timestamptz IS NULL OR decided_at < $2::timestamptz)
+        ORDER BY decided_at DESC, wallet
+        LIMIT $3
+     )
+     SELECT campaign_id, wallet, asked_at, status, action, share_bps, rule, reason, cited_txs, not_checked, facts,
             serv_request_id, decided_at, slot
        FROM asks
       WHERE campaign_id = $1 AND status IN ('decided', 'failed') AND ($2::timestamptz IS NULL OR decided_at < $2::timestamptz)
+        AND decided_at >= (SELECT min(decided_at) FROM newest)
       ORDER BY decided_at DESC, wallet
-      LIMIT $3`,
-    [campaignId, before, limit],
+      LIMIT $4`,
+    [campaignId, before, limit, limit + MAX_BOARD_TIES],
   );
   return rows.map(readPublicAsk);
 }
@@ -1017,19 +1086,21 @@ export async function addListVersion(
 }
 
 /**
- * A built version's root went on chain in postTx and can be claimed from claimableAt, in Unix seconds.
+ * A built version's root went on chain in postTx and can be claimed from claimableAt, in Unix seconds. postTx is null
+ * for a root the worker finds pending on the vault after a restart without having seen the transaction that posted it;
+ * claimableAt is always given, because the vault holds it.
  * @returns true when the version was built and is now posted; false, changing nothing, for any other version.
- * @throws StoreError when version is not a whole number from 1, postTx is not 0x and 64 lowercase hex, or claimableAt
- *   is not whole seconds from 0.
+ * @throws StoreError when version is not a whole number from 1, postTx is neither null nor 0x and 64 lowercase hex,
+ *   or claimableAt is not whole seconds from 0.
  */
 export async function markListPosted(
   db: Db,
   campaignId: string,
   version: number,
-  posted: { postTx: string; claimableAt: number },
+  posted: { postTx: string | null; claimableAt: number },
 ): Promise<boolean> {
   wholeNumber(version, 'version', 1, MAX_INTEGER);
-  const postTx = txHashOf(posted.postTx, 'postTx');
+  const postTx = posted.postTx === null ? null : txHashOf(posted.postTx, 'postTx');
   const claimableAt = wholeNumber(posted.claimableAt, 'claimableAt', 0, Number.MAX_SAFE_INTEGER);
   if (!isCampaignId(campaignId)) return false;
   const rows = await db.query(
@@ -1065,8 +1136,9 @@ export async function markListActive(db: Db, campaignId: string, version: number
 }
 
 /**
- * A version that never became active is cancelled: one built but never posted, or posted and cancelled on chain
- * inside its delay. An active or superseded version has already been claimable, so it cannot be cancelled.
+ * A version that never became active is cancelled: one built but never posted, or posted and then cancelled on chain
+ * by the owner's cancelRoot inside its delay. An active or superseded version has already been claimable, so it cannot
+ * be cancelled, and neither can one already cancelled.
  * @returns true when the version was built or posted and is now cancelled; false, changing nothing, otherwise.
  * @throws StoreError when version is not a whole number from 1.
  */
@@ -1187,8 +1259,9 @@ export async function queueRelays(
 }
 
 /**
- * Hands the oldest waiting relay to one worker: one pending, or sent and last touched at or before now less
- * leaseSeconds, whose holder is taken to have stopped. It is marked sent with one more attempt and updated_at now, and
+ * Hands the oldest ready relay to one worker: one pending with no retry time or one at or before now, or sent and last
+ * touched at or before now less leaseSeconds, whose holder is taken to have stopped. A relay still waiting out its retry
+ * time never holds back the ones behind it. It is marked sent with one more attempt and updated_at now, and
  * the worker holds it until updated_at plus leaseSeconds. First, in the same transaction, a relay whose lease ran out
  * on its last allowed attempt is marked failed, so none gets more than MAX_RELAY_ATTEMPTS. The take is one statement
  * that skips rows another caller has locked, so two workers calling at once never get the same relay.
@@ -1201,19 +1274,21 @@ export async function takeRelay(db: Db, now: Date, leaseSeconds: number): Promis
   const staleAt = shifted(now, -leaseSeconds);
   const row = await db.transaction(async (tx) => {
     await tx.query(
-      `UPDATE claim_relays SET status = 'failed', updated_at = $1::timestamptz
+      `UPDATE claim_relays SET status = 'failed', updated_at = $1::timestamptz, retry_at = NULL
         WHERE attempts >= $3::int AND (status = 'pending' OR (status = 'sent' AND updated_at <= $2::timestamptz))`,
       [nowAt, staleAt, MAX_RELAY_ATTEMPTS],
     );
     const [taken] = await tx.query<RelayRow>(
       `WITH next AS (
          SELECT campaign_id, wallet, version FROM claim_relays
-          WHERE attempts < $3::int AND (status = 'pending' OR (status = 'sent' AND updated_at <= $2::timestamptz))
+          WHERE attempts < $3::int
+            AND ((status = 'pending' AND (retry_at IS NULL OR retry_at <= $1::timestamptz))
+                 OR (status = 'sent' AND updated_at <= $2::timestamptz))
           ORDER BY updated_at, campaign_id, version, wallet
           LIMIT 1
           FOR UPDATE SKIP LOCKED
        )
-       UPDATE claim_relays SET status = 'sent', attempts = claim_relays.attempts + 1, updated_at = $1::timestamptz
+       UPDATE claim_relays SET status = 'sent', attempts = claim_relays.attempts + 1, updated_at = $1::timestamptz, retry_at = NULL
          FROM next
         WHERE claim_relays.campaign_id = next.campaign_id AND claim_relays.wallet = next.wallet
           AND claim_relays.version = next.version
@@ -1228,20 +1303,23 @@ export async function takeRelay(db: Db, now: Date, leaseSeconds: number): Promis
 
 /**
  * Records what became of a relay a worker holds (status sent): 'sent' keeps holding it and restarts its lease, for
- * example once the claim is broadcast; 'confirmed' and 'failed' end it; 'pending' gives it back for another attempt,
- * or ends it failed when it has had MAX_RELAY_ATTEMPTS. tx, when given, replaces the stored hash; null or left out
- * keeps it. A claim the vault refuses because nothing is left to claim is confirmed with no tx of ours. Which worker
- * holds the lease is not checked, and a relay takeRelay already failed is left failed even if a late claim landed;
- * the vault pays each wallet only what it has not yet claimed (C27), so neither case can pay twice.
+ * example once the claim is broadcast; 'confirmed' and 'failed' end it, and takeRelay never hands it out again (C27);
+ * 'pending' gives it back for another attempt, which takeRelay leaves be until now plus retryAfterSeconds so a chain
+ * outage is waited out, or ends it failed when it has had MAX_RELAY_ATTEMPTS. retryAfterSeconds counts only with
+ * 'pending'. tx, when given, replaces the stored hash; null or left out keeps it. A claim the vault refuses because
+ * nothing is left to claim is confirmed with no tx of ours. Which worker holds the lease is not checked, and a relay
+ * takeRelay already failed is left failed even if a late claim landed; the vault pays each wallet only what it has not
+ * yet claimed (C27), so neither case can pay twice.
+ * @param result.retryAfterSeconds 0, the default, makes it ready at once; at most 86,400 (C41).
  * @returns the status the relay ended in, or null when there is no such relay or it was not sent, changing nothing.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when the status is not pending,
- *   sent, confirmed or failed, tx is not 0x and 64 lowercase hex, version is not a whole number from 1, or now is not a
- *   valid Date.
+ *   sent, confirmed or failed, tx is not 0x and 64 lowercase hex, retryAfterSeconds is not a whole number from 0 to
+ *   86,400, version is not a whole number from 1, or now is not a valid Date, each before anything is written.
  */
 export async function markRelay(
   db: Db,
   key: RelayKey,
-  result: { status: RelayStatus; tx?: string | null },
+  result: { status: RelayStatus; tx?: string | null; retryAfterSeconds?: number },
   now: Date,
 ): Promise<RelayStatus | null> {
   const nowAt = instant(now);
@@ -1249,15 +1327,18 @@ export async function markRelay(
   wholeNumber(key.version, 'version', 1, MAX_INTEGER);
   if (!RELAY_STATUSES.includes(result.status)) throw new StoreError('status must be pending, sent, confirmed or failed');
   const tx = result.tx === undefined || result.tx === null ? null : txHashOf(result.tx, 'tx');
+  const delay = wholeNumber(result.retryAfterSeconds ?? 0, 'retryAfterSeconds', 0, MAX_RETRY_SECONDS);
+  const retryAt = result.status === 'pending' ? shifted(now, delay) : null;
   if (!isCampaignId(key.campaignId)) return null;
   const [row] = await db.query<{ status: RelayStatus }>(
     `UPDATE claim_relays
         SET status = CASE WHEN $4::text = 'pending' AND attempts >= $7::int THEN 'failed' ELSE $4::text END,
             tx = COALESCE($5::text, tx),
-            updated_at = $6::timestamptz
+            updated_at = $6::timestamptz,
+            retry_at = CASE WHEN $4::text = 'pending' AND attempts < $7::int THEN $8::timestamptz ELSE NULL END
       WHERE campaign_id = $1 AND wallet = $2 AND version = $3 AND status = 'sent'
      RETURNING status`,
-    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS],
+    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS, retryAt],
   );
   return row?.status ?? null;
 }

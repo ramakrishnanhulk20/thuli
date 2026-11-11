@@ -7,10 +7,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { getAsk, getCampaign, listVersions, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
 
 const INIT = fileURLToPath(new URL('../migrations/001_init.sql', import.meta.url));
+const CAMPAIGNS = fileURLToPath(new URL('../migrations/002_campaigns.sql', import.meta.url));
 
 describe('migrate', () => {
   let db: Db;
@@ -72,7 +74,48 @@ describe('migrate', () => {
     });
   });
 
-  it('C40: every table holds exactly the columns in the work order, so no secret has a column to live in', async () => {
+  it('a database made by 001 and 002 alone, holding a campaign, an ask and a relay, migrates on and keeps every row readable', async () => {
+    await writeFile(path.join(directory, '002_campaigns.sql'), await readFile(CAMPAIGNS));
+    expect(await migrate(db, directory)).toEqual({ applied: ['001_init.sql', '002_campaigns.sql'], alreadyApplied: [] });
+    const vault = '0x00000000000000000000000000000000000a11ce';
+    const wallet = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
+    const at = '2026-11-11T12:00:00.000Z';
+    // Written the way the code before this migration wrote them, column for column.
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+       VALUES ('old', 'Before the retries', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{"groupMinSize": 3}',
+               'open', $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz)`,
+      [vault, at],
+    );
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
+       VALUES ('old', $1, 1800000000, $2, $3::timestamptz, 'queued', 0)`,
+      [wallet, `0x${'ab'.repeat(65)}`, at],
+    );
+    await db.query(
+      `INSERT INTO list_versions (campaign_id, version, root, published_list, declared_total, status, post_tx, claimable_at, created_at)
+       VALUES ('old', 1, $1, '[]', '0', 'active', $2, 1800000000, $3::timestamptz)`,
+      [`0x${'aa'.repeat(32)}`, `0x${'bb'.repeat(32)}`, at],
+    );
+    await db.query(
+      `INSERT INTO claim_relays (campaign_id, wallet, version, amount, status, tx, attempts, updated_at)
+       VALUES ('old', $1, 1, '1000000', 'pending', NULL, 4, $2::timestamptz)`,
+      [wallet, at],
+    );
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toEqual(['001_init.sql', '002_campaigns.sql']);
+    expect(upgraded.applied).toEqual(['003_retries_and_vault_block.sql']);
+    expect(await getCampaign(db, 'old')).toMatchObject({ id: 'old', settings: { groupMinSize: 3 }, vaultBlock: null, status: 'open' });
+    expect(await getAsk(db, 'old', wallet)).toMatchObject({ status: 'queued', wallet });
+    expect((await listVersions(db, 'old')).map((list) => [list.version, list.status, list.postTx])).toEqual([[1, 'active', `0x${'bb'.repeat(32)}`]]);
+    const now = new Date('2026-11-11T12:01:00.000Z');
+    expect(await takeAsk(db, now, 60, 3)).toMatchObject({ campaignId: 'old', wallet, attempts: 1 });
+    expect(await takeRelay(db, now, 60)).toMatchObject({ campaignId: 'old', wallet, version: 1, attempts: 5, status: 'sent' });
+  });
+
+  it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {
     await migrate(db);
     const rows = await db.query<{ table_name: string; column_name: string }>(
       'SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = current_schema() ORDER BY table_name, ordinal_position',
@@ -88,14 +131,14 @@ describe('migrate', () => {
       check_cache: ['address', 'chain', 'rulebook', 'body', 'checked_at', 'expires_at'],
       campaigns: [
         'id', 'name', 'chain', 'vault', 'token', 'owner', 'agent', 'reward_per_wallet', 'per_wallet_cap', 'partial_share_bps',
-        'max_slots', 'rulebook', 'settings', 'status', 'opens_at', 'closes_at', 'created_at',
+        'max_slots', 'rulebook', 'settings', 'status', 'opens_at', 'closes_at', 'created_at', 'vault_block',
       ],
       asks: [
         'campaign_id', 'wallet', 'signed_at', 'signature', 'asked_at', 'status', 'lease_until', 'attempts', 'action', 'share_bps',
-        'rule', 'reason', 'cited_txs', 'not_checked', 'facts', 'serv_request_id', 'decided_at', 'slot',
+        'rule', 'reason', 'cited_txs', 'not_checked', 'facts', 'serv_request_id', 'decided_at', 'slot', 'retry_at',
       ],
       list_versions: ['campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at'],
-      claim_relays: ['campaign_id', 'wallet', 'version', 'amount', 'status', 'tx', 'attempts', 'updated_at'],
+      claim_relays: ['campaign_id', 'wallet', 'version', 'amount', 'status', 'tx', 'attempts', 'updated_at', 'retry_at'],
     });
   });
 });
