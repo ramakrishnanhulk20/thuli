@@ -59,13 +59,40 @@ export function prepareAppealText(raw: string): string {
   return raw.trim();
 }
 
-export type AppealProblem = 'empty' | 'unplain';
+// Every control character (the tab and both line ends among them, U+0085 too) and the two Unicode separators, as core
+// reads them. They are escapes on purpose: a raw U+2028 or U+2029 in a source literal breaks a parser.
+const BREAKS_THE_LINE = /[\p{Cc}\u2028\u2029]/u;
+const BREAKS_THE_LINE_ALL = /[\p{Cc}\u2028\u2029]/gu;
 
-/** Why the text in the box cannot be sent yet, or null when it can. */
+/** True when the text has nothing that starts a line of its own. Core refuses an appeal that does. */
+export function isOneLine(text: string): boolean {
+  return !BREAKS_THE_LINE.test(text);
+}
+
+export type AppealProblem = 'empty' | 'unplain' | 'oneLine';
+
+/**
+ * Why the text in the box cannot be sent yet, or null when it can. The order is core's: empty, then links and markup
+ * with line breakers read as spaces, then the one-line rule, so the box names the same cause the route would.
+ */
 export function appealProblem(raw: string): AppealProblem | null {
   const text = prepareAppealText(raw);
   if (text === '') return 'empty';
-  return isPlainWords(text) ? null : 'unplain';
+  if (!isPlainWords(text.replace(BREAKS_THE_LINE_ALL, ' '))) return 'unplain';
+  return isOneLine(text) ? null : 'oneLine';
+}
+
+/** The text can be sent: the button is on only then. */
+export function appealSendable(raw: string): boolean {
+  return appealProblem(raw) === null;
+}
+
+export const APPEAL_ONE_LINE = 'Keep it to one line.';
+
+/** The line under the input for a problem the visitor can fix, or null when there is nothing to say. */
+export function appealWarning(problem: AppealProblem | null): string | null {
+  if (problem === 'unplain') return 'Write plain words, with no links or markup.';
+  return problem === 'oneLine' ? APPEAL_ONE_LINE : null;
 }
 
 /** The SHA-256 of the text as UTF-8 bytes: 0x and 64 lowercase hex characters, the form core hashes to. */

@@ -9,9 +9,12 @@ import {
   appealBody,
   appealMessage,
   appealProblem,
+  appealSendable,
   appealTextHash,
+  appealWarning,
   askBody,
   askMessage,
+  isOneLine,
   isOwnKeySignature,
   isPlainWords,
   prepareAppealText,
@@ -761,10 +764,10 @@ describe('the plain-words rule for an appeal', () => {
     'vertical\u000btab',
     'delete\u007f',
     'next line\u0085',
-    'zero​width',
-    'joiner‍join',
-    'right to left‮override',
-    'mark﻿byte',
+    'zero\u200bwidth',
+    'joiner\u200djoin',
+    'right to left\u202eoverride',
+    'mark\ufeffbyte',
     'lone \ud800 surrogate',
     'low \udc00 surrogate',
     'emoji \u{1F600} fine',
@@ -1172,5 +1175,99 @@ describe('a wallet that has never been used', () => {
   it('is accepted by the API schema', () => {
     expect(NeverUsedBody.safeParse(fx.neverUsed).success).toBe(true);
     expect(NeverUsedBody.safeParse({ neverUsed: false }).success).toBe(false);
+  });
+});
+
+describe('the appeal text on one line', () => {
+  const stamp = 1_800_000_000;
+  const CAUSES = {
+    empty: 'the appeal text is empty',
+    unplain: 'the appeal text contained a link, markup or control characters',
+    oneLine: 'the appeal text must be one line',
+  } as const;
+  // Every character that is not an ordinary one is written as an escape: a raw line separator inside a literal breaks the parser.
+  const TABLE = [
+    'one\ntwo',
+    'one\rtwo',
+    'one\r\ntwo',
+    'one\ttwo',
+    'one\u0085two',
+    'one\u2028two',
+    'one\u2029two',
+    'one\u000btwo',
+    'one\u000ctwo',
+    'one\u0000two',
+    'bell\u0007',
+    'delete\u007f',
+    'last control\u009f',
+    'see http://x.example\nmore',
+    'tab and www.example.com\there',
+    'zero\u200bwidth',
+    'right to left\u202eover',
+    'lone \ud800 surrogate',
+    '\nleading and trailing\n',
+    '\t tab around \t',
+    'plain words',
+    'தமிழ் எழுத்து',
+    'café against café',
+    'emoji \u{1F600} fine',
+    'a'.repeat(280),
+    '  padded  ',
+    '',
+    '   ',
+  ];
+
+  it('agrees with core on each text in the table: the same cause for a bad one, and none for a good one', async () => {
+    for (const text of TABLE) {
+      const prepared = prepareAppealText(text);
+      const verdict = await core.checkAppeal(
+        { campaignId: CAMPAIGN_ID, wallet: signer.address, text: prepared, signedAt: stamp, signature: `0x${'a'.repeat(130)}` },
+        { expectedCampaignId: CAMPAIGN_ID, now: stamp + 5, isContract: async () => false },
+      );
+      const problem = appealProblem(text);
+      // The signature is not a real one, so a text core likes ends at the signature check, and the others end at their own cause.
+      expect(verdict.ok, JSON.stringify(text)).toBe(false);
+      expect(verdict.cause, JSON.stringify(text)).toBe(problem === null ? 'the signature does not match this appeal' : CAUSES[problem]);
+    }
+  });
+
+  it('agrees with core on what breaks a line', () => {
+    for (const text of TABLE) expect(isOneLine(text), JSON.stringify(text)).toBe(core.isOneLine(text));
+    expect(isOneLine('plain words')).toBe(true);
+    expect(isOneLine('one\u2028two')).toBe(false);
+    expect(isOneLine('one\u2029two')).toBe(false);
+  });
+
+  it('says a pasted line break, tab or separator needs one line, and keeps the other causes first', () => {
+    for (const text of ['one\ntwo', 'one\rtwo', 'one\ttwo', 'one\u0085two', 'one\u2028two', 'one\u2029two', 'one\u0000two']) expect(appealProblem(text), JSON.stringify(text)).toBe('oneLine');
+    expect(appealProblem('see http://x.example\nmore')).toBe('unplain');
+    expect(appealProblem('zero\u200bwidth')).toBe('unplain');
+    expect(appealProblem('\nleading and trailing\n')).toBeNull();
+    expect(appealProblem('\n\n')).toBe('empty');
+    expect(appealProblem('தமிழ் எழுத்து')).toBeNull();
+    expect(appealProblem('café against café')).toBeNull();
+    expect(appealProblem('emoji \u{1F600} fine')).toBeNull();
+  });
+
+  it('shows "Keep it to one line." under the input for that problem, and the plain-words line for the other', () => {
+    expect(appealWarning('oneLine')).toBe('Keep it to one line.');
+    expect(appealWarning('unplain')).toBe(APPEAL_COPY.unplain);
+    expect(appealWarning('empty')).toBeNull();
+    expect(appealWarning(null)).toBeNull();
+  });
+
+  it('keeps the button off while any problem shows, and on for a good text', () => {
+    expect(appealSendable('one\ntwo')).toBe(false);
+    expect(appealSendable('one\u2028two')).toBe(false);
+    expect(appealSendable('see http://x.example')).toBe(false);
+    expect(appealSendable('   ')).toBe(false);
+    expect(appealSendable('Please look again.')).toBe(true);
+    expect(appealSendable('தமிழ்')).toBe(true);
+  });
+
+  it('shows the cause of a 400 from the route as it comes', () => {
+    const post = classifyAppealAnswer(400, { error: 'the appeal text must be one line' });
+    expect(post).toEqual({ kind: 'bad', cause: 'the appeal text must be one line' });
+    if (post.kind === 'bad') expect(appealRefusalText(post)).toBe('the appeal text must be one line');
   });
 });

@@ -7,7 +7,9 @@ import {
   APPEAL_MAX_CHARS,
   appealMessage,
   appealProblem,
+  appealSendable,
   appealTextHash,
+  appealWarning,
   isOwnKeySignature,
   prepareAppealText,
   signedAtNow,
@@ -141,6 +143,7 @@ export function AppealBlock({ campaignId, wallet, panel, sent, onSent, onGone }:
   if (sent) return <Filed appeal={null} />;
 
   const problem = appealProblem(text);
+  const warning = appealWarning(problem);
   const busy = phase !== 'idle';
 
   async function send(signed: Signed) {
@@ -221,9 +224,9 @@ export function AppealBlock({ campaignId, wallet, panel, sent, onSent, onGone }:
             />
           </div>
           <div className={styles.appealMeta}>
-            {problem === 'unplain' ? (
+            {warning !== null ? (
               <p className={styles.appealWarning} role="alert" data-appeal-unplain>
-                {APPEAL_COPY.unplain}
+                {warning}
               </p>
             ) : (
               <span />
@@ -233,7 +236,7 @@ export function AppealBlock({ campaignId, wallet, panel, sent, onSent, onGone }:
             ) : null}
           </div>
         </div>
-        <button type="button" className={styles.secondary} disabled={problem !== null || busy} onClick={() => void onAppeal()} data-appeal-send>
+        <button type="button" className={styles.secondary} disabled={!appealSendable(text) || busy} onClick={() => void onAppeal()} data-appeal-send>
           {label}
         </button>
       </div>
