@@ -17,6 +17,12 @@ const CREDITS = [
   ['CONTROL GROUP FROM', 'HOP PROTOCOL'],
 ] as const;
 
+// The top bar is full at six links, so the owner's page is reached from the footer, straight after the campaign.
+const START_LINK = { href: '/campaign/start', label: 'Start a campaign' };
+const PRODUCT_LINKS: { href: string; label: string; footerLabel?: string }[] = NAV_LINKS.flatMap((link) =>
+  link.href === '/campaign' ? [link, START_LINK] : [link],
+);
+
 const BUILT_WITH = [
   { href: 'https://www.openserv.ai', label: 'SERV by OpenServ' },
   { href: 'https://docs.reppo.ai', label: 'Reppo' },
@@ -65,7 +71,7 @@ export function SiteFooter() {
         <div>
           <h2 className={styles.columnLabel}>PRODUCT</h2>
           <ul className={styles.footLinks}>
-            {NAV_LINKS.map((link) => (
+            {PRODUCT_LINKS.map((link) => (
               <li key={link.href}>
                 <Link href={link.href} className={styles.footLink}>
                   <span className={styles.footLinkLabel}>{link.footerLabel ?? link.label}</span>

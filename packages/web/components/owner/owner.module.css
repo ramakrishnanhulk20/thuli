@@ -1,0 +1,538 @@
+/* The owner's setup page. Colours, fonts, radii and the panel come from the campaign page's styles and the site tokens. */
+
+/* The page frame is the campaign page's, with the 16px side gutter this page's mobile layout asks for. */
+.page {
+  --pad: clamp(16px, 3vw, 48px);
+
+  padding: 72px var(--pad) 120px;
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.intro {
+  max-width: 560px;
+  margin-top: 20px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.testLine {
+  margin-top: 10px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* Who can do what */
+.blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  margin-top: 24px;
+}
+
+.blockHeading {
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-ink);
+}
+
+.lines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.line {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.lineMark {
+  flex: none;
+  margin-top: 6px;
+  line-height: 0;
+}
+
+.youMark {
+  color: var(--color-accent);
+}
+
+.thuliMark {
+  color: var(--color-hold);
+}
+
+.whoNote {
+  margin-top: 20px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.whoLink {
+  margin-top: 4px;
+}
+
+/* The four rows */
+.rows {
+  margin-top: 0;
+}
+
+.row {
+  padding: 18px 0;
+  border-top: 1px solid var(--color-line);
+}
+
+.rowHead {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  column-gap: 14px;
+}
+
+.rowNumber {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.rowTitle {
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-ink);
+}
+
+.word {
+  position: relative;
+  display: inline-block;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.leaving {
+  position: absolute;
+  top: 0;
+  right: 0;
+  animation: fade-out 200ms ease both;
+}
+
+.arriving {
+  display: inline-block;
+  animation: fade-in 200ms ease both;
+}
+
+.wordTodo {
+  color: var(--color-ink-3);
+}
+
+.wordWait {
+  color: var(--color-accent);
+}
+
+.wordDone {
+  color: var(--color-full);
+}
+
+.wordFailed {
+  color: var(--color-exclude);
+}
+
+/* A row's body opens and closes by height and opacity. The grid row goes from 0fr to 1fr, which animates to the content's height. */
+.collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    grid-template-rows 300ms var(--ease-out-expo),
+    opacity 300ms var(--ease-out-expo),
+    visibility 0s linear 300ms;
+}
+
+.collapseOpen {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+  transition:
+    grid-template-rows 300ms var(--ease-out-expo),
+    opacity 300ms var(--ease-out-expo),
+    visibility 0s;
+}
+
+.collapseInner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.rowBody {
+  padding-top: 16px;
+}
+
+.result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.resultLead {
+  color: var(--color-ink);
+}
+
+.addressLine {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.falling {
+  display: inline-flex;
+  line-height: 0;
+  color: var(--color-accent);
+  animation: fall 500ms var(--ease-out-expo) both;
+}
+
+.status {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.statusLinks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 14px;
+  margin-top: 4px;
+}
+
+.reason {
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-exclude);
+}
+
+.reasonAbove {
+  margin-bottom: 14px;
+}
+
+/* The terms form */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.fieldLabel {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.control {
+  display: flex;
+  align-items: center;
+  height: 44px;
+  margin-top: 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-night);
+  transition: border-color 160ms ease;
+}
+
+.control:focus-within {
+  border-color: var(--color-accent);
+}
+
+.controlError {
+  border-color: var(--color-exclude);
+}
+
+.controlError:focus-within {
+  border-color: var(--color-accent);
+}
+
+.input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  outline: none;
+}
+
+.suffix {
+  flex: none;
+  padding-right: 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.fixed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 12px;
+  margin-top: 4px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  color: var(--color-ink);
+}
+
+.helper {
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.fieldError {
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-exclude);
+}
+
+.helperSecond {
+  margin-top: 4px;
+}
+
+/* Buttons */
+.primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  padding: 0 20px;
+  border-radius: 8px;
+  background: var(--color-accent);
+  color: var(--color-night);
+  font-family: var(--font-body);
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.primary:hover:not(:disabled) {
+  background: #ffc24d;
+}
+
+.primary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.primary:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  margin-top: 14px;
+  padding: 0 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.secondary:hover:not(:disabled) {
+  border-color: var(--color-ink-3);
+}
+
+.secondary:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.secondary:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.submit {
+  margin-top: 4px;
+}
+
+.afterLine {
+  margin-top: 14px;
+}
+
+/* The funded card */
+.funded {
+  padding-top: 24px;
+  border-top: 1px solid var(--color-line);
+}
+
+.fact {
+  margin-top: 22px;
+}
+
+.factLabel {
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--color-ink-3);
+}
+
+.factLine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 16px;
+  margin-top: 2px;
+}
+
+.afterSend {
+  margin-top: 2px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.afterNote {
+  margin-top: 22px;
+  max-width: 52ch;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.fundedLinks {
+  margin-top: 12px;
+}
+
+.restart {
+  margin-top: 8px;
+}
+
+@media (max-width: 767px) {
+  .page {
+    padding-bottom: 96px;
+  }
+
+  .intro {
+    font-size: 16px;
+  }
+
+  .rowHead {
+    grid-template-columns: auto minmax(0, 1fr);
+    row-gap: 2px;
+  }
+
+  .word {
+    grid-column: 2;
+    justify-self: start;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .leaving {
+    right: auto;
+    left: 0;
+  }
+
+  .primary,
+  .secondary {
+    width: 100%;
+  }
+}
+
+@keyframes fall {
+  from {
+    opacity: 0;
+    transform: translateY(-12px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+/* Reduced motion: rows open and close at once, words change without a fade, and the mark is simply there. */
+@media (prefers-reduced-motion: reduce) {
+  .falling,
+  .arriving {
+    animation: none;
+  }
+
+  .leaving {
+    display: none;
+  }
+
+  .collapse,
+  .collapseOpen {
+    transition: none;
+  }
+}

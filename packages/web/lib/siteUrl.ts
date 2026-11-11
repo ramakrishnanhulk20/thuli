@@ -1,5 +1,5 @@
 /** Pages the sitemap lists besides the docs. The lab pages and the per-address pages are never listed. */
-export const SITEMAP_PAGES = ['/', '/replay', '/campaign', '/check', '/versions', '/break'] as const;
+export const SITEMAP_PAGES = ['/', '/replay', '/campaign', '/campaign/start', '/check', '/versions', '/break'] as const;
 
 /** Paths robots.txt keeps crawlers out of. /lab covers every lab page, /check/ only the per-address pages. */
 export const ROBOTS_DISALLOWED = ['/lab', '/api', '/check/'] as const;

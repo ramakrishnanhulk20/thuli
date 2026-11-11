@@ -64,14 +64,14 @@ describe('sitemap', () => {
   const entries = sitemap();
   const paths = entries.map((entry) => entry.url.replace(siteUrl(), ''));
 
-  it('lists the six pages and the seventeen docs pages, nothing else', () => {
+  it('lists the seven pages and the seventeen docs pages, nothing else', () => {
     const docs = JSON.parse(read('content', 'docs', 'meta.json')) as { pages: string[] };
     const slugs = docs.pages.filter((entry) => !entry.startsWith('---'));
     expect(slugs).toHaveLength(17);
-    expect(paths.slice(0, 6)).toEqual(['/', '/replay', '/campaign', '/check', '/versions', '/break']);
-    expect(paths.slice(6)).toEqual(slugs.map((slug) => (slug === 'index' ? '/docs' : `/docs/${slug}`)));
-    expect(entries).toHaveLength(23);
-    expect([...SITEMAP_PAGES]).toEqual(['/', '/replay', '/campaign', '/check', '/versions', '/break']);
+    expect(paths.slice(0, 7)).toEqual(['/', '/replay', '/campaign', '/campaign/start', '/check', '/versions', '/break']);
+    expect(paths.slice(7)).toEqual(slugs.map((slug) => (slug === 'index' ? '/docs' : `/docs/${slug}`)));
+    expect(entries).toHaveLength(24);
+    expect([...SITEMAP_PAGES]).toEqual(['/', '/replay', '/campaign', '/campaign/start', '/check', '/versions', '/break']);
   });
 
   it('never lists a lab page, an api route or a per-address page', () => {
