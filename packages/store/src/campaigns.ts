@@ -4,6 +4,7 @@ import {
   MAX_EVIDENCE_TXS,
   OUTCOMES,
   parseAddress,
+  Settings,
   shareFor,
   TxHash,
   type Address,
@@ -46,6 +47,8 @@ const HELD_REASON = 'Held for review: the screening could not finish.';
 const RELAY_STATUSES: readonly string[] = ['pending', 'sent', 'confirmed', 'failed'];
 const FACT_KEYS: readonly string[] = ['ageDays', 'txCount', 'accountType', 'funder', 'burstWallets', 'groupSize', 'missing'];
 const FUNDER_KEYS: readonly string[] = ['address', 'kind', 'fanout', 'hops'];
+// Core's own schema with every key optional: an unknown key or a bad value is refused, as a full Settings would be.
+const CampaignSettings = Settings.partial();
 const MAX_FACT_WORD_CHARS = 32;
 const MAX_MISSING_FACTS = 16;
 const MAX_MISSING_FACT_CHARS = 64;
@@ -74,6 +77,8 @@ export interface Campaign {
   partialShareBps: number;
   maxSlots: number;
   rulebook: number;
+  /** The screening settings this campaign changes from the defaults, and only those. Part of its terms. */
+  settings: Partial<Settings>;
   status: CampaignStatus;
   opensAt: Date;
   closesAt: Date;
@@ -225,6 +230,7 @@ interface CampaignRow {
   partial_share_bps: number;
   max_slots: number;
   rulebook: number;
+  settings: unknown;
   status: string;
   opens_at: unknown;
   closes_at: unknown;
@@ -401,6 +407,22 @@ function readFacts(value: unknown): AskFacts | null {
   };
 }
 
+function settingsOf(value: unknown, partialShareBps: number): Partial<Settings> {
+  const parsed = CampaignSettings.safeParse(value);
+  if (!parsed.success) throw new StoreError('settings must hold only screening settings, each with a valid value');
+  // The row's own partial share decides payouts, so a second, different one here could only disagree with it.
+  if (parsed.data.partialShareBps !== undefined && parsed.data.partialShareBps !== partialShareBps) {
+    throw new StoreError('settings.partialShareBps must equal the campaign partialShareBps when it is given');
+  }
+  return parsed.data;
+}
+
+// One text per set of settings whatever order its keys came in, so two equal sets compare equal.
+function settingsKey(settings: Partial<Settings>): string {
+  const entries = Object.entries(settings).filter(([, value]) => value !== undefined);
+  return JSON.stringify(entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+}
+
 function campaignTerms(input: CampaignInput): Campaign {
   const id = campaignIdOf(input.id);
   const name = plainTextOf(input.name, 'name', MAX_NAME_CHARS);
@@ -417,6 +439,7 @@ function campaignTerms(input: CampaignInput): Campaign {
   const partialShareBps = wholeNumber(input.partialShareBps, 'partialShareBps', 1, 9_999);
   const maxSlots = wholeNumber(input.maxSlots, 'maxSlots', 1, MAX_SLOTS);
   const rulebook = wholeNumber(input.rulebook, 'rulebook', 1, MAX_INTEGER);
+  const settings = settingsOf(input.settings, partialShareBps);
   if (input.status !== 'open' && input.status !== 'closed') throw new StoreError("status must be 'open' or 'closed'");
   const opensAt = new Date(timeOf(input.opensAt, 'opensAt'));
   const closesAt = new Date(timeOf(input.closesAt, 'closesAt'));
@@ -435,11 +458,19 @@ function campaignTerms(input: CampaignInput): Campaign {
     partialShareBps,
     maxSlots,
     rulebook,
+    settings,
     status: input.status,
     opensAt,
     closesAt,
     createdAt,
   };
+}
+
+// Read back through the same schema it was written with, so a row edited by hand cannot hand the worker a bad setting.
+function storedSettings(value: unknown): Partial<Settings> {
+  const parsed = CampaignSettings.safeParse(value);
+  if (!parsed.success) throw new StoreError('the database returned campaign settings that are not valid');
+  return parsed.data;
 }
 
 function readCampaign(row: CampaignRow): Campaign {
@@ -456,6 +487,7 @@ function readCampaign(row: CampaignRow): Campaign {
     partialShareBps: row.partial_share_bps,
     maxSlots: row.max_slots,
     rulebook: row.rulebook,
+    settings: storedSettings(row.settings),
     status: row.status as CampaignStatus,
     opensAt: readTime(row.opens_at),
     closesAt: readTime(row.closes_at),
@@ -477,6 +509,7 @@ function sameTerms(a: Campaign, b: Campaign): boolean {
     a.partialShareBps === b.partialShareBps &&
     a.maxSlots === b.maxSlots &&
     a.rulebook === b.rulebook &&
+    settingsKey(a.settings) === settingsKey(b.settings) &&
     a.status === b.status &&
     a.opensAt.getTime() === b.opensAt.getTime() &&
     a.closesAt.getTime() === b.closesAt.getTime()
@@ -535,7 +568,7 @@ async function lockCampaign(tx: Queryable, id: string): Promise<void> {
 async function findCampaign(q: Queryable, id: string): Promise<Campaign | null> {
   const [row] = await q.query<CampaignRow>(
     `SELECT id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps, max_slots,
-            rulebook, status, opens_at, closes_at, created_at
+            rulebook, settings, status, opens_at, closes_at, created_at
        FROM campaigns WHERE id = $1`,
     [id],
   );
@@ -549,8 +582,9 @@ async function findCampaign(q: Queryable, id: string): Promise<Campaign | null> 
  * @throws AddressError from @thuli/core when an address is not one. StoreError when the id already holds different
  *   terms, or any value is out of range: an id outside 1 to 128 letters, digits, dots, dashes or underscores, a name
  *   that is not plain text of 1 to 80 characters, an amount that is not positive decimal digits within 256 bits, a
- *   reward above the cap, a partial share outside 1 to 9,999, max slots outside 1 to 100,000, a status other than open
- *   or closed, or closesAt not after opensAt.
+ *   reward above the cap, a partial share outside 1 to 9,999, max slots outside 1 to 100,000, settings that are not an
+ *   object of known screening settings with valid values (an empty object is fine) or that give a partialShareBps other
+ *   than the campaign's, a status other than open or closed, or closesAt not after opensAt.
  */
 export async function createCampaign(db: Db, campaign: CampaignInput): Promise<CreateCampaignResult> {
   const terms = campaignTerms(campaign);
@@ -563,8 +597,9 @@ export async function createCampaign(db: Db, campaign: CampaignInput): Promise<C
     }
     await tx.query(
       `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap,
-                              partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz, $16::timestamptz)`,
+                              partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at, settings)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz, $16::timestamptz,
+               $17::jsonb)`,
       [
         terms.id,
         terms.name,
@@ -582,6 +617,7 @@ export async function createCampaign(db: Db, campaign: CampaignInput): Promise<C
         terms.opensAt.toISOString(),
         terms.closesAt.toISOString(),
         terms.createdAt.toISOString(),
+        JSON.stringify(terms.settings),
       ],
     );
     return 'created';

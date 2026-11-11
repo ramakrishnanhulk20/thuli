@@ -110,6 +110,7 @@ function terms(overrides: Partial<CampaignInput> = {}): CampaignInput {
     partialShareBps: 5000,
     maxSlots: 20,
     rulebook: 2,
+    settings: {},
     status: 'open',
     opensAt: plus(-3_600),
     closesAt: plus(86_400),
@@ -438,6 +439,32 @@ for (const { name, open } of TARGETS) {
       expect(await getCampaign(db, 'not an id')).toBeNull();
     });
 
+    it("a campaign's settings are checked by core's schema, stored, read back and held to as terms", async () => {
+      expect(await createCampaign(db, terms({ id: 'small', settings: { groupMinSize: 3, funderFanoutMin: 4 } }))).toBe('created');
+      expect((await getCampaign(db, 'small'))?.settings).toEqual({ groupMinSize: 3, funderFanoutMin: 4 });
+      expect(await createCampaign(db, terms({ id: 'small', settings: { funderFanoutMin: 4, groupMinSize: 3 } }))).toBe('unchanged');
+      for (const settings of [{ groupMinSize: 4, funderFanoutMin: 4 }, { groupMinSize: 3 }, {}]) {
+        await expect(createCampaign(db, terms({ id: 'small', settings }))).rejects.toThrow(StoreError);
+      }
+      expect(await createCampaign(db, terms({ id: 'plain' }))).toBe('created');
+      expect((await getCampaign(db, 'plain'))?.settings).toEqual({});
+      expect(await createCampaign(db, terms({ id: 'same-share', settings: { partialShareBps: 5000 } }))).toBe('created');
+      for (const settings of [
+        { groupSize: 3 },
+        { groupMinSize: 1 },
+        { allowPartial: 'yes' },
+        { partialShareBps: 2500 },
+        [],
+        null,
+      ]) {
+        await expect(createCampaign(db, terms({ id: 'refused', settings: settings as CampaignInput['settings'] }))).rejects.toThrow(
+          StoreError,
+        );
+      }
+      expect(await getCampaign(db, 'refused')).toBeNull();
+      expect((await getCampaign(db, 'small'))?.settings).toEqual({ groupMinSize: 3, funderFanoutMin: 4 });
+    });
+
     it('amounts are plain decimal digits, refused by the code and by the table alike', async () => {
       for (const rewardPerWallet of ['01000000', '1e6', '-1', '1.5', ' 1', '0', '1000001']) {
         await expect(createCampaign(db, terms({ rewardPerWallet }))).rejects.toThrow(StoreError);
@@ -449,8 +476,8 @@ for (const { name, open } of TARGETS) {
       await expect(
         db.query(
           `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap,
-                                  partial_share_bps, max_slots, rulebook, status, opens_at, closes_at, created_at)
-           VALUES ('raw', 'raw', 1, $1, $1, $1, $1, '1.5', '2', 5000, 3, 2, 'open', $2::timestamptz, $3::timestamptz, $2::timestamptz)`,
+                                  partial_share_bps, max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+           VALUES ('raw', 'raw', 1, $1, $1, $1, $1, '1.5', '2', 5000, 3, 2, '{}', 'open', $2::timestamptz, $3::timestamptz, $2::timestamptz)`,
           [VAULT, NOW.toISOString(), plus(60).toISOString()],
         ),
       ).rejects.toThrow(StoreError);

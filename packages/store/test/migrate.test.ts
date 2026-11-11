@@ -88,7 +88,7 @@ describe('migrate', () => {
       check_cache: ['address', 'chain', 'rulebook', 'body', 'checked_at', 'expires_at'],
       campaigns: [
         'id', 'name', 'chain', 'vault', 'token', 'owner', 'agent', 'reward_per_wallet', 'per_wallet_cap', 'partial_share_bps',
-        'max_slots', 'rulebook', 'status', 'opens_at', 'closes_at', 'created_at',
+        'max_slots', 'rulebook', 'settings', 'status', 'opens_at', 'closes_at', 'created_at',
       ],
       asks: [
         'campaign_id', 'wallet', 'signed_at', 'signature', 'asked_at', 'status', 'lease_until', 'attempts', 'action', 'share_bps',

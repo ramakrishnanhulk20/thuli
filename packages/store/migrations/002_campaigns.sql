@@ -21,6 +21,8 @@ CREATE TABLE campaigns (
   partial_share_bps integer NOT NULL CHECK (partial_share_bps BETWEEN 1 AND 9999),
   max_slots integer NOT NULL CHECK (max_slots BETWEEN 1 AND 100000),
   rulebook integer NOT NULL CHECK (rulebook >= 1),
+  -- Only the screening settings this campaign changes from the defaults, checked against core's Settings on the way in.
+  settings jsonb NOT NULL CHECK (jsonb_typeof(settings) = 'object' AND length(settings::text) <= 2048),
   status text NOT NULL CHECK (status IN ('open', 'closed')),
   opens_at timestamptz NOT NULL,
   closes_at timestamptz NOT NULL,
