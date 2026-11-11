@@ -161,6 +161,8 @@ export const QueuedBody = z.strictObject({ queued: z.literal(true) });
 export const ClosedBody = z.strictObject({ closed: z.literal(true) });
 /** The campaign cannot seat another wallet: every slot is taken, or its asks have reached their cap. */
 export const FullBody = z.strictObject({ full: z.literal(true) });
+/** The wallet has sent no transaction and holds no balance on Ethereum, so nothing was stored, queued or counted. */
+export const NeverUsedBody = z.strictObject({ neverUsed: z.literal(true) });
 
 const ListVersionJson = z.strictObject({
   version: z.int().min(1),

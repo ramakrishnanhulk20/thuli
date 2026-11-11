@@ -183,5 +183,8 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
     }),
   });
 
-  return { campaignId: CAMPAIGN_ID, campaign, lists, ask, appeal, withAppeal, ticket, board, askView: (a: ReturnType<typeof ask>, t?: ReturnType<typeof ticket>) => (t === undefined ? { ask: a } : { ask: a, ticket: t }) };
+  /** What the ask route answers with when the wallet has sent no transaction and holds nothing: nothing is stored. */
+  const neverUsed = { neverUsed: true };
+
+  return { campaignId: CAMPAIGN_ID, campaign, lists, ask, appeal, withAppeal, ticket, board, neverUsed, askView: (a: ReturnType<typeof ask>, t?: ReturnType<typeof ticket>) => (t === undefined ? { ask: a } : { ask: a, ticket: t }) };
 }

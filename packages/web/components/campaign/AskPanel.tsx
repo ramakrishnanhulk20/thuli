@@ -16,8 +16,10 @@ import {
   postAsk,
   READY_TEXT,
   readyVariant,
+  refusalFor,
   refusalWords,
   REWARD_POLL_MILLISECONDS,
+  sessionFor,
   UNREACHABLE_TEXT,
   type AskView,
   type CampaignView,
@@ -93,6 +95,7 @@ function Refusal({ kind, retryAfter }: { kind: RefusalKind; retryAfter: string |
     <div aria-live="polite" data-refusal={kind}>
       <h3 className={`${styles.panelTitle} ${styles.waitTitle}`}>{words.heading}</h3>
       <p className={styles.panelBody}>{words.body}</p>
+      {words.note === undefined ? null : <p className={styles.refusalNote}>{words.note}</p>}
     </div>
   );
 }
@@ -111,7 +114,7 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
   const { busy: pauseBusy, ok: pauseOk, quiet: pauseQuiet } = pause;
 
   // A session that belongs to another wallet is never shown: the first render after a switch already starts clean.
-  const mine: Session | null = address === null ? null : session !== null && session.wallet === address ? session : freshSession(address);
+  const mine: Session | null = sessionFor(session, address, freshSession);
 
   const patch = useCallback((wallet: string, changes: Partial<Session>) => {
     if (current.current !== wallet) return;
@@ -212,10 +215,9 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
         patch(signed.wallet, { notice: 'closed' });
         break;
       case 'full':
-        patch(signed.wallet, { refusal: { kind: 'full', retryAfter: null } });
-        break;
       case 'ceiling':
-        patch(signed.wallet, { refusal: { kind: 'ceiling', retryAfter: result.retryAfter } });
+      case 'neverUsed':
+        patch(signed.wallet, { refusal: refusalFor(result) });
         break;
       case 'limit':
         patch(signed.wallet, { notice: 'limit' });

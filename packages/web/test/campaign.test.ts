@@ -63,10 +63,12 @@ import {
   postAsk,
   READY_TEXT,
   readyVariant,
+  refusalFor,
   refusalWords,
   SLOWED_LINE,
   SLOWED_POLL_MILLISECONDS,
   showsWhatToDo,
+  sessionFor,
   settledWords,
   statusLine,
   usdc,
@@ -95,6 +97,7 @@ const {
   ErrorBody,
   ExistsBody,
   FullBody,
+  NeverUsedBody,
   AppealJson,
   ApprovedBody,
   ExistsAppealBody,
@@ -1103,5 +1106,71 @@ describe('the words when every slot is taken', () => {
   it('no longer promise that a wallet can still ask', () => {
     expect('full' in READY_TEXT).toBe(false);
     expect(JSON.stringify(READY_TEXT)).not.toMatch(/still ask/);
+  });
+});
+
+describe('a wallet that has never been used', () => {
+  const sent = { wallet: signer.address, signedAt: 1_800_000_000, signature: `0x${'b'.repeat(130)}` };
+  const answer = (status: number, body: unknown) => (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+
+  it('reads a 200 that says neverUsed as its own answer, and nothing looser', async () => {
+    expect(classifyAskAnswer(200, fx.neverUsed)).toEqual({ kind: 'neverUsed' });
+    expect(await postAsk(CAMPAIGN_ID, sent, answer(200, fx.neverUsed))).toEqual({ kind: 'neverUsed' });
+    const loose: unknown[] = [{ neverUsed: false }, { neverUsed: 'true' }, { neverUsed: 1 }, { neverUsed: true, exists: true }, { neverUsed: true, extra: 1 }, {}, null, 'neverUsed'];
+    for (const body of loose) expect(classifyAskAnswer(200, body), JSON.stringify(body)).toEqual({ kind: 'unreachable' });
+  });
+
+  it('keeps the answers it already knew, and does not take a neverUsed body on another status', () => {
+    const exists = fx.ask('hold', signer.address) as unknown as AskJson;
+    expect(classifyAskAnswer(200, { exists: true, ask: exists })).toEqual({ kind: 'exists', ask: exists });
+    expect(classifyAskAnswer(202, fx.neverUsed)).toEqual({ kind: 'unreachable' });
+    expect(classifyAskAnswer(409, fx.neverUsed)).toEqual({ kind: 'closed' });
+  });
+
+  it('says it in three lines: the heading, the body, and that nothing was stored', () => {
+    expect(refusalWords('neverUsed')).toEqual({
+      heading: 'This wallet has never been used',
+      body: 'It has sent no transaction and holds nothing on Ethereum, so there is nothing to screen. Ask with a wallet you have used for a while.',
+      note: 'Nothing was stored, and signing cost nothing.',
+    });
+  });
+
+  it('gives no other refusal a note', () => {
+    for (const kind of ['stopped', 'slots', 'full', 'contract'] as const) expect('note' in refusalWords(kind), kind).toBe(false);
+    expect('note' in refusalWords('ceiling', '7200')).toBe(false);
+  });
+
+  it('is a refusal of the panel, like a full campaign or a contract wallet, with no ask behind it', () => {
+    expect(refusalFor({ kind: 'neverUsed' })).toEqual({ kind: 'neverUsed', retryAfter: null });
+    expect(refusalFor({ kind: 'full' })).toEqual({ kind: 'full', retryAfter: null });
+    expect(refusalFor({ kind: 'ceiling', retryAfter: '7200' })).toEqual({ kind: 'ceiling', retryAfter: '7200' });
+    for (const post of [{ kind: 'queued' }, { kind: 'closed' }, { kind: 'limit' }, { kind: 'unreachable' }, { kind: 'gone' }, { kind: 'bad', cause: 'x' }] as const) {
+      expect(refusalFor(post), post.kind).toBeNull();
+    }
+    const base: PanelInput = { connected: true, ask: null, looking: false, signing: false, sent: false, refused: true, unreachable: false };
+    expect(choosePanel(base)).toBe('refused');
+    expect(choosePanel({ ...base, connected: false })).toBe('connect');
+  });
+
+  it('belongs to the wallet it came for: another wallet, or none, starts clean', () => {
+    type Session = { wallet: string; refusal: string | null };
+    const fresh = (wallet: string): Session => ({ wallet, refusal: null });
+    const refused: Session = { wallet: signer.address, refusal: 'neverUsed' };
+    expect(sessionFor(refused, signer.address, fresh)).toBe(refused);
+    expect(sessionFor(refused, fixtureWallet(1), fresh)).toEqual({ wallet: fixtureWallet(1), refusal: null });
+    expect(sessionFor(refused, null, fresh)).toBeNull();
+    expect(sessionFor(null, signer.address, fresh)).toEqual({ wallet: signer.address, refusal: null });
+  });
+
+  it('has the fixture body the API will send, and nothing stored to look up', () => {
+    expect(fx.neverUsed).toEqual({ neverUsed: true });
+    expect(classifyAskAnswer(404, { error: 'no ask from this wallet' })).toEqual({ kind: 'gone' });
+  });
+
+  // The API's body for this answer is not committed yet. Once it exports one, hold the fixture to it like the others above:
+  // expect(NeverUsedBody.safeParse(fx.neverUsed).success).toBe(true)
+  it('is accepted by the API schema', () => {
+    expect(NeverUsedBody.safeParse(fx.neverUsed).success).toBe(true);
+    expect(NeverUsedBody.safeParse({ neverUsed: false }).success).toBe(false);
   });
 });

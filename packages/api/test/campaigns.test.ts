@@ -1,8 +1,11 @@
-// Not covered here: a real chain and a real Postgres. Wallet types and vault amounts come from stand-ins, so the
-// readers site.ts builds on ETH_RPC_URL and the Base RPCs are not run; every route runs on one in-memory PGlite, which
+// Not covered here: a real chain and a real Postgres. Wallet types, the door's sent counts and balances, and vault
+// amounts come from stand-ins in the route tests; the Ethereum reader site.ts builds is run once against a local
+// stand-in RPC for the calls it makes, and the Base readers are not run. Every route runs on one in-memory PGlite, which
 // runs one statement at a time, so limits are not raced between two connections here (the store's own tests cover the
 // atomic writes). The site's mount of these routes is covered in packages/web/test/api.test.ts. Nothing here screens a
 // wallet: the worker takes asks off the queue, and its loop is not part of this package.
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { StandardMerkleTree } from '@openzeppelin/merkle-tree';
 import type { FacilitatorClient } from '@x402/core/server';
 import type { SettleResponse, SupportedResponse, VerifyResponse } from '@x402/core/types';
@@ -36,12 +39,15 @@ import { buildClaimList } from '@thuli/worker/src/vault/claimList.ts';
 import { buildRoot, publishList } from '@thuli/worker/src/vault/root.ts';
 import { createApp } from '../src/app.ts';
 import {
+  accountTypeReader,
   APPEALS_PER_CALLER_HOUR,
   ASK_CLIENT_MAX_PER_MINUTE,
   CAMPAIGN_CHAIN_READS_PER_MINUTE,
+  CAMPAIGN_DOOR_READS_PER_MINUTE,
   CAMPAIGN_READS_PER_MINUTE,
   CAMPAIGNS_PATH,
   type CampaignDeps,
+  type EthereumReader,
   type VaultReader,
 } from '../src/campaigns.ts';
 import {
@@ -54,6 +60,7 @@ import {
   ExistsAppealBody,
   ExistsBody,
   FullBody,
+  NeverUsedBody,
   QueuedBody,
 } from '../src/schema.ts';
 import { captureLogs, expectNoDatabaseUrl, noChain, post, screenResult, socketFrom, storeDown, testnetConfig, url } from './support.ts';
@@ -157,6 +164,22 @@ const NO_CODE: VaultReader = {
   claimable: async () => Promise.reject(new Error('this test reads no vault')),
 };
 
+/** What a test may give the Ethereum stand-in. sent and balance may answer anything, to play a reader gone wrong. */
+interface EthereumStandIn {
+  contract?: (address: Address) => Promise<boolean>;
+  sent?: (address: Address) => Promise<unknown>;
+  balance?: (address: Address) => Promise<unknown>;
+}
+
+/** The Ethereum reader unless a test gives its own: no address has code, and every wallet has sent one transaction. */
+function ethereum(standIn: EthereumStandIn = {}): EthereumReader {
+  const contract = standIn.contract ?? (async () => false);
+  return Object.assign(async (address: Address) => contract(address), {
+    sentCount: (standIn.sent ?? (async () => 1)) as EthereumReader['sentCount'],
+    balance: (standIn.balance ?? (async () => 0n)) as EthereumReader['balance'],
+  });
+}
+
 /** Every body any test received, so the last test can search them all for a stored signature (C40). */
 const seen: string[] = [];
 
@@ -181,7 +204,7 @@ describe('campaign routes', () => {
       now: options.now ?? (() => NOW),
       campaigns: {
         db: options.db ?? db,
-        isContract: options.isContract ?? (async () => false),
+        isContract: options.isContract ?? ethereum(),
         vault: 'vault' in options ? options.vault : () => NO_CODE,
       },
     });
@@ -261,14 +284,16 @@ describe('campaign routes', () => {
       [{ wallet: appeal.address, signedAt: NOW_SECONDS, signature: appealSigned }, 'the signature does not match this ask', send],
       [await signedAsk(1, { campaignId: 'other' }), 'the signature does not match this ask', send],
       [await signedAsk(2, { signedAt: NOW_SECONDS - 601 }), 'the signature is too old', send],
-      [await signedAsk(3), 'contract wallets cannot ask yet', campaignApp({ isContract: async () => true })],
+      [await signedAsk(3), 'contract wallets cannot ask yet', campaignApp({ isContract: ethereum({ contract: async () => true }) })],
       [
         await signedAsk(4),
         'the wallet type could not be checked',
         campaignApp({
-          isContract: async () => {
-            throw new Error('the code read timed out');
-          },
+          isContract: ethereum({
+            contract: async () => {
+              throw new Error('the code read timed out');
+            },
+          }),
         }),
       ],
     ];
@@ -296,10 +321,12 @@ describe('campaign routes', () => {
       claimed: async () => 0n,
       claimable: async () => 0n,
     });
-    const onEthereum = async (address: Address) => {
-      reads.push(1);
-      return code[1]?.has(address) ?? false;
-    };
+    const onEthereum = ethereum({
+      contract: async (address) => {
+        reads.push(1);
+        return code[1]?.has(address) ?? false;
+      },
+    });
     const send = campaignApp({ isContract: onEthereum, vault: (chainId) => (chainId === CHAIN ? readerFor(chainId) : null) });
     const contract = await send(asks(), post(await signedAsk(0)));
     expect([contract.status, JSON.parse(contract.text)]).toEqual([400, { error: 'contract wallets cannot ask yet' }]);
@@ -456,6 +483,200 @@ describe('campaign routes', () => {
     expect(await db.query('SELECT name, count FROM day_counts')).toEqual([]);
   });
 
+  it('C24, C42: 1,000 never-used wallets store nothing and take no cap, so the next honest wallet is still queued', async () => {
+    await createCampaign(db, terms({ maxSlots: 3 }));
+    const fresh = Array.from({ length: 1_000 }, () => privateKeyToAccount(generatePrivateKey()));
+    const honest = KEYS[0] as PrivateKeyAccount;
+    let clock = NOW;
+    const seconds = () => Math.floor(clock.getTime() / 1000);
+    const send = campaignApp({
+      isContract: ethereum({ sent: async (address) => (address === honest.address ? 1 : 0) }),
+      now: () => clock,
+    });
+    const countsNow = async () => CampaignView.parse(JSON.parse((await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}`)).text)).counts;
+    const before = await countsNow();
+    const answers = new Map<string, number>();
+    for (const [n, account] of fresh.entries()) {
+      // One ask a second, five from each of 200 callers, so no caller's limit and no minute ceiling is what stops them.
+      clock = new Date(NOW.getTime() + n * 1_000);
+      const reply = await send(asks(), post(await signedBy(account, { signedAt: seconds() })), `198.18.0.${Math.floor(n / 5) + 1}`);
+      const key = `${reply.status} ${reply.text}`;
+      answers.set(key, (answers.get(key) ?? 0) + 1);
+      // Stands in for the worker deciding asks as they come, so the waiting backlog is never what fills first.
+      if (n % 100 === 99) {
+        await db.query(
+          `UPDATE asks SET status = 'decided', attempts = 1, action = 'hold', share_bps = 0, rule = 'A9', reason = 'Held.',
+                  cited_txs = '[]', not_checked = '[]', facts = $1::jsonb, decided_at = asked_at
+            WHERE status = 'queued'`,
+          [JSON.stringify(HOLD.facts)],
+        );
+      }
+    }
+    const after = await countsNow();
+    const honestReply = await send(asks(), post(await signedBy(honest, { signedAt: seconds() })), '198.51.100.67');
+    expect([honestReply.status, honestReply.text]).toEqual([202, '{"queued":true}']);
+    expect(Object.fromEntries(answers)).toEqual({ '200 {"neverUsed":true}': 1_000 });
+    expect(after).toEqual(before);
+    expect((await db.query('SELECT wallet FROM asks')).map((row) => row.wallet)).toEqual([honest.address]);
+  }, 180_000);
+
+  it('C1, C24: a wallet that has sent a transaction, or one that holds a balance, is queued, read by its canonical address', async () => {
+    await createCampaign(db, terms());
+    const sent = new Map<string, number>([
+      [walletOf(0), 1],
+      [walletOf(1), 0],
+    ]);
+    const held = new Map<string, bigint>([
+      [walletOf(0), 0n],
+      [walletOf(1), 1n],
+    ]);
+    const readFor: string[] = [];
+    const send = campaignApp({
+      isContract: ethereum({
+        sent: async (address) => {
+          readFor.push(address);
+          return sent.get(address);
+        },
+        balance: async (address) => held.get(address),
+      }),
+    });
+    const used = await send(asks(), post(await signedAsk(0)), '198.51.100.80');
+    const funded = await send(asks(), post(await signedAsk(1, { wallet: walletOf(1).toLowerCase() })), '198.51.100.81');
+    expect([used.status, used.text, funded.status, funded.text]).toEqual([202, '{"queued":true}', 202, '{"queued":true}']);
+    expect(readFor).toEqual([walletOf(0), walletOf(1)]);
+    expect((await db.query<{ wallet: string }>('SELECT wallet FROM asks')).map((row) => row.wallet).sort()).toEqual([walletOf(0), walletOf(1)].sort());
+  });
+
+  it('C11, fail closed: a count or balance read that fails, is missing or is not a whole number is 503 and stores nothing', async () => {
+    await createCampaign(db, terms());
+    const failed = async () => Promise.reject(new Error('the read timed out'));
+    const cases: EthereumStandIn[] = [
+      { sent: failed },
+      { sent: async () => 0, balance: failed },
+      // A count that says used never stands in for a balance that could not be read, nor the other way round.
+      { sent: async () => 4, balance: failed },
+      { sent: failed, balance: async () => 5n },
+      ...[-1, 1.5, Number.NaN, 2 ** 53, '0', null, undefined, -1n].map((value) => ({ sent: async () => value })),
+      ...[-1n, 0.5, '0', null, undefined].map((value) => ({ sent: async () => 0, balance: async () => value })),
+    ];
+    const readers: EthereumReader[] = [...cases.map(ethereum), (async () => false) as unknown as EthereumReader];
+    const fresh = readers.map(() => privateKeyToAccount(generatePrivateKey()));
+    const logs = captureLogs();
+    const replies: Reply[] = [];
+    for (const [n, reader] of readers.entries()) {
+      replies.push(await campaignApp({ isContract: reader })(asks(), post(await signedBy(fresh[n] as PrivateKeyAccount)), `198.51.100.${10 + n}`));
+    }
+    logs.restore();
+    expect(replies.map((reply) => `${reply.status} ${reply.text}`)).toEqual(Array(readers.length).fill('503 {"busy":true}'));
+    expect(await rows('asks')).toBe(0);
+    expect(logs.text()).not.toContain('the read timed out');
+  });
+
+  it('C24: a wallet already in the store gets exists with no door read, whatever the chain says of it now', async () => {
+    await createCampaign(db, terms());
+    let doorReads = 0;
+    let chain: 'used' | 'never used' | 'unreadable' = 'used';
+    const read = <T>(used: T, never: T) => async () => {
+      doorReads += 1;
+      if (chain === 'unreadable') throw new Error('the read timed out');
+      return chain === 'used' ? used : never;
+    };
+    const send = campaignApp({ isContract: ethereum({ sent: read(3, 0), balance: read(0n, 0n) }) });
+    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.82')).status).toBe(202);
+    expect(doorReads).toBe(2);
+    for (const [n, now] of (['never used', 'unreadable'] as const).entries()) {
+      chain = now;
+      const again = await send(asks(), post(await signedAsk(0, { signedAt: NOW_SECONDS - 5 })), `198.51.100.${83 + n}`);
+      expect(again.status).toBe(200);
+      expect(ExistsBody.parse(JSON.parse(again.text)).ask).toMatchObject({ wallet: walletOf(0), status: 'queued' });
+    }
+    expect(doorReads).toBe(2);
+    const [door] = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM rate_events WHERE bucket = 'campaign-door-reads'");
+    expect(door?.n).toBe(1);
+  });
+
+  it('C42: door reads stop at 300 a minute across every caller with 503 busy and nothing stored, then open again', async () => {
+    await createCampaign(db, terms());
+    expect(CAMPAIGN_DOOR_READS_PER_MINUTE).toBe(300);
+    let doorReads = 0;
+    const counted = <T>(value: T) => async () => {
+      doorReads += 1;
+      return value;
+    };
+    let clock = NOW;
+    const send = campaignApp({ isContract: ethereum({ sent: counted(1), balance: counted(0n) }), now: () => clock });
+    const asksInMinute = CAMPAIGN_DOOR_READS_PER_MINUTE / 2;
+    const fresh = Array.from({ length: asksInMinute + 2 }, () => privateKeyToAccount(generatePrivateKey()));
+    const statuses: string[] = [];
+    for (const [n, account] of fresh.slice(0, asksInMinute + 1).entries()) {
+      const reply = await send(asks(), post(await signedBy(account)), `198.18.1.${Math.floor(n / 5) + 1}`);
+      statuses.push(`${reply.status} ${reply.text}`);
+    }
+    expect(statuses).toEqual([...Array(asksInMinute).fill('202 {"queued":true}'), '503 {"busy":true}']);
+    expect(doorReads).toBe(CAMPAIGN_DOOR_READS_PER_MINUTE);
+    expect(await rows('asks')).toBe(asksInMinute);
+    clock = new Date(NOW.getTime() + 61_000);
+    const later = await send(asks(), post(await signedBy(fresh[asksInMinute + 1] as PrivateKeyAccount)), '198.18.1.200');
+    expect([later.status, later.text]).toEqual([202, '{"queued":true}']);
+    expect(doorReads).toBe(CAMPAIGN_DOOR_READS_PER_MINUTE + 2);
+  });
+
+  it('C42: a bad signature causes no chain read of any kind, while a good one reads the code on both chains and the door', async () => {
+    await createCampaign(db, terms());
+    const reads: string[] = [];
+    const note = <T>(name: string, value: T) => async () => {
+      reads.push(name);
+      return value;
+    };
+    const isContract = ethereum({ contract: note('ethereum code', false), sent: note('sent count', 1), balance: note('balance', 0n) });
+    const vault: VaultReader = { isContract: note('campaign chain code', false), claimed: note('claimed', 0n), claimable: note('claimable', 0n) };
+    const send = campaignApp({ isContract, vault: () => vault });
+    const bad = [
+      await signedAsk(3, { wallet: walletOf(0) }),
+      UNSIGNED,
+      await signedAsk(1, { campaignId: 'other' }),
+      await signedAsk(2, { signedAt: NOW_SECONDS - 601 }),
+    ];
+    for (const [n, body] of bad.entries()) {
+      expect((await send(asks(), post(body), `198.51.100.${86 + n}`)).status).toBe(400);
+    }
+    expect(reads).toEqual([]);
+    expect(await rows('asks')).toBe(0);
+    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.90')).status).toBe(202);
+    expect(reads.sort()).toEqual(['balance', 'campaign chain code', 'ethereum code', 'sent count']);
+  });
+
+  it('the Ethereum reader site.ts builds asks for the sent count and the balance at the latest block', async () => {
+    const calls: { method: string; params: unknown[] }[] = [];
+    const answers: Record<string, string> = { eth_getTransactionCount: '0x2a', eth_getBalance: '0xde0b6b3a7640000', eth_getCode: '0x' };
+    const rpc = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      request.on('end', () => {
+        const call = JSON.parse(body) as { id: number; method: string; params: unknown[] };
+        calls.push({ method: call.method, params: call.params });
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, result: answers[call.method] ?? null }));
+      });
+    });
+    await new Promise<void>((resolve) => rpc.listen(0, '127.0.0.1', resolve));
+    try {
+      const reader = accountTypeReader(`http://127.0.0.1:${(rpc.address() as AddressInfo).port}`);
+      expect(await reader.sentCount(walletOf(0))).toBe(42);
+      expect(await reader.balance(walletOf(0))).toBe(10n ** 18n);
+      expect(await reader(walletOf(0))).toBe(false);
+      expect(calls).toEqual([
+        { method: 'eth_getTransactionCount', params: [walletOf(0), 'latest'] },
+        { method: 'eth_getBalance', params: [walletOf(0), 'latest'] },
+        { method: 'eth_getCode', params: [walletOf(0), 'latest'] },
+      ]);
+    } finally {
+      await new Promise((resolve) => rpc.close(resolve));
+    }
+  });
+
   it('C42: the minute is counted before the body is read, so the 21st malformed body in a minute is 429', async () => {
     await createCampaign(db, terms());
     const send = campaignApp();
@@ -573,9 +794,9 @@ describe('campaign routes', () => {
     };
     const reader = (contract: boolean, failing = false): VaultReader => ({ ...NO_CODE, isContract: counting(contract, failing) });
     const cases: [ReturnType<typeof campaignApp>, string][] = [
-      [campaignApp({ isContract: counting(true), vault: () => reader(false) }), 'contract wallets cannot appeal yet'],
-      [campaignApp({ isContract: counting(false), vault: () => reader(true) }), 'contract wallets cannot appeal yet'],
-      [campaignApp({ isContract: counting(false), vault: () => reader(false, true) }), 'the wallet type could not be checked'],
+      [campaignApp({ isContract: ethereum({ contract: counting(true) }), vault: () => reader(false) }), 'contract wallets cannot appeal yet'],
+      [campaignApp({ isContract: ethereum({ contract: counting(false) }), vault: () => reader(true) }), 'contract wallets cannot appeal yet'],
+      [campaignApp({ isContract: ethereum({ contract: counting(false) }), vault: () => reader(false, true) }), 'the wallet type could not be checked'],
     ];
     for (const [index, [send, cause]] of cases.entries()) {
       const reply = await send(appeals(), post(await signedAppeal(index)), `198.51.100.${130 + index}`);
@@ -584,7 +805,7 @@ describe('campaign routes', () => {
     expect(reads).toBe(6);
     reads = 0;
     const stranger = await signedAppeal(3, { wallet: walletOf(0) });
-    const send = campaignApp({ isContract: counting(false), vault: () => reader(false) });
+    const send = campaignApp({ isContract: ethereum({ contract: counting(false) }), vault: () => reader(false) });
     const forged = await send(appeals(), post(stranger), '198.51.100.140');
     expect([forged.status, JSON.parse(forged.text)]).toEqual([400, { error: 'the signature does not match this appeal' }]);
     expect(reads).toBe(0);
@@ -913,20 +1134,21 @@ describe('campaign routes', () => {
     ];
     for (const reply of replies) expect([reply.status, reply.text]).toEqual([503, '{"busy":true}']);
 
-    // Reads work and the third transaction, the ask itself, fails: still 503, and no ask is written.
+    // Reads work, the minute, the hour and the door-read count pass, and the fourth transaction, the ask itself, fails:
+    // still 503, and no ask is written.
     let transactions = 0;
     const writesFail: Db = {
       query: (text, params) => db.query(text, params),
       transaction: async <T>(fn: (tx: Queryable) => Promise<T>) => {
         transactions += 1;
-        if (transactions >= 3) throw storeDown();
+        if (transactions >= 4) throw storeDown();
         return db.transaction(fn);
       },
       close: async () => undefined,
     };
     const late = await campaignApp({ db: writesFail })(asks(), post(await signedAsk(1)));
     expect([late.status, late.text]).toEqual([503, '{"busy":true}']);
-    expect(transactions).toBe(3);
+    expect(transactions).toBe(4);
     expect(await rows('asks')).toBe(0);
     expectNoDatabaseUrl(logs.text());
     logs.restore();
@@ -959,6 +1181,8 @@ describe('campaign routes', () => {
       [ErrorBody, await send(`${asks()}/0x1234`)],
       [ErrorBody, await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/lists/7`)],
       [BusyBody, await campaignApp({ db: { query: async () => Promise.reject(storeDown()), transaction: async () => Promise.reject(storeDown()), close: async () => undefined } })(`${CAMPAIGNS_PATH}/${CAMPAIGN}`)],
+      [NeverUsedBody, await campaignApp({ isContract: ethereum({ sent: async () => 0 }) })(asks(), post(await signedAsk(6)), '192.0.2.29')],
+      [BusyBody, await campaignApp({ isContract: ethereum({ balance: async () => -1n }) })(asks(), post(await signedAsk(7)), '192.0.2.30')],
     ];
     for (let index = 0; index <= ASK_CLIENT_MAX_PER_MINUTE; index += 1) {
       const reply = await send(asks(), post(UNSIGNED), '192.0.2.27');
@@ -966,12 +1190,14 @@ describe('campaign routes', () => {
     }
     logs.restore();
     expect(checked.map(([, reply]) => reply.status)).toEqual([
-      200, 404, 200, 400, 202, 200, 400, 400, 413, 409, 409, 200, 200, 404, 400, 404, 503, 429,
+      200, 404, 200, 400, 202, 200, 400, 400, 413, 409, 409, 200, 200, 404, 400, 404, 503, 200, 503, 429,
     ]);
     for (const [shape, reply] of checked) {
       expect(reply.type).toContain('application/json');
       expect(shape.safeParse(JSON.parse(reply.text)).success, reply.text).toBe(true);
     }
+    expect(NeverUsedBody.safeParse({ neverUsed: true, wallet: walletOf(6) }).success).toBe(false);
+    expect(NeverUsedBody.safeParse({ neverUsed: false }).success).toBe(false);
     const ticketed = AskView.parse(JSON.parse((checked[11] as [z.ZodType, Reply])[1].text));
     expect(ticketed.ticket).toMatchObject({ claimed: '0', claimable: '1000000' });
 

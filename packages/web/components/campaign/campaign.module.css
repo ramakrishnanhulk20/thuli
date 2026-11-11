@@ -237,6 +237,14 @@
   color: var(--color-ink);
 }
 
+.refusalNote {
+  margin-top: 12px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
 .waitTitle {
   margin-top: 24px;
 }

@@ -284,6 +284,8 @@ export async function fetchAsk(id: string, wallet: string, request: Fetcher = fe
 
 export type AskPost =
   | { kind: 'queued' }
+  /** The wallet has sent no transaction and holds nothing, so nothing was stored for it. */
+  | { kind: 'neverUsed' }
   | { kind: 'exists'; ask: AskJson }
   | { kind: 'closed' }
   | { kind: 'full' }
@@ -297,7 +299,11 @@ export type AskPost =
 /** Maps a status, a parsed body and the Retry-After header from the ask route to what the page shows. */
 export function classifyAskAnswer(status: number, body: unknown, retryAfter: string | null = null): AskPost {
   if (status === 202) return isRecord(body) && body.queued === true ? { kind: 'queued' } : { kind: 'unreachable' };
-  if (status === 200) return isRecord(body) && body.exists === true && isAskJson(body.ask) ? { kind: 'exists', ask: body.ask } : { kind: 'unreachable' };
+  if (status === 200) {
+    // Exactly { neverUsed: true }: a body that says more is not this answer.
+    if (isRecord(body) && Object.keys(body).length === 1 && body.neverUsed === true) return { kind: 'neverUsed' };
+    return isRecord(body) && body.exists === true && isAskJson(body.ask) ? { kind: 'exists', ask: body.ask } : { kind: 'unreachable' };
+  }
   if (status === 404) return { kind: 'gone' };
   if (status === 409) return isRecord(body) && body.full === true ? { kind: 'full' } : { kind: 'closed' };
   if (status === 429) return retryAfter === null ? { kind: 'limit' } : { kind: 'ceiling', retryAfter };
@@ -454,7 +460,7 @@ export const READY_TEXT = {
   closed: 'This campaign is closed.',
 } as const;
 
-export type RefusalKind = 'stopped' | 'slots' | 'full' | 'ceiling' | 'contract';
+export type RefusalKind = 'stopped' | 'slots' | 'full' | 'ceiling' | 'contract' | 'neverUsed';
 
 /**
  * The wait to tell a visitor when the day's ceiling is used, from the seconds in Retry-After: whole hours from one hour
@@ -471,7 +477,7 @@ export function ceilingWords(retryAfter: string | null): string {
 }
 
 /** The heading and body of a refusal that stands in place of the ask. Only the day's ceiling needs Retry-After. */
-export function refusalWords(kind: RefusalKind, retryAfter: string | null = null): { heading: string; body: string } {
+export function refusalWords(kind: RefusalKind, retryAfter: string | null = null): { heading: string; body: string; note?: string } {
   switch (kind) {
     case 'stopped':
       return { heading: 'This campaign has stopped taking requests', body: 'It has screened as many wallets as it set out to. No new request can be sent.' };
@@ -484,12 +490,38 @@ export function refusalWords(kind: RefusalKind, retryAfter: string | null = null
       return { heading: 'This campaign is full', body: 'Your request was not taken, and nothing was spent. Signing a message costs nothing.' };
     case 'ceiling':
       return { heading: 'Thuli has taken all the requests it screens in a day', body: ceilingWords(retryAfter) };
+    case 'neverUsed':
+      return {
+        heading: 'This wallet has never been used',
+        body: 'It has sent no transaction and holds nothing on Ethereum, so there is nothing to screen. Ask with a wallet you have used for a while.',
+        note: 'Nothing was stored, and signing cost nothing.',
+      };
     case 'contract':
       return {
         heading: 'This looks like a smart contract wallet',
         body: 'Wallets that sign through a contract cannot ask yet. Ask with a wallet that signs with its own key.',
       };
   }
+}
+
+/** The refusal an answer of the ask route puts in the panel, or null for an answer that is not one. */
+export function refusalFor(post: AskPost): { kind: RefusalKind; retryAfter: string | null } | null {
+  switch (post.kind) {
+    case 'full':
+      return { kind: 'full', retryAfter: null };
+    case 'ceiling':
+      return { kind: 'ceiling', retryAfter: post.retryAfter };
+    case 'neverUsed':
+      return { kind: 'neverUsed', retryAfter: null };
+    default:
+      return null;
+  }
+}
+
+/** What the panel holds for the connected wallet: a session that belongs to another wallet is never shown, and none is for no wallet. */
+export function sessionFor<T extends { wallet: string }>(session: T | null, address: string | null, fresh: (wallet: string) => T): T | null {
+  if (address === null) return null;
+  return session !== null && session.wallet === address ? session : fresh(address);
 }
 
 /** How long a route is left alone after it answered 429. */

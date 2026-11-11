@@ -310,8 +310,10 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  *
  * Every paid request answers by REQUEST_DEADLINE_MS from its first line (C41). It is not settled unless SETTLE_ROOM_MS
  * is left, and after settling the screening gets the time left less REPLY_MARGIN_MS, at most its own 120 s. With under
- * SCREEN_LEAST_MS left, or when the screening runs out of time, the answer is 503 with the settled-retry body and a
- * Retry-After; the claim stays settled and no hold written for lack of time is ever stored.
+ * SCREEN_LEAST_MS left, or when a screening before the payment's last try (REDEEM_SCREEN_TRIES, two) runs out of time,
+ * the answer is 503 with the settled-retry body and a Retry-After and the claim stays settled; when the last try runs
+ * out of time, or every try is already used, the hold for a screening that ran out of time is stored and sent as the
+ * result.
  *
  * The claims and limits live in deps.stores, this process's memory unless given. When a store call fails (the database
  * is down or slow), the rule has two sides:
