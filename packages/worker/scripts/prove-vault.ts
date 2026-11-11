@@ -30,7 +30,6 @@ import {
   type TransactionReceipt,
   type Transport,
 } from 'viem';
-import type { z } from 'zod';
 import { parseAddress, proofFor } from '@thuli/core';
 import { FACTORY_ABI, VAULT_ABI } from '../src/vault/abi.ts';
 import { addressLink, BASE_SEPOLIA, ChainCallError, confirm, connectBaseSepolia, revertName, txLink, vaultPort, type Sent, type Wallet } from '../src/vault/chain.ts';
@@ -47,6 +46,7 @@ import {
   ProofRecordFile,
   ProofSetupError,
   ProofState,
+  readJson,
   verifyProofRecord,
 } from '../src/vault/proof.ts';
 import { buildRoot, postRoot, readPublishedList, RootError, type CampaignRecord } from '../src/vault/root.ts';
@@ -55,20 +55,11 @@ const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEFAULT_DEPLOYMENT = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia.json');
 const DEFAULT_STATE = path.join(REPO_ROOT, 'data', 'vault-proof', 'state.json');
 const PROOF_RECORD = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia-proof.json');
-const MAX_FILE_BYTES = 64 * 1024;
 const USAGE =
   'Usage: npm run prove:vault -- setup|claim|record [--rpc-url http://127.0.0.1:PORT] [--deployment FILE] [--state FILE], or verify [--record FILE] [--deployment FILE]';
 
 type Client = PublicClient<Transport, Chain>;
 type Logged = Sent & { label: string };
-
-function readJson<T extends z.ZodType>(schema: T, file: string, what: string): z.infer<T> {
-  if (!fs.existsSync(file)) throw new ProofSetupError(`No ${what} at ${file}.`);
-  if (fs.statSync(file).size > MAX_FILE_BYTES) throw new ProofSetupError(`The ${what} at ${file} is too large.`);
-  const parsed = schema.safeParse(JSON.parse(fs.readFileSync(file, 'utf8')));
-  if (!parsed.success) throw new ProofSetupError(`The ${what} at ${file} is malformed.`);
-  return parsed.data;
-}
 
 async function requireCode(client: Client, address: Address, what: string): Promise<void> {
   const code = await client.getCode({ address });

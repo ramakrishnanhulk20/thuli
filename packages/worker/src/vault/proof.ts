@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import { concat, decodeEventLog, erc20Abi, keccak256, toHex, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { z } from 'zod';
@@ -17,6 +18,28 @@ export const PROOF_TERMS = {
 
 export class ProofSetupError extends Error {
   override name = 'ProofSetupError';
+}
+
+// The deployment and proof records are a few hundred bytes; a file far past this is not one of them.
+const MAX_RECORD_BYTES = 64 * 1024;
+
+/**
+ * A small JSON file read through `schema`, such as a committed deployment or proof record.
+ *
+ * @throws ProofSetupError naming the file when it is missing, too large, not JSON or not in the schema.
+ */
+export function readJson<T extends z.ZodType>(schema: T, file: string, what: string): z.infer<T> {
+  if (!fs.existsSync(file)) throw new ProofSetupError(`No ${what} at ${file}.`);
+  if (fs.statSync(file).size > MAX_RECORD_BYTES) throw new ProofSetupError(`The ${what} at ${file} is too large.`);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    throw new ProofSetupError(`The ${what} at ${file} is malformed.`);
+  }
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success) throw new ProofSetupError(`The ${what} at ${file} is malformed.`);
+  return parsed.data;
 }
 
 /** The chain did not show what the proof claims. */
