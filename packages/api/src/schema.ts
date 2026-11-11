@@ -9,6 +9,7 @@ import {
   TxHash,
   type Address,
 } from '@thuli/core';
+import { MAX_BOARD_PAGE, MAX_BOARD_TIES } from '@thuli/store';
 import { heldScreen, NOT_CHECKED, SINGLE_SCOPE, type SingleScreen } from '@thuli/worker/src/screen/single.ts';
 import { NETWORKS } from './config.ts';
 
@@ -198,7 +199,9 @@ export const TicketJson = z.strictObject({
 
 export const AskView = z.strictObject({ ask: AskJson, ticket: TicketJson.optional() });
 export const ExistsBody = z.strictObject({ exists: z.literal(true), ask: AskJson });
-export const BoardPage = z.strictObject({ asks: z.array(AskJson).max(50) });
+// The most one board call can return: its own page limit, then the asks that share the last one's instant. A page
+// that runs on through a tie must still pass, or the tie would turn into a 500.
+export const BoardPage = z.strictObject({ asks: z.array(AskJson).max(MAX_BOARD_PAGE + MAX_BOARD_TIES) });
 
 /**
  * A cached free check read back from the store, checked like an input before it goes out again (C34): it must pass

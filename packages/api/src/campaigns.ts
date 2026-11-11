@@ -54,20 +54,25 @@ const MAX_LIST_VERSION = 2_147_483_647;
 
 const NO_CAMPAIGN = { error: 'no such campaign' } as const;
 
-/** Reads one campaign vault's claimed and claimable amounts. Either call may reject when the chain cannot be read. */
+/**
+ * Reads one campaign chain: the vault's claimed and claimable amounts, and whether an address is a contract there. Any
+ * call may reject when the chain cannot be read.
+ */
 export interface VaultReader {
   claimed(vault: Address, account: Address): Promise<bigint>;
   claimable(vault: Address, account: Address, cumulativeAmount: bigint): Promise<bigint>;
+  /** True only for account type contract on this chain, by the same rule as CampaignDeps.isContract. */
+  isContract(address: Address): Promise<boolean>;
 }
 
 export interface CampaignDeps {
   /** The database the campaign tables live in, the one the other stores use. */
   db: Db;
-  /** True only for account type contract: a delegated EOA keeps its own key and counts as a wallet (C20). */
+  /** On Ethereum, true only for account type contract: a delegated EOA keeps its own key and counts as a wallet (C20). */
   isContract(address: Address): Promise<boolean>;
   /**
-   * The vault reader for a campaign's chain, or null when Thuli has none for it. Left out, or null, a claim ticket goes
-   * out without claimed and claimable.
+   * The reader for a campaign's chain, or null when Thuli has none for it. Left out, or null, a claim ticket goes out
+   * without claimed and claimable, and every ask to a campaign off Ethereum is refused, because its chain cannot be read.
    */
   vault?: (chainId: number) => VaultReader | null;
   now?: () => Date;
@@ -135,11 +140,13 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  * {"busy": true} with nothing written. The app's own middleware marks every answer cache-control: no-store.
  *
  * - GET /api/campaigns/:id: the campaign's public terms, its counts and its list versions.
- * - GET /api/campaigns/:id/board?before=<ISO time>: up to 50 decided or failed asks, newest first, decided strictly
- *   before the given time when one is given; 400 for a time that is not ISO 8601.
+ * - GET /api/campaigns/:id/board?before=<ISO time>: 50 decided or failed asks, newest first, decided strictly before
+ *   the given time when one is given, plus every further ask decided at the same instant as the 50th, so walking the
+ *   board with before set to the last ask's decidedAt never skips one (see board in the store); 400 for a time that is
+ *   not ISO 8601.
  * - POST /api/campaigns/:id/asks with exactly {wallet, signedAt, signature}, at most 1 KB. In order: the caller's
  *   address (400), its 20 requests a minute (429), counted before anything reads the chain, the body (413, 400),
- *   checkAsk with the campaign from the path (400
+ *   checkAsk with the campaign from the path and a wallet type read on Ethereum and on the campaign's chain (400
  *   with its cause), the caller's 5 signed asks an hour (429), then addAsk: 202 {"queued": true}, 200 {"exists": true,
  *   "ask"} with the first ask's public view, or 409 {"closed": true}. Nothing is screened inside the request.
  * - GET /api/campaigns/:id/asks/:wallet: the ask's public view (404 when the wallet never asked, 400 for a bad
@@ -255,7 +262,11 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       const at = now();
       const checked = await checkAsk(
         { campaignId: campaign.id, wallet, signedAt, signature },
-        { expectedCampaignId: campaign.id, now: Math.floor(at.getTime() / 1000), isContract: deps.isContract },
+        {
+          expectedCampaignId: campaign.id,
+          now: Math.floor(at.getTime() / 1000),
+          isContract: (address) => contractOnEitherChain(campaign, address),
+        },
       );
       if (!checked.ok) return refused(c, checked.cause, 400);
       try {
@@ -331,6 +342,20 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
     return c.body(text, 200, { 'content-type': 'application/json' });
   });
 
+  /**
+   * Whether address is a contract on Ethereum or on the campaign's own chain, read once when the campaign is on
+   * Ethereum. A contract on either is refused, because the same address can be a person's wallet on one chain and a
+   * contract on the other. Any failed read, a missing reader for the campaign's chain or an answer that is not true or
+   * false rejects, so checkAsk refuses the ask as unreadable rather than letting it through (C11).
+   */
+  async function contractOnEitherChain(campaign: Campaign, address: Address): Promise<boolean> {
+    if (campaign.chain === mainnet.id) return yesOrNo(await deps.isContract(address));
+    const reader = deps.vault?.(campaign.chain) ?? null;
+    if (reader === null) throw new Error("no reader for the campaign's chain");
+    const [onEthereum, onCampaignChain] = await Promise.all([deps.isContract(address), reader.isContract(address)]);
+    return yesOrNo(onEthereum) || yesOrNo(onCampaignChain);
+  }
+
   /** The vault's claimed and claimable for a ticket, as decimal text, or nothing when no reader answers. Never throws. */
   async function vaultAmounts(campaign: Campaign, wallet: Address, cumulativeAmount: bigint): Promise<{ claimed?: string; claimable?: string }> {
     const reader = deps.vault?.(campaign.chain) ?? null;
@@ -349,10 +374,22 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
   }
 }
 
+function yesOrNo(answer: unknown): boolean {
+  if (typeof answer !== 'boolean') throw new Error('a wallet type reader answered something other than true or false');
+  return answer;
+}
+
+// The facts' rule, so both chains judge one address the same way: no code is a wallet, a delegated EOA (EIP-7702) is
+// a wallet, any other code is a contract. Code that is not hex rejects, so checkAsk refuses the wallet as unreadable.
+function isContractCode(code: string | undefined): boolean {
+  const type = accountTypeFromCode(code);
+  if (type === 'unknown') throw new Error('the account code was not hex');
+  return type === 'contract';
+}
+
 /**
- * Reads whether an address is a contract on Ethereum mainnet from its code, by the rule the facts use: no code is a
- * wallet, a delegated EOA (EIP-7702) is a wallet, any other code is a contract. Code that is not hex rejects, so
- * checkAsk refuses the wallet as unreadable. Offchain lookups are off (C38), and each read gives up after 10 seconds.
+ * Reads whether an address is a contract on Ethereum mainnet from its code, by the facts' rule (isContractCode).
+ * Offchain lookups are off (C38), and each read gives up after 10 seconds.
  */
 export function accountTypeReader(rpcUrl: string): (address: Address) => Promise<boolean> {
   const client = createPublicClient({
@@ -360,11 +397,7 @@ export function accountTypeReader(rpcUrl: string): (address: Address) => Promise
     transport: http(rpcUrl, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1 }),
     ccipRead: false,
   });
-  return async (address) => {
-    const type = accountTypeFromCode(await client.getCode({ address }));
-    if (type === 'unknown') throw new Error('the account code was not hex');
-    return type === 'contract';
-  };
+  return async (address) => isContractCode(await client.getCode({ address }));
 }
 
 /**
@@ -389,6 +422,7 @@ export function vaultReaders(baseRpcUrl: string | null): (chainId: number) => Va
       claimed: (vault, account) => client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimed', args: [account] }),
       claimable: (vault, account, cumulativeAmount) =>
         client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimable', args: [account, cumulativeAmount] }),
+      isContract: async (address) => isContractCode(await client.getCode({ address })),
     };
     readers.set(chainId, reader);
     return reader;

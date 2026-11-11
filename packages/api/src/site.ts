@@ -74,8 +74,9 @@ async function migrateFrom(db: Db, migrations: Readonly<Record<string, string>>)
  * - Production needs both DATABASE_URL and TRUSTED_CLIENT_HEADER (on Vercel, x-vercel-forwarded-for). Outside
  *   production the caller is read from x-forwarded-for, which Next's own server fills from the socket.
  * Production is env.NODE_ENV as the server runs, not as the site was built.
- * - The campaign routes share that database. They read wallet types on ETH_RPC_URL, and vaults on Base Sepolia's
- *   public RPC, or for a Base campaign on BASE_RPC_URL when it is set.
+ * - The campaign routes share that database. They read wallet types on ETH_RPC_URL and on the campaign's own chain,
+ *   and vaults on that chain: Base Sepolia's public RPC, or for a Base campaign BASE_RPC_URL. A Base campaign with
+ *   BASE_RPC_URL unset gets tickets without vault amounts and refuses every ask, because its chain cannot be read.
  *
  * A setting that is missing, malformed or forbidden, a private key in env included (C39), means no API at all: every
  * request answers 503 {busy: true} and the cause is logged once, by variable name, never with a value (C40). The site

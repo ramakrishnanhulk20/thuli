@@ -92,6 +92,13 @@ interface Reply {
   type: string | null;
 }
 
+/** The campaign chain's reader unless a test gives its own: no address has code, and the vault is not read. */
+const NO_CODE: VaultReader = {
+  isContract: async () => false,
+  claimed: async () => Promise.reject(new Error('this test reads no vault')),
+  claimable: async () => Promise.reject(new Error('this test reads no vault')),
+};
+
 /** Every body any test received, so the last test can search them all for a stored signature (C40). */
 const seen: string[] = [];
 
@@ -114,7 +121,11 @@ describe('campaign routes', () => {
       screen: async (wallet) => screenResult(wallet),
       readReceipt: noChain,
       now: () => NOW,
-      campaigns: { db: options.db ?? db, isContract: options.isContract ?? (async () => false), vault: options.vault },
+      campaigns: {
+        db: options.db ?? db,
+        isContract: options.isContract ?? (async () => false),
+        vault: 'vault' in options ? options.vault : () => NO_CODE,
+      },
     });
     return async (path: string, init: RequestInit = {}, caller = '192.0.2.10'): Promise<Reply> => {
       const reply = await app.fetch(new Request(url(path), init), socketFrom(caller));
@@ -206,6 +217,53 @@ describe('campaign routes', () => {
     expect(await rows('hour')).toBe(0);
   });
 
+  it("C7: a wallet with code on the campaign's chain is refused as a contract, and an unreadable chain refuses", async () => {
+    await createCampaign(db, terms());
+    await createCampaign(db, terms({ id: 'mainnet', chain: 1 }));
+    // Wallet 0 has code only on Base Sepolia, the campaign's chain; wallet 1 has code nowhere.
+    const code: Record<number, Set<string>> = { 1: new Set(), [CHAIN]: new Set([walletOf(0)]) };
+    const reads: number[] = [];
+    const readerFor = (chainId: number, failing = false): VaultReader => ({
+      isContract: async (address) => {
+        reads.push(chainId);
+        if (failing) throw new Error('the code read timed out');
+        return code[chainId]?.has(address) ?? false;
+      },
+      claimed: async () => 0n,
+      claimable: async () => 0n,
+    });
+    const onEthereum = async (address: Address) => {
+      reads.push(1);
+      return code[1]?.has(address) ?? false;
+    };
+    const send = campaignApp({ isContract: onEthereum, vault: (chainId) => (chainId === CHAIN ? readerFor(chainId) : null) });
+    const contract = await send(asks(), post(await signedAsk(0)));
+    expect([contract.status, JSON.parse(contract.text)]).toEqual([400, { error: 'contract wallets cannot ask yet' }]);
+    expect(reads.sort()).toEqual([1, CHAIN]);
+    const plain = await send(asks(), post(await signedAsk(1)), '192.0.2.31');
+    expect([plain.status, plain.text]).toEqual([202, '{"queued":true}']);
+
+    const unreadable = [
+      campaignApp({ isContract: onEthereum, vault: (chainId) => readerFor(chainId, true) }),
+      campaignApp({ isContract: onEthereum, vault: () => null }),
+    ];
+    for (const app of unreadable) {
+      const reply = await app(asks(), post(await signedAsk(2)), '192.0.2.32');
+      expect([reply.status, JSON.parse(reply.text)]).toEqual([400, { error: 'the wallet type could not be checked' }]);
+    }
+    expect((await db.query('SELECT wallet FROM asks')).map((row) => row.wallet)).toEqual([walletOf(1)]);
+
+    // A campaign on Ethereum itself reads Ethereum once and no other chain.
+    reads.length = 0;
+    const mainnetAsk = await campaignApp({ isContract: onEthereum, vault: (chainId) => readerFor(chainId, true) })(
+      asks('mainnet'),
+      post(await signedAsk(3, { campaignId: 'mainnet' })),
+      '192.0.2.33',
+    );
+    expect(mainnetAsk.status).toBe(202);
+    expect(reads).toEqual([1]);
+  });
+
   it('C1: the same wallet in two spellings gets 202 then 200 exists, and one row keeps the first ask', async () => {
     await createCampaign(db, terms());
     const send = campaignApp();
@@ -265,7 +323,7 @@ describe('campaign routes', () => {
       ],
       false,
     );
-    const reader: VaultReader = { claimed: async () => 0n, claimable: async (_vault, _account, amount) => amount };
+    const reader: VaultReader = { ...NO_CODE, claimed: async () => 0n, claimable: async (_vault, _account, amount) => amount };
     const send = campaignApp({ vault: (chainId) => (chainId === CHAIN ? reader : null) });
 
     for (const [index, amount] of [
@@ -285,9 +343,9 @@ describe('campaign routes', () => {
     expect(posted.ask.slot).toBe(3);
     expect(posted.ticket).toBeUndefined();
 
-    const unread = AskView.parse(JSON.parse((await campaignApp()(`${asks()}/${walletOf(0)}`)).text));
+    const unread = AskView.parse(JSON.parse((await campaignApp({ vault: () => null })(`${asks()}/${walletOf(0)}`)).text));
     expect(Object.keys(unread.ticket ?? {}).sort()).toEqual(['cumulativeAmount', 'proof', 'root']);
-    const failing = campaignApp({ vault: () => ({ claimed: async () => Promise.reject(new Error('rpc down')), claimable: async () => 1n }) });
+    const failing = campaignApp({ vault: () => ({ ...NO_CODE, claimed: async () => Promise.reject(new Error('rpc down')), claimable: async () => 1n }) });
     const logs = captureLogs();
     const failed = AskView.parse(JSON.parse((await failing(`${asks()}/${walletOf(0)}`)).text));
     logs.restore();
@@ -316,6 +374,56 @@ describe('campaign routes', () => {
     expect(BoardPage.parse(JSON.parse(earlier.text))).toEqual({ asks: [] });
     const badTime = await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board?before=yesterday`);
     expect(badTime.status).toBe(400);
+  });
+
+  it('C34: walking the board page by page returns every ask exactly once, a page running on through a tie still in shape', async () => {
+    await createCampaign(db, terms());
+    // 48 asks at their own instants, then 5 decided together across the 50th place, then 2 older ones.
+    const times = [...Array.from({ length: 48 }, (_, n) => 1_000 - n), 500, 500, 500, 500, 500, 400, 300];
+    const wallets = times.map((_, n) => parseAddress(`0x${(0xbeef0000 + n).toString(16).padStart(40, '0')}`));
+    for (const [n, seconds] of times.entries()) {
+      await db.query(
+        `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
+         VALUES ($1, $2, $3::bigint, $4, $5::timestamptz, 'queued', 0)`,
+        [CAMPAIGN, wallets[n], String(NOW_SECONDS), `0x${'ab'.repeat(65)}`, NOW.toISOString()],
+      );
+      expect(await takeAsk(db, NOW, 60, 3)).toMatchObject({ wallet: wallets[n] });
+      const at = new Date(NOW.getTime() + seconds * 1000);
+      const result = await decideAsk(
+        db,
+        {
+          campaignId: CAMPAIGN,
+          wallet: wallets[n] as string,
+          action: 'hold',
+          shareBps: 0,
+          rule: 'A9',
+          reason: 'Held while the funder is checked.',
+          citedTxs: [],
+          notChecked: [],
+          facts: { ageDays: 3, txCount: 1, accountType: 'eoa', funder: null, burstWallets: null, groupSize: null, missing: [] },
+          servRequestId: null,
+        },
+        at,
+      );
+      expect(result).toEqual({ slot: null });
+    }
+    const send = campaignApp();
+    const pages: string[][] = [];
+    let path = `${CAMPAIGNS_PATH}/${CAMPAIGN}/board`;
+    for (let page = 0; page < 10; page += 1) {
+      const reply = await send(path);
+      expect(reply.status, reply.text).toBe(200);
+      const parsed = BoardPage.safeParse(JSON.parse(reply.text));
+      expect(parsed.success).toBe(true);
+      const asks = parsed.success ? parsed.data.asks : [];
+      if (asks.length === 0) break;
+      pages.push(asks.map((ask) => ask.wallet));
+      path = `${CAMPAIGNS_PATH}/${CAMPAIGN}/board?before=${asks.at(-1)?.decidedAt}`;
+    }
+    expect(pages.map((page) => page.length)).toEqual([53, 2]);
+    const walked = pages.flat();
+    expect(walked).toHaveLength(wallets.length);
+    expect(new Set(walked)).toEqual(new Set(wallets));
   });
 
   it('an ask to a closed campaign is 409 closed, and every route for an unknown id is the same 404', async () => {
@@ -383,7 +491,7 @@ describe('campaign routes', () => {
     await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
     expect(await decided(0, 'full')).toEqual({ slot: 1 });
     await publish([{ index: 0, action: 'full' }]);
-    const send = campaignApp({ vault: () => ({ claimed: async () => 0n, claimable: async () => 1_000_000n }) });
+    const send = campaignApp({ vault: () => ({ ...NO_CODE, claimed: async () => 0n, claimable: async () => 1_000_000n }) });
     const logs = captureLogs();
     const checked: [z.ZodType, Reply][] = [
       [CampaignView, await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}`)],
