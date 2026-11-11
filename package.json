@@ -31,7 +31,7 @@
     "contracts:test": "forge test --root packages/contracts",
     "contracts:lint": "npm run lint --prefix packages/contracts",
     "vault:deploy": "node --env-file=.env packages/contracts/script/deploy.mjs",
-    "prove:vault": "node --env-file=.env --import tsx packages/worker/scripts/prove-vault.ts",
+    "prove:vault": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/prove-vault.ts",
     "db:migrate": "node --env-file=.env --import tsx packages/store/scripts/migrate.ts"
   },
   "devDependencies": {
