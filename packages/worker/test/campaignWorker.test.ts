@@ -38,7 +38,7 @@ import {
   type Db,
 } from '@thuli/store';
 import { NO_VAULT_BLOCK, runLoop, runOnce, type WorkerDeps } from '../src/campaign/loop.ts';
-import { publishCheck, reconcileCheck } from '../src/campaign/publish.ts';
+import { CANCEL_MARGIN_SECONDS, cancelProven, publishCheck, reconcileCheck, UNSEEN_LIST } from '../src/campaign/publish.ts';
 import { activateCheck, relayNext } from '../src/campaign/relay.ts';
 import { CAMPAIGN_SCREEN_CAUSES, MAX_ASK_ATTEMPTS, retryDelaySeconds, screenNextAsk, type ScreenOutcome } from '../src/campaign/screen.ts';
 import { emptyChainMemory, NO_ROOT, type CampaignVault, type ClaimSimulation } from '../src/campaign/vault.ts';
@@ -107,6 +107,21 @@ class StandInVault implements CampaignVault {
     this.now += seconds;
   }
 
+  /**
+   * What a lagging node answers: set to an earlier view, the worker's reads (roots and readSnapshot) show the vault as it
+   * was then, while every write still lands on the vault as it is.
+   */
+  staleView: { active: MerkleHash; pending: MerkleHash; pendingAt: bigint; now: bigint } | null = null;
+
+  /** The vault as a read would show it right now, to hand to staleView later. */
+  view() {
+    return { ...this.roots_(), now: this.now };
+  }
+
+  private read() {
+    return this.staleView ?? this.view();
+  }
+
   private roots_() {
     const due = this.pending !== NO_ROOT && this.now >= this.pendingAt;
     return due
@@ -148,10 +163,10 @@ class StandInVault implements CampaignVault {
 
   async readSnapshot(_vault: Address, accounts: readonly Address[]): Promise<VaultSnapshot> {
     this.calls.push('readSnapshot');
-    const { active, pending } = this.roots_();
+    const { active, pending, now } = this.read();
     return {
       blockNumber: 1000n,
-      timestamp: this.now,
+      timestamp: now,
       agent: AGENT,
       deposited: this.deposited,
       totalPaid: this.totalPaid,
@@ -200,8 +215,8 @@ class StandInVault implements CampaignVault {
 
   async roots(_vault: Address) {
     this.calls.push('roots');
-    const { active, pending, pendingAt } = this.roots_();
-    return { blockNumber: 1000n, timestamp: this.now, activeRoot: active, pendingRoot: pending, pendingClaimableAt: pendingAt, paused: false };
+    const { active, pending, pendingAt, now } = this.read();
+    return { blockNumber: 1000n, timestamp: now, activeRoot: active, pendingRoot: pending, pendingClaimableAt: pendingAt, paused: false };
   }
 
   async claimableOf(_vault: Address, entries: readonly VaultEntry[], _blockNumber: bigint) {
@@ -789,6 +804,7 @@ describe('picking up where the vault stands after a restart', () => {
     await screenAll(worker);
     expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
     vault.cancelPending();
+    vault.advance(BigInt(CANCEL_MARGIN_SECONDS));
 
     expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [1] });
     expect(lines).toContain(`reconcile ${CAMPAIGN}: the owner cancelled list version 1 on the vault, so it is recorded as cancelled`);
@@ -806,6 +822,65 @@ describe('picking up where the vault stands after a restart', () => {
     expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 2, wallets: 2 });
     expect(posts(vault)).toBe(2);
     expect((await listVersions(db, CAMPAIGN)).map((version) => version.status)).toEqual(['cancelled', 'posted']);
+  });
+});
+
+describe('a read older than the worker\'s own last write', () => {
+  const posts = (vault: StandInVault) => vault.sent.filter((fn) => fn === 'postRoot').length;
+
+  async function postedOnce() {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    const beforePost = vault.view();
+    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
+    return { vault, worker, beforePost };
+  }
+
+  it('cancels nothing on a stale read taken right after its own post, and activates the list on the next fresh read', async () => {
+    const { vault, worker, beforePost } = await postedOnce();
+    vault.staleView = beforePost;
+    expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [] });
+    expect((await listVersions(db, CAMPAIGN)).map((version) => version.status)).toEqual(['posted']);
+    expect(lines.some((line) => line.includes('cancelled'))).toBe(false);
+
+    vault.staleView = null;
+    vault.advance(ROOT_DELAY);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [] });
+    expect(await activateCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'queued', version: 1, activated: true, added: 1 });
+    expect(posts(vault)).toBe(1);
+  });
+
+  it('records an owner cancel only once the vault is read at least the margin after the post', async () => {
+    const { vault, worker } = await postedOnce();
+    vault.cancelPending();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [] });
+    vault.advance(BigInt(CANCEL_MARGIN_SECONDS - 1));
+    expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [] });
+    vault.advance(1n);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [1] });
+  });
+
+  it('never proves a cancel for a version with no claimable time or a vault with no known delay', () => {
+    const readAt = 2_000_000_000n;
+    expect(cancelProven({ claimableAt: null }, 3600n, readAt)).toBe(false);
+    expect(cancelProven({ claimableAt: 1_900_000_000 }, null, readAt)).toBe(false);
+    const postedAt = 1_900_000_000n;
+    const claimableAt = Number(postedAt + 3600n);
+    expect(cancelProven({ claimableAt }, 3600n, postedAt + BigInt(CANCEL_MARGIN_SECONDS) - 1n)).toBe(false);
+    expect(cancelProven({ claimableAt }, 3600n, postedAt + BigInt(CANCEL_MARGIN_SECONDS))).toBe(true);
+  });
+
+  it('posts nothing over its own pending list when a stale read no longer shows it, even with a new slot holder', async () => {
+    const { vault, worker, beforePost } = await postedOnce();
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    vault.staleView = beforePost;
+    expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: UNSEEN_LIST });
+    expect(posts(vault)).toBe(1);
+    expect((await listVersions(db, CAMPAIGN)).map((version) => version.status)).toEqual(['posted']);
   });
 });
 

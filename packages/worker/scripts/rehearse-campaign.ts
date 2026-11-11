@@ -64,7 +64,7 @@ import {
 } from '@thuli/store';
 import { readFactoryRecord, scrubber } from '../src/campaign/config.ts';
 import { runOnce, type RunReport, type WorkerDeps } from '../src/campaign/loop.ts';
-import { CANCELLED_LIST, publishCheck } from '../src/campaign/publish.ts';
+import { CANCEL_MARGIN_SECONDS, CANCELLED_LIST, publishCheck } from '../src/campaign/publish.ts';
 import { activateCheck, relayNext, type RelayOutcome } from '../src/campaign/relay.ts';
 import { screenNextAsk } from '../src/campaign/screen.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
@@ -592,6 +592,10 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
     const cancel = await publicClient.simulateContract({ address: second.vault, abi: VAULT_ABI, functionName: 'cancelRoot', account: owner.account });
     await confirm(publicClient, await owner.writeContract(cancel.request), owner.account.address);
     say(`  the owner cancelled the pending root of ${CAMPAIGN_B} with cancelRoot`);
+    // A read inside the margin after a post never proves a cancel, so the fork's clock moves past it.
+    await test.increaseTime({ seconds: CANCEL_MARGIN_SECONDS });
+    await test.mine({ blocks: 1 });
+    say(`  evm_increaseTime ${CANCEL_MARGIN_SECONDS} seconds and evm_mine, past the cancel margin`);
     const beforeCancelRuns = await agentNonce();
     const afterCancel = reportFor(await runOnce(standIn));
     const laterRun = reportFor(await runOnce(standIn));

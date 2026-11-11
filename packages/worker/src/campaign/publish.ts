@@ -36,9 +36,49 @@ const skipped = (reason: string): PublishOutcome => ({ kind: 'skipped', reason }
 /** The reason publishCheck gives for leaving alone a list whose root the owner cancelled on the vault. */
 export const CANCELLED_LIST = 'the owner cancelled this list; nothing is posted until the slot holders change';
 
+/** The reason publishCheck gives while the newest posted list is missing from the read, until it shows or its cancel is recorded. */
+export const UNSEEN_LIST =
+  'the newest posted list is neither pending nor paid in this read of the vault; nothing is posted until it shows or its cancel is recorded';
+
+/**
+ * How long after a post a read of the vault must be before it may prove the owner cancelled that post. A public RPC is
+ * load balanced, and a node a few blocks behind still shows the vault as it was before our own postRoot. Two minutes is
+ * far longer than any such lag and far shorter than the hour a root waits, so a real cancel is still recorded long
+ * before the delay would have ended.
+ */
+export const CANCEL_MARGIN_SECONDS = 120;
+
 // Statuses a version only reaches once its root was on the vault, so a version older than one of these may have been
 // replaced there rather than cancelled.
 const REACHED_CHAIN: readonly string[] = ['posted', 'active', 'superseded'];
+
+/** The newest posted version, when no newer version ever reached the vault; the only one a read can find missing. */
+function newestPosted(versions: readonly ListVersion[]): ListVersion | undefined {
+  const last = versions.filter((version) => version.status === 'posted').at(-1);
+  if (last === undefined) return undefined;
+  return versions.some((version) => version.version > last.version && REACHED_CHAIN.includes(version.status)) ? undefined : last;
+}
+
+/**
+ * True only when a read at `readAt` is at least CANCEL_MARGIN_SECONDS after the version was posted, its post moment
+ * being its claimableAt less the vault's root delay, so a missing root in that read cannot be a node that has not yet
+ * seen our post. Without a claimable time or a delay it is false, which leaves the version posted (fail closed). Pure.
+ */
+export function cancelProven(version: Pick<ListVersion, 'claimableAt'>, rootDelay: bigint | null, readAt: bigint): boolean {
+  if (version.claimableAt === null || rootDelay === null) return false;
+  const postedAt = BigInt(version.claimableAt) - rootDelay;
+  return readAt >= postedAt + BigInt(CANCEL_MARGIN_SECONDS);
+}
+
+/** The vault's root delay from its record, or null when the record cannot be had, which proves no cancel. */
+async function rootDelayOf(deps: ChainDeps, campaign: Campaign): Promise<bigint | null> {
+  if (campaign.vaultBlock === null) return null;
+  try {
+    return (await recordFor(deps, campaign)).rootDelay;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Brings a campaign's list versions into line with what its vault shows at one block, so a worker stopped between any
@@ -48,10 +88,14 @@ const REACHED_CHAIN: readonly string[] = ['posted', 'active', 'superseded'];
  *    stopped before recording it, so it is marked posted, with no transaction hash and the vault's own claimable time;
  * 2. a built version's root is the root the vault pays now: the same, found after the delay, so it is marked posted with
  *    the block's time, which the vault has passed, and activateCheck makes it active on this same run;
- * 3. the newest posted version's root is neither pending nor paid, and no newer version ever reached the vault: the
- *    owner cancelled it with cancelRoot or setAgent, so it is marked cancelled. An older posted version with a newer one
- *    on chain after it may have been replaced instead, which the vault's state cannot tell apart, so it is left as it is.
- * The vault keeps no claimable time for a root it already pays, so case 2 records the block's time instead.
+ * 3. the newest posted version's root is neither pending nor paid, no newer version ever reached the vault, and the read
+ *    is at least CANCEL_MARGIN_SECONDS after that version was posted (cancelProven): the owner cancelled it with
+ *    cancelRoot or setAgent, so it is marked cancelled. A read inside the margin may come from a node that has not seen
+ *    our post yet, so the version stays posted and nothing is said; a real cancel is recorded on a later run. An older
+ *    posted version with a newer one on chain after it may have been replaced instead, which the vault's state cannot
+ *    tell apart, so it is left as it is.
+ * Cases 1 and 2 cannot be misled by a lagging node: an older view of the vault shows our root pending or paid only if it
+ * was posted. The vault keeps no claimable time for a root it already pays, so case 2 records the block's time instead.
  *
  * @returns reconciled with the versions marked posted and cancelled, or skipped with the reason.
  * @throws StoreError or a chain error when a read fails; nothing is written after a failed read.
@@ -83,11 +127,9 @@ export async function reconcileCheck(deps: ChainDeps, campaignId: string): Promi
     }
   }
 
-  const current = await listVersions(deps.db, campaignId);
-  const lastPosted = current.filter((version) => version.status === 'posted').at(-1);
-  const replacedLater =
-    lastPosted !== undefined && current.some((version) => version.version > lastPosted.version && REACHED_CHAIN.includes(version.status));
-  if (lastPosted !== undefined && !replacedLater && lastPosted.root !== roots.pendingRoot && lastPosted.root !== roots.activeRoot) {
+  const lastPosted = newestPosted(await listVersions(deps.db, campaignId));
+  const missing = lastPosted !== undefined && lastPosted.root !== roots.pendingRoot && lastPosted.root !== roots.activeRoot;
+  if (missing && cancelProven(lastPosted, await rootDelayOf(deps, here.campaign), roots.timestamp)) {
     if (await markListCancelled(deps.db, campaignId, lastPosted.version)) {
       cancelled.push(lastPosted.version);
       deps.log(`reconcile ${campaignId}: the owner cancelled list version ${lastPosted.version} on the vault, so it is recorded as cancelled`);
@@ -135,7 +177,8 @@ async function versionFor(
  * has one entitlement, and the vault pays only what it has not paid yet (C27).
  *
  * Nothing is sent while the vault has a pending root, when the slot holders are exactly the newest posted or active
- * version, or when they are exactly the newest version and the owner cancelled it (CANCELLED_LIST). postRoot then runs every check it has: the vault record matches the factory's VaultCreated log and the
+ * version, when they are exactly the newest version and the owner cancelled it (CANCELLED_LIST), or while the newest
+ * posted version is missing from the read, which may be a node behind our own post (UNSEEN_LIST). postRoot then runs every check it has: the vault record matches the factory's VaultCreated log and the
  * campaign row (vaultRecordFor, verifyVault), the agent is this key, the vault is not paused and the root can activate
  * before the end, the active root rebuilds from its own published list, and the vault can pay everything both lists may
  * still owe. The version is marked posted with the transaction and the vault's own claimable time.
@@ -174,6 +217,13 @@ export async function publishCheck(deps: ChainDeps, campaignId: string): Promise
   // posted again only as a new root, once a new wallet takes a slot.
   const newest = versions.at(-1);
   if (newest?.status === 'cancelled' && newest.root === root) return skipped(CANCELLED_LIST);
+  // A read that shows no pending root may come from a node that has not seen our own last post. Posting then would
+  // replace that list on the vault and restart its delay, so nothing is posted until the read shows it or reconcile
+  // has recorded its cancel.
+  const lastPosted = newestPosted(versions);
+  if (lastPosted !== undefined && lastPosted.root !== roots.pendingRoot && lastPosted.root !== roots.activeRoot) {
+    return skipped(UNSEEN_LIST);
+  }
 
   let activePublished: string | undefined;
   if (roots.activeRoot !== NO_ROOT) {
