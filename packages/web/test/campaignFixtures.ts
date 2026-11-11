@@ -135,6 +135,7 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
               burstWallets: null,
               groupSize: kind === 'hold' ? 22 : null,
               missing: [],
+              chain: 'ethereum',
               ...factsOverride,
             },
       decidedAt: isoAt(now - minutesAgo * 60_000),

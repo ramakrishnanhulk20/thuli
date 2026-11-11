@@ -42,7 +42,11 @@ export interface AskFacts {
   burstWallets: number | null;
   groupSize: number | null;
   missing: string[];
+  /** The chain whose history was screened. */
+  chain: ScreenedChain;
 }
+
+export type ScreenedChain = 'ethereum' | 'base';
 
 export type AppealRoute = 'ship' | 'review' | 'block';
 
@@ -188,7 +192,8 @@ function isFacts(value: unknown): value is AskFacts {
       (isRecord(funder) && isText(funder.address) && isText(funder.kind) && orNull(funder.fanout, isCount) && isCount(funder.hops))) &&
     orNull(value.burstWallets, isCount) &&
     orNull(value.groupSize, isCount) &&
-    isTexts(value.missing)
+    isTexts(value.missing) &&
+    (value.chain === 'ethereum' || value.chain === 'base')
   );
 }
 

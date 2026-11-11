@@ -433,7 +433,7 @@ for (const { name, open } of TARGETS) {
         { reason: 'See https://evil.example for proof.' },
         { reason: '<img src=x onerror=alert(1)>' },
         { reason: '[claim](evil.example)' },
-        { reason: 'Hidden‮right to left' },
+        { reason: 'Hidden\u202eright to left' },
         { reason: 'x'.repeat(401) },
         { reason: '' },
         { reason: 'Broken \uD800 text' },
@@ -489,7 +489,7 @@ for (const { name, open } of TARGETS) {
       expect(await decideAsk(db, decision(wallet(2), 'hold', { facts: { ...FACTS, funder: null } }), plus(20))).toEqual({ slot: null });
       expect(await decideAsk(db, decision(wallet(3), 'partial'), plus(30))).toEqual({ slot: 2 });
       expect(await releaseAsk(db, CAMPAIGN, wallet(4), plus(40), 1)).toBe('failed');
-      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.facts).toEqual({ ...FACTS, funder: { ...funder, address: FUNDER } });
+      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.facts).toEqual({ ...FACTS, funder: { ...funder, address: FUNDER }, chain: 'ethereum' });
       expect((await getAsk(db, CAMPAIGN, wallet(2)))?.facts?.funder).toBeNull();
       expect((await getAsk(db, CAMPAIGN, wallet(4)))?.facts).toBeNull();
       const stored = await db.query<{ address: string }>(
@@ -501,6 +501,43 @@ for (const { name, open } of TARGETS) {
         { wallet: wallet(3), funderAddress: FUNDER, funderKind: 'wallet', decidedAt: plus(30) },
       ]);
       expect(await funderLinks(db, 'missing')).toEqual([]);
+    });
+
+    it('the facts carry the screened chain: given, left out, missing from an older row, refused when unknown in or out', async () => {
+      await createCampaign(db, terms());
+      for (let n = 1; n <= 4; n += 1) expect(await ask(n, plus(n))).toBe('queued');
+      await screenAll(4, plus(5));
+      const before = await row(1);
+      for (const chain of ['solana', 'Base', '', null, 8453]) {
+        await expect(decideAsk(db, decision(wallet(1), 'full', { facts: { ...FACTS, chain } as AskFactsInput }), NOW)).rejects.toThrow(StoreError);
+      }
+      expect(await row(1)).toEqual(before);
+      expect(await decideAsk(db, decision(wallet(1), 'full', { facts: { ...FACTS, chain: 'base' } }), plus(10))).toEqual({ slot: 1 });
+      expect(await decideAsk(db, decision(wallet(2), 'hold', { facts: FACTS }), plus(20))).toEqual({ slot: null });
+      expect(await decideAsk(db, decision(wallet(3), 'hold', { facts: { ...FACTS, chain: 'ethereum' } }), plus(30))).toEqual({ slot: null });
+      const chains = async () => (await board(db, CAMPAIGN, 10)).map((one) => [one.wallet, one.facts?.chain]);
+      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.facts?.chain).toBe('base');
+      expect((await getAsk(db, CAMPAIGN, wallet(2)))?.facts?.chain).toBe('ethereum');
+      expect(await chains()).toEqual([
+        [wallet(3), 'ethereum'],
+        [wallet(2), 'ethereum'],
+        [wallet(1), 'base'],
+      ]);
+      const [stored] = await db.query<{ chain: string | null }>("SELECT facts ->> 'chain' AS chain FROM asks WHERE wallet = $1", [wallet(2)]);
+      expect(stored?.chain).toBe('ethereum');
+
+      // A row decided before the chain was recorded has no key, and was screened on Ethereum.
+      await db.query("UPDATE asks SET facts = facts - 'chain' WHERE wallet = $1", [wallet(1)]);
+      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.facts).toEqual({ ...FACTS, funder: { ...FACTS.funder, address: FUNDER }, chain: 'ethereum' });
+
+      // A stored chain Thuli does not know is refused on the way out, like a stored list that is not text.
+      await db.query("UPDATE asks SET facts = jsonb_set(facts, '{chain}', '\"solana\"') WHERE wallet = $1", [wallet(3)]);
+      await expect(getAsk(db, CAMPAIGN, wallet(3))).rejects.toThrow(StoreError);
+      await expect(board(db, CAMPAIGN, 10)).rejects.toThrow(StoreError);
+      await db.query("UPDATE asks SET facts = jsonb_set(facts, '{chain}', 'null') WHERE wallet = $1", [wallet(3)]);
+      await expect(getAsk(db, CAMPAIGN, wallet(3))).rejects.toThrow(StoreError);
+      await db.query("UPDATE asks SET facts = jsonb_set(facts - 'chain', '{missing}', '[1]') WHERE wallet = $1", [wallet(3)]);
+      await expect(getAsk(db, CAMPAIGN, wallet(3))).rejects.toThrow(StoreError);
     });
 
     it('a second createCampaign with different terms throws StoreError, and identical terms are a no-op', async () => {

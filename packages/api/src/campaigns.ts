@@ -20,8 +20,12 @@ import {
   activeList,
   addAppeal,
   addAsk,
+  appealStanding,
+  APPEALS_PER_CAMPAIGN_DAY,
   board,
+  campaignAppealsCounter,
   counts,
+  dayCount,
   getAppeal,
   getAsk,
   getCampaign,
@@ -29,6 +33,8 @@ import {
   listVersions,
   MAX_REPPO_NOTE_CHARS,
   recordIfUnder,
+  type AddAppealResult,
+  type AppealStanding,
   type Campaign,
   type Db,
   type PublicAppeal,
@@ -296,14 +302,18 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  *   the Base reads. Then addAsk: 202 {"queued": true}; 200 exists; 409 {"closed": true}; 409
  *   {"full": true} when no slot is left, 200 asks wait undecided or the campaign's lifetime cap is reached.
  * - POST /api/campaigns/:id/appeals with exactly {wallet, text, signedAt, signature}, at most 2 KB. In order: the size
- *   (413), the caller and the minute, the shape (400), checkAppeal with the campaign from the path, its text one line
- *   and the signature before the same counted two-chain wallet-type read (400 with its cause, 503 {"busy": true} past
- *   the shared ceiling), the caller's 2 signed appeals an hour (429), then
- *   addAppeal, which counts the store's 20 appeals a UTC day: 202 {"queued": true}; 200 {"exists": true, "appeal"} with
- *   the first appeal's public view; 409 {"undecided": true}; 409 {"approved": true}; 404 {"error": "no ask from this
- *   wallet"}; 429 {"busy": true} with Retry-After set to the seconds until the next UTC day when the day's appeals are
- *   used. The text hash is rebuilt from the text, never taken from the caller, and no answer or log line carries the
- *   text, its hash, the signature or the owner's note (C40).
+ *   (413), the caller and the minute, the shape (400), checkAppeal's free checks with the campaign from the path (its
+ *   text one line, the signature; 400 with its cause), then the store's appealStanding for the wallet's ask, before any
+ *   chain read: no ask, an ask not decided yet, a full approval or an earlier appeal is answered at once, exactly as
+ *   addAppeal would answer it, with no chain read and no count against the type-read ceiling or the caller's hour; a
+ *   store that cannot be read is 503 {"busy": true}. Only an ask it may appeal goes on to the counted two-chain
+ *   wallet-type read (400 with its cause, 503 {"busy": true} past the shared ceiling), the caller's 2 signed appeals an
+ *   hour (429), then addAppeal, which counts the campaign's share and the store's 20 appeals a UTC day. The answers,
+ *   one mapping for both: 202 {"queued": true}; 200 {"exists": true, "appeal"} with the first appeal's public view; 409
+ *   {"undecided": true}; 409 {"approved": true}; 404 {"error": "no ask from this wallet"}; 429 {"busy": true} with
+ *   Retry-After set to the seconds until the next UTC day when the campaign's share or the day's appeals are used. The
+ *   text hash is rebuilt from the text, never taken from the caller, and no answer or log line carries the text, its
+ *   hash, the signature or the owner's note (C40).
  *
  * @param clientOf the caller's address as the paid route reads it, or null when it cannot be read.
  */
@@ -480,13 +490,38 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       const parsed = AppealRequest.safeParse(body);
       if (!parsed.success) return refused(c, 'the body must be exactly {"wallet", "text", "signedAt", "signature"}', 400);
       const { wallet, text, signedAt, signature } = parsed.data;
-      // The hash comes back from checkAppeal, rebuilt from the text it was given, so no caller can name one (C8).
+      // checkAppeal calls this reader only once the signature is verified, so that is where the ask is looked up: a
+      // wallet with no ask it may appeal is answered from the store alone, with no chain read, no type-read count and
+      // no count against the caller's hour (C49). Only for 'open' are the wallet types read, counted.
       const types = countedTypeReader(campaign, at);
+      const lookup: { standing: AppealStanding | null; unread: boolean; wallet: Address | null } = { standing: null, unread: false, wallet: null };
+      const isContract = async (address: Address): Promise<boolean> => {
+        lookup.wallet = address;
+        try {
+          lookup.standing = await appealStanding(db, campaign.id, address);
+        } catch (error) {
+          storeFailed("looking up an appeal's ask", error);
+          lookup.unread = true;
+          throw new Error("the appeal's ask could not be read");
+        }
+        if (lookup.standing !== 'open') throw new Error('the wallet has no ask it may appeal');
+        return types.isContract(address);
+      };
+      // The hash comes back from checkAppeal, rebuilt from the text it was given, so no caller can name one (C8).
       const checked = await checkAppeal(
         { campaignId: campaign.id, wallet, text, signedAt, signature },
-        { expectedCampaignId: campaign.id, now: Math.floor(at.getTime() / 1000), isContract: (address) => types.isContract(address) },
+        { expectedCampaignId: campaign.id, now: Math.floor(at.getTime() / 1000), isContract },
       );
-      if (!checked.ok) return types.refused() ? busy(c) : refused(c, checked.cause, 400);
+      if (!checked.ok) {
+        if (lookup.unread || types.refused()) return busy(c);
+        if (lookup.standing === null || lookup.standing === 'open' || lookup.wallet === null) return refused(c, checked.cause, 400);
+        try {
+          return await appealAnswer(c, lookup.standing, campaign, lookup.wallet, at);
+        } catch (error) {
+          storeFailed('answering an appeal', error);
+          return busy(c);
+        }
+      }
       try {
         if (!(await recordIfUnder(db, APPEAL_HOUR_BUCKET, client, APPEALS_PER_CALLER_HOUR, 3_600, at))) {
           console.warn('api appeal busy: a client is past the hour limit');
@@ -497,18 +532,7 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
           { campaignId: campaign.id, wallet: checked.wallet, text, textHash: checked.textHash, signedAt, signature },
           at,
         );
-        if (result === 'queued') return answer(c, QueuedBody, { queued: true }, 202);
-        if (result === 'undecided') return answer(c, UndecidedBody, { undecided: true }, 409);
-        if (result === 'approved') return answer(c, ApprovedBody, { approved: true }, 409);
-        if (result === 'unknown') return refused(c, 'no ask from this wallet', 404);
-        if (result === 'busy') {
-          console.warn("api appeal busy: today's appeals across every campaign are used");
-          c.header('Retry-After', String(untilNextUtcDay(at)));
-          return busy(c, 429);
-        }
-        const first = await getAppeal(db, campaign.id, checked.wallet);
-        if (first === null) return busy(c);
-        return answer(c, ExistsAppealBody, { exists: true, appeal: appealJson(first) }, 200);
+        return await appealAnswer(c, result, campaign, checked.wallet, at);
       } catch (error) {
         storeFailed('adding an appeal', error);
         return busy(c);
@@ -605,6 +629,34 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       return busy(c, 429);
     }
     return client;
+  }
+
+  /**
+   * The appeal route's answer to what the store said of a wallet's appeal, the same whether appealStanding said it
+   * before any chain read or addAppeal said it after, so the two can never answer one case differently. A 'busy' is
+   * logged as the share it used up: this campaign's for the day, which addAppeal counts first, or the day's across every
+   * campaign. The store reads here may throw; the caller answers busy.
+   */
+  async function appealAnswer(c: Context, result: AddAppealResult, campaign: Campaign, wallet: Address, at: Date): Promise<Response> {
+    if (result === 'queued') return answer(c, QueuedBody, { queued: true }, 202);
+    if (result === 'undecided') return answer(c, UndecidedBody, { undecided: true }, 409);
+    if (result === 'approved') return answer(c, ApprovedBody, { approved: true }, 409);
+    if (result === 'unknown') return refused(c, 'no ask from this wallet', 404);
+    if (result === 'busy') {
+      const campaignShare = await dayCount(db, campaignAppealsCounter(campaign.id), at).catch(() => null);
+      if (campaignShare !== null && campaignShare >= APPEALS_PER_CAMPAIGN_DAY) {
+        console.warn("api appeal busy: this campaign's appeals for today are used");
+      } else if (campaignShare !== null) {
+        console.warn("api appeal busy: today's appeals across every campaign are used");
+      } else {
+        console.warn("api appeal busy: this campaign's or every campaign's appeals for today are used");
+      }
+      c.header('Retry-After', String(untilNextUtcDay(at)));
+      return busy(c, 429);
+    }
+    const first = await getAppeal(db, campaign.id, wallet);
+    if (first === null) return busy(c);
+    return answer(c, ExistsAppealBody, { exists: true, appeal: appealJson(first) }, 200);
   }
 
   /**

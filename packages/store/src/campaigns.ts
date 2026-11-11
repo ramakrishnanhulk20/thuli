@@ -1,14 +1,17 @@
 import {
   DECISION_RULES,
   isPlainText,
+  isScreenedChain,
   MAX_EVIDENCE_TXS,
   OUTCOMES,
   parseAddress,
+  SCREENED_CHAINS,
   Settings,
   shareFor,
   TxHash,
   type Address,
   type Outcome,
+  type ScreenedChain,
 } from '@thuli/core';
 import { readPublicAppeal, type PublicAppeal, type PublicAppealRow } from './appeals.ts';
 import { instant, shifted, StoreError, wholeNumber, type Db, type Queryable } from './db.ts';
@@ -69,7 +72,11 @@ const DIGITS = /^(0|[1-9][0-9]*)$/;
 
 const HELD_REASON = 'Held for review: the screening could not finish.';
 const RELAY_STATUSES: readonly string[] = ['pending', 'sent', 'confirmed', 'failed'];
-const FACT_KEYS: readonly string[] = ['ageDays', 'txCount', 'accountType', 'funder', 'burstWallets', 'groupSize', 'missing'];
+const FACT_KEYS: readonly string[] = ['ageDays', 'txCount', 'accountType', 'funder', 'burstWallets', 'groupSize', 'missing', 'chain'];
+// Facts given without the screened chain, the shape every caller used before the chain was recorded.
+const FACT_KEYS_WITHOUT_CHAIN: readonly string[] = FACT_KEYS.filter((key) => key !== 'chain');
+// Every ask decided before the chain was recorded was screened on Ethereum, the only chain read then.
+const CHAIN_BEFORE_RECORDING: ScreenedChain = 'ethereum';
 const FUNDER_KEYS: readonly string[] = ['address', 'kind', 'fanout', 'hops'];
 // Core's own schema with every key optional: an unknown key or a bad value is refused, as a full Settings would be.
 const CampaignSettings = Settings.partial();
@@ -140,10 +147,19 @@ export interface AskFacts {
   burstWallets: number | null;
   groupSize: number | null;
   missing: string[];
+  /** The chain the facts were read on, so each cited transaction links to that chain's explorer. */
+  chain: ScreenedChain;
 }
 
-/** What decideAsk takes as facts: AskFacts whose funder address may be in any spelling parseAddress accepts. */
-export type AskFactsInput = Omit<AskFacts, 'funder'> & { funder: (Omit<AskFunder, 'address'> & { address: string }) | null };
+/**
+ * What decideAsk takes as facts: AskFacts whose funder address may be in any spelling parseAddress accepts, and whose
+ * chain may be left out. Left out, the chain is stored as 'ethereum', the only chain any ask was screened on before the
+ * chain was recorded.
+ */
+export type AskFactsInput = Omit<AskFacts, 'funder' | 'chain'> & {
+  funder: (Omit<AskFunder, 'address'> & { address: string }) | null;
+  chain?: ScreenedChain;
+};
 
 /** One decided ask whose facts name a first funder, as the worker reads them to count the wallets one funder paid. */
 export interface FunderLink {
@@ -399,7 +415,13 @@ function countOrNull(value: unknown, label: string): number | null {
 }
 
 function factsOf(value: unknown): AskFacts {
-  const facts = exactKeys(value, FACT_KEYS, 'facts');
+  const withChain = typeof value === 'object' && value !== null && Object.hasOwn(value, 'chain');
+  const facts = exactKeys(value, withChain ? FACT_KEYS : FACT_KEYS_WITHOUT_CHAIN, 'facts');
+  let chain = CHAIN_BEFORE_RECORDING;
+  if (facts.chain !== undefined) {
+    if (!isScreenedChain(facts.chain)) throw new StoreError(`facts.chain must be one of ${SCREENED_CHAINS.join(', ')}`);
+    chain = facts.chain;
+  }
   let funder: AskFunder | null = null;
   if (facts.funder !== null) {
     const given = exactKeys(facts.funder, FUNDER_KEYS, 'facts.funder');
@@ -428,14 +450,19 @@ function factsOf(value: unknown): AskFacts {
     burstWallets: countOrNull(facts.burstWallets, 'facts.burstWallets'),
     groupSize: countOrNull(facts.groupSize, 'facts.groupSize'),
     missing: missing.map((item: unknown, index) => plainTextOf(item, `facts.missing ${index}`, MAX_MISSING_FACT_CHARS)),
+    chain,
   };
 }
 
-// Picks the known keys out of a stored row, so even a row edited by hand cannot add a field to the public view.
+// Picks the known keys out of a stored row, so even a row edited by hand cannot add a field to the public view. A row
+// stored before the chain was recorded has no chain key and was screened on Ethereum; a chain key holding anything
+// but a ScreenedChain is refused like any other malformed stored value, never guessed at.
 function readFacts(value: unknown): AskFacts | null {
   if (value === null || value === undefined) return null;
   const stored = value as Record<string, unknown>;
   const funder = stored.funder as Record<string, unknown> | null | undefined;
+  const chain = stored.chain === undefined ? CHAIN_BEFORE_RECORDING : stored.chain;
+  if (!isScreenedChain(chain)) throw new StoreError('the database returned a screened chain that is not one Thuli knows');
   return {
     ageDays: (stored.ageDays ?? null) as number | null,
     txCount: (stored.txCount ?? null) as number | null,
@@ -452,6 +479,7 @@ function readFacts(value: unknown): AskFacts | null {
     burstWallets: (stored.burstWallets ?? null) as number | null,
     groupSize: (stored.groupSize ?? null) as number | null,
     missing: readTexts(stored.missing) ?? [],
+    chain,
   };
 }
 
@@ -863,9 +891,11 @@ export async function takeAsk(db: Db, now: Date, leaseSeconds: number, maxAttemp
  *   partial, hold or exclude, the share does not match it, the rule is not a known decision rule, the reason is not
  *   plain text of 1 to 400 characters (C13, C33), a cited transaction is not 0x and 64 lowercase hex or there are more
  *   than 256, notChecked holds more than 16 entries or one that is not plain text of 1 to 64 characters, the request id
- *   is malformed, facts does not have exactly the AskFacts keys or holds a value outside its shape (a funder address
- *   that is not an address included), record is given but is not a JSON object of at most 16 KB, or now is not a valid
- *   Date. The funder address is stored canonical (C1). The record is private and no public view returns it (C40).
+ *   is malformed, facts does not have exactly the AskFacts keys (chain may be left out) or holds a value outside its
+ *   shape (a funder address that is not an address and a chain that is not a ScreenedChain included), record is given
+ *   but is not a JSON object of at most 16 KB, or now is not a valid Date. The funder address is stored canonical (C1),
+ *   and facts given without a chain are stored with chain 'ethereum'. The record is private and no public view returns
+ *   it (C40).
  */
 export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promise<{ slot: number | null } | null> {
   const nowAt = instant(now);

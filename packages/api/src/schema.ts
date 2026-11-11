@@ -6,6 +6,7 @@ import {
   isPlainText,
   MAX_EVIDENCE_TXS,
   OutcomeSchema,
+  SCREENED_CHAINS,
   TxHash,
   type Address,
 } from '@thuli/core';
@@ -207,6 +208,8 @@ const FactsJson = z.strictObject({
   burstWallets: Count.nullable(),
   groupSize: Count.nullable(),
   missing: z.array(plainText(64)).max(16),
+  // The chain the facts were read on, so each cited transaction links to that chain's explorer.
+  chain: z.enum(SCREENED_CHAINS),
 });
 
 /**

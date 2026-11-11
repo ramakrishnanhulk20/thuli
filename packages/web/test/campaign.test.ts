@@ -560,7 +560,7 @@ describe('the plain line for a held wallet that has no history', () => {
   });
 
   it('does not show for a screening that failed, or one still running', () => {
-    expect(showsWhatToDo({ ...(fx.ask('failed', signer.address) as unknown as AskJson), facts: { ...noHistory, accountType: 'eoa', burstWallets: null, missing: [] } })).toBe(false);
+    expect(showsWhatToDo({ ...(fx.ask('failed', signer.address) as unknown as AskJson), facts: { ...noHistory, accountType: 'eoa', burstWallets: null, missing: [], chain: 'ethereum' } })).toBe(false);
     expect(showsWhatToDo(fx.ask('queued', signer.address) as unknown as AskJson)).toBe(false);
     expect(showsWhatToDo(fx.ask('screening', signer.address) as unknown as AskJson)).toBe(false);
   });
@@ -786,7 +786,7 @@ describe('the plain-words rule for an appeal', () => {
   it('says why a text cannot go: empty or only spaces, or not plain, and says nothing for a good one', () => {
     expect(appealProblem('')).toBe('empty');
     expect(appealProblem('     ')).toBe('empty');
-    expect(appealProblem('  ')).toBe('empty');
+    expect(appealProblem('\u00a0\u00a0')).toBe('empty');
     expect(appealProblem('see https://x.y')).toBe('unplain');
     expect(appealProblem('  fine words  ')).toBeNull();
     expect(appealProblem('a'.repeat(APPEAL_MAX_CHARS))).toBeNull();
