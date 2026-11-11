@@ -1,6 +1,9 @@
 // Not covered here: live Reppo, a real Postgres, the API route that files an appeal and the site. Reppo is a stand-in
 // that answers the way the real client does, verdicts going through core's own parseVerdict; the store is PGlite in this
 // process. The Reppo client's HTTP rules are reppoClient.test.ts; the store's appeal rules are the store's own tests.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from 'vitest';
 import {
@@ -13,6 +16,7 @@ import {
   type Facts,
   type GraphRecord,
   type Outcome,
+  type ReppoVerdict,
 } from '@thuli/core';
 import {
   addAppeal,
@@ -40,6 +44,9 @@ import {
   parseSettleArgs,
   routeFrom,
   settleAppealCommand,
+  AppealExportLine,
+  EXPORT_SUMMARY,
+  exportAppeals,
   type AppealDeps,
   type AppealReppo,
 } from '../src/campaign/appeals.ts';
@@ -227,6 +234,9 @@ describe('the outside check of an appeal', () => {
       reppoNote: 'The hold follows the stated facts and the fairness rules.',
       reppoEvalId: 'eval_1',
       creditsCharged: 440,
+      reppoScore: 78,
+      reppoDecision: 'accept',
+      reppoConfidence: 'high',
       outcome: 'open',
     });
     expect(await getAsk(db, CAMPAIGN, wallet)).toMatchObject({ action: before?.action, rule: before?.rule, slot: null });
@@ -328,7 +338,7 @@ describe('the outside check of an appeal', () => {
     expect(lines.filter((line) => line.includes(APPEAL_CAUSES.outOfCredit))).toEqual([`appeal: waiting, ${APPEAL_CAUSES.outOfCredit}`]);
   });
 
-  it('maps every route Reppo can send, and an unknown one to none, which no check is recorded with', async () => {
+  it('maps every route Reppo can send, and ends a paid check naming an unknown one as checked with no route, never handed out again (C23)', async () => {
     expect(['ship', 'review', 'block', 'SHIP', 'escalate', '', null, undefined, 3].map(routeFrom)).toEqual([
       'ship',
       'review',
@@ -344,8 +354,39 @@ describe('the outside check of an appeal', () => {
     await appealed(wallet);
     const reppo = new StandInReppo();
     reppo.answers.push(completed('escalate'));
-    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'unchecked', cause: APPEAL_CAUSES.unknownRoute });
-    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', reppoRoute: null });
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', route: null, evalId: 'eval_1', creditsCharged: 440 });
+    expect(await appealRow(wallet)).toMatchObject({
+      checkStatus: 'checked',
+      reppoRoute: null,
+      reppoEvalId: 'eval_1',
+      creditsCharged: 440,
+      reppoScore: null,
+      reppoDecision: null,
+      reppoConfidence: null,
+    });
+    later(LONGEST_RETRY_SECONDS);
+    expect(await appealNext(deps)).toEqual({ kind: 'idle' });
+    expect(reppo.submitted).toHaveLength(1);
+    expect(reppo.lookedUp).toHaveLength(1);
+  });
+
+  it('stores no score Reppo gave out of range, and still records the check with the rest of the verdict', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    const outOfRange = { score: 140, decision: 'accept', confidence: 'high', route: 'ship', reason: 'The hold is fair.' } as unknown as ReppoVerdict;
+    reppo.answers.push({ status: 'COMPLETED', creditsCharged: 440, verdict: outOfRange });
+    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'checked', route: 'ship' });
+    expect(await appealRow(wallet)).toMatchObject({
+      checkStatus: 'checked',
+      reppoRoute: 'ship',
+      reppoScore: null,
+      reppoDecision: 'accept',
+      reppoConfidence: 'high',
+      reppoNote: 'The hold is fair.',
+      creditsCharged: 440,
+    });
   });
 
   it('stores no note that holds a link, and cuts a long note to 280 plain characters (C13, C34)', async () => {
@@ -537,5 +578,98 @@ describe('the operator\'s appeal commands', () => {
       ],
     });
     expect(await appealListLines(db, 'no-such-campaign')).toEqual({ ok: true, lines: ['no appeals in campaign no-such-campaign'] });
+  });
+});
+
+describe('the appeal export', () => {
+  let dir: string;
+  let file: string;
+  const OWNER_NOTE = 'Owner checked the funder by hand. OWNER-NOTE-4410';
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thuli-appeal-export-'));
+    file = path.join(dir, 'feedback', 'campaign-appeals.jsonl');
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const fileLines = () => fs.readFileSync(file, 'utf8').split('\n').filter((line) => line !== '');
+
+  /** One checked appeal, settled reversed with an owner's note, beside one still queued that the export must leave out. */
+  async function checkedAndQueued() {
+    const checked = await decided();
+    const queued = await decided();
+    await appealed(checked.wallet);
+    const reppo = new StandInReppo();
+    reppo.answers.push(completed('review', 'A person should look at the shared funder.'));
+    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'checked' });
+    await appealed(queued.wallet);
+    const settle = parseSettleArgs({ id: CAMPAIGN, wallet: checked.wallet, outcome: 'reversed', action: 'full', note: OWNER_NOTE });
+    if (!settle.ok) throw new Error('the flags were refused');
+    expect(await settleAppealCommand(db, settle.value, true, clock)).toMatchObject({ ok: true });
+    return { checked, queued };
+  }
+
+  it('writes one line per checked appeal in its own strict shape, with the decision as it was appealed and the record the check used', async () => {
+    const { checked } = await checkedAndQueued();
+    const ask = await getAsk(db, CAMPAIGN, checked.wallet);
+    const result = await exportAppeals(db, CAMPAIGN, file, true);
+    expect(result.ok).toBe(true);
+    expect(result.lines).toContain(EXPORT_SUMMARY);
+    expect(EXPORT_SUMMARY).toBe('exported as input for the next rulebook change; the scorecard does not score appeals yet');
+    const lines = fileLines();
+    expect(lines).toHaveLength(1);
+    const line = AppealExportLine.parse(JSON.parse(lines[0] as string));
+    expect(line).toEqual({
+      campaignId: CAMPAIGN,
+      wallet: parseAddress(checked.wallet),
+      appealedAction: 'hold',
+      appealedRule: 'A4',
+      reason: ask?.reason,
+      record: checked.record,
+      route: 'review',
+      score: 78,
+      decision: 'accept',
+      confidence: 'high',
+      note: 'A person should look at the shared funder.',
+      evalId: 'eval_1',
+      creditsCharged: 440,
+      checkedAt: (await appealRow(checked.wallet))?.checkedAt?.toISOString(),
+      outcome: 'reversed',
+      newAction: 'full',
+    });
+  });
+
+  it('skips an evaluation id already in the file, and a dry run writes nothing', async () => {
+    await checkedAndQueued();
+    const dry = await exportAppeals(db, CAMPAIGN, file, false);
+    expect(dry.ok).toBe(true);
+    expect(dry.lines).toContain('1 line would be added; add --write to write it');
+    expect(fs.existsSync(file)).toBe(false);
+
+    expect((await exportAppeals(db, CAMPAIGN, file, true)).lines).toContain(`1 line added to ${file}`);
+    const again = await exportAppeals(db, CAMPAIGN, file, true);
+    expect(again.lines).toContain('1 checked appeal, 1 already in the file, 0 to add');
+    expect(fileLines()).toHaveLength(1);
+  });
+
+  it('refuses to write into a file holding any line that is not an exported appeal', async () => {
+    await checkedAndQueued();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"key":"other","value":{"text":"a line of another shape"}}\n');
+    expect(await exportAppeals(db, CAMPAIGN, file, true)).toMatchObject({ ok: false });
+    expect(fs.readFileSync(file, 'utf8')).toBe('{"key":"other","value":{"text":"a line of another shape"}}\n');
+  });
+
+  it('holds no appeal text, text hash, signature or owner note in any line (C34, C40)', async () => {
+    await checkedAndQueued();
+    const result = await exportAppeals(db, CAMPAIGN, file, true);
+    const written = fs.readFileSync(file, 'utf8');
+    for (const secret of ['MARKER-7731', TEXT, appealTextHash(TEXT), SIGNATURE.slice(2), 'OWNER-NOTE-4410']) {
+      expect(written).not.toContain(secret);
+      expect(result.lines.join('\n')).not.toContain(secret);
+    }
   });
 });

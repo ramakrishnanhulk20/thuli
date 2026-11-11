@@ -1,9 +1,23 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
-import { CAMPAIGN_ID, isPlainText, parseAddress, ReppoPayloadError, reppoInput, type Address, type GraphRecord } from '@thuli/core';
+import { z } from 'zod';
+import {
+  CAMPAIGN_ID,
+  isPlainText,
+  OutcomeSchema,
+  parseAddress,
+  ReppoPayloadError,
+  reppoInput,
+  ReppoVerdict,
+  type Address,
+  type GraphRecord,
+} from '@thuli/core';
 import {
   getAsk,
   markAppealUnchecked,
   MAX_OWNER_NOTE_CHARS,
+  MAX_REPPO_DECISION_CHARS,
   MAX_REPPO_NOTE_CHARS,
   noteAppealEval,
   ownerAppeals,
@@ -16,6 +30,7 @@ import {
   type OwnerAppeal,
   type PublicAsk,
   type ReleaseAppealResult,
+  type ReppoConfidence,
   type ReppoRoute,
   type TakenAppeal,
 } from '@thuli/store';
@@ -43,7 +58,6 @@ export const APPEAL_CAUSES = Object.freeze({
   outOfCredit: 'the outside check is out of credit',
   unfinished: 'the outside check had not finished',
   failed: 'the outside check could not finish',
-  unknownRoute: 'the outside check answered with a route Thuli does not know',
   lost: 'the appeal was no longer being checked by this worker',
 });
 
@@ -76,7 +90,7 @@ type Where = { campaignId: string; wallet: Address };
 export type AppealOutcome =
   | { kind: 'idle' }
   | { kind: 'skipped'; reason: string }
-  | (Where & { kind: 'checked'; route: ReppoRoute; evalId: string; creditsCharged: number })
+  | (Where & { kind: 'checked'; route: ReppoRoute | null; evalId: string; creditsCharged: number })
   | (Where & { kind: 'unchecked'; cause: string })
   | (Where & { kind: 'released'; cause: string; status: ReleaseAppealResult | null })
   | (Where & { kind: 'dropped'; cause: string });
@@ -151,8 +165,9 @@ function causeOf(error: unknown): string {
  * - An evaluation id already on the appeal, from a try cut short after its submit: that evaluation is looked up and
  *   nothing is submitted again (C23). Otherwise the text is submitted and its id is kept with noteAppealEval before the
  *   wait, with no stop allowed between the two, because the evaluation is paid for once it is submitted.
- * - COMPLETED with one of the three routes: recordAppealCheck with the route, noteFrom of Reppo's reason, the id and the
- *   credits charged. With no route Thuli knows, the store can keep no check, so it ends unchecked.
+ * - COMPLETED: recordAppealCheck with the route, noteFrom of Reppo's reason, the id, the credits charged and the
+ *   verdict's score, decision and confidence, each null when the store would refuse it. A paid check always ends checked,
+ *   with route null when Reppo named none Thuli knows or its verdict was out of shape (C23).
  * - UNFINISHED, FAILED or any failed call: given back with retryDelaySeconds for its attempt, the id staying on it. Out
  *   of credit: given back with LONGEST_RETRY_SECONDS and its try handed back, said once (C24). The store ends an appeal
  *   that runs out of tries unchecked (C41).
@@ -208,24 +223,45 @@ async function recordCheck(
 ): Promise<AppealOutcome> {
   const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
   const label = `appeal ${taken.campaignId} ${taken.wallet}`;
-  const route = result.verdict === null ? null : routeFrom(result.verdict.route);
+  const verdict: Partial<Record<keyof ReppoVerdict, unknown>> | null = result.verdict;
+  // A charged evaluation is always recorded as checked, with no route when it named none Thuli knows, so it is never
+  // handed out or paid for again (C23).
+  const route = verdict === null ? null : routeFrom(verdict.route);
   checkpoint(signal, 'recording an outside check');
   deps.spend.credits += result.creditsCharged;
   const spent = `${result.creditsCharged} credits, ${deps.spend.credits} credits since start`;
-  if (route === null) {
-    // The store keeps a check only with one of the three routes, so a paid check that names none ends unchecked.
-    await markAppealUnchecked(deps.db, where, deps.now());
-    deps.log(`${label}: unchecked, ${APPEAL_CAUSES.unknownRoute}, evaluation ${evalId}, ${spent}`);
-    return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.unknownRoute };
-  }
-  const check = { evalId, route, note: noteFrom(result.verdict?.reason ?? null), creditsCharged: result.creditsCharged };
+  const check = {
+    evalId,
+    route,
+    note: noteFrom(typeof verdict?.reason === 'string' ? verdict.reason : null),
+    creditsCharged: result.creditsCharged,
+    score: scoreFrom(verdict?.score),
+    decision: decisionFrom(verdict?.decision),
+    confidence: confidenceFrom(verdict?.confidence),
+  };
   if (!(await recordAppealCheck(deps.db, where, check, deps.now()))) {
     deps.log(`${label}: ${APPEAL_CAUSES.lost}, so the check of evaluation ${evalId} was not kept, ${spent}`);
     return { kind: 'dropped', ...where, cause: APPEAL_CAUSES.lost };
   }
   waitNoted(deps.memory.waiting, APPEAL_LABEL, undefined);
-  deps.log(`${label}: checked, route ${route}, evaluation ${evalId}, ${spent}`);
+  deps.log(`${label}: checked, ${route === null ? 'with no route Thuli knows' : `route ${route}`}, evaluation ${evalId}, ${spent}`);
   return { kind: 'checked', ...where, route, evalId, creditsCharged: result.creditsCharged };
+}
+
+// Each verdict field is held to the rule the store holds it to, core's ReppoVerdict for the score and the confidence and
+// plain text for the decision, so a value the store would refuse costs that one field and never the paid check (C23).
+function scoreFrom(value: unknown): number | null {
+  const parsed = ReppoVerdict.shape.score.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function confidenceFrom(value: unknown): ReppoConfidence | null {
+  const parsed = ReppoVerdict.shape.confidence.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function decisionFrom(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_REPPO_DECISION_CHARS && isPlainText(value) ? value : null;
 }
 
 async function giveBack(deps: AppealDeps, taken: TakenAppeal, cause: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
@@ -341,4 +377,112 @@ export async function settleAppealCommand(db: Db, args: SettleArgs, write: boole
   if ('refused' in result) return { ok: false, lines: [head, `refused: ${result.refused}`] };
   if (args.outcome === 'upheld') return { ok: true, lines: [head, 'settled as upheld; the ask is unchanged'] };
   return { ok: true, lines: [head, `settled as ${what}, ${result.slot === null ? 'with no slot, since every slot is taken' : `slot ${result.slot}`}`] };
+}
+
+/** What every export run says, because no scoring reads these lines today. */
+export const EXPORT_SUMMARY = 'exported as input for the next rulebook change; the scorecard does not score appeals yet';
+
+/**
+ * One checked appeal as appeal:export writes it, in its own strict shape: the decision as it was appealed, with the ask's
+ * reason, the stored record the check was built from, Reppo's whole verdict and the outcome. There is no field for the
+ * appeal's text, its hash, its signature or the owner's note, so none can be written (C34, C40). The record still holds
+ * the evidence transaction hashes that reppoInput leaves out of what Reppo sees, so these lines are private data, kept
+ * only in a git-ignored file.
+ */
+export const AppealExportLine = z.strictObject({
+  campaignId: z.string(),
+  wallet: z.string(),
+  appealedAction: OutcomeSchema,
+  appealedRule: z.string(),
+  reason: z.string().nullable(),
+  record: z.record(z.string(), z.unknown()).nullable(),
+  route: z.enum(['ship', 'review', 'block']).nullable(),
+  score: ReppoVerdict.shape.score.nullable(),
+  decision: z.string().nullable(),
+  confidence: ReppoVerdict.shape.confidence.nullable(),
+  note: z.string().nullable(),
+  evalId: z.string(),
+  creditsCharged: z.int().min(0),
+  checkedAt: z.string(),
+  outcome: z.enum(['open', 'reversed', 'upheld']),
+  newAction: z.enum(['full', 'partial']).nullable(),
+});
+export type AppealExportLine = z.infer<typeof AppealExportLine>;
+
+// At 20 appeals a day and a few KB a line this is years of appeals, so a file past it is not this export's (C41).
+const MAX_EXPORT_FILE_BYTES = 16 * 1024 * 1024;
+
+const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+
+async function exportLine(db: Db, appeal: OwnerAppeal): Promise<AppealExportLine> {
+  const ask = await getAsk(db, appeal.campaignId, appeal.wallet);
+  // The store reads an ask's private record only inside takeAppeal, which leases the appeal, so this one column is read
+  // here, read only, for an export that stays on this machine.
+  const [row] = await db.query<{ record: unknown }>('SELECT record FROM asks WHERE campaign_id = $1 AND wallet = $2', [
+    appeal.campaignId,
+    appeal.wallet,
+  ]);
+  return AppealExportLine.parse({
+    campaignId: appeal.campaignId,
+    wallet: appeal.wallet,
+    appealedAction: appeal.appealedAction,
+    appealedRule: appeal.appealedRule,
+    reason: ask?.reason ?? null,
+    record: row?.record ?? null,
+    route: appeal.reppoRoute,
+    score: appeal.reppoScore,
+    decision: appeal.reppoDecision,
+    confidence: appeal.reppoConfidence,
+    note: appeal.reppoNote,
+    evalId: appeal.reppoEvalId,
+    creditsCharged: appeal.creditsCharged ?? 0,
+    checkedAt: appeal.checkedAt?.toISOString(),
+    outcome: appeal.outcome,
+    newAction: appeal.newAction,
+  });
+}
+
+/**
+ * appeal:export for one campaign: every checked appeal not yet in `file`, by evaluation id, as one AppealExportLine each,
+ * appended with write and only counted without. A file holding any line that is not an exported appeal is refused and
+ * left exactly as it was, so this never mixes into a file another tool owns. The list read is one campaign's appeals, at
+ * most one per ask, and the file read is capped at MAX_EXPORT_FILE_BYTES (C41).
+ *
+ * @returns ok with the lines to print, ending with EXPORT_SUMMARY; not ok, nothing written, for a file it cannot add to.
+ */
+export async function exportAppeals(db: Db, campaignId: string, file: string, write: boolean): Promise<{ ok: boolean; lines: string[] }> {
+  let existing = '';
+  if (fs.existsSync(file)) {
+    if (fs.statSync(file).size > MAX_EXPORT_FILE_BYTES) {
+      return { ok: false, lines: [`${file} is over ${MAX_EXPORT_FILE_BYTES} bytes, so nothing was written`] };
+    }
+    existing = fs.readFileSync(file, 'utf8');
+  }
+  const known = new Set<string>();
+  for (const [index, text] of existing.split('\n').entries()) {
+    if (text.trim() === '') continue;
+    let parsed: ReturnType<typeof AppealExportLine.safeParse> | undefined;
+    try {
+      parsed = AppealExportLine.safeParse(JSON.parse(text));
+    } catch {
+      parsed = undefined;
+    }
+    if (parsed === undefined || !parsed.success) {
+      return { ok: false, lines: [`line ${index + 1} of ${file} is not an exported appeal, so nothing was written`] };
+    }
+    known.add(parsed.data.evalId);
+  }
+  const checked = (await ownerAppeals(db, campaignId)).filter((appeal) => appeal.checkStatus === 'checked' && appeal.reppoEvalId !== null);
+  const fresh: AppealExportLine[] = [];
+  for (const appeal of checked) {
+    if (!known.has(appeal.reppoEvalId as string)) fresh.push(await exportLine(db, appeal));
+  }
+  const counts = `${plural(checked.length, 'checked appeal')}, ${checked.length - fresh.length} already in the file, ${fresh.length} to add`;
+  if (!write) return { ok: true, lines: [counts, `${plural(fresh.length, 'line')} would be added; add --write to write it`, EXPORT_SUMMARY] };
+  if (fresh.length > 0) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const lead = existing !== '' && !existing.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(file, `${lead}${fresh.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  }
+  return { ok: true, lines: [counts, `${plural(fresh.length, 'line')} added to ${file}`, EXPORT_SUMMARY] };
 }
