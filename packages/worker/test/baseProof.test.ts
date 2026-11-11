@@ -109,12 +109,13 @@ describe('reaching Base mainnet', () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(message);
     }
-  });
+    // Three node processes are started one after another, which passes the default limit when the whole suite runs.
+  }, 30_000);
 });
 
 describe('naming a revert', () => {
   // anvil's answer, exactly as a fresh fork of Base returned it, to an eth_call of ThuliVault.claim on a vault with no
-  // state (captured by scratchpad/wo80/capture-revert.mjs). Replayed over HTTP, viem builds from it the same nested error
+  // state. Replayed over HTTP, viem builds from it the same nested error
   // the refused-wallet check meets on the fork.
   const FORK_ANSWER = { jsonrpc: '2.0', id: 1, error: { code: 3, message: 'execution reverted: custom error 0x553ae054', data: '0x553ae054' } };
 
