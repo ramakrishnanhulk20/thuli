@@ -1,0 +1,46 @@
+---
+title: The Hop control group
+description: What Hop Protocol's published lists show about how often Thuli's code holds wallets, with no model in the loop.
+---
+
+A false-hold test needs a list of wallets that are mostly real people. Hop Protocol published one. When it ran its 2022 airdrop, Hop published the wallets it kept and the wallets it removed as sybil attackers. Hop's repository lists 28,857 kept wallets and 14,195 removed ones. That makes it a useful control group: a real list, built by another team, that Thuli did not shape.
+
+The Hop numbers on this page come from Thuli's code alone, with no model. Each wallet gets the start from the fixed checks A1 to A9, and held means the start is hold or exclude. The replay reads only chain data from before Hop's snapshot of 1 April 2022.
+
+## The two groups
+
+Probably-real wallets are the kept wallets that none of Hop's own candidate groups ever named. There are 21,174 of them. A second set of 7,683 kept wallets were named by a group and kept anyway, and this page leaves those out because a hold there is neither clearly right nor clearly wrong. The removed wallets are the 14,195 Hop eliminated, which fall into 501 clusters.
+
+Wallets with no Ethereum history, meaning age 0, no transactions, no funder and no unread fact, are left out of each group, because there is nothing to read and the result would be a gap in the test, not a judgment.
+
+## The numbers
+
+| | Probably-real wallets | Removed wallets |
+| --- | --- | --- |
+| Screened | 21,174 | 14,195 |
+| No Ethereum history, left out | 754 | 5,426 |
+| Counted | 20,420 | 8,769 |
+| Held (hold or exclude) | 119 (0.58%) | 5,078 (57.91%) |
+| 95% interval on held | 0.49% to 0.70% | 56.87% to 58.94% |
+| Of those, excluded | 1 | 93 |
+| Cut to partial | 1,518 (7.43%) | 1,373 (15.66%) |
+| Paid in full | 18,783 (91.98%) | 2,318 (26.43%) |
+
+Of Hop's 501 eliminated clusters, 287 had at least one counted wallet held, 80 had every counted wallet held, and 25 had no counted wallet to judge. The 95% interval is the range the true rate probably falls in, given how many wallets were counted.
+
+## How to read the left column
+
+The left column is the headline false-hold figure for the code alone: 119 of 20,420 probably-real wallets held, 0.58%. It is a different measurement from the 1.00% on [Feedback and versions](/docs/versions). That page scores SERV Reasoning's final decisions on a random sample of 1,500 probably-real wallets, so the model's own holds are in it. This page scores the code's start on every counted wallet. Do not mix the two.
+
+## Why the right column is not a catch rate
+
+57.91% of the removed wallets are held, but that is not a catch rate. Hop found its removed list with a transfer graph, so a graph method like Thuli's agrees with it partly by construction. The number says Thuli's code and Hop's graph point the same way. It does not say how many farms Thuli would find that nobody had found.
+
+## What else this does not show
+
+- Kept does not mean proved real. The kept list includes anyone Hop never examined and any farm Hop missed, so some held wallets here may be real farms.
+- Only Ethereum is read, and Hop's users also lived on other chains. 5,426 of the 14,195 removed wallets have no Ethereum history at all.
+- Only each wallet's first 100 transfers are read.
+- A wallet whose read failed is not left out. It stays counted as a hold on A1, so a failed read can only raise the held rate and never hide.
+- A shared address counts as private when at least half the senders in its oldest 100 transfers are on the list, so a new public address used first by list wallets can still link them.
+- The data is a 2022 snapshot of bridge users and one project's judgment. It says nothing about farming in 2026.

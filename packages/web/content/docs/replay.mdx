@@ -1,0 +1,59 @@
+---
+title: The ROBO replay
+description: Every wallet that claimed the ROBO airdrop, screened as if before the first claim, with the results and what they do not cover.
+---
+
+The ROBO replay takes every wallet that claimed the ROBO airdrop on Ethereum, 35,323 wallets across 35,402 claims, and screens each one as if before the first claim. Nothing was paid or held back for real. Open any wallet at [/replay](/replay).
+
+## The answer key and the honesty rule
+
+Scoring needs to know which wallets were farms. The answer key is Bitquery's published analysis of the ROBO airdrop. The key lists 11,282 claim wallets in 482 families, one family per collector wallet that the farm's tokens were swept into. Bitquery's file names the collectors, not the wallets, so Thuli rebuilt the wallet list from chain data. Thuli cites it for scoring and does not republish it.
+
+The honesty rule is that only chain data from before the first claim was used. The first ROBO claim is at Ethereum block 24,546,233, so the replay reads nothing after block 24,546,232. Bitquery built its key from later movements: the farm's tokens were swept to collectors in July and August 2026, months after the claim. A screener at claim time could not see those sweeps, so the replay tests whether claim-time facts find wallets later shown to move together.
+
+## Results
+
+Run date in the published file: 10 November 2026, rulebook version 2.
+
+| Outcome | Farm list wallets | Everyone else |
+| --- | --- | --- |
+| Wallets | 11,282 | 24,041 |
+| Paid in full | 0 | 934 |
+| Cut to partial | 109 | 22,758 |
+| Held | 11,173 | 283 |
+| Excluded | 0 | 66 |
+
+The replay held at least one wallet in all 482 families, and every wallet in 470. It held 11,173 of the 11,282 farm list wallets, 99.03%. The farm list claimed 87.43% of all ROBO claimed.
+
+### ROBO and dollars held back
+
+Unrealised, replay only: nothing was sold or paid. Dollars use the claim-day value Bitquery gives for the whole drop, 329.1 million ROBO worth $13.8 million, which is $0.0419 per ROBO. The claimed amounts are what the wallets really claimed on chain. Their dollar values and everything held back are unrealised. Held back means the part of a claim the decision does not pay: all of a held wallet's, half of a partial wallet's.
+
+| | ROBO claimed | ROBO held back | Dollars claimed | Dollars held back |
+| --- | --- | --- | --- | --- |
+| Farm list | 287.7 million | 286.4 million | $12,064,999 | $12,007,754 |
+| Everyone else | 41.4 million | 19.6 million | $1,734,262 | $820,122 |
+
+### The model's answers
+
+Each wallet's facts went to SERV Reasoning, and every answer was checked in code. After the stored answers were checked again under rulebook version 2, 35,259 were accepted as given. The checks refused 1,679 first answers, and a second ask fixed 1,651 of them. Separately, 19 final answers stayed refused by a check and were held. The first count is about first answers and the second about final answers, so they do not add up.
+
+SERV Reasoning was reached two ways. 13,488 wallets went through a decision graph built from the rulebook, and 21,835 through the route that sends the rulebook text directly. Burst-funded wallets go to the second route by design, as do wallets whose graph call failed.
+
+### Realised cost
+
+Realised: $17.51 of SERV credit for the whole run, read from the SERV console balance, about 0.05 cents a wallet. It counts SERV credit only.
+
+## Why most other wallets are cut to a partial reward
+
+22,758 of the 24,041 other wallets, 94.66%, were cut to partial, mostly by funding bursts. In the replay's per-wallet file, 21,833 of the 35,323 wallets are flagged as first funded in a burst, and 21,786 of the 22,867 wallets cut to partial are burst-funded. The other 1,081 were cut for another reason, such as being new or quiet. A burst is a pattern, not proof of one owner, so it caps a wallet at partial and never holds it. It also cuts real users to partial, which is the price of the rule. See [The rulebook](/docs/rulebook).
+
+## What the replay does not cover
+
+- These are past wallets, not a live campaign.
+- Dollars use one price for the whole drop, and a real sale would move it.
+- The key is another firm's analysis, a strict rule built from what wallets did after the claim, so farmers outside it may exist. The 349 other wallets held or excluded are an upper bound on false holds, not a measured false-hold rate. That rate comes from [the Hop control group](/docs/hop-control).
+- Farmers who leave no shared trace pass, such as a farm that funds each wallet from a separate exchange withdrawal and never sweeps.
+- The burst thresholds were set by reading this same data, so that part is not a held-out result.
+- Only each wallet's first 100 transfers are read, and only native ETH funding is traced.
+- The site shows what the current rulebook decides: each stored model reply was checked again under today's checks, and no model was called.

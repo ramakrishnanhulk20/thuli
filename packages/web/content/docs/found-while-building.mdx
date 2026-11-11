@@ -1,0 +1,40 @@
+---
+title: Found while building
+description: Measured notes on SERV Reasoning from one build in November 2026, offered as feedback.
+---
+
+These are notes from one build in November 2026 on a beta feature, offered as feedback. The behaviour may have changed since.
+
+## Replies without a schema
+
+Without a strict response schema, a SERV v2 reply renamed the decision's fields and returned the literal word "redacted" for two of them. Thuli now sends each v2 decision request, and the appeal advice request, with a strict JSON schema. It also checks every reply against the fixed answer shape before using it.
+
+## Prompt Guard
+
+With Prompt Guard declared, a call carrying the rulebook was refused with "I can't share that." before the model ran, at zero tokens. Thuli declares the guard only on the appeal call, the one place a stranger's words reach the model.
+
+## Graph generation
+
+Graph generation in the v3 beta was partly random. The same rulebook text generated a usable graph in 1 of 9 independent attempts. Prompts that named a caller tool generated 0 of 9 times, and prompts without one generated 3 of 7. Identical prompts returned cached twins of an earlier graph. One generated graph carried a top-level output schema that returned only its first step's summary, so the decision was lost.
+
+Thuli froze one graph that generated correctly. It moved the fixed checks and every paid lookup into code, and it translates a flat record in and a flat answer out.
+
+## Graph input
+
+SERV checks a graph run's input strictly against the graph's own schema and does not invent missing fields. Thuli translates its flat record into the graph's own input shape, and it refuses to send a record that holds a fact the graph has no field for.
+
+## Cost
+
+Realised cost, measured from the console balance: a graph run cost about 0.09 cents and a v2 call about 0.03 cents in these runs. Realised spend for all 35,323 ROBO wallets was $17.51 by the console balance, which is 0.050 cents a wallet. Token counts are not the bill. Thuli reports spend from the balance, not from token counts.
+
+## Speed and limits
+
+No rate limit was reached at 40 v2 calls and 32 graph calls at once. A v2 call took about 4 seconds and a graph call about 6. Thuli gives each SERV request a 120 second timeout and caps a screening at 12 SERV calls.
+
+## Output discipline
+
+Of 35,323 first answers, 1,679 were refused by Thuli's checks. A second ask on the same route fixed 1,651 of them. 19 answers stayed refused, and those wallets are held. In the first pass the checks caught answers citing a transaction Thuli never fetched and answers with malformed hashes. Thuli accepts a cited hash only if it fetched that transaction for that wallet, and an answer that fails a check never raises a wallet.
+
+## Judgement
+
+Across 35,323 wallets the model never used its one permitted raise. Its own holds were where outside feedback disagreed most, which led to rulebook version 2. Thuli publishes both versions side by side on [the versions page](/docs/versions).

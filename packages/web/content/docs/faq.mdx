@@ -1,0 +1,52 @@
+---
+title: FAQ
+description: Short answers to what a project founder or a judge would ask about Thuli.
+---
+
+## Does Thuli prove a wallet belongs to a real person?
+
+No. Thuli reads on-chain behaviour and finds wallets that move together, such as a shared funder or a sweep to one collector. A farmer who funds each wallet from a separate exchange withdrawal, waits, and never sweeps will pass. Thuli makes farming more expensive and explains each call with a rule and cited transactions.
+
+## What happens to a held wallet?
+
+A hold means a person reviews the wallet. It is not paid and not excluded, its reason names the facts and cites the transactions, and it gets no entry in the claim list. A held wallet can appeal with a signed message, one open appeal per wallet per campaign, but the public appeal route is not built yet.
+
+## Can a project override a decision?
+
+Yes. The project owns its campaign and has the last word. A model's advice on an appeal never changes a decision; only the owner can settle it, from a signed-in session. Owner sign-in is not built yet, and a reversal does not yet change the claim list or the vault root.
+
+## Can the model be talked into paying a farm?
+
+Code sets a ceiling for every wallet before the model runs, and the final decision is never more generous. The model's input holds only numbers, booleans, fixed words, addresses and hashes, with no text a stranger wrote. Its one permitted raise, rule B2, is bounded by the ceiling too, and across 35,323 wallets it never used it. The one place a stranger's words reach a model is appeal text, which carries Prompt Guard and only produces advice.
+
+## What if SERV is down?
+
+Doubt means hold. A paid request always gets a decision: if SERV gives no answer, the buyer receives a hold on rule A1 with the cause "SERV gave no answer". The free check does the same and keeps that hold for 5 minutes. A screening stops after 120 seconds or 12 SERV calls.
+
+## Who holds the reward money?
+
+The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. The only vault so far is a proof vault on Base Sepolia with test USDC.
+
+## What does it cost?
+
+The free check costs a visitor nothing, up to 5 new checks an hour per caller. The paid route costs $0.05 per wallet in USDC over x402. The vault contract takes no fee, and the project pays gas. Thuli's own realised cost in the ROBO replay was $17.51 of SERV credit for 35,323 wallets, which is 0.050 cents a wallet.
+
+## Which chains does it use?
+
+Screening reads Ethereum mainnet only. The paid route takes USDC on Base or on Base Sepolia, the test network. The vault is deployed on Base Sepolia only, and Base mainnet is not deployed yet. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
+
+## Is the rulebook public, and does that help farmers?
+
+It is public, and you can read it on [the rulebook page](/docs/rulebook). It is public so the process is fair and appealable. Farmers can read it too, and Thuli lists that as a stated non-goal.
+
+## What is not built yet?
+
+As of 11 November 2026: owner sign-in, campaigns, publishing, a job queue, paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The check page at /check, the front end of the free check, is not built yet. The full list is on [limits](/docs/limits).
+
+## Is it audited?
+
+No outside firm has audited Thuli. It is self-audited: a threat model written before the code, three internal review rounds, and fuzz, invariant and fork tests on the vault. See [security](/docs/security).
+
+## Are the dollar figures real money?
+
+The dollar figures on the replay are unrealised. They value ROBO at the claim-day price of $0.0419, and nothing was sold or paid. The money Thuli spent is realised: $17.51 of SERV credit. Vault payments so far are test USDC.

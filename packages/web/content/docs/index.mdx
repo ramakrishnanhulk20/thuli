@@ -1,0 +1,63 @@
+---
+title: Overview
+description: What Thuli does, the three numbers it has measured, and what is built and not built yet.
+---
+
+Thuli screens an airdrop or reward claim list and holds back the wallets that look like one operator's farm. For every wallet it holds, it gives a reason with the evidence behind it, and rewards pay out from a vault that only approved wallets can claim from.
+
+It is for a project that is about to pay rewards: an airdrop, a quest or testnet reward, free credits. Farmers run many wallets to collect many rewards. Thuli makes that more expensive and explains each call it makes, so a real user who gets held can see why. It does not prove that a wallet belongs to one unique person, and its decisions are assessments of on-chain behaviour, not accusations.
+
+The name is Tamil. Thuli means "a drop": every drop of an airdrop should land in a real hand.
+
+## Three numbers, measured
+
+Each number comes from a run on past data. None of them is a promise about your campaign.
+
+### 99.03% of the farm list held back
+
+11,173 of the 11,282 wallets on Bitquery's farm list for the ROBO airdrop were held, using only chain data from before the first claim. This is a replay of past wallets, not a live campaign. The list is one firm's analysis, and it was built from what the wallets did after the claim. Details: [The ROBO replay](/docs/replay).
+
+### 1.00% of a control sample held by mistake
+
+Under the current rulebook, 15 of 1,500 wallets sampled from the list Hop Protocol kept in its 2022 airdrop were held. The 95% interval, the range the true rate probably falls in, is 0.61% to 1.64%. Hop's kept list does not prove a wallet is real, and the rate comes from a sample, so read it as an estimate. Details: [Feedback and versions](/docs/versions).
+
+### $0.0005 of SERV credit per wallet
+
+Realised: $17.51 of SERV credit for 35,323 wallets, about 0.05 cents a wallet. That is the SERV credit for the ROBO run only. It does not include Reppo's evaluation credits or any server costs. The paid screening route charges 5 cents a wallet, see [The paid API](/docs/paid-api). Details: [The ROBO replay](/docs/replay).
+
+## What is live today
+
+Live on the site:
+
+- The ROBO replay at [/replay](/replay): every wallet that claimed the airdrop, with its decision and reason.
+- The versions scorecard at [/versions](/versions): two rulebook versions scored on the same stored answers.
+
+Live on a testnet:
+
+- The reward vault on Base Sepolia, with a live proof. Realised, with test USDC that has no real value: one approved wallet claimed 1 USDC from the vault, and a wallet left off the list was refused with the error `InvalidProof`. See [The vault](/docs/vault).
+
+Built in code and tested, but not served by the website yet:
+
+- The free check, `POST /api/check`. The [/check](/check) page that would call it is not built yet.
+- The paid screening route, `POST /api/x402/screen`. It charges 5 cents in USDC per wallet over x402, a standard for paying for a web request.
+
+Not built yet:
+
+- Base mainnet contracts. Only Base Sepolia has a deployment.
+- A hosted database. The code for a Postgres store exists, and nothing is hosted.
+- Self-serve campaigns: sign-in, campaign setup, claim list upload and publishing.
+- A service that publishes a claim list and posts its root to a vault. The pieces exist, and only a proof script has used them.
+- Paid data lookups. Nothing calls a paid data provider today.
+
+## Start here
+
+- Open [the replay](/replay), pick a family of wallets, then open one wallet to read its reason.
+- [Check a wallet](/check). The page is not built yet.
+- [How it works](/docs/how-it-works): the pipeline from chain data to a decision.
+- [Try it](/docs/try-it): what to click, and what to run if you have the repository.
+- [The rulebook](/docs/rulebook): every check and what it means.
+- [The ROBO replay](/docs/replay): the full results table and what it does not cover.
+- [Feedback and versions](/docs/versions): how outside feedback changed the rulebook.
+- [The Hop control group](/docs/hop-control): the false-hold test on a real published list.
+- [The paid API](/docs/paid-api), [The vault](/docs/vault) and [Limits](/docs/limits).
+- [Security](/docs/security) and [The threat model](/docs/threat-model).

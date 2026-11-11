@@ -1,0 +1,58 @@
+---
+title: Limits and non-goals
+description: What Thuli does not catch, does not defend against, has not built, and has not measured.
+---
+
+The "not built" items describe the code on 11 November 2026.
+
+## What Thuli does not catch
+
+- A farm that funds each wallet from its own exchange withdrawal, waits, and never sweeps will pass. Thuli makes farming dearer and explains its calls; it does not prove a wallet belongs to one person.
+- Farms funded through a batch-send contract (a router) are not grouped. A sweep into a contract wallet (a Safe, a forwarder) never links, so one contract collector avoids rule A3.
+- A farm running its own high fan-out funder is missed by the shared-funder rule.
+- A farm that pays its collector from enough throwaway wallets first makes it look public, so A3 stops firing there. Shared funding still catches it.
+- A funding burst split across UTC midnight, or kept under the minimum, is not caught.
+- Only native ETH funding is traced, not tokens. Only Ethereum is read. In the replay, transfers past a wallet's first 100 are not read.
+- One wallet screened alone cannot show a group, a shared deposit address, a funding burst or a claim paid elsewhere.
+
+It can also be wrong the other way:
+
+- A new public address used first mostly by list wallets links them.
+- Wallets on one list could sweep into an address a victim once used and turn the victim's payment into an A3 exclude.
+- Someone who knew the list before the snapshot could fund listed wallets and cause holds, which a person reviews.
+- The shared-funder rule gave up holds that were sometimes right: on Hop's eliminated A8 and A9 sample, holds fell from 11.2% to 3.0%.
+- A funding burst cuts real users funded in one to partial too.
+
+## What Thuli does not defend against
+
+- Prompt injection inside the model. The protection is structural: a ceiling set by code, no stranger-written text in the input, and appeals that need an owner.
+- The campaign owner. An owner can set unfair settings, override any decision and withdraw after the end. The vault does not protect claimants from the project that funds it. A stolen agent key is covered on [the vault page](/docs/vault).
+- A lying data source. Chain data is not verified cryptographically; Thuli trusts its configured RPC endpoints and explorer and fails closed only on missing or inconsistent data.
+- Outside parties failing: the x402 facilitator, Kite Passport, the model providers, Circle freezing or pausing USDC, the Base sequencer.
+- Hiding claimants from the screening services. SERV sees full addresses.
+- A stolen claimant key. Whoever holds it can appeal and claim as that wallet.
+- Verdicts about people and scraping. A decision assesses on-chain behaviour from evidence and is not an accusation. Published decisions are public by design.
+- Farmers reading the rulebook. It is public so the process is fair and appealable. Farmers reading it is a stated non-goal.
+- Payment edge cases. Without a database, a restart can let a copy inside its window be answered from a facilitator's pending cache. A facilitator that fails after broadcasting leaves a payment unserved until the buyer retries.
+
+## What Thuli has not built
+
+- Owner sign-in, campaigns, publishing and an owner dashboard. There are no owner routes.
+- A database for campaigns, decisions, wallets or appeals. Postgres holds only payment claims, rate limits and the free-check cache. Appeals and run state are local files.
+- A job queue. The paid route screens inside the request.
+- Paid data through Kite Passport, Nansen or Allium, and Dolphin summaries. No code calls them.
+- A deployed worker host.
+- Base mainnet contracts. The paid route has been proven only on Base Sepolia with test USDC.
+- A service that turns decisions into a posted list. The code that builds claim lists and claim tickets has tests, but only the vault proof script posts a root, from a hand-written list. Nothing serves a claimant its proof.
+- The check page at `/check`, the front end of the free check.
+- Appeals in public. The checks, record, store and advice exist; the public route, owner sign-in and rate limit do not. Contract wallets cannot appeal. A reversal does not change the claim list or the vault root.
+- An external audit.
+
+## What Thuli has not measured
+
+- How a model answers under a different rulebook text. The [versions](/docs/versions) comparison checks one stored reply per wallet under both rulebooks.
+- Reppo judged decisions made before the shared-funder rule, so no verdict is on a v2 decision.
+- The false-hold rate on real users. Hop's probably-real wallets are not proved real, and the rate comes from a sample. Holds outside Bitquery's key are an upper bound on false holds, because the key may miss farms. Catching Hop's eliminated wallets is partly by construction, not a recall claim.
+- Dollar figures on the site are unrealised: they value ROBO at the claim-day price, nothing was sold or paid, and a real sale would move the price.
+- The cost of paid data lookups, because they are not built.
+- Vault edge cases. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens. The fork tests do not cover Circle blacklisting USDC.

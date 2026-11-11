@@ -1,0 +1,63 @@
+---
+title: The reward vault
+description: How one campaign's reward money is held on Base and who can do what.
+---
+
+Each campaign gets its own vault contract from a factory. The project running it is the owner: it funds the vault, can cancel a waiting list, can pause, and takes back what is left after the end. Thuli's worker key is the agent, and all it can do is post a list. Anyone can submit a claim, and the money goes only to the wallet named in the list.
+
+## How the money is protected
+
+- The agent key can only post a list. It cannot withdraw, cancel, pause or change anything else.
+- Every list waits a delay the owner set at creation, from 1 hour to 30 days, and the owner can cancel it meanwhile.
+- A wallet is paid its approved total minus what it already received, never above the per-wallet cap fixed at creation, and total paid never passes the deposit.
+- The owner withdraws only after the end, and the end never moves earlier.
+- A pause moves the end, and a waiting list's start, later by exactly the time paused. No withdrawal runs while paused.
+
+Stated loss: if nobody cancels a bad list in time, a stolen agent key can direct whatever the deposit has not yet paid out, at most the cap per wallet. Known gap: no watcher yet rebuilds each posted list and alerts the owner inside the delay.
+
+## The leaf and the proof
+
+The approved list becomes one Merkle root, a single fingerprint of the whole list. Each wallet's entry, its leaf, says that on this chain, in this vault, this wallet is owed this total. To claim, anyone submits the entry and a proof, the short run of hashes tying it to the root. If the vault rebuilds the root, it pays.
+
+```text
+leaf = keccak256(bytes.concat(keccak256(abi.encode(uint256 chainId, address vault, address account, uint256 cumulativeAmount))))
+```
+
+Hashing twice stops an inner tree node passing as a leaf. The chain id and vault address sit inside the leaf, so a proof for one vault or chain is worthless on another. Amounts are totals across every list so far. A later list that lowers or drops a wallet pays it nothing more and takes nothing back.
+
+## Every external function
+
+| Function | Who may call | What it does |
+| --- | --- | --- |
+| `createVault` (factory) | anyone | Makes a vault; the factory has no owner and no settings |
+| `deposit` | owner, before the end | Pulls reward tokens in; refuses a token that skims a fee |
+| `postRoot` | agent, not while paused | Posts a list root that pays after the delay; refuses a total above the deposit |
+| `cancelRoot` | owner | Cancels the waiting root, paused or not |
+| `setAgent` | owner | Replaces the agent key and drops any root still waiting |
+| `extendEnd` | owner, before the end | Moves the end later, at most 365 days out |
+| `pause` | owner | Stops claims, withdrawal, new roots and the root clock |
+| `unpause` | owner | Resumes; moves the end and any waiting root later by the time paused |
+| `claim` | anyone | Pays the wallet in the leaf what it is owed, and only that wallet |
+| `withdrawAfterEnd` | owner, from the end | Sends everything left to an address the owner names |
+| `rescue` | owner | Returns a stray token, never the reward token |
+| `transferOwnership`, `acceptOwnership` | owner, then new owner | Two-step ownership change; the agent can never become owner |
+| `renounceOwnership` | nobody | Always reverts; a vault with no owner could never cancel a bad root |
+| `state`, `claimable`, getters | anyone | Read-only: full state, what a claim pays, stored values |
+
+## Gas, from the proof run
+
+Gas units for the proof vault's five transactions. The record has no gas price, so no dollar cost.
+
+| Transaction | Sent by | Gas used | In plain words |
+| --- | --- | --- | --- |
+| `createVault` | owner | 1,686,371 | builds the vault |
+| `approve` | owner | 55,437 | lets the vault pull 2 test USDC |
+| `deposit` | owner | 100,114 | moves the 2 test USDC in |
+| `postRoot` | agent | 75,112 | posts a list of one wallet |
+| `claim` | agent | 145,907 | pays 1 test USDC to that wallet |
+
+## What the vault does not do
+
+The vault protects claimants from a hacked Thuli server and from early withdrawal. It does not protect them from the project that funds it. The owner may name a new agent, and a list that agent posts replaces the old one after the delay. Every agent change and every list is public on chain, so claimants get that delay as notice.
+
+There is one vault per campaign and no upgrade path. A fresh vault keeps each deposit in its own account, so claims draw only on their own campaign's money. A code change means a new factory for new campaigns, not an admin swapping code under a live vault. Addresses are on [contracts](/docs/contracts); what is not built is on [limits](/docs/limits).

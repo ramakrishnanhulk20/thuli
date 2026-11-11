@@ -1,0 +1,46 @@
+---
+title: Security
+description: How Thuli's security work was done, what the tests count, what stops the five main attacks, and why it is not externally audited.
+---
+
+The threat model came before the code. On 27 October 2026 an independent review pass, working only from a plain description of the system, wrote down what kind of system this is, what an attacker would go after, and 47 numbered rules. Each rule is an invariant, a statement that must always hold, and each names the test or attack that shows it. A change that touches a rule must carry its test. Three internal review rounds then read the backend against the list, and every finding was fixed or closed with a written reason. The full rules are on [the threat model page](/docs/threat-model).
+
+## What the contract tests hold
+
+The vault has 85 test functions in `packages/contracts/test`, counted from the files.
+
+- 64 unit tests of each vault function and each way it can fail.
+- 1 fixture test that pins one list and its proofs, which the TypeScript tree builder is checked against.
+- 11 fuzz tests. The Foundry setting runs each on 10,000 random cases.
+- 7 invariant tests. The setting runs 256 random call sequences, up to 64 calls deep, and fails the run on any revert the test did not expect.
+- 2 fork tests on a local copy of Base mainnet at block 55,661,700 with real USDC. They skip when no Base RPC address is set.
+
+These counts come from reading the files. They do not say the tests passed on a given day; `npm run contracts:test` runs them. A mutation pass was also run on the vault, but the repository holds no output from it, so this page gives no count for it. The TypeScript packages have their own tests in `packages/*/test`.
+
+## No external audit
+
+No outside firm has audited Thuli. It is self-audited: the threat model, the three review rounds and the tests above. The vault holds only test USDC today. What the tests do not cover is on [limits](/docs/limits).
+
+## The five attacker goals
+
+### Getting farm wallets paid
+
+The attacker injects instructions through token names, calldata or appeal text, or funds each wallet from a separate exchange withdrawal. Code sets a ceiling for every wallet before the model runs, and the final decision is never more generous (C12). The model's input holds only numbers, booleans, fixed words, addresses and hashes, so a stranger's text has no way in (C14). A reply that cites a hash Thuli never fetched ends in a hold (C13). A farm that funds each wallet separately and never sweeps still passes.
+
+### Taking money directly
+
+In the vault, the agent key can only post lists, each list waits a delay the owner can use to cancel, a wallet is capped, and total paid cannot pass the deposit (C27, C29, C30). A stolen key can still direct what the deposit has not paid out, up to the cap per wallet, if nobody cancels in time; no watcher yet alerts the owner. On the paid route, the exact price, network, token and payee are checked and a replayed payment fails (C25). The free check has per-caller and daily ceilings (C24).
+
+### Taking over the worker or stealing keys
+
+The API refuses to start if any setting named like a private key is present (C39). Chain reads follow no off-chain lookup and no redirect (C38). Error messages name a setting, never its value (C40). The rule against shell injection through the paid-data tool (C37) has no code yet, because nothing calls that tool, and no worker host is deployed.
+
+### Reading or changing another project's campaign
+
+The rules say owners act only on their own campaigns, unpublished data stays unreachable, and a sign-in works once (C4, C5, C6). Campaigns, owner routes and sign-in are not built yet, so this goal has no running code to defend today. The appeal check is built: it ties a signature to the exact text, campaign, wallet and time (C8).
+
+### Turning Thuli's pages against users, or framing a wallet
+
+A reason holding a link or markup is refused by the decision checks, and the replay shows reasons as inert text (C33). A forged `Transfer` event cannot get a wallet excluded, because only movements the wallet itself authorised count as sweeps, and evidence it did not author can lead to a hold, never an exclude (C15).
+
+The full list, with the known gaps, is on [the threat model page](/docs/threat-model). What Thuli does not catch, defend against, build or measure is on [limits](/docs/limits).

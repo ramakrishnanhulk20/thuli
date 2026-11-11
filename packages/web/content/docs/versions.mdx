@@ -1,0 +1,57 @@
+---
+title: Feedback and versions
+description: How outside feedback changed the rulebook from version 1 to version 2, scored on the same stored answers, and what the change cost.
+---
+
+Thuli has one live rulebook, version 2. It differs from version 1 by one rule, and an outside evaluator's feedback is why. This page covers the feedback, the change, a scorecard for both versions, and the cost. The scorecard is also at [/versions](/versions).
+
+## How the outside feedback worked
+
+Reppo runs an outside evaluation service, and its judges score a decision. Thuli sent it 49 of its own decisions from the ROBO and Hop replays. Each went out as a short text: the task, the fairness rules, the wallet's facts in words and counts, then Thuli's decision and reason. Every address, transaction hash, date, amount and rule code was removed first, and a final check refuses any text that still holds a hex identifier.
+
+The 49 were chosen by group, so they are not a random sample of all decisions. The groups included plain full rewards, wallets held as linked groups, burst-funded partials, and holds the model made on its own rule, B1. Reppo gave each a score from 0 to 100 and a route.
+
+| Route | Decisions |
+| --- | --- |
+| Ship | 3 |
+| Review | 35 |
+| Block | 11 |
+| Paid but out of shape | 0 |
+
+## What the judges blocked, and why
+
+All 11 blocked decisions were holds the model made with rule B1. In ten of them, the only evidence behind the hold was a funder that had paid many wallets on the list, with no funding trail traced and no link the wallet made itself. The eleventh is still a hold under version 2. The judges scored all 11 below the pass mark, mostly because the hold went against the stated fairness rules, which say a funding pattern alone does not justify a hold. A few were also marked down for a reason that misstated who had funded whom. None of the 15 B1 holds in the set shipped.
+
+## The change
+
+Version 2 adds one rule: a shared funder alone cannot hold a wallet. How many wallets a funder paid is a count, not a trail. A wallet with a link of its own, or a traced trail to a shared source, is still held. When a hold rests on a funder count alone, the code replaces it with its own start and a code-written reason. See [The rulebook](/docs/rulebook).
+
+## The scorecard
+
+Both columns come from the same stored model replies. No model was called, so the only difference is the rule that changed.
+
+| Measure | Version 1 | Version 2 |
+| --- | --- | --- |
+| ROBO catch rate: Bitquery key wallets held or excluded | 99.03% (11,173 of 11,282) | 99.03% (11,173 of 11,282) |
+| Hop false-hold rate: probably-real sample held or excluded | 2.53% (38 of 1,500), 95% interval 1.85% to 3.46% | 1.00% (15 of 1,500), 95% interval 0.61% to 1.64% |
+| Feedback set right | 0 of 11 | 10 of 11 |
+| Hop's eliminated A8 and A9 sample held | 11.20% (56 of 500) | 3.00% (15 of 500) |
+
+Right on a blocked entry means that version no longer makes the decision Reppo blocked. Under version 2, 10 of the 11 became full rewards, the code's own start, and 1 is still a hold. The 95% interval is the range the true rate probably falls in.
+
+## The cost of the change
+
+The fourth row is a cost, not a gain. Version 2 gives up holds that were sometimes right. On a sample of 500 wallets that Hop removed and whose start was A8 or A9, version 1 held 56 and version 2 holds 15, so the share held fell from 11.20% to 3.00%. This is not a recall figure. It counts holds given up on a set where some holds were correct.
+
+A shared funder was not a usable signal on its own. Measured earlier on Hop wallets funded by an exchange, the model's funder-based hold hit 1.25% of probably-real wallets and 1.13% of eliminated ones, so the hold had no signal.
+
+## Not covered
+
+- Each wallet has one stored reply and both columns check that one reply, so neither shows how a model would answer under a different rulebook text.
+- Reppo judged decisions made before the shared-funder rule. No verdict here is on a version 2 decision.
+- Right on a blocked entry means that version no longer makes the decision Reppo blocked, not that Reppo would pass what it does instead.
+- Hop's probably-real wallets are not proved real, and the rate comes from a sample.
+- A record with no model reply to check again keeps its stored hold in both columns. That is 3 ROBO records, 9 in the Hop sample and 9 in the eliminated sample.
+- The Hop answers were asked again on 11 November 2026 for wallets whose facts changed after the fixes of 10 November, and the eliminated sample was drawn again from that day's rows.
+
+One appeal exists in the feedback data, from a test wallet, so it is left out of every number here. The code-only Hop numbers are on [The Hop control group](/docs/hop-control).

@@ -1,0 +1,24 @@
+{
+  "title": "Docs",
+  "pages": [
+    "---Start---",
+    "index",
+    "how-it-works",
+    "try-it",
+    "---The method---",
+    "rulebook",
+    "replay",
+    "versions",
+    "hop-control",
+    "---Product---",
+    "paid-api",
+    "vault",
+    "contracts",
+    "---Trust---",
+    "security",
+    "threat-model",
+    "limits",
+    "found-while-building",
+    "faq"
+  ]
+}

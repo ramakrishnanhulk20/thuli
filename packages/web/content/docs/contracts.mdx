@@ -1,0 +1,53 @@
+---
+title: Contracts and addresses
+description: The deployed factory and proof vault on Base Sepolia, the five proof transactions, and how to check them.
+---
+
+Everything here is on Base Sepolia, Base's public test network, chain id `84532`. The vault pays test USDC, which has no value. Base mainnet is not deployed yet: there is no mainnet record, and the deploy script refuses every chain except Base Sepolia.
+
+| What | Value |
+| --- | --- |
+| Factory | `0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56` |
+| Verified source | [base-sepolia.blockscout.com](https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56) |
+| Factory deploy | [0x5019bb52...4df7f7](https://sepolia.basescan.org/tx/0x5019bb52542ab56a619a0512a97fe1ad9bec61635025871b11fca532224df7f7), block 57247894 |
+| Proof vault | [`0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034) |
+| Reward token | test USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
+| Owner | `0x86D40838B9805FF63343B8F060EF3fC336f59E78` |
+| Agent | `0xBedcF312f0070295c73bff4De974F372aa03Dee6` |
+| Terms | cap of 1 USDC per wallet (`1000000` base units), root delay 3,600 seconds, 2 USDC deposited |
+| Root | `0x1d575779216ee7c9f5a6883fda38a3d538a05fc4bab059498ace8ba5cae221c1`, claimable from unix `1794375097` (11 Nov 2026, 05:31:37 UTC) |
+
+The deploy record writes the factory address in lowercase and the proof record in checksum case. They are the same address.
+
+## The five proof transactions
+
+| Step | Transaction | Block | Sent by |
+| --- | --- | --- | --- |
+| `createVault` | [0xda041583...5bd13c](https://sepolia.basescan.org/tx/0xda041583c1c4170d470e537c7d36f41fc1912b398758a3612d492960e45bd13c) | 57248098 | owner |
+| `approve` | [0x8568fcfa...3fcfee](https://sepolia.basescan.org/tx/0x8568fcfa06c6839f00829bb4e817e6c4dc0972e74ca1cb4856122db8be3fcfee) | 57248111 | owner |
+| `deposit` | [0x6ccc12d3...6100f2](https://sepolia.basescan.org/tx/0x6ccc12d3ad823b4163964d895db1765017bf963b040edbb425f5e36a976100f2) | 57248123 | owner |
+| `postRoot` | [0x3c4db865...bea0db](https://sepolia.basescan.org/tx/0x3c4db8655abb753e91ee260a65d74a4ebf93d130fe0d0d1ede912ef4d4bea0db) | 57248143 | agent |
+| `claim` | [0x67d821af...a9ed28](https://sepolia.basescan.org/tx/0x67d821afd5bfd7e33af6c73382c2bc53f8d50370ef0b516c0320e04b54a9ed28) | 57266597 | agent |
+
+The root waited its one hour before the claim, which is why the claim block is much later than the others. Gas for each step is on [the vault page](/docs/vault).
+
+## Who was paid and who was refused
+
+Wallet `0xFE2B7D1707A725E2D8D6040506D26a28A98a5CdD` was on the list at 1 USDC and was paid exactly 1 USDC. The agent key sent the claim, not the wallet: the vault pays the wallet named in the list whoever submits. After the claim the vault reported 2 USDC deposited and 1 USDC paid.
+
+Wallet `0xb2864c5C992f22E6d8A6A47945c0E897C440DAf7` was left off the list. A call to `claim` for it, using the first wallet's proof, reverts with `InvalidProof`. That refusal is a simulated call, not a transaction, so it has no hash on the explorer. The record keeps only the error name. Both wallets were made for this proof.
+
+## Rebuild the record from the chain
+
+`npm run prove:vault -- record` reads the saved proof run back from Base Sepolia. It loads no key and sends nothing. It writes the public record only when every check agrees:
+
+- all five transactions succeeded, each sent by the owner (create, approve, deposit) or the agent (post, claim), to the factory, USDC or the vault as expected
+- the create receipt holds the factory's `VaultCreated` event for this vault, owner and agent
+- the post receipt holds the vault's `RootPosted` event for the saved root and time
+- the saved list holds only the paid wallet and rebuilds to the saved root
+- the vault's token, owner, agent, cap and delay match, and the saved root is active
+- the claim receipt holds one `Claimed` event and one USDC transfer of 1 USDC from the vault to the paid wallet
+- the vault's total paid and the paid wallet's claimed amount both equal that 1 USDC
+- a fresh simulated claim for the refused wallet, with the paid wallet's proof, reverts with `InvalidProof`
+
+The command needs the saved run file from the setup step, which is not stored in the repository, so only the machine that ran the proof can repeat it. Anyone else can check the same facts from the table above on the explorer.

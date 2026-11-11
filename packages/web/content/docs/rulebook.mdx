@@ -1,0 +1,63 @@
+---
+title: The rulebook
+description: The nine fixed checks, the two things the model may do, the ceiling, funding bursts and the rulebook versions.
+---
+
+Nine fixed checks, A1 to A9, are computed in code before the model runs. They run in order and the first match wins. The model, SERV Reasoning, may then move the result with only two rules, B1 and B2.
+
+## The fixed checks
+
+| Check | Plain meaning | Outcome | Default threshold |
+| --- | --- | --- | --- |
+| A1 | A fact about this wallet could not be read, so it waits for a person. | hold | None. |
+| A2 | The claimant is a contract, not a personal wallet. | hold | None. |
+| A3 | This wallet's own transfers link it to a group of claim wallets that sweep to one collector. | exclude | Group of 5 or more. |
+| A4 | The wallet belongs to a linked group of claim wallets. | hold | Group of 5 or more. |
+| A5 | One ordinary wallet funded this wallet and many other claim wallets. | hold | Funder paid 10 or more claim wallets. |
+| A6 | It shares an exchange deposit address with other claimants. | hold | At least 2 other claim wallets. |
+| A7 | Its claim was paid to a different address. | hold | None. Cannot fire in the replay or a single-wallet check, as no claim exists. |
+| A8 | A new or little-used wallet, or one funded in a same-day burst from an exchange. It gets a partial reward. | partial, or hold if partial is off | Under 30 days old, under 5 transactions, or a burst of 20 or more wallets. Partial pays 50%. |
+| A9 | Nothing in the record points to a farm. | full | None. |
+
+A3 is the only check that excludes, and it needs a link the wallet made itself. Money sent to a wallet can lead to a hold, never an exclude.
+
+## What the model may do
+
+B1: the model holds a wallet heading to a reward, because a traced funding trail leads to a shared source. It applies only when the start is A8 or A9, and only to hold. A count of wallets a funder paid is not a trail. Under version 2, a B1 hold survives only if the wallet made a link itself, shares a deposit address, or a paid lookup traced a trail. Paid lookups are not built, so only the first two count today.
+
+B2: the model raises a held wallet because its shared links look like ordinary infrastructure, such as a bridge or an exchange. It applies only when the start is A4, A5 or A6, and can raise the wallet to partial or full.
+
+A reply that changes the result without B1 or B2 becomes a hold on A1.
+
+## The ceiling
+
+The ceiling is the most generous outcome the code allows, computed from the same facts before the model runs. First match wins:
+
+- Any fact unread, or a contract or unknown account: at most hold.
+- The A3 evidence is present: exclude.
+- The claim was paid to a different address: at most hold.
+- A new, quiet or burst-funded wallet: at most partial, or hold when partial is off.
+- Otherwise: full.
+
+The final outcome is the less generous of the model's answer and the ceiling.
+
+## Funding bursts
+
+A funding burst is 20 or more wallets first funded straight from one exchange on one UTC day, in amounts within 25% of the smallest. An exchange here is a sender with 10,000 or more transactions at the snapshot, not a hand-kept list.
+
+A burst is a pattern, not proof of one owner, so it can only cut a wallet to partial. It never starts a hold or an exclude, and never joins wallets into a group. On a burst wallet whose start is partial, a model reply that moves it, changes the rule or leaves the burst out of its reason is replaced by the start and a code-written reason.
+
+The defaults are 20 wallets and a 25% spread. They were set by reading the ROBO replay data they are scored on, so that part is not a held-out result. Real users funded in a burst are cut to partial too. A burst split across midnight UTC is not caught.
+
+## Rulebook versions
+
+Version 1 let a model hold a wallet on a shared funder. The code replaced that hold only for an exchange funder. Version 2 adds one rule: a shared funder alone cannot hold a wallet. The evidence is in [Feedback and versions](/docs/versions). Live screening runs version 2.
+
+## What the checks miss
+
+- A farmer who funds each wallet from a separate exchange withdrawal, waits, and never sweeps will pass.
+- Farms funded through a batch-send contract are not grouped, and a sweep into a contract wallet never links.
+
+## Where the full text is
+
+The model is given the written rulebook in `packages/rulebook/thuli-rulebook.md`. The file is public on purpose: a wallet should be able to read the rules it is judged by. The thresholds are code defaults, meant to be set per project as numbers, never as rule text. Setting them is not built yet.
