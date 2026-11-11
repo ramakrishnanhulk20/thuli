@@ -47,7 +47,7 @@ export function FeedbackLoop() {
             <p className={styles.body}>So the rulebook changed by one rule: a shared funder alone cannot hold a wallet.</p>
             <p className={styles.body}>Scored again on the same model replies, before and after:</p>
             <div className={styles.linkRow}>
-              <Link href="/versions" prefetch={false} className={styles.link}>
+              <Link href="/versions" className={styles.link}>
                 <span className={styles.linkLabel}>See both versions side by side</span>
                 <svg className={styles.linkArrow} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
                   <path d="M1 6h9M6.5 2.5L10 6l-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" />

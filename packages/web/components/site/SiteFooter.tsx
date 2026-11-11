@@ -67,8 +67,8 @@ export function SiteFooter() {
           <ul className={styles.footLinks}>
             {NAV_LINKS.map((link) => (
               <li key={link.href}>
-                <Link href={link.href} prefetch={false} className={styles.footLink}>
-                  <span className={styles.footLinkLabel}>{link.label}</span>
+                <Link href={link.href} className={styles.footLink}>
+                  <span className={styles.footLinkLabel}>{link.footerLabel ?? link.label}</span>
                 </Link>
               </li>
             ))}

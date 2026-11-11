@@ -10,6 +10,7 @@ export const NAV_LINKS = [
   { href: '/replay', label: 'Replay' },
   { href: '/check', label: 'Check a wallet' },
   { href: '/versions', label: 'Versions' },
+  { href: '/break', label: 'Break it', footerLabel: 'Try to break it' },
   { href: '/docs', label: 'Docs' },
 ];
 
@@ -66,15 +67,14 @@ export function SiteNav({ mode, revealAfterHero = false }: SiteNavProps) {
       className={`${styles.nav} ${mode === 'bar' ? styles.bar : styles.overlay}`}
       data-shown={reveal ? 'false' : undefined}
     >
-      {/* Prefetch is off on every link here until the pages exist: prefetching a missing page logs a 404. */}
-      <Link href="/" prefetch={false} className={styles.wordmark}>
+      <Link href="/" className={styles.wordmark}>
         <Drop width={10} className={styles.wordmarkMark} />
         <span className={styles.wordmarkName}>THULI</span>
         <span className={styles.wordmarkTamil}>துளி</span>
       </Link>
       <nav className={styles.links} aria-label={mode === 'bar' ? 'Site' : 'Main'}>
         {NAV_LINKS.map((link) => (
-          <Link key={link.href} href={link.href} prefetch={false} className={styles.link}>
+          <Link key={link.href} href={link.href} className={styles.link}>
             {link.label}
           </Link>
         ))}

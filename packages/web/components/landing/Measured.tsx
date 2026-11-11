@@ -52,7 +52,7 @@ export function Measured() {
             Every number here comes from a run you can repeat. The method and its limits are on the versions page.
           </p>
           <div className={styles.linkRow}>
-            <Link href="/versions" prefetch={false} className={styles.link}>
+            <Link href="/versions" className={styles.link}>
               <span className={styles.linkLabel}>How these were measured</span>
               <svg className={styles.linkArrow} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
                 <path d="M1 6h9M6.5 2.5L10 6l-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" />

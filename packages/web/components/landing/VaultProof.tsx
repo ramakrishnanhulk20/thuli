@@ -1,4 +1,5 @@
 import * as motion from 'motion/react-client';
+import Link from 'next/link';
 import { describeVaultProof, loadVaultProof } from '@/lib/vaultProof';
 import { Drop } from '../Drop';
 import { ProofLine } from './ProofLine';
@@ -88,6 +89,12 @@ export function VaultProof() {
           <div className={styles.links}>
             <ArrowLink href={view.vaultUrl}>The vault on BaseScan</ArrowLink>
             <ArrowLink href={view.factoryUrl}>{"The factory's verified source"}</ArrowLink>
+            <Link className={styles.link} href="/break">
+              <span className={styles.linkLabel}>Attack this vault yourself</span>
+              <svg className={styles.linkArrow} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M1 6h9M6.5 2.5L10 6l-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" />
+              </svg>
+            </Link>
           </div>
           <p className={styles.lastLine}>Test money on a test network. Base mainnet is not deployed yet.</p>
         </div>

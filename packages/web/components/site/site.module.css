@@ -314,7 +314,7 @@
 /* Small laptop, 1024 to 1279 */
 @media (max-width: 1279px) {
   .links {
-    gap: 22px;
+    gap: 18px;
   }
 }
 

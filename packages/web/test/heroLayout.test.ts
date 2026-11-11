@@ -154,7 +154,7 @@ describe('moonFor', () => {
   it('uses the tablet numbers at 768 by 1024', () => {
     const moon = moonFor(768, 1024, 'tablet');
     expect(moon.x).toBeCloseTo(552.96, 2);
-    expect(moon.y).toBeCloseTo(327.68, 2);
+    expect(moon.y).toBeCloseTo(163.84, 2);
     expect(moon.r).toBeCloseTo(245.76, 2);
   });
 

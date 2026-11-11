@@ -112,7 +112,7 @@ export function moonFor(width: number, height: number, layout: HeroLayout): { x:
     return { x: percent(width, 70), y: percent(height, 37), r: Math.min(percent(width, 27), percent(height, 28)) };
   }
   if (layout === 'tablet') {
-    return { x: percent(width, 72), y: percent(height, 32), r: Math.min(percent(width, 36), percent(height, 24)) };
+    return { x: percent(width, 72), y: percent(height, 16), r: Math.min(percent(width, 36), percent(height, 24)) };
   }
   return { x: percent(width, 80), y: 170, r: percent(width, 60) };
 }

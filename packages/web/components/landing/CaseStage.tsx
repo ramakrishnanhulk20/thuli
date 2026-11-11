@@ -300,7 +300,7 @@ export function CaseStage({ data }: { data: CaseFileData }) {
                   )}
                   {n === 5 ? (
                     <div className={`${styles.linkRow} ${styles.stepLink}`}>
-                      <Link href={`/replay?family=${data.group}`} prefetch={false} className={styles.link}>
+                      <Link href={`/replay?family=${data.group}`} className={styles.link}>
                         <span className={styles.linkLabel}>Open this family in the replay</span>
                         <svg className={styles.linkArrow} width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
                           <path d="M1 6h9M6.5 2.5L10 6l-3.5 3.5" fill="none" stroke="currentColor" strokeWidth="1.5" />

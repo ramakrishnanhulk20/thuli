@@ -191,13 +191,25 @@ describe('filing an API answer', () => {
     expect(classifyApiAnswer(413, { error: 'the body is too large' }, [413, 400], 3).answer).toBe('413 the body is too large');
   });
 
+  it("a 429 is the route refusing this caller, for any attack, with the limit's own words", () => {
+    for (const expected of [[400], [402], [402, 400], [413, 400]]) {
+      expect(classifyApiAnswer(429, { busy: true }, expected, 21)).toEqual({
+        status: 'refused',
+        answer: "429 this caller's limit was reached",
+        note: null,
+        ms: 21,
+        target: 'site',
+      });
+    }
+  });
+
   it('a 2xx answer means the request went through', () => {
     expect(classifyApiAnswer(200, { decision: {} }, [402], 5)).toMatchObject({ status: 'not-refused', answer: '200' });
   });
 
   it('any other status is not the answer the attack is about, so it did not run', () => {
     expect(classifyApiAnswer(500, { error: 'internal error' }, [402], 5).status).toBe('could-not-run');
-    expect(classifyApiAnswer(429, { busy: true }, [402], 5).status).toBe('could-not-run');
+    expect(classifyApiAnswer(404, {}, [402], 5).status).toBe('could-not-run');
   });
 
   it('reads the error text, a true key, or a plain status word', () => {

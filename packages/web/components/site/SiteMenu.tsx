@@ -85,7 +85,6 @@ export function SiteMenu({ links }: { links: NavLink[] }) {
               <Link
                 key={link.href}
                 href={link.href}
-                prefetch={false}
                 className={styles.sheetLink}
                 style={{ '--i': index } as CSSProperties}
                 onClick={() => setOpen(false)}

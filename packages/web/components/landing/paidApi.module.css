@@ -1,0 +1,273 @@
+/* The shared frame, taken from the landing styles without copying them. */
+.section {
+  composes: section from './landing.module.css';
+}
+
+.inner {
+  composes: inner from './landing.module.css';
+}
+
+.label {
+  composes: label from './landing.module.css';
+}
+
+.labelMark {
+  composes: labelMark from './landing.module.css';
+}
+
+.heading {
+  composes: heading from './landing.module.css';
+}
+
+.body {
+  composes: body from './landing.module.css';
+}
+
+.reveal {
+  composes: reveal from './landing.module.css';
+}
+
+.link {
+  composes: link from './landing.module.css';
+}
+
+.linkLabel {
+  composes: linkLabel from './landing.module.css';
+}
+
+.linkArrow {
+  composes: linkArrow from './landing.module.css';
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 56px;
+}
+
+/* The three steps */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  margin-top: 48px;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: start;
+}
+
+.stepNumber {
+  padding-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.stepTitle {
+  font-family: var(--font-display);
+  font-variation-settings: 'wght' 600;
+  font-weight: 600;
+  font-size: 22px;
+  line-height: 1.2;
+  color: var(--color-ink);
+}
+
+.stepLine {
+  max-width: 46ch;
+  margin-top: 6px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.price {
+  max-width: 52ch;
+  margin-top: 36px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-ink-3);
+}
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 32px;
+  margin-top: 24px;
+}
+
+.lastLine {
+  max-width: 52ch;
+  margin-top: 24px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* The receipt: a ticket stub with holes punched along its top edge */
+.receipt {
+  position: relative;
+  align-self: start;
+  padding: 24px 26px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-night-2);
+}
+
+.stub {
+  position: absolute;
+  top: -5px;
+  left: 26px;
+  right: 26px;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+}
+
+.punch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-night);
+}
+
+.receiptRow + .receiptRow {
+  margin-top: 18px;
+}
+
+.rowName {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-ink-3);
+}
+
+.rowDate {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-ink-2);
+}
+
+.rowWallet,
+.rowPaid {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.decision {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 6px;
+}
+
+.full {
+  --tone: var(--color-full);
+}
+
+.partial {
+  --tone: var(--color-partial);
+}
+
+.hold {
+  --tone: var(--color-hold);
+}
+
+.exclude {
+  --tone: var(--color-exclude);
+}
+
+.outcome {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.1;
+  color: var(--tone);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--color-ink);
+}
+
+.reason {
+  display: -webkit-box;
+  margin-top: 6px;
+  overflow: hidden;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.settlement {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--color-ink);
+}
+
+.settlementLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.settlementLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.settlement:hover .settlementLabel::after {
+  transform: scaleX(1);
+}
+
+@media (min-width: 1024px) {
+  .layout {
+    grid-template-columns: minmax(0, 52fr) minmax(0, 48fr);
+    gap: 64px;
+  }
+}
+
+@media (max-width: 767px) {
+  .links {
+    gap: 4px 32px;
+  }
+
+  .settlement {
+    min-height: 44px;
+  }
+}

@@ -67,7 +67,7 @@ export function Hero() {
           </span>
         </h1>
         <div className={styles.cta}>
-          <Link href="/replay" prefetch={false} className={styles.primary}>
+          <Link href="/replay" className={styles.primary}>
             <svg className={styles.play} width="10" height="12" viewBox="0 0 10 12" aria-hidden="true">
               <path d="M0 0L10 6L0 12Z" fill="currentColor" />
             </svg>

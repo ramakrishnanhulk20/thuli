@@ -238,10 +238,13 @@ export function answerText(status: number, body: unknown): string {
 }
 
 /**
- * Files an HTTP answer: a status the attack expected is the route refusing; any 2xx means the request went through;
- * every other status means the route did not give the answer the attack is about, so it did not run.
+ * Files an HTTP answer: a status the attack expected, or a 429 for this caller's limit, is the route refusing; any 2xx
+ * means the request went through; every other status means the route did not give the answer the attack is about, so
+ * it did not run.
  */
 export function classifyApiAnswer(status: number, body: unknown, refusedStatuses: readonly number[], ms: number): AttackResult {
+  // A route that has reached its limit for this caller is refusing the request too, whichever attack it was.
+  if (status === 429) return { status: 'refused', answer: "429 this caller's limit was reached", note: null, ms, target: 'site' };
   if (refusedStatuses.includes(status)) {
     return { status: 'refused', answer: `${status} ${answerText(status, body)}`, note: null, ms, target: 'site' };
   }
