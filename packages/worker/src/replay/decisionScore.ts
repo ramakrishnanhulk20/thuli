@@ -195,8 +195,13 @@ function roboText(decimal: string): string {
   return `${BigInt(whole).toLocaleString('en-US')}.${fraction[0] ?? '0'} ROBO`;
 }
 
+/** Whole dollars at the claim-day value for ROBO given as decimal text, the figure the scorecard prints. */
+export function wholeDollars(roboDecimal: string): number {
+  return Math.round(Number(roboDecimal) * USD_PER_ROBO_AT_CLAIM);
+}
+
 function dollars(roboDecimal: string): string {
-  return `$${Math.round(Number(roboDecimal) * USD_PER_ROBO_AT_CLAIM).toLocaleString('en-US')}`;
+  return `$${wholeDollars(roboDecimal).toLocaleString('en-US')}`;
 }
 
 function total(counts: Record<Outcome, number>): number {
