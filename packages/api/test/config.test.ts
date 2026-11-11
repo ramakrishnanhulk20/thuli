@@ -178,6 +178,38 @@ describe('loadApiConfig', () => {
     }
   });
 
+  describe('the database address, when a host sets both a pooled and a direct one', () => {
+    const pooled = 'postgres://thuli:hunter2-pooled@db-pooler.internal.example/thuli';
+    const direct = 'postgres://thuli:hunter2-direct@db.internal.example/thuli';
+
+    it('uses DATABASE_URL_UNPOOLED when it is set, alone or beside DATABASE_URL, and prints neither', () => {
+      const both = loadApiConfig(testnet({ DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: direct }));
+      expect(both.databaseUrl).toBe(direct);
+      expect(loadApiConfig(testnet({ DATABASE_URL_UNPOOLED: direct })).databaseUrl).toBe(direct);
+      for (const printed of [JSON.stringify(both), inspect(both, { depth: 5 }), Object.keys(both).join()]) {
+        expect(printed).not.toContain('hunter2');
+      }
+    });
+
+    it('still reads DATABASE_URL alone', () => {
+      expect(loadApiConfig(testnet({ DATABASE_URL: pooled })).databaseUrl).toBe(pooled);
+    });
+
+    it('falls back to DATABASE_URL when DATABASE_URL_UNPOOLED is empty or blank', () => {
+      expect(loadApiConfig(testnet({ DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: '' })).databaseUrl).toBe(pooled);
+      expect(loadApiConfig(testnet({ DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: '   ' })).databaseUrl).toBe(pooled);
+    });
+
+    it('refuses a malformed DATABASE_URL_UNPOOLED rather than quietly using DATABASE_URL, naming it and printing neither', () => {
+      for (const bad of ['mysql://thuli:hunter2-direct@db.internal.example/thuli', 'postgres://thuli:hunter2-direct@/thuli']) {
+        const error = configError(testnet({ DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: bad }));
+        expect(error.message, bad).toContain('DATABASE_URL_UNPOOLED');
+        expect(error.message, bad).not.toContain('hunter2');
+        expect(error.message, bad).not.toContain('internal.example');
+      }
+    });
+  });
+
   it('still refuses to start for a private key when a DATABASE_URL is set, and names neither value (C39, C40)', () => {
     const error = configError(testnet({ DATABASE_URL: 'postgres://thuli:hunter2-db-secret@db.internal.example/thuli', WORKER_PRIVATE_KEY: WORKER_KEY }));
     expect(error.message).toContain('WORKER_PRIVATE_KEY');

@@ -152,9 +152,12 @@ function publicOrigin(env: Env, isRequired: boolean): string | null {
 // The scheme test is the one the store's own connector applies, and the parts it decodes must decode here too, so a URL
 // this accepts is one the store can read. The message never holds the value, which carries the password (C40).
 function databaseUrl(env: Env): string | null {
-  const value = read(env, 'DATABASE_URL');
+  // A pooled address refuses the statement timeout the store sets at connect and the session lock it takes to migrate,
+  // so a host's direct address, when it supplies one, wins; a bad one is refused, never swapped for the pooled one.
+  const name = read(env, 'DATABASE_URL_UNPOOLED') === undefined ? 'DATABASE_URL' : 'DATABASE_URL_UNPOOLED';
+  const value = read(env, name);
   if (value === undefined) return null;
-  const refusal = new ConfigError('DATABASE_URL must be a postgres:// or postgresql:// URL that names a host. Leave it empty to keep payments in memory.');
+  const refusal = new ConfigError(`${name} must be a postgres:// or postgresql:// URL that names a host. Leave it empty to keep payments in memory.`);
   if (!/^postgres(ql)?:\/\//.test(value) || !URL.canParse(value)) throw refusal;
   const url = new URL(value);
   if (url.hostname === '') throw refusal;
@@ -179,7 +182,8 @@ function port(env: Env): number {
  * Reads and checks the paid API's settings. X402_NETWORK has no default, so testnet payments are off unless chosen.
  * Base needs PAYTO_ADDRESS, the CDP keys, PUBLIC_ORIGIN and BASE_RPC_URL; Base Sepolia needs PAYTO_ADDRESS_TESTNET,
  * may name a FACILITATOR_URL and a PUBLIC_ORIGIN, and reads its receipts from the public Sepolia RPC.
- * TRUSTED_CLIENT_HEADER and DATABASE_URL are optional on both.
+ * TRUSTED_CLIENT_HEADER and DATABASE_URL are optional on both; DATABASE_URL_UNPOOLED, when set, is used instead of
+ * DATABASE_URL.
  *
  * Refuses to start while any variable named like a private key is set, because a key held by an internet-facing server
  * is a key an attacker can reach (C39). This runs first, before any other setting is read.
