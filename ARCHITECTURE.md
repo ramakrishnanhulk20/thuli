@@ -714,22 +714,133 @@ no model is called. `summary.json` names that version in `run.rulebook`. No file
 Sections 1 to 3 draw the whole system. On 11 Nov 2026 the code does not have the parts below; each was checked by
 searching the code.
 
-- Postgres for campaigns, appeals and jobs. `packages/store` exists (Postgres through `pg`, with tables for payment
-  claims, leases, rate events, day counts and the check cache), and the paid and free routes use it when
-  `DATABASE_URL` is set, while campaigns, appeals and jobs have no tables yet.
-- The web app's own routes for sign-in, campaigns, appeals and publishing. The site already serves `/api/x402/*` and
-  `/api/check*` through `packages/web/lib/server/thuliApi.ts` (4.4), and has no route handler for anything else.
-- The job queue. Nothing queues or takes jobs: the paid route screens inside the request, and the replays run as
-  scripts.
+- Postgres for appeals and general jobs. `packages/store` (Postgres through `pg`) has tables for payment claims,
+  leases, rate events, day counts, the check cache, and the live campaign's terms, asks, list versions and claim
+  relays (4.9). The paid, free and campaign routes use it, shared by every server copy when `DATABASE_URL` is set.
+  Appeals and general jobs have no tables yet.
+- The web app's own routes for sign-in, owner campaign management, appeals and publishing. The site serves
+  `/api/x402/*`, `/api/check*` and the public campaign routes `/api/campaigns/*` (4.9) through
+  `packages/web/lib/server/thuliApi.ts`; its only other route handler is the docs search at `/api/search`. No route
+  creates a campaign.
+- A general job queue. Only campaign asks and claim relays are queued, each in its own table (4.9); the paid route
+  screens inside the request, and the replays run as scripts.
 - Paid data through Kite Passport, and the Nansen and Allium lookups behind it. No code calls Kite, Nansen or Allium.
 - Dolphin summaries. There is no Dolphin client.
 - A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
   one machine.
 - Base mainnet contracts. Only the Base Sepolia record exists (4.1).
-- Serving claim tickets. A decision's share becomes a leaf amount through `shareOf` in `packages/core/src/money.ts`,
-  and `buildClaimList` and `claimTicket` in `packages/worker/src/vault/claimList.ts` build the list and one wallet's
-  ticket, but no route serves a wallet its claim ticket and no service posts lists.
 - Half-built: the root signer. `postRoot` in `packages/worker/src/vault/root.ts` runs every check before it posts, but
   only the vault proof script calls it. No service takes a published list and posts its root.
 - Half-built: appeals. The checks, the record, the store and the advice exist; the public route, owner sign-in and
   rate limit do not (4.6).
+
+### 4.9 Campaign routes
+
+One open campaign, public from the start, where any wallet may ask for a reward. A wallet signs an ask, the worker
+screens it later, an approved wallet takes one of the campaign's paid slots, and once its list is active on the vault
+the wallet can read its claim ticket. The routes are `registerCampaignRoutes` in `packages/api/src/campaigns.ts`,
+served by the site at `/api/campaigns/*`. Nothing is screened inside a request.
+
+Rules every route keeps:
+
+- The campaign is looked up before anything else in the request is read, so an unknown id always answers 404
+  `{"error": "no such campaign"}`, whatever the path, body or query hold.
+- A database that cannot be reached answers 503 `{"busy": true}`, and nothing is written.
+- Every answer passes a strict shape in `packages/api/src/schema.ts` before it leaves and carries
+  `cache-control: no-store`. No answer holds a signature, a lease, an attempt count or a caller's address.
+- Amounts are base units as decimal text. Times are ISO 8601. Show every `reason` as text only.
+
+| Route | Answer |
+| --- | --- |
+| `GET /api/campaigns/:id` | 200 with the campaign below |
+| `GET /api/campaigns/:id/board?before=<ISO time>` | 200 `{"asks": [...]}`: up to 50 decided or failed asks, newest decision first, decided strictly before `before` when it is given; 400 for a time that is not ISO 8601 |
+| `POST /api/campaigns/:id/asks` | the ask answers below |
+| `GET /api/campaigns/:id/asks/:wallet` | 200 `{"ask": ..., "ticket": ...}`, with `ticket` only for a wallet on the active list; 400 `{"error": "the wallet is not a valid address"}`; 404 `{"error": "no ask from this wallet"}` |
+| `GET /api/campaigns/:id/lists/:version` | 200 with the list's published text exactly as stored, as `application/json`, so anyone can rebuild its root; 404 `{"error": "no such list version"}` |
+
+The campaign:
+
+| Field | Type |
+| --- | --- |
+| `name` | plain text, 1 to 80 characters |
+| `chain` | the vault's chain id, 84532 for Base Sepolia |
+| `vault`, `token` | checksummed addresses |
+| `rewardPerWallet`, `perWalletCap` | decimal text, base units |
+| `maxSlots` | how many wallets can be paid, 1 to 100,000 |
+| `status` | `"open"` or `"closed"` |
+| `opensAt`, `closesAt` | ISO 8601; asks are taken from `opensAt` up to, not including, `closesAt` |
+| `counts` | `asked`, `queued` (screening included), `decided` (failed included), `held` (failed included), `slotsTaken`, `slotsLeft` |
+| `lists` | one entry per list version, oldest first: `version`, `root`, `status` (`built`, `posted`, `active`, `superseded` or `cancelled`), `postTx` and `claimableAt` (Unix seconds), both null until posted |
+
+One ask, as `ask` in the answers above and as each entry of the board:
+
+| Field | Type |
+| --- | --- |
+| `campaignId`, `wallet` | the campaign id and the checksummed wallet |
+| `askedAt` | ISO 8601 |
+| `status` | `"queued"`, `"screening"`, `"decided"` or `"failed"` |
+| `action`, `shareBps`, `rule`, `reason`, `citedTxs`, `notChecked`, `decidedAt` | the decision as in the paid reply (4.4), null until the ask is decided or failed |
+| `facts` | the public chain facts the decision rested on, null unless decided: `ageDays`, `txCount`, `accountType`, `funder` (`address`, `kind`, `fanout`, `hops`, or null), `burstWallets`, `groupSize`, `missing` |
+| `servRequestId` | SERV's run id or null |
+| `slot` | the wallet's paid slot, 1 up to `maxSlots`, or null |
+
+A failed ask is one whose screening could not finish after its attempts: it reads action `hold`, rule `A1` and the
+reason "Held for review: the screening could not finish." Held and excluded wallets never take a slot, and slots go
+in the order asks are decided.
+
+The ticket, built by `claimTicket` from the active version's published text and refused unless it rebuilds that
+version's recorded root:
+
+| Field | Type |
+| --- | --- |
+| `cumulativeAmount` | decimal text, the amount in the wallet's leaf |
+| `proof` | the Merkle proof, `0x` and 64 lowercase hex each |
+| `root` | the active root it proves against |
+| `claimed`, `claimable` | decimal text read from the vault, left out when the vault's chain has no reader or the read fails |
+
+The wallet, or anyone for it, then calls `claim(account, cumulativeAmount, proof)` on the vault (4.2).
+
+Asking. The wallet signs the text `askMessage({ campaignId, wallet, signedAt })` in `packages/core/src/ask.ts` builds,
+four lines, each ending in a newline, as a plain personal message (EIP-191):
+
+```text
+Thuli ask v1
+Campaign: <campaignId>
+Wallet: <checksummed address>
+Signed at: <unix seconds>
+```
+
+The body is exactly `{"wallet": "0x...", "signedAt": <unix seconds>, "signature": "0x..."}`, at most 1 KB. The
+campaign comes from the path, never the body. A caller is its IP address, read exactly as on the paid route. The
+answers, in the order the route checks for them:
+
+| Status | Body | When |
+| --- | --- | --- |
+| 404 | `{"error": "no such campaign"}` | no campaign has this id |
+| 400 | `{"error": "the client address could not be read"}` | the caller's IP address is unknown |
+| 429 | `{"busy": true}` | more than 20 requests from this caller in 60 seconds, counted before any chain read |
+| 413 | `{"error": "the body is too large"}` | the body is over 1 KB |
+| 400 | `{"error": "..."}` | the body is not JSON, or not exactly the three fields |
+| 400 | `{"error": "<cause>"}` | the ask failed its check, with one of the causes below |
+| 429 | `{"busy": true}` | more than 5 asks that passed the check from this caller in an hour |
+| 202 | `{"queued": true}` | the ask is stored and waits for screening |
+| 200 | `{"exists": true, "ask": ...}` | this wallet already asked, in any spelling; the first ask stands unchanged |
+| 409 | `{"closed": true}` | the campaign is closed, or now is outside `opensAt` to `closesAt` |
+| 503 | `{"busy": true}` | the database could not be reached; nothing was written |
+
+The check is `checkAsk` in `packages/core/src/ask.ts`. It stops at the first failure, in this order: "the wallet is
+not a valid address", "the signing time is not a whole number of seconds", "the signature is too old" (signed more
+than 600 seconds ago), "the signature is dated in the future" (more than 60 seconds ahead), "contract wallets cannot
+ask yet", "the wallet type could not be checked", "the signature does not match this ask". A signature made over an
+appeal, or over another campaign's ask, fails the last check.
+
+Readers. The wallet type is read from its code on `ETH_RPC_URL`, by the facts' rule: a delegated EOA (EIP-7702)
+keeps its own key and counts as a wallet. Vault amounts are read on Base Sepolia's public RPC for chain 84532, and for
+Base (8453) on `BASE_RPC_URL` when it is set; a `BASE_RPC_URL` that is set but not https stops the API from mounting.
+A campaign on any other chain gets tickets without `claimed` and `claimable`.
+
+Storage, in `packages/store/src/campaigns.ts` (migration `002_campaigns.sql`): `campaigns` holds the terms, among them
+`settings`, only the screening settings this campaign changes from the defaults, checked by core's `Settings` schema;
+`asks` holds one row per wallet, its signature kept as the proof it asked and returned by no route; `list_versions`
+holds each list exactly as published; `claim_relays` holds the claims the worker submits for wallets, at most 5
+attempts each. Campaigns are created with `createCampaign`, which refuses different terms for an existing id.
