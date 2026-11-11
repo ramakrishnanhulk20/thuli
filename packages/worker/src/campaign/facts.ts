@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, Facts, parseAddress, Settings, type Address, type FunderKind } from '@thuli/core';
+import { DEFAULT_SETTINGS, Facts, parseAddress, Settings, type Address, type FunderKind, type ScreenedChain } from '@thuli/core';
 import type { AskFactsInput, FunderLink } from '@thuli/store';
 
 /**
@@ -157,8 +157,11 @@ export function campaignSettings(campaign: { partialShareBps: number; settings?:
   return Settings.parse({ ...DEFAULT_SETTINGS, ...changed, partialShareBps: campaign.partialShareBps });
 }
 
-/** The public facts decideAsk stores with a decision, in the store's own field names. */
-export function askFactsOf(facts: Facts): AskFactsInput {
+/**
+ * The public facts decideAsk stores with a decision, in the store's own field names, with the chain they were read on.
+ * The campaign screening always names the chain; left out, it is 'ethereum', the only chain read before Base history.
+ */
+export function askFactsOf(facts: Facts, chain: ScreenedChain = 'ethereum'): AskFactsInput {
   const funder = facts.firstFunder;
   return {
     ageDays: facts.walletAgeDays,
@@ -171,5 +174,6 @@ export function askFactsOf(facts: Facts): AskFactsInput {
     burstWallets: facts.fundingBurst?.wallets ?? null,
     groupSize: facts.group?.size ?? null,
     missing: [...facts.missing],
+    chain,
   };
 }

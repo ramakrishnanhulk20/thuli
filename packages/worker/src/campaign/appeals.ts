@@ -11,6 +11,7 @@ import {
   ReppoPayloadError,
   reppoInput,
   ReppoVerdict,
+  SCREENED_CHAINS,
   type Address,
   type GraphRecord,
 } from '@thuli/core';
@@ -552,10 +553,10 @@ export const EXPORT_SUMMARY = 'exported as input for the next rulebook change; t
 
 /**
  * One checked appeal as appeal:export writes it, in its own strict shape: the decision as it was appealed, with the ask's
- * reason, the stored record the check was built from, Reppo's whole verdict and the outcome. There is no field for the
- * appeal's text, its hash, its signature or the owner's note, so none can be written (C34, C40). The record still holds
- * the evidence transaction hashes that reppoInput leaves out of what Reppo sees, so these lines are private data, kept
- * only in a git-ignored file.
+ * reason, the chain its facts were read on, the stored record the check was built from, Reppo's whole verdict and the
+ * outcome. There is no field for the appeal's text, its hash, its signature or the owner's note, so none can be written
+ * (C34, C40). The record still holds the evidence transaction hashes that reppoInput leaves out of what Reppo sees, so
+ * these lines are private data, kept only in a git-ignored file.
  */
 export const AppealExportLine = z.strictObject({
   campaignId: z.string(),
@@ -563,6 +564,11 @@ export const AppealExportLine = z.strictObject({
   appealedAction: OutcomeSchema,
   appealedRule: z.string(),
   reason: z.string().nullable(),
+  /**
+   * The screened chain, from the ask's facts; null when the ask has none. Left out only by lines exported before the
+   * chain was recorded, so a file holding them is still added to.
+   */
+  chain: z.enum(SCREENED_CHAINS).nullable().optional(),
   record: z.record(z.string(), z.unknown()).nullable(),
   route: z.enum(['ship', 'review', 'block']).nullable(),
   score: ReppoVerdict.shape.score.nullable(),
@@ -596,6 +602,7 @@ async function exportLine(db: Db, appeal: OwnerAppeal): Promise<AppealExportLine
     appealedAction: appeal.appealedAction,
     appealedRule: appeal.appealedRule,
     reason: ask?.reason ?? null,
+    chain: ask?.facts?.chain ?? null,
     record: row?.record ?? null,
     route: appeal.reppoRoute,
     score: appeal.reppoScore,

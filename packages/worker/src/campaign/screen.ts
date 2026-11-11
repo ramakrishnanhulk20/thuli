@@ -9,6 +9,7 @@ import {
   type AccountState,
   type Address,
   type Outcome,
+  type ScreenedChain,
   type Settings,
   type Start,
 } from '@thuli/core';
@@ -29,6 +30,7 @@ import {
 } from '@thuli/store';
 import { decideWallet, OutOfCredit, type DecideDeps, type DecisionRecord } from '../replay/decide.ts';
 import { inSingleScope, MAX_SERV_CALLS_PER_SCREEN, SCREEN_CAUSES, SCREEN_TIME_LIMIT_MS, servBudget } from '../screen/single.ts';
+import { pickChain, type ChainReaders } from './chain.ts';
 import { askFactsOf, campaignFacts, campaignSettings, familyAddressesToCheck } from './facts.ts';
 import { checkpoint, waitNoted, type ChainMemory } from './vault.ts';
 
@@ -88,19 +90,30 @@ export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
   store: 'the decision could not be stored',
   dayBudget: "the day's budget of model screenings is used up",
   dayCounter: "the day's count of model screenings could not be read",
+  chains: "the wallet's history could not be read on both chains",
 });
 
 const SCREEN_LABEL = 'screen';
 
 export interface ScreenDeps {
   db: Db;
-  /** The single-wallet screening's own reader, factsAtFinalizedBlock in production; a stand-in in tests. */
+  /**
+   * The single-wallet screening's own reader on Ethereum, factsAtFinalizedBlock in production; a stand-in in tests. Used
+   * only while Base history is off, with no chains.
+   */
   facts(wallet: Address): Promise<Facts>;
   /**
    * An address's nonce and code on Ethereum at a finalized block, accountStateAtFinalizedBlock in production. The first
-   * funder is classified from it, because the single-wallet reader leaves every funder's kind unknown.
+   * funder is classified from it, because the single-wallet reader leaves every funder's kind unknown. Used only while
+   * Base history is off, with no chains.
    */
   accountState(address: Address): Promise<AccountState>;
+  /**
+   * A reader per screened chain, given only while Base history is on (screenChains, with BLOCKSCOUT_API_KEY set). With
+   * it, each ask is screened on the chain pickChain names, its funder's kind read on that same chain, and facts and
+   * accountState above are never called. Left out, every ask is screened on Ethereum through them, as before.
+   */
+  chains?: ChainReaders;
   /** SERV's two routes and the wait between retries, as decideWallet takes them. */
   serv: DecideDeps;
   now(): Date;
@@ -149,13 +162,14 @@ async function refusedUnless<T>(work: () => Promise<T> | T, cause: string): Prom
 /**
  * The wallet's facts with its first funder's kind read from the chain rather than left unknown: contract by code, an
  * exchange at HIGH_VOLUME_NONCE and above, otherwise a wallet, through core's funderKind, the very predicate the replay
- * classifies a funding root with (C16, standard 2). A funder whose nonce or code cannot be read stops the screening with
- * the facts cause, so the ask is tried again and is never linked or cleared on a guess (C11).
+ * classifies a funding root with (C16, standard 2). `accountState` reads the chain the facts were read on, where the
+ * funding was. A funder whose nonce or code cannot be read stops the screening with the facts cause, so the ask is tried
+ * again and is never linked or cleared on a guess (C11).
  */
-async function withFunderKind(single: Facts, deps: ScreenDeps): Promise<Facts> {
+async function withFunderKind(single: Facts, accountState: ScreenDeps['accountState']): Promise<Facts> {
   const funder = single.firstFunder;
   if (funder === null) return single;
-  const kind = await refusedUnless(async () => funderKind(await deps.accountState(funder.address)), SCREEN_CAUSES.facts);
+  const kind = await refusedUnless(async () => funderKind(await accountState(funder.address)), SCREEN_CAUSES.facts);
   if (kind === 'unknown') throw new ScreenRefused(SCREEN_CAUSES.facts);
   return { ...single, firstFunder: { ...funder, kind } };
 }
@@ -184,16 +198,48 @@ async function decideOnce(
   return record;
 }
 
-/** The reason stored for a wallet decided by code because it was never used. */
+/** The reason stored for a wallet decided by code because it was never used, while Base history is off. */
 export const NEVER_USED_REASON = 'A1: This wallet has never been used on Ethereum, so there is nothing to screen.';
+/** The reason stored for a wallet decided by code because it was never used, while Base history is on. */
+export const NEVER_USED_ON_EITHER_REASON = 'A1: This wallet has never been used on Ethereum or Base, so there is nothing to screen.';
 
 /**
- * True when the wallet's own facts show it was never used on Ethereum: no transaction sent, a plain account with no
- * code, and no first funder in a history that was read, its age known. A failed read leaves the count, the account
- * type or the age unknown, so it is never taken for an empty wallet and goes to the model as before.
+ * True when the wallet's own facts show it was never used on the chain they were read on: no transaction sent, a plain
+ * account with no code, and no first funder in a history that was read, its age known. A failed read leaves the count,
+ * the account type or the age unknown, so it is never taken for an empty wallet and goes to the model as before.
  */
 function neverUsed(single: Facts): boolean {
   return single.txCountAtSnapshot === 0 && single.accountType === 'eoa' && single.firstFunder === null && single.walletAgeDays !== null;
+}
+
+/** The wallet's own facts in single-wallet scope, the chain they were read on and what goes with that chain. */
+interface OwnFacts {
+  chain: ScreenedChain;
+  read: Facts;
+  accountState: ScreenDeps['accountState'];
+  neverUsedReason: string;
+}
+
+/**
+ * The wallet's own facts. With Base history off, read on Ethereum through deps.facts as before. With it on, pickChain
+ * first: the facts are read on the chain it names, at the very block it read that chain at, and the funder's state on
+ * that chain too. When neither chain shows any activity the facts are read on Ethereum, at the picker's Ethereum block,
+ * so the never-used test and the stored facts rest on real reads. A chain that could not be read fails the try with
+ * CAMPAIGN_SCREEN_CAUSES.chains, through the same retry path as unreadable facts, so an ask is never decided from one
+ * chain while the other could not be read (C11).
+ */
+async function ownFacts(wallet: Address, deps: ScreenDeps, signal: AbortSignal | undefined): Promise<OwnFacts> {
+  if (deps.chains === undefined) {
+    const read = await refusedUnless(async () => inSingleScope(Facts.parse(await deps.facts(wallet))), SCREEN_CAUSES.facts);
+    return { chain: 'ethereum', read, accountState: (address) => deps.accountState(address), neverUsedReason: NEVER_USED_REASON };
+  }
+  const picked = await pickChain(wallet, deps.chains, signal);
+  if (picked === 'unknown') throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.chains);
+  const chain = picked.chain ?? 'ethereum';
+  const reader = deps.chains[chain];
+  const read = await refusedUnless(async () => inSingleScope(Facts.parse(await reader.facts(wallet, picked.blocks[chain]))), SCREEN_CAUSES.facts);
+  // Called through the reader, never handed on loose, so a reader written as a class keeps its own state.
+  return { chain, read, accountState: (address) => reader.accountState(address), neverUsedReason: NEVER_USED_ON_EITHER_REASON };
 }
 
 /** A decision for decideAsk, and whether it is the code-written hold the output checks put in place of a refused answer. */
@@ -207,8 +253,8 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps, 
   if (campaign === null) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.noCampaign);
   if (campaign.rulebook !== CURRENT_RULEBOOK) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.rulebook);
   const settings = await refusedUnless(() => campaignSettings(campaign), CAMPAIGN_SCREEN_CAUSES.settings);
-  const read = await refusedUnless(async () => inSingleScope(Facts.parse(await deps.facts(taken.wallet))), SCREEN_CAUSES.facts);
-  const single = await withFunderKind(read, deps);
+  const own = await ownFacts(taken.wallet, deps, signal);
+  const single = await withFunderKind(own.read, own.accountState);
   const links = await refusedUnless(async () => {
     const all = await funderLinks(deps.db, taken.campaignId);
     return all.filter((link) => parseAddress(link.wallet) !== taken.wallet);
@@ -234,10 +280,10 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps, 
       action: 'hold',
       shareBps: 0,
       rule: 'A1',
-      reason: NEVER_USED_REASON,
+      reason: own.neverUsedReason,
       citedTxs: [],
       notChecked,
-      facts: askFactsOf(facts),
+      facts: askFactsOf(facts, own.chain),
       servRequestId: null,
       record,
     };
@@ -265,7 +311,7 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps, 
     // Lowercased again here, whatever the checks already did, because the store compares hashes as text (C13).
     citedTxs: decided.citedTxs.map((hash) => hash.toLowerCase()),
     notChecked,
-    facts: askFactsOf(facts),
+    facts: askFactsOf(facts, own.chain),
     servRequestId: decided.requestId,
     record,
   };
@@ -325,22 +371,24 @@ async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal:
 /**
  * Screens the oldest waiting ask of any campaign, through the same path as every other screening (C12): the wallet's
  * own facts from the single-wallet reader taken into single-wallet scope, linked to the campaign's other asks by
- * campaignFacts, the code's start and ceiling, then SERV and the output checks in decideWallet. A wallet whose own facts
- * show it was never used, and whose start and ceiling are both hold under A1, is decided by code with NEVER_USED_REASON
- * and no SERV call, on its first try. Every other screening first takes one count of CAMPAIGN_SCREENINGS_DAY_MAX; when
- * the day is used up the ask is given back, its try handed back, until just after the next UTC midnight, and when the
- * count cannot be read it is given back like any failed try. The decision is stored by decideAsk, which gives an
- * approved ask the next slot while slots are left (C44), with every cited hash lowercase (C13), the public facts it
- * rested on, and, privately, the flat record the model was given or would have been (C40).
+ * campaignFacts, the code's start and ceiling, then SERV and the output checks in decideWallet. With Base history on
+ * (deps.chains), the facts are read on one chain only, Ethereum or Base, whichever pickChain finds the wallet active on
+ * first, and the chain they were read on is stored with them. A wallet whose own facts show it was never used, and
+ * whose start and ceiling are both hold under A1, is decided by code with NEVER_USED_REASON, or with Base history on
+ * NEVER_USED_ON_EITHER_REASON, and no SERV call, on its first try. Every other screening first takes one count of
+ * CAMPAIGN_SCREENINGS_DAY_MAX; when the day is used up the ask is given back, its try handed back, until just after the
+ * next UTC midnight, and when the count cannot be read it is given back like any failed try. The decision is stored by
+ * decideAsk, which gives an approved ask the next slot while slots are left (C44), with every cited hash lowercase
+ * (C13), the public facts it rested on, and, privately, the flat record the model was given or would have been (C40).
  *
  * Nothing but a checked answer becomes a decision. A campaign that is missing or names a rulebook other than
- * CURRENT_RULEBOOK, settings that are not valid, facts that cannot be read, no answer from SERV, SERV out of credit, the
- * call cap, the time limit, or a decision the store refuses all give the ask back with releaseAsk: queued again below
- * MAX_ASK_ATTEMPTS, not to be taken before retryDelaySeconds for its attempt has passed, and held for review with rule
- * A1 at it (C11, C41). An answer the checks refuse is a hold with rule A1; on the first REFUSED_ANSWER_TRIES tries of
- * the ask it is given back like a failed try, and from then on it is stored as the hold. No path gives a slot to an ask
- * whose screening failed. The step's signal is checked before every store write, so a step stopped at its limit takes
- * no ask and writes no decision (C41).
+ * CURRENT_RULEBOOK, settings that are not valid, a chain whose history the picker could not settle, facts that cannot
+ * be read, no answer from SERV, SERV out of credit, the call cap, the time limit, or a decision the store refuses all
+ * give the ask back with releaseAsk: queued again below MAX_ASK_ATTEMPTS, not to be taken before retryDelaySeconds for
+ * its attempt has passed, and held for review with rule A1 at it (C11, C41). An answer the checks refuse is a hold with
+ * rule A1; on the first REFUSED_ANSWER_TRIES tries of the ask it is given back like a failed try, and from then on it is
+ * stored as the hold. No path gives a slot to an ask whose screening failed. The step's signal is checked before every
+ * store write, so a step stopped at its limit takes no ask and writes no decision (C41).
  *
  * @returns idle when no ask is waiting; decided with the slot given, if any; released with the fixed cause; dropped
  *   when another worker decided the ask first.

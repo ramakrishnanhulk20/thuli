@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { GRAPH_G1, parseAddress } from '@thuli/core';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
+import { BASE_PUBLIC_RPC_URL, BLOCKSCOUT_BASE_API_DEFAULT, EnvError, loadEnv } from '../src/env.ts';
 
 const KEY = `0x${'5a'.repeat(32)}`;
 const GOOD = {
@@ -73,9 +74,93 @@ describe('loadWorkerConfig without campaign settings', () => {
     };
     const config = loadWorkerConfig(only);
     expect(Object.keys(config).sort()).toEqual(
-      ['blockscoutApi', 'chainRpcUrl', 'databaseUrl', 'ethRpcUrl', 'reppo', 'servApiKey', 'servBaseUrl', 'servGraphId', 'workerKey'].sort(),
+      [
+        'baseRpcUrl',
+        'blockscoutApi',
+        'blockscoutApiKey',
+        'blockscoutBaseApi',
+        'chainRpcUrl',
+        'databaseUrl',
+        'ethRpcUrl',
+        'reppo',
+        'servApiKey',
+        'servBaseUrl',
+        'servGraphId',
+        'workerKey',
+      ].sort(),
     );
     expect(config.reppo).toBeNull();
+  });
+});
+
+describe('loadWorkerConfig and Base history', () => {
+  const SCOUT_KEY = 'proapi_not-a-real-key-0123456789';
+
+  it("leaves Base history off with no key, and takes Base's public endpoint and Blockscout's API on Base when the URLs are unset", () => {
+    for (const unset of [{}, { BASE_RPC_URL: ' ', BLOCKSCOUT_BASE_API: '', BLOCKSCOUT_API_KEY: '  ' }]) {
+      expect(loadWorkerConfig({ ...GOOD, ...unset })).toMatchObject({
+        baseRpcUrl: BASE_PUBLIC_RPC_URL,
+        blockscoutBaseApi: BLOCKSCOUT_BASE_API_DEFAULT,
+        blockscoutApiKey: null,
+      });
+    }
+    expect(BASE_PUBLIC_RPC_URL).toBe('https://mainnet.base.org');
+    expect(BLOCKSCOUT_BASE_API_DEFAULT).toBe('https://api.blockscout.com/8453/api/v2');
+  });
+
+  it('reads the key and the two URLs when set, trimming a trailing slash', () => {
+    const config = loadWorkerConfig({
+      ...GOOD,
+      BASE_RPC_URL: 'https://base.example.com/rpc/',
+      BLOCKSCOUT_BASE_API: 'https://scout.example.com/8453/api/v2/',
+      BLOCKSCOUT_API_KEY: ` ${SCOUT_KEY} `,
+    });
+    expect(config).toMatchObject({
+      baseRpcUrl: 'https://base.example.com/rpc',
+      blockscoutBaseApi: 'https://scout.example.com/8453/api/v2',
+      blockscoutApiKey: SCOUT_KEY,
+    });
+  });
+
+  it('refuses a URL that is not https and a key with a space or under 8 characters, in both validators, never repeating a value', () => {
+    const bad = { BASE_RPC_URL: 'http://mainnet.base.org', BLOCKSCOUT_BASE_API: 'ftp://scout.example.com', BLOCKSCOUT_API_KEY: `${SCOUT_KEY} x` };
+    let message = '';
+    try {
+      loadWorkerConfig({ ...GOOD, ...bad });
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkerConfigError);
+      message = (error as Error).message;
+    }
+    for (const name of Object.keys(bad)) expect(message).toContain(`${name} is not valid`);
+    for (const value of Object.values(bad)) expect(message).not.toContain(value);
+    expect(message).not.toContain(SCOUT_KEY);
+    expect(() => loadWorkerConfig({ ...GOOD, BLOCKSCOUT_API_KEY: 'short' })).toThrow('BLOCKSCOUT_API_KEY is not valid');
+
+    const env = { SERV_API_KEY: 'k', SERV_BASE_URL: GOOD.SERV_BASE_URL, ETH_RPC_URL: GOOD.ETH_RPC_URL, BLOCKSCOUT_ETH_API: GOOD.BLOCKSCOUT_ETH_API };
+    const defaults = loadEnv(env);
+    expect(defaults).toMatchObject({ BASE_RPC_URL: BASE_PUBLIC_RPC_URL, BLOCKSCOUT_BASE_API: BLOCKSCOUT_BASE_API_DEFAULT });
+    expect(defaults.BLOCKSCOUT_API_KEY).toBeUndefined();
+    for (const [name, value] of Object.entries({ ...bad, BLOCKSCOUT_API_KEY: 'short' })) {
+      let envMessage = '';
+      try {
+        loadEnv({ ...env, [name]: value });
+      } catch (error) {
+        expect(error).toBeInstanceOf(EnvError);
+        envMessage = (error as Error).message;
+      }
+      expect(envMessage).toContain(name);
+      expect(envMessage).not.toContain(value);
+    }
+    expect(loadEnv({ ...env, BLOCKSCOUT_API_KEY: SCOUT_KEY }).BLOCKSCOUT_API_KEY).toBe(SCOUT_KEY);
+  });
+
+  it('blanks the Blockscout key and the Base URLs from every log line', () => {
+    const clean = scrubber(
+      secretsOf(loadWorkerConfig({ ...GOOD, BASE_RPC_URL: 'https://base.example.com/rpc-key-654321', BLOCKSCOUT_API_KEY: SCOUT_KEY })),
+    );
+    const cleaned = clean(`failed: Bearer ${SCOUT_KEY} at https://base.example.com/rpc-key-654321`);
+    expect(cleaned).not.toContain(SCOUT_KEY);
+    expect(cleaned).not.toContain('rpc-key-654321');
   });
 });
 

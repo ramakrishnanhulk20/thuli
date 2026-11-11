@@ -9,7 +9,9 @@
 // and BASE_SEPOLIA_RPC_URL from .env, and the factory from packages/contracts/deployments/base-sepolia.json. It serves
 // every open campaign in the store, so starting a campaign needs no change here. The database must be migrated first
 // (npm run db:migrate). REPPO_API_KEY and REPPO_BASE_URL are optional: with them, each appeal gets Reppo's outside
-// check; without them, appeals wait in the queue.
+// check; without them, appeals wait in the queue. BLOCKSCOUT_API_KEY is optional: with it, each ask is screened on
+// Ethereum or Base history, whichever is older, reading BASE_RPC_URL and BLOCKSCOUT_BASE_API, both with defaults;
+// without it, on Ethereum only, as one line at start says.
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
@@ -17,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { connectPostgres, openCampaigns } from '@thuli/store';
 import { reppoForAppeals } from '../src/campaign/appeals.ts';
+import { screenChains } from '../src/campaign/chain.ts';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
 import { runLoop } from '../src/campaign/loop.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
@@ -35,6 +38,7 @@ async function main(): Promise<number> {
   const { values } = parseArgs({ options: { once: { type: 'boolean', default: false } } });
   const config = loadWorkerConfig(process.env);
   clean = scrubber(secretsOf(config));
+  const chains = screenChains(config, log);
   const rulebook = fs.readFileSync(RULEBOOK_FILE, 'utf8');
   if (rulebook.trim() === '') throw new WorkerConfigError('The rulebook is empty, so no screening could follow it.');
   const factory = readFactoryRecord(DEPLOYMENT_FILE).address;
@@ -61,8 +65,9 @@ async function main(): Promise<number> {
     const runs = await runLoop(
       {
         db,
-        facts: factsAtFinalizedBlock({ rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi }),
-        accountState: accountStateAtFinalizedBlock({ rpcUrl: config.ethRpcUrl }),
+        facts: factsAtFinalizedBlock({ rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi }, 'ethereum'),
+        accountState: accountStateAtFinalizedBlock({ rpcUrl: config.ethRpcUrl }, 'ethereum'),
+        ...(chains === undefined ? {} : { chains }),
         serv: {
           viaGraph: (record) => decideViaGraph(record, { ...serv, graphId: config.servGraphId }),
           viaV2: (record) => decideViaV2(record, rulebook, serv),

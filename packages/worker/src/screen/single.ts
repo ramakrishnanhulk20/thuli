@@ -1,5 +1,3 @@
-import { createPublicClient, http } from 'viem';
-import { mainnet } from 'viem/chains';
 import {
   computeCeiling,
   computeStart,
@@ -10,10 +8,11 @@ import {
   type Address,
   type FactName,
   type Outcome,
+  type ScreenedChain,
   type Settings,
   type Start,
 } from '@thuli/core';
-import { collectBasicFacts, REQUEST_TIMEOUT_MS, type FactSources } from '../facts/basic.ts';
+import { chainClient, collectBasicFacts, type FactSources } from '../facts/basic.ts';
 import { DecisionRecord, decideWallet, OutOfCredit, type DecideDeps } from '../replay/decide.ts';
 
 export const SINGLE_SCOPE = 'one wallet on Ethereum, no claim list';
@@ -232,18 +231,18 @@ export async function screenOneWallet(wallet: string, deps: SingleScreenDeps, si
 }
 
 /**
- * Reads one address's nonce and code as of the latest finalized Ethereum block, with the same client, timeout and
- * offchain lookups off as factsAtFinalizedBlock (C38, C41). Empty code comes back as "0x", the raw eth_getCode answer
- * the replay's states hold, so core's funderKind reads both the same way. The single-wallet screening does not call it.
+ * Reads one address's nonce and code as of the chain's latest finalized block, Ethereum unless another screened chain
+ * is named, with the same client, timeout and offchain lookups off as factsAtFinalizedBlock (C38, C41). Empty code comes
+ * back as "0x", the raw eth_getCode answer the replay's states hold, so core's funderKind reads both the same way. The
+ * single-wallet screening does not call it.
  *
  * @throws the client's error when the block, the nonce or the code cannot be read; nothing is guessed.
  */
-export function accountStateAtFinalizedBlock(sources: Pick<FactSources, 'rpcUrl'>): (address: Address) => Promise<AccountState> {
-  const client = createPublicClient({
-    chain: mainnet,
-    transport: http(sources.rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1 }),
-    ccipRead: false,
-  });
+export function accountStateAtFinalizedBlock(
+  sources: Pick<FactSources, 'rpcUrl'>,
+  chain: ScreenedChain = 'ethereum',
+): (address: Address) => Promise<AccountState> {
+  const client = chainClient(chain, sources.rpcUrl);
   return async (address) => {
     const block = await client.getBlock({ blockTag: 'finalized' });
     const [nonce, code] = await Promise.all([
@@ -255,17 +254,14 @@ export function accountStateAtFinalizedBlock(sources: Pick<FactSources, 'rpcUrl'
 }
 
 /**
- * Reads one wallet's free facts as of the latest finalized Ethereum block, so a reorg cannot change what was screened.
- * The block read has the same timeout as every fact read, and offchain lookups are off (C38, C41).
+ * Reads one wallet's free facts as of the chain's latest finalized block, Ethereum unless another screened chain is
+ * named, so a reorg cannot change what was screened. The block read has the same timeout as every fact read, and
+ * offchain lookups are off (C38, C41).
  */
-export function factsAtFinalizedBlock(sources: FactSources): (wallet: Address) => Promise<Facts> {
-  const client = createPublicClient({
-    chain: mainnet,
-    transport: http(sources.rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1 }),
-    ccipRead: false,
-  });
+export function factsAtFinalizedBlock(sources: FactSources, chain: ScreenedChain = 'ethereum'): (wallet: Address) => Promise<Facts> {
+  const client = chainClient(chain, sources.rpcUrl);
   return async (wallet) => {
     const block = await client.getBlock({ blockTag: 'finalized' });
-    return collectBasicFacts(wallet, { chain: 'ethereum', block: Number(block.number) }, sources);
+    return collectBasicFacts(wallet, { chain, block: Number(block.number) }, sources);
   };
 }

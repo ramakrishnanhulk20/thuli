@@ -118,9 +118,9 @@ describe('campaignSettings', () => {
 });
 
 describe('askFactsOf', () => {
-  it('writes the facts in the store field names, with the canonical funder', () => {
+  it('writes the facts in the store field names, with the canonical funder and the chain they were read on', () => {
     const { facts } = campaignFacts(SINGLE, [link(1, FUNDER.toLowerCase())], DEMO);
-    expect(askFactsOf(facts)).toEqual({
+    const written = {
       ageDays: 400,
       txCount: 50,
       accountType: 'eoa',
@@ -128,6 +128,9 @@ describe('askFactsOf', () => {
       burstWallets: null,
       groupSize: 2,
       missing: [],
-    });
+    };
+    expect(askFactsOf(facts, 'base')).toEqual({ ...written, chain: 'base' });
+    expect(askFactsOf(facts, 'ethereum')).toEqual({ ...written, chain: 'ethereum' });
+    expect(askFactsOf(facts)).toEqual({ ...written, chain: 'ethereum' });
   });
 });

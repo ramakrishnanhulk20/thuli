@@ -965,6 +965,7 @@ describe('the appeal export', () => {
       appealedAction: 'hold',
       appealedRule: 'A4',
       reason: ask?.reason,
+      chain: 'ethereum',
       record: checked.record,
       route: 'review',
       score: 78,
@@ -977,6 +978,40 @@ describe('the appeal export', () => {
       outcome: 'reversed',
       newAction: 'full',
     });
+  });
+
+  it('carries the chain the ask was screened on, and still adds to a file whose older lines carry none (l)', async () => {
+    const wallet = privateKeyToAccount(generatePrivateKey()).address;
+    await addAsk(db, { campaignId: CAMPAIGN, wallet, signedAt: Math.floor(clock.getTime() / 1000), signature: SIGNATURE }, clock);
+    expect(await takeAsk(db, clock, 300, 10)).toMatchObject({ wallet });
+    const onBase = {
+      campaignId: CAMPAIGN,
+      wallet,
+      action: 'hold' as const,
+      shareBps: 0,
+      rule: 'A4',
+      reason: 'In a group of 2 linked wallets that share a first funder, so a person should look.',
+      citedTxs: [],
+      notChecked: [],
+      facts: askFactsOf(HELD_FACTS, 'base'),
+      servRequestId: 'run-1',
+      record: toGraphRecord(HELD_FACTS, { outcome: 'hold', rule: 'A4' }) as Record<string, unknown>,
+    };
+    expect(await decideAsk(db, onBase, clock)).not.toBeNull();
+    later(1);
+    await appealed(wallet);
+    expect(await appealNext(appealDeps(new StandInReppo()))).toMatchObject({ kind: 'checked' });
+
+    expect((await exportAppeals(db, CAMPAIGN, file, true)).ok).toBe(true);
+    const [written] = fileLines();
+    expect(AppealExportLine.parse(JSON.parse(written as string))).toMatchObject({ wallet: parseAddress(wallet), chain: 'base' });
+
+    // A line exported before the chain was recorded has no chain key, and the file it sits in is still added to.
+    const { chain: _chain, ...older } = JSON.parse(written as string) as Record<string, unknown>;
+    fs.writeFileSync(file, `${JSON.stringify(older)}\n`);
+    const again = await exportAppeals(db, CAMPAIGN, file, true);
+    expect(again.ok).toBe(true);
+    expect(again.lines).toContain('1 checked appeal, 1 already in the file, 0 to add');
   });
 
   it('skips an evaluation id already in the file, and a dry run writes nothing', async () => {
