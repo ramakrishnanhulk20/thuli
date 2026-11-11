@@ -10,6 +10,14 @@ export const MAX_PAYMENT_CLAIMS = 100_000;
  */
 export const PAID_RESULT_KEEP_SECONDS = 86_400;
 
+/**
+ * Screenings one payment may start, counting the first (C26). A screening that runs out of time stores nothing, so
+ * without a count every redeem could start another, each up to the call cap, until the day's ceiling refused paying
+ * buyers. Two gives a slow SERV one second chance; when the last try cannot finish either, the buyer gets the
+ * time-up hold instead of a third screening (C25).
+ */
+export const REDEEM_SCREEN_TRIES = 2;
+
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
 /** latestSeconds is the route's timeout plus the clock allowance: the furthest validBefore a claim accepts. */
@@ -33,14 +41,16 @@ export interface Settlement {
 /**
  * What redeemPayment found for a key. none: no settled payment within its day, so the header goes the way of any new
  * payment. refused: settled for another wallet, or a row missing what a settlement records. in-use: settled for this
- * wallet, and another live request is screening it now. settled: the caller now screens it. served: the stored
- * result, as it was written.
+ * wallet, and another live request is screening it now. settled: the caller now owns it and starts its screening
+ * number `screening`, already counted. spent: the caller now owns it, every try was used and none stored a result,
+ * so it stores the time-up hold and starts no screening. served: the stored result, as it was written.
  */
 export type Redeemed =
   | { found: 'none' }
   | { found: 'refused' }
   | { found: 'in-use' }
-  | { found: 'settled'; transaction: string }
+  | { found: 'settled'; transaction: string; screening: number }
+  | { found: 'spent'; transaction: string }
   | { found: 'served'; transaction: string; body: unknown };
 
 async function claimCount(tx: Queryable): Promise<number> {
@@ -130,10 +140,11 @@ function ownerTiming({ nowSeconds, ownedUntil }: OwnerTiming): [string, string] 
  * Looks for a payment of key that already went through, for a request that carries its header again (C25). Inside
  * PAID_RESULT_KEEP_SECONDS from the settlement, and only for the wallet the payment was for: a served claim answers
  * with its stored result, and a settled one no other live request owns is taken by owner until ownedUntil, to screen
- * it; while another does own it, the answer is 'in-use'. The wallet is checked first, so another wallet is 'refused'
- * whoever owns the claim. Runs in one transaction under the key's advisory lock, so of two requests started together
- * at most one gets 'settled'. Writes nothing unless it answers 'settled'. A row in any other state, or settled more
- * than a day ago, is 'none'.
+ * it; while another does own it, the answer is 'in-use'. Taking it counts one more screening in the same statement, so
+ * a payment never starts more than REDEEM_SCREEN_TRIES (C26); once they are used, it is taken as 'spent', counting
+ * nothing. The wallet is checked first, so another wallet is 'refused' whoever owns the claim. Runs in one transaction
+ * under the key's advisory lock, so of two requests started together at most one takes it. Writes nothing unless it
+ * answers 'settled' or 'spent'. A row in any other state, or settled more than a day ago, is 'none'.
  * @param wallet compared in its canonical form, the only form markPaymentSettled stores.
  * @throws AddressError from @thuli/core when wallet is not an address. StoreError when ownedUntil is not after
  *   nowSeconds, the owner is empty or too long, or the database refuses.
@@ -151,8 +162,9 @@ export async function redeemPayment(db: Db, key: string, wallet: string, owner: 
       owner: string | null;
       owned_until: string | null;
       result: unknown;
+      screenings: number;
     }>(
-      `SELECT state, wallet, tx, settled_at::text AS settled_at, owner, owned_until::text AS owned_until, result
+      `SELECT state, wallet, tx, settled_at::text AS settled_at, owner, owned_until::text AS owned_until, result, screenings
          FROM payment_claims WHERE key = $1`,
       [key],
     );
@@ -165,18 +177,23 @@ export async function redeemPayment(db: Db, key: string, wallet: string, owner: 
     if (entry.owner !== null && entry.owned_until !== null && BigInt(entry.owned_until) > timing.nowSeconds) {
       return { found: 'in-use' };
     }
+    const spent = entry.screenings >= REDEEM_SCREEN_TRIES;
     await tx.query(
-      'UPDATE payment_claims SET owner = $2, owned_until = $3::bigint, updated_at = to_timestamp($4::bigint) WHERE key = $1',
-      [key, owner, until, now],
+      `UPDATE payment_claims
+          SET owner = $2, owned_until = $3::bigint, updated_at = to_timestamp($4::bigint),
+              screenings = screenings + $5::int, owner_counted = ($5::int = 1)
+        WHERE key = $1`,
+      [key, owner, until, now, spent ? 0 : 1],
     );
-    return { found: 'settled', transaction: entry.tx };
+    return spent ? { found: 'spent', transaction: entry.tx } : { found: 'settled', transaction: entry.tx, screening: entry.screenings + 1 };
   });
 }
 
 /**
  * The settlement for key went through. The claim becomes settled, with the wallet and transaction it paid for and
- * nowSeconds as the second it settled, and stays owned by owner until ownedUntil while that request screens it. Every
- * copy is refused from now on except a redeem of the same wallet. Does nothing unless owner holds the key.
+ * nowSeconds as the second it settled, and stays owned by owner until ownedUntil while that request screens it: its
+ * first screening, counted here (C26). Every copy is refused from now on except a redeem of the same wallet. Does
+ * nothing unless owner holds the key.
  * @throws AddressError when the wallet is not an address. StoreError when the transaction is not 0x and 64 lowercase
  *   hex characters, ownedUntil is not after nowSeconds, or the database refuses.
  */
@@ -185,7 +202,8 @@ export async function markPaymentSettled(db: Db, key: string, owner: string, set
   const [now, until] = ownerTiming(timing);
   await db.query(
     `UPDATE payment_claims
-        SET state = 'settled', wallet = $3, tx = $4, settled_at = $5::bigint, owned_until = $6::bigint, updated_at = to_timestamp($5::bigint)
+        SET state = 'settled', wallet = $3, tx = $4, settled_at = $5::bigint, owned_until = $6::bigint, updated_at = to_timestamp($5::bigint),
+            screenings = 1, owner_counted = true
       WHERE key = $1 AND state = 'held' AND owner = $2`,
     [key, owner, wallet, settlement.transaction, now, until],
   );
@@ -207,7 +225,7 @@ export async function servePayment(db: Db, key: string, owner: string, body: unk
   }
   if (json === undefined || body === null) throw new StoreError('the paid result must be a JSON value other than null');
   await db.query(
-    `UPDATE payment_claims SET state = 'served', result = $3::jsonb, owner = NULL, owned_until = NULL
+    `UPDATE payment_claims SET state = 'served', result = $3::jsonb, owner = NULL, owned_until = NULL, owner_counted = false
       WHERE key = $1 AND state = 'settled' AND owner = $2`,
     [key, owner, json],
   );
@@ -215,12 +233,18 @@ export async function servePayment(db: Db, key: string, owner: string, body: unk
 
 /**
  * The request screening a settled payment ends without a result. The claim stays settled, owned by no request, so the
- * next request with its header screens it at once. Does nothing unless owner owns the settled key.
+ * next request with its header may take it at once. With handBackTry, the owner never started the screening its taking
+ * counted, so that one try is given back; left out, nothing is given back, the safe side when in doubt. Only an owner
+ * whose taking counted a try can hand one back, so an owner that took a spent claim can never reopen it (C26). Does
+ * nothing unless owner owns the settled key.
  */
-export async function leaveSettledPayment(db: Db, key: string, owner: string): Promise<void> {
+export async function leaveSettledPayment(db: Db, key: string, owner: string, handBackTry = false): Promise<void> {
   await db.query(
-    "UPDATE payment_claims SET owner = NULL, owned_until = NULL WHERE key = $1 AND state = 'settled' AND owner = $2",
-    [key, owner],
+    `UPDATE payment_claims
+        SET owner = NULL, owned_until = NULL, owner_counted = false,
+            screenings = screenings - CASE WHEN $3::boolean AND owner_counted THEN 1 ELSE 0 END
+      WHERE key = $1 AND state = 'settled' AND owner = $2`,
+    [key, owner, handBackTry],
   );
 }
 

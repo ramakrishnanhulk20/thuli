@@ -202,6 +202,34 @@ describe('screenOneWallet', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(deps.decide.viaGraph).not.toHaveBeenCalled();
   });
+
+  it('stops when its caller aborts mid-screening: it answers the time-up hold at once and starts no SERV call afterwards', async () => {
+    let fail: () => void = () => undefined;
+    const deps = stubDeps({
+      viaGraph: vi.fn(() => new Promise<ServReply>((_, reject) => (fail = () => reject(unavailable())))),
+    });
+    const controller = new AbortController();
+    const pending = screenOneWallet(WALLET, deps, controller.signal);
+    await vi.waitFor(() => expect(deps.decide.viaGraph).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const screen = await pending;
+    expect(screen.decision).toMatchObject({ action: 'hold', rule: 'A1', cause: SCREEN_CAUSES.timeUp });
+    // The call already in flight then fails as a retryable SERV error would: its retry and the other route are refused.
+    fail();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(deps.decide.viaGraph).toHaveBeenCalledTimes(1);
+    expect(deps.decide.viaV2).not.toHaveBeenCalled();
+    expect(deps.decide.sleep).not.toHaveBeenCalled();
+
+    // A screening whose caller has already given up reads its facts but asks SERV nothing.
+    const early = stubDeps();
+    const aborted = new AbortController();
+    aborted.abort();
+    expect((await screenOneWallet(WALLET, early, aborted.signal)).decision).toMatchObject({ cause: SCREEN_CAUSES.timeUp });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(early.decide.viaGraph).not.toHaveBeenCalled();
+    expect(early.decide.viaV2).not.toHaveBeenCalled();
+  });
 });
 
 describe('servBudget', () => {

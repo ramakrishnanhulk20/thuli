@@ -11,15 +11,23 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { z } from 'zod';
 import { appealMessage, appealTextHash, askMessage, LEAF_TYPES, leafValues, parseAddress, type Address } from '@thuli/core';
 import {
+  addAppeal,
+  addAsk,
   addListVersion,
+  APPEALS_DAY_COUNTER,
+  APPEALS_DAY_MAX,
   createCampaign,
   decideAsk,
   markListActive,
   markListPosted,
   migrate,
   openMemoryDb,
+  recordAppealCheck,
+  settleAppeal,
   StoreError,
+  takeAppeal,
   takeAsk,
+  type AskDecision,
   type CampaignInput,
   type Db,
   type Queryable,
@@ -28,16 +36,26 @@ import { buildClaimList } from '@thuli/worker/src/vault/claimList.ts';
 import { buildRoot, publishList } from '@thuli/worker/src/vault/root.ts';
 import { createApp } from '../src/app.ts';
 import {
+  APPEALS_PER_CALLER_HOUR,
   ASK_CLIENT_MAX_PER_MINUTE,
-  CAMPAIGN_ASKS_DAY_COUNTER,
-  CAMPAIGN_ASKS_DAY_MAX,
   CAMPAIGN_CHAIN_READS_PER_MINUTE,
   CAMPAIGN_READS_PER_MINUTE,
   CAMPAIGNS_PATH,
   type CampaignDeps,
   type VaultReader,
 } from '../src/campaigns.ts';
-import { AskView, BoardPage, BusyBody, CampaignView, ClosedBody, ErrorBody, ExistsBody, FullBody, QueuedBody } from '../src/schema.ts';
+import {
+  AskView,
+  BoardPage,
+  BusyBody,
+  CampaignView,
+  ClosedBody,
+  ErrorBody,
+  ExistsAppealBody,
+  ExistsBody,
+  FullBody,
+  QueuedBody,
+} from '../src/schema.ts';
 import { captureLogs, expectNoDatabaseUrl, noChain, post, screenResult, socketFrom, storeDown, testnetConfig, url } from './support.ts';
 
 /** The campaign routes never take a payment, so this facilitator only answers what the app asks at start. */
@@ -100,6 +118,31 @@ async function signedBy(account: PrivateKeyAccount, options: { campaignId?: stri
   return { wallet: options.wallet ?? account.address, signedAt, signature: await account.signMessage({ message }) };
 }
 
+const APPEAL_TEXT = 'My funder is an exchange; this wallet is mine alone.';
+
+/** Wallet index's appeal, signed over the five-line appeal message for the text sent, as the site signs it. */
+async function signedAppeal(index: number, options: { campaignId?: string; signedAt?: number; text?: string; wallet?: string } = {}) {
+  const account = KEYS[index] as PrivateKeyAccount;
+  const signedAt = options.signedAt ?? NOW_SECONDS;
+  const text = options.text ?? APPEAL_TEXT;
+  const message = appealMessage({ campaignId: options.campaignId ?? CAMPAIGN, wallet: account.address, textHash: appealTextHash(text), signedAt });
+  return { wallet: options.wallet ?? account.address, text, signedAt, signature: await account.signMessage({ message }) };
+}
+
+/** A hold for decideAsk, with the wallet filled in by the test. */
+const HOLD: AskDecision = {
+  campaignId: CAMPAIGN,
+  wallet: '',
+  action: 'hold',
+  shareBps: 0,
+  rule: 'A9',
+  reason: 'Held while the funder is checked.',
+  citedTxs: [],
+  notChecked: [],
+  facts: { ageDays: 400, txCount: 90, accountType: 'eoa', funder: null, burstWallets: null, groupSize: null, missing: [] },
+  servRequestId: null,
+};
+
 interface Reply {
   status: number;
   text: string;
@@ -124,7 +167,7 @@ describe('campaign routes', () => {
     await migrate(db);
   }, 60_000);
   beforeEach(async () => {
-    await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns, rate_events, day_counts');
+    await db.query('TRUNCATE appeals, claim_relays, list_versions, asks, campaigns, rate_events, day_counts');
   });
   afterAll(async () => {
     await db.close();
@@ -152,6 +195,7 @@ describe('campaign routes', () => {
   }
 
   const asks = (id = CAMPAIGN) => `${CAMPAIGNS_PATH}/${id}/asks`;
+  const appeals = (id = CAMPAIGN) => `${CAMPAIGNS_PATH}/${id}/appeals`;
 
   async function rows(sql: 'asks' | 'hour'): Promise<number> {
     const text = {
@@ -372,56 +416,257 @@ describe('campaign routes', () => {
     expect(Object.fromEntries(counted)).toEqual({ 200: CAMPAIGN_READS_PER_MINUTE, 429: 500 - CAMPAIGN_READS_PER_MINUTE });
   });
 
-  it('C24: 300 asks a UTC day across campaigns, then 429 with Retry-After to midnight; exists, closed and full asks use none', async () => {
+  it('C24: the route answers full while 200 asks wait undecided, and queues again once one of them is decided', async () => {
     await createCampaign(db, terms());
-    await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
-    await createCampaign(db, terms({ id: 'one', maxSlots: 1 }));
-    expect(await decided(10, 'full', undefined, 'one')).toEqual({ slot: 1 });
-    const today = async (day = '2026-11-11') => {
-      const [row] = await db.query<{ count: number }>('SELECT count FROM day_counts WHERE name = $1 AND day = $2::date', [
-        CAMPAIGN_ASKS_DAY_COUNTER,
-        day,
-      ]);
-      return row?.count ?? 0;
-    };
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
+       SELECT 'demo', '0x' || lpad(to_hex(n), 40, '0'), 1, $1, $2::timestamptz, 'queued', 0 FROM generate_series(1, 200) AS n`,
+      [`0x${'ab'.repeat(65)}`, new Date(NOW.getTime() - 100_000).toISOString()],
+    );
     const send = campaignApp();
-    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.40')).status).toBe(202);
-    expect(await today()).toBe(1);
-    // Stands in for the asks other campaigns already took today.
-    await db.query('UPDATE day_counts SET count = $1 WHERE name = $2', [CAMPAIGN_ASKS_DAY_MAX - 1, CAMPAIGN_ASKS_DAY_COUNTER]);
-    const answers = [
-      await send(asks(), post(await signedAsk(0)), '198.51.100.41'),
-      await send(asks('shut'), post(await signedAsk(1, { campaignId: 'shut' })), '198.51.100.42'),
-      await send(asks('one'), post(await signedAsk(2, { campaignId: 'one' })), '198.51.100.43'),
-      await send(asks(), post(UNSIGNED), '198.51.100.44'),
-    ];
-    expect(answers.map((reply) => reply.status)).toEqual([200, 409, 409, 400]);
-    expect(answers.slice(1, 3).map((reply) => reply.text)).toEqual(['{"closed":true}', '{"full":true}']);
-    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX - 1);
-    expect((await send(asks(), post(await signedAsk(3)), '198.51.100.45')).status).toBe(202);
-    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX);
-    const refusedToday = await send(asks(), post(await signedAsk(4)), '198.51.100.46');
-    expect([refusedToday.status, refusedToday.text, refusedToday.retryAfter]).toEqual([429, '{"busy":true}', '43200']);
-    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX);
-    expect((await db.query('SELECT wallet FROM asks WHERE wallet = $1', [walletOf(4)])).length).toBe(0);
-
-    // Half a second before midnight Retry-After is the one second left, and the next UTC day starts from zero.
-    const lateAt = new Date('2026-11-11T23:59:59.500Z');
-    const late = await campaignApp({ now: () => lateAt })(
-      asks(),
-      post(await signedAsk(4, { signedAt: Math.floor(lateAt.getTime() / 1000) })),
-      '198.51.100.47',
-    );
-    expect([late.status, late.retryAfter]).toEqual([429, '1']);
-    const nextAt = new Date('2026-11-12T00:00:01.000Z');
-    const next = await campaignApp({ now: () => nextAt })(
-      asks(),
-      post(await signedAsk(4, { signedAt: Math.floor(nextAt.getTime() / 1000) })),
-      '198.51.100.48',
-    );
-    expect(next.status).toBe(202);
-    expect(await today('2026-11-12')).toBe(1);
+    const full = await send(asks(), post(await signedAsk(0)), '198.51.100.60');
+    expect([full.status, full.text]).toEqual([409, '{"full":true}']);
+    const taken = await takeAsk(db, NOW, 60, 3);
+    expect(await decideAsk(db, { ...HOLD, wallet: taken?.wallet as string }, NOW)).toEqual({ slot: null });
+    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.61')).status).toBe(202);
+    expect((await send(asks(), post(await signedAsk(1)), '198.51.100.62')).text).toBe('{"full":true}');
   });
+
+  it('C24: the route answers full at the lifetime cap, and an ask refused as full, exists or closed spends no global count', async () => {
+    await createCampaign(db, terms({ maxSlots: 1 }));
+    await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts, action, share_bps, rule, reason,
+                         cited_txs, not_checked, facts, decided_at)
+       SELECT 'demo', '0x' || lpad(to_hex(n), 40, '0'), 1, $1, $2::timestamptz, 'decided', 1, 'hold', 0, 'A9', 'Held.',
+              '[]', '[]', $3::jsonb, $2::timestamptz
+         FROM generate_series(1, 999) AS n`,
+      [`0x${'ab'.repeat(65)}`, new Date(NOW.getTime() - 100_000).toISOString(), JSON.stringify(HOLD.facts)],
+    );
+    const send = campaignApp();
+    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.63')).status).toBe(202);
+    const answers = [
+      await send(asks(), post(await signedAsk(1)), '198.51.100.64'),
+      await send(asks(), post(await signedAsk(0)), '198.51.100.65'),
+      await send(asks('shut'), post(await signedAsk(2, { campaignId: 'shut' })), '198.51.100.66'),
+    ];
+    expect(answers.map((reply) => reply.status)).toEqual([409, 200, 409]);
+    expect([answers[0]?.text, answers[2]?.text]).toEqual(['{"full":true}', '{"closed":true}']);
+    expect(answers.every((reply) => reply.retryAfter === null)).toBe(true);
+    expect(await db.query('SELECT name, count FROM day_counts')).toEqual([]);
+  });
+
+  it('C42: the minute is counted before the body is read, so the 21st malformed body in a minute is 429', async () => {
+    await createCampaign(db, terms());
+    const send = campaignApp();
+    const statuses: number[] = [];
+    for (let index = 0; index <= ASK_CLIENT_MAX_PER_MINUTE; index += 1) {
+      const body = index % 2 === 0 ? 'not json' : { wallet: 'x' };
+      statuses.push((await send(asks(), post(body), '198.51.100.70')).status);
+    }
+    expect(statuses).toEqual([...Array(ASK_CLIENT_MAX_PER_MINUTE).fill(400), 429]);
+    // The size check still comes first, and counts nothing.
+    expect((await send(asks(), post({ wallet: 'x'.repeat(2_000) }), '198.51.100.71')).status).toBe(413);
+    const [counted] = await db.query<{ n: number }>("SELECT count(*)::int AS n FROM rate_events WHERE client = '198.51.100.71'");
+    expect(counted?.n).toBe(0);
+  });
+
+  it('C34: counts carry the appeals and each ask and board row its appeal, and an outside note with markup leaves as null', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    expect(await decided(1, 'hold')).toEqual({ slot: null });
+    const filed = await signedAppeal(0);
+    expect(await addAppeal(db, { ...filed, campaignId: CAMPAIGN, textHash: appealTextHash(filed.text) }, NOW)).toBe('queued');
+    expect(await takeAppeal(db, NOW, 300, 6)).toMatchObject({ wallet: walletOf(0) });
+    const note = 'The hold rests on a funder count alone.';
+    expect(await recordAppealCheck(db, { campaignId: CAMPAIGN, wallet: walletOf(0) }, { evalId: 'eval_1', route: 'block', note, creditsCharged: 4 }, NOW)).toBe(true);
+    const send = campaignApp();
+    const view = CampaignView.parse(JSON.parse((await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}`)).text));
+    expect(view.counts.appeals).toEqual({ filed: 1, checked: 1, block: 1, reversed: 0 });
+    const appealed = AskView.parse(JSON.parse((await send(`${asks()}/${walletOf(0)}`)).text));
+    expect(appealed.ask.appeal).toEqual({
+      filedAt: NOW.toISOString(),
+      checkStatus: 'checked',
+      reppoRoute: 'block',
+      reppoNote: note,
+      reppoEvalId: 'eval_1',
+      checkedAt: NOW.toISOString(),
+      outcome: 'open',
+      newAction: null,
+      settledAt: null,
+    });
+    expect(AskView.parse(JSON.parse((await send(`${asks()}/${walletOf(1)}`)).text)).ask.appeal).toBeNull();
+    const page = BoardPage.parse(JSON.parse((await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board`)).text));
+    expect(new Map(page.asks.map((ask) => [ask.wallet, ask.appeal?.reppoRoute ?? null]))).toEqual(
+      new Map([
+        [walletOf(0), 'block'],
+        [walletOf(1), null],
+      ]),
+    );
+    // A note from the other service is model text: one that is not plain text never leaves, even if it was stored.
+    await db.query("UPDATE appeals SET reppo_note = '<img src=x onerror=alert(1)>' WHERE wallet = $1", [walletOf(0)]);
+    expect(AskView.parse(JSON.parse((await send(`${asks()}/${walletOf(0)}`)).text)).ask.appeal?.reppoNote).toBeNull();
+  });
+
+  it('the appeals route answers queued, exists, approved, undecided, no ask, no campaign and each refusal, each in its shape', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    expect(await decided(1, 'full')).toEqual({ slot: 1 });
+    expect(await decided(2, 'partial')).toEqual({ slot: 2 });
+    expect(await addAsk(db, { campaignId: CAMPAIGN, wallet: walletOf(3), signedAt: NOW_SECONDS, signature: (await signedAsk(3)).signature }, NOW)).toBe('queued');
+    const send = campaignApp();
+    const at = (n: number) => `198.51.100.${100 + n}`;
+    const queued = await send(appeals(), post(await signedAppeal(0)), at(0));
+    expect([queued.status, queued.text]).toEqual([202, '{"queued":true}']);
+    const again = await send(appeals(), post(await signedAppeal(0, { text: 'A second try.' })), at(1));
+    expect(again.status).toBe(200);
+    expect(ExistsAppealBody.parse(JSON.parse(again.text)).appeal).toMatchObject({ checkStatus: 'queued', outcome: 'open' });
+    const answers: [number, string, Reply][] = [
+      [202, '{"queued":true}', await send(appeals(), post(await signedAppeal(2)), at(2))],
+      [409, '{"approved":true}', await send(appeals(), post(await signedAppeal(1)), at(3))],
+      [409, '{"undecided":true}', await send(appeals(), post(await signedAppeal(3)), at(4))],
+      [404, '{"error":"no ask from this wallet"}', await send(appeals(), post(await signedAppeal(5)), at(5))],
+      [404, NO_CAMPAIGN, await send(appeals('nope'), post(await signedAppeal(0, { campaignId: 'nope' })), at(6))],
+      [400, '{"error":"the signature is too old"}', await send(appeals(), post(await signedAppeal(4, { signedAt: NOW_SECONDS - 601 })), at(7))],
+      [
+        400,
+        '{"error":"the appeal text contained a link, markup or control characters"}',
+        await send(appeals(), post(await signedAppeal(4, { text: 'See https://evil.example' })), at(8)),
+      ],
+      [400, '{"error":"the appeal text is empty"}', await send(appeals(), post(await signedAppeal(4, { text: '   ' })), at(9))],
+      [400, '{"error":"the body must be exactly {\\"wallet\\", \\"text\\", \\"signedAt\\", \\"signature\\"}"}', await send(appeals(), post({ ...(await signedAppeal(4)), extra: 1 }), at(10))],
+      [400, '{"error":"the body must be JSON like {\\"wallet\\": \\"0x...\\", \\"text\\": \\"...\\", \\"signedAt\\": 0, \\"signature\\": \\"0x...\\"}"}', await send(appeals(), post('not json'), at(11))],
+      [413, '{"error":"the body is too large"}', await send(appeals(), post({ ...(await signedAppeal(4)), text: 'x'.repeat(2_100) }), at(12))],
+    ];
+    for (const [status, text, reply] of answers) expect([reply.status, reply.text]).toEqual([status, text]);
+    expect((await db.query('SELECT wallet FROM appeals ORDER BY wallet')).length).toBe(2);
+  });
+
+  it('C24, C42: a caller files two appeals an hour, the day takes 20, and the 21st is 429 with Retry-After to midnight', async () => {
+    await createCampaign(db, terms());
+    for (const n of [0, 1, 2, 3, 4]) expect(await decided(n, 'hold')).toEqual({ slot: null });
+    const send = campaignApp();
+    expect(APPEALS_PER_CALLER_HOUR).toBe(2);
+    const one = '198.51.100.120';
+    expect((await send(appeals(), post(await signedAppeal(0)), one)).status).toBe(202);
+    expect((await send(appeals(), post(await signedAppeal(1)), one)).status).toBe(202);
+    const third = await send(appeals(), post(await signedAppeal(2)), one);
+    expect([third.status, third.text, third.retryAfter]).toEqual([429, '{"busy":true}', null]);
+    expect((await db.query('SELECT wallet FROM appeals WHERE wallet = $1', [walletOf(2)])).length).toBe(0);
+
+    // Stands in for the appeals other campaigns filed today.
+    await db.query('UPDATE day_counts SET count = $1 WHERE name = $2', [APPEALS_DAY_MAX - 1, APPEALS_DAY_COUNTER]);
+    expect((await send(appeals(), post(await signedAppeal(2)), '198.51.100.121')).status).toBe(202);
+    const past = await send(appeals(), post(await signedAppeal(3)), '198.51.100.122');
+    expect([past.status, past.text, past.retryAfter]).toEqual([429, '{"busy":true}', '43200']);
+    expect((await db.query('SELECT wallet FROM appeals WHERE wallet = $1', [walletOf(3)])).length).toBe(0);
+  });
+
+  it('C9: a contract wallet on either chain cannot appeal, an unreadable one is refused, and a bad signature reads no chain', async () => {
+    await createCampaign(db, terms());
+    for (const n of [0, 1, 2, 3]) expect(await decided(n, 'hold')).toEqual({ slot: null });
+    let reads = 0;
+    const counting = (contract: boolean, failing = false) => async () => {
+      reads += 1;
+      if (failing) throw new Error('the code read timed out');
+      return contract;
+    };
+    const reader = (contract: boolean, failing = false): VaultReader => ({ ...NO_CODE, isContract: counting(contract, failing) });
+    const cases: [ReturnType<typeof campaignApp>, string][] = [
+      [campaignApp({ isContract: counting(true), vault: () => reader(false) }), 'contract wallets cannot appeal yet'],
+      [campaignApp({ isContract: counting(false), vault: () => reader(true) }), 'contract wallets cannot appeal yet'],
+      [campaignApp({ isContract: counting(false), vault: () => reader(false, true) }), 'the wallet type could not be checked'],
+    ];
+    for (const [index, [send, cause]] of cases.entries()) {
+      const reply = await send(appeals(), post(await signedAppeal(index)), `198.51.100.${130 + index}`);
+      expect([reply.status, JSON.parse(reply.text)]).toEqual([400, { error: cause }]);
+    }
+    expect(reads).toBe(6);
+    reads = 0;
+    const stranger = await signedAppeal(3, { wallet: walletOf(0) });
+    const send = campaignApp({ isContract: counting(false), vault: () => reader(false) });
+    const forged = await send(appeals(), post(stranger), '198.51.100.140');
+    expect([forged.status, JSON.parse(forged.text)]).toEqual([400, { error: 'the signature does not match this appeal' }]);
+    expect(reads).toBe(0);
+    expect(await db.query('SELECT wallet FROM appeals')).toEqual([]);
+  });
+
+  it('C7, C8: an appeal signature never works as an ask, an ask signature never works as an appeal', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    const send = campaignApp();
+    const appealSigned = await signedAppeal(0);
+    const asAsk = await send(asks(), post({ wallet: appealSigned.wallet, signedAt: appealSigned.signedAt, signature: appealSigned.signature }), '198.51.100.150');
+    expect([asAsk.status, JSON.parse(asAsk.text)]).toEqual([400, { error: 'the signature does not match this ask' }]);
+    const askSigned = await signedAsk(0);
+    const asAppeal = await send(appeals(), post({ ...askSigned, text: APPEAL_TEXT }), '198.51.100.151');
+    expect([asAppeal.status, JSON.parse(asAppeal.text)]).toEqual([400, { error: 'the signature does not match this appeal' }]);
+    // The same signature over other text is refused too: the server hashes the text it was sent (C8).
+    const otherText = await send(appeals(), post({ ...appealSigned, text: 'A different line.' }), '198.51.100.152');
+    expect([otherText.status, JSON.parse(otherText.text)]).toEqual([400, { error: 'the signature does not match this appeal' }]);
+    expect(await db.query('SELECT wallet FROM appeals')).toEqual([]);
+  });
+
+  it('C42: appeals share the asks\' minute, and a limiter or store that cannot be read refuses with 503 and writes nothing', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    const send = campaignApp();
+    for (let index = 0; index < ASK_CLIENT_MAX_PER_MINUTE; index += 1) {
+      expect((await send(asks(), post('not json'), '198.51.100.160')).status).toBe(400);
+    }
+    const shared = await send(appeals(), post(await signedAppeal(0)), '198.51.100.160');
+    expect([shared.status, shared.text]).toEqual([429, '{"busy":true}']);
+
+    const logs = captureLogs();
+    const down: Db = { query: async () => Promise.reject(storeDown()), transaction: async () => Promise.reject(storeDown()), close: async () => undefined };
+    let transactions = 0;
+    const failingAfter = (allowed: number): Db => ({
+      query: (text, params) => db.query(text, params),
+      transaction: async <T>(fn: (tx: Queryable) => Promise<T>) => {
+        transactions += 1;
+        if (transactions > allowed) throw storeDown();
+        return db.transaction(fn);
+      },
+      close: async () => undefined,
+    });
+    const replies = [await campaignApp({ db: down })(appeals(), post(await signedAppeal(0)), '198.51.100.161')];
+    for (const allowed of [0, 1, 2]) {
+      transactions = 0;
+      replies.push(await campaignApp({ db: failingAfter(allowed) })(appeals(), post(await signedAppeal(0)), `198.51.100.${162 + allowed}`));
+    }
+    logs.restore();
+    for (const reply of replies) expect([reply.status, reply.text]).toEqual([503, '{"busy":true}']);
+    expect(await db.query('SELECT wallet FROM appeals')).toEqual([]);
+    expectNoDatabaseUrl(logs.text());
+  });
+
+  it('C40: no answer from any campaign route, and no log line, holds an appeal\'s text, hash, signature or owner note', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    const logs = captureLogs();
+    const send = campaignApp();
+    const filed = await signedAppeal(0, { text: 'Only the owner may read this line.' });
+    expect((await send(appeals(), post(filed), '198.51.100.170')).status).toBe(202);
+    expect(await takeAppeal(db, NOW, 300, 6)).toMatchObject({ wallet: walletOf(0) });
+    expect(await recordAppealCheck(db, { campaignId: CAMPAIGN, wallet: walletOf(0) }, { evalId: 'eval_7', route: 'review', note: 'Worth a second look.', creditsCharged: 2 }, NOW)).toBe(true);
+    const ownerNote = 'Owner note that stays private.';
+    expect(await settleAppeal(db, { campaignId: CAMPAIGN, wallet: walletOf(0), outcome: 'upheld', newAction: null, ownerNote }, NOW)).toEqual({ slot: null });
+    const replies = [
+      await send(appeals(), post(filed), '198.51.100.171'),
+      await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}`),
+      await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board`),
+      await send(`${asks()}/${walletOf(0)}`),
+      await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/lists/1`),
+    ];
+    logs.restore();
+    expect(replies.map((reply) => reply.status)).toEqual([200, 200, 200, 200, 404]);
+    const hidden = [filed.text, appealTextHash(filed.text), filed.signature.slice(2), ownerNote];
+    for (const text of [...replies.map((reply) => reply.text), logs.text()]) {
+      for (const secret of hidden) expect(text).not.toContain(secret);
+    }
+    expect(JSON.parse(replies[0]?.text ?? '{}')).toMatchObject({ exists: true, appeal: { outcome: 'upheld', reppoNote: 'Worth a second look.' } });
+  });
+
 
   it('C42: past 600 chain reads a minute a ticket goes out without claimed and claimable, and amounts are kept 15 seconds', async () => {
     await createCampaign(db, terms());

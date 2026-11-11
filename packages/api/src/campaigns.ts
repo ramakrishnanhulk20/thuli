@@ -6,7 +6,9 @@ import { base, baseSepolia, mainnet } from 'viem/chains';
 import type { z } from 'zod';
 import {
   accountTypeFromCode,
+  checkAppeal,
   checkAsk,
+  isPlainText,
   parseAddress,
   proofFor,
   type Address,
@@ -15,23 +17,28 @@ import {
 } from '@thuli/core';
 import {
   activeList,
+  addAppeal,
   addAsk,
   board,
   counts,
+  getAppeal,
   getAsk,
   getCampaign,
   listText,
   listVersions,
+  MAX_REPPO_NOTE_CHARS,
   recordIfUnder,
   type Campaign,
   type Db,
+  type PublicAppeal,
   type PublicAsk,
 } from '@thuli/store';
 import { VAULT_ABI } from '@thuli/worker/src/vault/abi.ts';
 import { buildRoot, readPublishedList } from '@thuli/worker/src/vault/root.ts';
 import { BASE_SEPOLIA_RPC } from './config.ts';
 import {
-  AskJson,
+  AppealRequest,
+  ApprovedBody,
   AskRequest,
   AskView,
   BoardPage,
@@ -39,24 +46,26 @@ import {
   CampaignView,
   ClosedBody,
   ErrorBody,
+  ExistsAppealBody,
   ExistsBody,
   FullBody,
   QueuedBody,
+  UndecidedBody,
+  type AppealJson,
+  type AskJson,
 } from './schema.ts';
 import { failureCode } from './stores.ts';
 
 export const CAMPAIGNS_PATH = '/api/campaigns';
-/** Requests one caller may send to the ask route in any 60 seconds, counted in a bucket of their own. */
+/** Requests one caller may send to the ask and appeal routes together in any 60 seconds, in a bucket of their own. */
 export const ASK_CLIENT_MAX_PER_MINUTE = 20;
 /** Asks with a valid signature one caller may send in any hour, counted in a bucket of their own. */
 export const ASK_CLIENT_MAX_PER_HOUR = 5;
 /**
- * Asks queued across every campaign in one UTC day, because each costs a screening that no sign-in or payment pays for
- * (C24). Counted only for an ask that is queued.
+ * Appeals with a valid signature one caller may send in any hour, in a bucket of their own. Each queued appeal buys an
+ * outside check, and the store's own day ceiling bounds them all together (C24).
  */
-export const CAMPAIGN_ASKS_DAY_MAX = 300;
-/** The store's day counter the day ceiling counts in, a name of its own. */
-export const CAMPAIGN_ASKS_DAY_COUNTER = 'campaign-asks';
+export const APPEALS_PER_CALLER_HOUR = 2;
 /** Requests one caller may send to the four campaign read routes together in any 60 seconds (C42). */
 export const CAMPAIGN_READS_PER_MINUTE = 120;
 /** Chain reads the read routes may cause in any 60 seconds across every caller and server copy, two per ticket. */
@@ -64,8 +73,10 @@ export const CAMPAIGN_CHAIN_READS_PER_MINUTE = 600;
 /** The most asks one board page holds. */
 export const BOARD_PAGE_SIZE = 50;
 
+// The asks' minute bucket is shared with the appeal route, so a caller cannot double its requests by splitting them.
 const ASK_MINUTE_BUCKET = 'ask-minute';
 const ASK_HOUR_BUCKET = 'ask-hour';
+const APPEAL_HOUR_BUCKET = 'appeal-hour';
 const READ_BUCKET = 'campaign-reads';
 const CHAIN_READ_BUCKET = 'campaign-chain-reads';
 // One shared counter for every caller, because the ceiling protects the RPC, which every caller shares.
@@ -79,6 +90,8 @@ const AMOUNT_CACHE_MS = 15_000;
 const DAY_SECONDS = 86_400;
 // A real ask is about 230 bytes: a wallet, a time and a 132 character signature (C41).
 const MAX_ASK_BODY_BYTES = 1024;
+// An appeal adds one line of text to that, so 2 KB is room for any plain line a person writes and nothing more.
+const MAX_APPEAL_BODY_BYTES = 2048;
 const CHAIN_READ_TIMEOUT_MS = 10_000;
 const MAX_LIST_VERSION = 2_147_483_647;
 
@@ -160,6 +173,26 @@ function askJson(ask: PublicAsk): AskJson {
     servRequestId: ask.servRequestId,
     decidedAt: ask.decidedAt === null ? null : ask.decidedAt.toISOString(),
     slot: ask.slot,
+    appeal: ask.appeal === null ? null : appealJson(ask.appeal),
+  };
+}
+
+/**
+ * The public appeal, field by field. reppoNote is another service's model text, so it leaves only when it passes core's
+ * plain-text rule and fits 280 characters; otherwise it leaves as null rather than failing the answer (C13, C34).
+ */
+function appealJson(appeal: PublicAppeal): AppealJson {
+  const note = appeal.reppoNote;
+  return {
+    filedAt: appeal.filedAt.toISOString(),
+    checkStatus: appeal.checkStatus,
+    reppoRoute: appeal.reppoRoute,
+    reppoNote: note !== null && note.length > 0 && note.length <= MAX_REPPO_NOTE_CHARS && isPlainText(note) ? note : null,
+    reppoEvalId: appeal.reppoEvalId,
+    checkedAt: appeal.checkedAt === null ? null : appeal.checkedAt.toISOString(),
+    outcome: appeal.outcome,
+    newAction: appeal.newAction,
+    settledAt: appeal.settledAt === null ? null : appeal.settledAt.toISOString(),
   };
 }
 
@@ -213,13 +246,22 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  * never changes, so an entry never goes stale. The other holds a wallet's claimed and claimable per chain, vault and
  * leaf amount for 15 seconds, at most 5,000 entries, dropping expired ones first and then the oldest.
  *
- * POST /api/campaigns/:id/asks with exactly {wallet, signedAt, signature}, at most 1 KB. In order: the body (413,
- * 400), the caller's address (400) and its 20 requests a minute (429), checkAsk with the campaign from the path, its
- * signature checked before a wallet type is read on Ethereum and on the campaign's chain (400 with its cause), the
- * caller's 5 signed asks an hour (429), then addAsk, which also counts toward 300 asks a UTC day across every campaign:
- * 202 {"queued": true}; 200 {"exists": true, "ask"} with the first ask's public view; 409 {"closed": true}; 409
- * {"full": true} when the campaign cannot seat another wallet; 429 {"busy": true} with Retry-After set to the seconds
- * until the next UTC day when the day's asks are used. Nothing is screened inside the request.
+ * The two POST routes share one allowance of 20 requests a minute per caller, counted after the body's size check and
+ * before its shape is read, so a malformed body counts too. Nothing is screened or checked by Reppo inside a request.
+ * - POST /api/campaigns/:id/asks with exactly {wallet, signedAt, signature}, at most 1 KB. In order: the size (413),
+ *   the caller's address (400) and the minute (429), the shape (400), checkAsk with the campaign from the path, its
+ *   signature checked before a wallet type is read on Ethereum and on the campaign's chain (400 with its cause), the
+ *   caller's 5 signed asks an hour (429), then addAsk: 202 {"queued": true}; 200 {"exists": true, "ask"} with the first
+ *   ask's public view; 409 {"closed": true}; 409 {"full": true} when no slot is left, 200 asks wait undecided or the
+ *   campaign's lifetime cap is reached.
+ * - POST /api/campaigns/:id/appeals with exactly {wallet, text, signedAt, signature}, at most 2 KB. In order: the size
+ *   (413), the caller and the minute, the shape (400), checkAppeal with the campaign from the path, the signature
+ *   before the same two-chain wallet-type read (400 with its cause), the caller's 2 signed appeals an hour (429), then
+ *   addAppeal, which counts the store's 20 appeals a UTC day: 202 {"queued": true}; 200 {"exists": true, "appeal"} with
+ *   the first appeal's public view; 409 {"undecided": true}; 409 {"approved": true}; 404 {"error": "no ask from this
+ *   wallet"}; 429 {"busy": true} with Retry-After set to the seconds until the next UTC day when the day's appeals are
+ *   used. The text hash is rebuilt from the text, never taken from the caller, and no answer or log line carries the
+ *   text, its hash, the signature or the owner's note (C40).
  *
  * @param clientOf the caller's address as the paid route reads it, or null when it cannot be read.
  */
@@ -314,6 +356,9 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
     bodyLimit({ maxSize: MAX_ASK_BODY_BYTES, onError: (c) => answer(c, ErrorBody, { error: 'the body is too large' }, 413) }),
     async (c) => {
       const campaign = campaignOf(c);
+      const at = now();
+      const client = await countPost(c, at);
+      if (client instanceof Response) return client;
       let body: unknown;
       try {
         body = await c.req.json();
@@ -323,23 +368,6 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       const parsed = AskRequest.safeParse(body);
       if (!parsed.success) return refused(c, 'the body must be exactly {"wallet", "signedAt", "signature"}', 400);
       const { wallet, signedAt, signature } = parsed.data;
-      const client = clientOf(c);
-      if (client === null) {
-        console.warn('api refused: the client address could not be read');
-        return refused(c, 'the client address could not be read', 400);
-      }
-      const at = now();
-      let counted: boolean;
-      try {
-        counted = await recordIfUnder(db, ASK_MINUTE_BUCKET, client, ASK_CLIENT_MAX_PER_MINUTE, 60, at);
-      } catch (error) {
-        storeFailed('counting an ask request', error);
-        return busy(c);
-      }
-      if (!counted) {
-        console.warn('api ask busy: a client is past the minute limit');
-        return busy(c, 429);
-      }
       const checked = await checkAsk(
         { campaignId: campaign.id, wallet, signedAt, signature },
         {
@@ -354,24 +382,73 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
           console.warn('api ask busy: a client is past the hour limit');
           return busy(c, 429);
         }
-        const result = await addAsk(db, { campaignId: campaign.id, wallet: checked.wallet, signedAt, signature }, at, {
-          name: CAMPAIGN_ASKS_DAY_COUNTER,
-          max: CAMPAIGN_ASKS_DAY_MAX,
-        });
+        const result = await addAsk(db, { campaignId: campaign.id, wallet: checked.wallet, signedAt, signature }, at);
         if (result === 'queued') return answer(c, QueuedBody, { queued: true }, 202);
         if (result === 'closed') return answer(c, ClosedBody, { closed: true }, 409);
         if (result === 'full') return answer(c, FullBody, { full: true }, 409);
         if (result === 'unknown') return answer(c, ErrorBody, NO_CAMPAIGN, 404);
-        if (result === 'busy') {
-          console.warn("api ask busy: today's asks across every campaign are used");
-          c.header('Retry-After', String(untilNextUtcDay(at)));
-          return busy(c, 429);
-        }
         const first = await getAsk(db, campaign.id, checked.wallet);
         if (first === null) return busy(c);
         return answer(c, ExistsBody, { exists: true, ask: askJson(first) }, 200);
       } catch (error) {
         storeFailed('adding an ask', error);
+        return busy(c);
+      }
+    },
+  );
+
+  app.post(
+    `${CAMPAIGNS_PATH}/:id/appeals`,
+    findCampaign,
+    bodyLimit({ maxSize: MAX_APPEAL_BODY_BYTES, onError: (c) => answer(c, ErrorBody, { error: 'the body is too large' }, 413) }),
+    async (c) => {
+      const campaign = campaignOf(c);
+      const at = now();
+      const client = await countPost(c, at);
+      if (client instanceof Response) return client;
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        return refused(c, 'the body must be JSON like {"wallet": "0x...", "text": "...", "signedAt": 0, "signature": "0x..."}', 400);
+      }
+      const parsed = AppealRequest.safeParse(body);
+      if (!parsed.success) return refused(c, 'the body must be exactly {"wallet", "text", "signedAt", "signature"}', 400);
+      const { wallet, text, signedAt, signature } = parsed.data;
+      // The hash comes back from checkAppeal, rebuilt from the text it was given, so no caller can name one (C8).
+      const checked = await checkAppeal(
+        { campaignId: campaign.id, wallet, text, signedAt, signature },
+        {
+          expectedCampaignId: campaign.id,
+          now: Math.floor(at.getTime() / 1000),
+          isContract: (address) => contractOnEitherChain(campaign, address),
+        },
+      );
+      if (!checked.ok) return refused(c, checked.cause, 400);
+      try {
+        if (!(await recordIfUnder(db, APPEAL_HOUR_BUCKET, client, APPEALS_PER_CALLER_HOUR, 3_600, at))) {
+          console.warn('api appeal busy: a client is past the hour limit');
+          return busy(c, 429);
+        }
+        const result = await addAppeal(
+          db,
+          { campaignId: campaign.id, wallet: checked.wallet, text, textHash: checked.textHash, signedAt, signature },
+          at,
+        );
+        if (result === 'queued') return answer(c, QueuedBody, { queued: true }, 202);
+        if (result === 'undecided') return answer(c, UndecidedBody, { undecided: true }, 409);
+        if (result === 'approved') return answer(c, ApprovedBody, { approved: true }, 409);
+        if (result === 'unknown') return refused(c, 'no ask from this wallet', 404);
+        if (result === 'busy') {
+          console.warn("api appeal busy: today's appeals across every campaign are used");
+          c.header('Retry-After', String(untilNextUtcDay(at)));
+          return busy(c, 429);
+        }
+        const first = await getAppeal(db, campaign.id, checked.wallet);
+        if (first === null) return busy(c);
+        return answer(c, ExistsAppealBody, { exists: true, appeal: appealJson(first) }, 200);
+      } catch (error) {
+        storeFailed('adding an appeal', error);
         return busy(c);
       }
     },
@@ -442,6 +519,31 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
     readPublishedList(text);
     return c.body(text, 200, { 'content-type': 'application/json' });
   });
+
+  /**
+   * The caller of a POST, counted once toward the minute the ask and appeal routes share, before the body is read so a
+   * malformed body counts too (C42). Returns the caller's address, or the refusal to send: 400 when the address cannot
+   * be read, 429 past the minute, 503 when the count cannot be read.
+   */
+  async function countPost(c: Context, at: Date): Promise<string | Response> {
+    const client = clientOf(c);
+    if (client === null) {
+      console.warn('api refused: the client address could not be read');
+      return refused(c, 'the client address could not be read', 400);
+    }
+    let counted: boolean;
+    try {
+      counted = await recordIfUnder(db, ASK_MINUTE_BUCKET, client, ASK_CLIENT_MAX_PER_MINUTE, 60, at);
+    } catch (error) {
+      storeFailed('counting a campaign request', error);
+      return busy(c);
+    }
+    if (!counted) {
+      console.warn('api campaign busy: a client is past the minute limit');
+      return busy(c, 429);
+    }
+    return client;
+  }
 
   /**
    * Whether address is a contract on Ethereum or on the campaign's own chain, read once when the campaign is on

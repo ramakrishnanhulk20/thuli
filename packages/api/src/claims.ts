@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
-import { PAID_RESULT_KEEP_SECONDS } from '@thuli/store';
+import { PAID_RESULT_KEEP_SECONDS, REDEEM_SCREEN_TRIES } from '@thuli/store';
 import { PRICE_UNITS, type NetworkId } from './config.ts';
 
 /** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
@@ -39,6 +39,10 @@ interface Claim {
   ownedUntil: bigint | null;
   /** A served claim's result as JSON text, kept as the shared store keeps it. */
   result: string | null;
+  /** Screenings started for this payment, counted as each owner takes it (C26). */
+  screenings: number;
+  /** True while the current owner's taking counted a try, the only owner that may hand one back. */
+  ownerCounted: boolean;
 }
 
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
@@ -46,14 +50,17 @@ export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 /**
  * What redeem found for a key, by redeemPayment's rules in @thuli/store. none: no settled payment within its day, so the
  * header goes the way of any new payment. refused: settled for another wallet, or a row missing what a settlement
- * records. in-use: settled for this wallet, and another live request is screening it now. settled: the caller now
- * screens it. served: the stored result, as it was written.
+ * records. in-use: settled for this wallet, and another live request is screening it now. settled: the caller now owns
+ * it and starts its screening number `screening`, already counted. spent: the caller now owns it, every try was used
+ * and none stored a result, so it stores the time-up hold and starts no screening. served: the stored result, as it
+ * was written.
  */
 export type Redeemed =
   | { found: 'none' }
   | { found: 'refused' }
   | { found: 'in-use' }
-  | { found: 'settled'; transaction: string }
+  | { found: 'settled'; transaction: string; screening: number }
+  | { found: 'spent'; transaction: string }
   | { found: 'served'; transaction: string; body: unknown };
 
 /**
@@ -110,15 +117,16 @@ export class PaymentClaims {
     }
     if (this.#claims.size >= MAX_CLAIMS) this.#forgetDue(nowSeconds);
     if (this.#claims.size >= MAX_CLAIMS) return 'full';
-    this.#claims.set(key, { owner, state: 'held', validBefore, settled: null, ownedUntil: null, result: null });
+    this.#claims.set(key, { owner, state: 'held', validBefore, settled: null, ownedUntil: null, result: null, screenings: 0, ownerCounted: false });
     return 'taken';
   }
 
   /**
    * Looks for a payment of key that already went through, for a request carrying its header again. Inside a day from
    * the settlement and only for the wallet it paid for: a served claim answers with its stored result, and a settled one
-   * no live request owns is taken by owner until ownedUntil, to screen it; one a live request owns is in use. The wallet
-   * is checked first, so another wallet is refused whoever owns the claim.
+   * no live request owns is taken by owner until ownedUntil, to screen it; one a live request owns is in use. Taking it
+   * counts one more screening in the same step, never past REDEEM_SCREEN_TRIES; once they are used it is taken as spent,
+   * counting nothing. The wallet is checked first, so another wallet is refused whoever owns the claim.
    */
   redeem(key: string, wallet: Address, owner: string, nowSeconds: bigint, ownedUntil: bigint): Redeemed {
     const entry = this.#claims.get(key);
@@ -130,16 +138,24 @@ export class PaymentClaims {
     if (entry.owner !== null && entry.ownedUntil !== null && entry.ownedUntil > nowSeconds) return { found: 'in-use' };
     entry.owner = owner;
     entry.ownedUntil = ownedUntil;
-    return { found: 'settled', transaction };
+    entry.ownerCounted = entry.screenings < REDEEM_SCREEN_TRIES;
+    if (!entry.ownerCounted) return { found: 'spent', transaction };
+    entry.screenings += 1;
+    return { found: 'settled', transaction, screening: entry.screenings };
   }
 
-  /** The settlement went through: the claim is settled for settlement, owned by owner until ownedUntil while it screens. */
+  /**
+   * The settlement went through: the claim is settled for settlement, owned by owner until ownedUntil while it screens,
+   * its first screening counted.
+   */
   markSettled(key: string, owner: string, settlement: Settlement, nowSeconds: bigint, ownedUntil: bigint): void {
     const entry = this.#take(key, owner);
     if (entry !== undefined) {
       entry.state = 'settled';
       entry.settled = { wallet: parseAddress(settlement.wallet), transaction: settlement.transaction, at: nowSeconds };
       entry.ownedUntil = ownedUntil;
+      entry.screenings = 1;
+      entry.ownerCounted = true;
     }
   }
 
@@ -153,15 +169,22 @@ export class PaymentClaims {
       entry.result = json;
       entry.owner = null;
       entry.ownedUntil = null;
+      entry.ownerCounted = false;
     }
   }
 
-  /** The screening ended with no result: the claim stays settled, owned by no request, for the next copy of its header. */
-  leave(key: string, owner: string): void {
+  /**
+   * The screening ended with no result: the claim stays settled, owned by no request, for the next copy of its header.
+   * With handBackTry the owner never started the screening its taking counted, so that try is given back; an owner
+   * whose taking counted none, one that took a spent claim, has nothing to give back.
+   */
+  leave(key: string, owner: string, handBackTry = false): void {
     const entry = this.#owned(key, owner);
     if (entry !== undefined) {
+      if (handBackTry && entry.ownerCounted) entry.screenings -= 1;
       entry.owner = null;
       entry.ownedUntil = null;
+      entry.ownerCounted = false;
     }
   }
 

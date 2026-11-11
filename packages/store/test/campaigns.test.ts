@@ -11,11 +11,12 @@ import {
   activeList,
   addAsk,
   addListVersion,
-  ASKS_PER_SLOT,
+  ASK_BACKLOG_CAP,
+  askLifetimeCap,
   board,
+  CAMPAIGN_SCREENINGS_DAY_COUNTER,
   counts,
   createCampaign,
-  MIN_ASKS_PER_CAMPAIGN,
   decideAsk,
   funderLinks,
   getAsk,
@@ -26,10 +27,12 @@ import {
   markListActive,
   markListCancelled,
   markListPosted,
+  markListResent,
   markListSending,
   markListUnsent,
   requeueFailedAsk,
   markRelay,
+  MAX_FUNDER_LINKS,
   MAX_RELAY_ATTEMPTS,
   openCampaigns,
   queueRelays,
@@ -63,6 +66,7 @@ const OTHER_SIGNATURE = `0x${'cd'.repeat(65)}`;
 const HASH = `0x${'1f'.repeat(32)}`;
 const PUBLIC_KEYS = [
   'action',
+  'appeal',
   'askedAt',
   'campaignId',
   'citedTxs',
@@ -151,7 +155,7 @@ for (const { name, open } of TARGETS) {
       await migrate(db);
     });
     beforeEach(async () => {
-      await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns, day_counts');
+      await db.query('TRUNCATE appeals, claim_relays, list_versions, asks, campaigns, day_counts');
     });
     afterAll(async () => {
       await db.close();
@@ -204,7 +208,16 @@ for (const { name, open } of TARGETS) {
       }
       expect((await getAsk(db, CAMPAIGN, wallet(6)))?.slot).toBeNull();
       expect((await getAsk(db, CAMPAIGN, wallet(7)))?.slot).toBeNull();
-      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 7, queued: 0, decided: 7, held: 1, slotsTaken: 3, slotsLeft: 0, asksLeft: 43 });
+      expect(await counts(db, CAMPAIGN)).toEqual({
+        asked: 7,
+        queued: 0,
+        decided: 7,
+        held: 1,
+        slotsTaken: 3,
+        slotsLeft: 0,
+        asksLeft: 993,
+        appeals: { filed: 0, checked: 0, block: 0, reversed: 0 },
+      });
 
       // A full campaign takes no new ask at all (C24), and nothing moves a slot once given.
       expect(await ask(8)).toBe('full');
@@ -382,6 +395,7 @@ for (const { name, open } of TARGETS) {
         servRequestId: null,
         decidedAt: plus(4),
         slot: null,
+        appeal: null,
       });
       expect(await takeAsk(db, plus(1_000), 60, 3)).toBeNull();
       expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(5), 3)).toBeNull();
@@ -577,65 +591,141 @@ for (const { name, open } of TARGETS) {
       expect(await db.query('SELECT id FROM campaigns')).toEqual([]);
     });
 
-    it('C24: addAsk answers full once the asks reach the cap or the slots are taken, and exists still beats full', async () => {
-      expect(MIN_ASKS_PER_CAMPAIGN).toBe(50);
-      expect(ASKS_PER_SLOT).toBe(10);
-      await createCampaign(db, terms({ maxSlots: 2 }));
-      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 0, slotsLeft: 2, asksLeft: 50 });
-      for (let n = 1; n <= 50; n += 1) expect(await ask(n)).toBe('queued');
-      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 50, slotsLeft: 2, asksLeft: 0 });
-      expect(await ask(51)).toBe('full');
+    it('C24: fifty decided holds leave a three-slot campaign open, because the cap counts the backlog, not history', async () => {
+      await createCampaign(db, terms({ maxSlots: 3 }));
+      for (let n = 1; n <= 50; n += 1) {
+        expect(await ask(n, plus(n))).toBe('queued');
+        expect(await takeAsk(db, plus(n), 60, 3)).toMatchObject({ wallet: wallet(n) });
+        expect(await decideAsk(db, decision(wallet(n), 'hold'), plus(n))).toEqual({ slot: null });
+      }
+      expect(await ask(51, plus(60))).toBe('queued');
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 51, slotsLeft: 3, asksLeft: 949 });
+    });
+
+    it('C24: an ask is full at 200 undecided asks and queued again once one is decided, and full when no slot is left', async () => {
+      expect(ASK_BACKLOG_CAP).toBe(200);
+      await createCampaign(db, terms({ maxSlots: 20 }));
+      // Two hundred waiting asks from other wallets, asked before anyone below.
+      await db.query(
+        `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
+         SELECT 'demo', '0x' || lpad(to_hex(n), 40, '0'), 1, $1, $2::timestamptz, 'queued', 0 FROM generate_series(1, 200) AS n`,
+        [SIGNATURE, plus(-100).toISOString()],
+      );
+      expect(await ask(1)).toBe('full');
+      const taken = await takeAsk(db, NOW, 60, 3);
+      expect(await decideAsk(db, decision(taken?.wallet as string, 'hold'), NOW)).toEqual({ slot: null });
+      expect(await ask(1)).toBe('queued');
+      expect(await ask(2)).toBe('full');
       expect(await ask(1)).toBe('exists');
-      const [stored] = await db.query<{ asks: number }>('SELECT count(*)::int AS asks FROM asks');
-      expect(stored?.asks).toBe(50);
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 201, queued: 200, asksLeft: 1_799 });
 
-      // Ten asks a slot past fifty: a campaign of 8 slots takes 80.
-      await createCampaign(db, terms({ id: 'big', maxSlots: 8 }));
-      expect(await counts(db, 'big')).toMatchObject({ asksLeft: 80 });
-
-      // Slots taken: no new ask is queued even though the cap has room.
+      // Every slot taken: no new ask is queued, however short the backlog.
       await createCampaign(db, terms({ id: 'one', maxSlots: 1 }));
-      // Asked before the others, so it is the ask the worker takes next.
-      expect(await ask(1, plus(-10), 'one')).toBe('queued');
+      expect(await ask(1, plus(-200), 'one')).toBe('queued');
       await screenAll(1);
       expect(await decideAsk(db, decision(wallet(1), 'full', { campaignId: 'one' }), NOW)).toEqual({ slot: 1 });
-      expect(await counts(db, 'one')).toMatchObject({ slotsLeft: 0, asksLeft: 49 });
       expect(await ask(2, NOW, 'one')).toBe('full');
       expect(await ask(1, NOW, 'one')).toBe('exists');
     });
 
-    it('C24: the day ceiling counts only an ask that is queued, in the same transaction, and refuses past it', async () => {
+    it('C24, C41: a campaign takes at most max(1,000, 100 a slot) asks in all, a bound on how far its rows can grow', async () => {
+      expect([askLifetimeCap(1), askLifetimeCap(10), askLifetimeCap(30), askLifetimeCap(100_000)]).toEqual([1_000, 1_000, 3_000, 10_000_000]);
+      expect(MAX_FUNDER_LINKS).toBe(askLifetimeCap(100_000));
       await createCampaign(db, terms({ maxSlots: 1 }));
-      await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
-      const day = { name: 'campaign-asks', max: 2 };
-      const add = (n: number, campaignId = CAMPAIGN) =>
-        addAsk(db, { campaignId, wallet: wallet(n), signedAt: 1_800_000_000, signature: SIGNATURE }, NOW, day);
-      expect(await add(1)).toBe('queued');
-      expect(await add(1)).toBe('exists');
-      expect(await add(9, 'shut')).toBe('closed');
-      expect(await add(9, 'missing')).toBe('unknown');
-      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(1);
-      await screenAll(1);
-      expect(await decideAsk(db, decision(wallet(1), 'full'), NOW)).toEqual({ slot: 1 });
-      expect(await add(2)).toBe('full');
-      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(1);
-      await createCampaign(db, terms({ id: 'other' }));
-      expect(await add(3, 'other')).toBe('queued');
-      expect(await add(4, 'other')).toBe('busy');
-      expect(await add(3, 'other')).toBe('exists');
-      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(2);
-      const [stored] = await db.query<{ asks: number }>("SELECT count(*)::int AS asks FROM asks WHERE campaign_id = 'other'");
-      expect(stored?.asks).toBe(1);
-      // A new UTC day starts again from zero, and leaving the ceiling out keeps today's behaviour.
-      expect(await addAsk(db, { campaignId: 'other', wallet: wallet(4), signedAt: 1, signature: SIGNATURE }, new Date('2026-11-12T00:00:00.000Z'), day)).toBe(
-        'queued',
+      await db.query(
+        `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts, action, share_bps, rule, reason,
+                           cited_txs, not_checked, facts, decided_at)
+         SELECT 'demo', '0x' || lpad(to_hex(n), 40, '0'), 1, $1, $2::timestamptz, 'decided', 1, 'hold', 0, 'A9', 'Held.',
+                '[]', '[]', $3::jsonb, $2::timestamptz
+           FROM generate_series(1, 999) AS n`,
+        [SIGNATURE, plus(-100).toISOString(), JSON.stringify(FACTS)],
       );
-      expect(await addAsk(db, { campaignId: 'other', wallet: wallet(5), signedAt: 1, signature: SIGNATURE }, NOW)).toBe('queued');
-      await expect(addAsk(db, { campaignId: 'other', wallet: wallet(6), signedAt: 1, signature: SIGNATURE }, NOW, { name: '', max: 2 })).rejects.toThrow(
-        StoreError,
-      );
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 999, queued: 0, asksLeft: 1 });
+      expect(await ask(1)).toBe('queued');
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 1_000, asksLeft: 0 });
+      expect(await ask(2)).toBe('full');
+      expect(await ask(1)).toBe('exists');
     });
 
+    it('C24: addAsk takes no day count and never answers busy; screenings are counted in a bucket of their own', async () => {
+      expect(CAMPAIGN_SCREENINGS_DAY_COUNTER).toBe('campaign-screenings');
+      await createCampaign(db, terms());
+      await db.query("INSERT INTO day_counts (day, name, count) VALUES ('2026-11-11', 'campaign-asks', 300)");
+      for (let n = 1; n <= 3; n += 1) expect(await ask(n)).toBe('queued');
+      // A caller still passing the old day ceiling gets an ask queued, never busy.
+      const oldShape = addAsk as unknown as (...args: unknown[]) => Promise<string>;
+      const fourth = { campaignId: CAMPAIGN, wallet: wallet(4), signedAt: 1, signature: SIGNATURE };
+      expect(await oldShape(db, fourth, NOW, { name: 'campaign-asks', max: 0 })).toBe('queued');
+      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(300);
+      expect(await dayCount(db, CAMPAIGN_SCREENINGS_DAY_COUNTER, NOW)).toBe(0);
+    });
+
+    it('C27, C32: a sent list keeps its nonce with its hash, a resend replaces only the hash, and unsent clears both', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3]) {
+        expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(n), publishedList: '[]', declaredTotal: '0' }, plus(n))).toBe(n);
+      }
+      const other = `0x${'2e'.repeat(32)}`;
+      const version = async (n: number) => (await listVersions(db, CAMPAIGN))[n - 1];
+      for (const postNonce of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '7' as unknown as number]) {
+        await expect(markListSending(db, CAMPAIGN, 1, { postTx: HASH, postNonce }, NOW)).rejects.toThrow(StoreError);
+      }
+      expect(await version(1)).toMatchObject({ status: 'built', postTx: null, postNonce: null });
+      expect(await markListSending(db, CAMPAIGN, 1, { postTx: HASH, postNonce: 7 }, NOW)).toBe(true);
+      expect(await version(1)).toMatchObject({ status: 'sending', postTx: HASH, postNonce: 7 });
+      await expect(markListResent(db, CAMPAIGN, 1, { postTx: 'not a hash' }, NOW)).rejects.toThrow(StoreError);
+      expect(await markListResent(db, CAMPAIGN, 1, { postTx: other }, plus(1))).toBe(true);
+      expect(await version(1)).toMatchObject({ status: 'sending', postTx: other, postNonce: 7 });
+      expect(await markListResent(db, CAMPAIGN, 2, { postTx: other }, plus(1))).toBe(false);
+      expect(await markListPosted(db, CAMPAIGN, 1, { postTx: null, claimableAt: 1_800_000_000 })).toBe(true);
+      expect(await version(1)).toMatchObject({ status: 'posted', postTx: other, postNonce: 7 });
+      expect(await markListResent(db, CAMPAIGN, 1, { postTx: HASH }, plus(2))).toBe(false);
+      expect(await version(1)).toMatchObject({ postTx: other, postNonce: 7 });
+
+      expect(await markListSending(db, CAMPAIGN, 3, { postTx: HASH, postNonce: 0 }, NOW)).toBe(true);
+      expect(await version(3)).toMatchObject({ status: 'sending', postNonce: 0 });
+      expect(await markListUnsent(db, CAMPAIGN, 3)).toBe(true);
+      expect(await version(3)).toMatchObject({ status: 'built', postTx: null, postNonce: null });
+      // The call shape from before the nonce still works and stores none.
+      expect(await markListSending(db, CAMPAIGN, 2, { postTx: HASH }, NOW)).toBe(true);
+      expect(await version(2)).toMatchObject({ status: 'sending', postTx: HASH, postNonce: null });
+      expect(await latestList(db, CAMPAIGN)).toMatchObject({ version: 3, postNonce: null });
+    });
+
+    it('C41: a try that was not the item\'s fault is handed back on an ask and a relay, never below zero, and the wait still holds', async () => {
+      await createCampaign(db, terms());
+      expect(await ask(1)).toBe('queued');
+      expect(await takeAsk(db, NOW, 60, 3)).toMatchObject({ attempts: 1 });
+      for (const refundTry of ['yes', 1, null]) {
+        await expect(releaseAsk(db, CAMPAIGN, wallet(1), NOW, 3, 30, { refundTry } as unknown as { refundTry: boolean })).rejects.toThrow(StoreError);
+      }
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), NOW, 3, 30, { refundTry: true })).toBe('queued');
+      expect(await row(1)).toMatchObject({ status: 'queued', attempts: 0 });
+      expect(await takeAsk(db, plus(29), 60, 3)).toBeNull();
+      expect(await takeAsk(db, plus(30), 60, 3)).toMatchObject({ attempts: 1 });
+      // At its last attempt, a refunded try still queues the ask rather than failing it.
+      await db.query("UPDATE asks SET attempts = 3 WHERE wallet = $1", [wallet(1)]);
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(31), 3, 0, { refundTry: true })).toBe('queued');
+      expect(await row(1)).toMatchObject({ attempts: 2 });
+      expect(await takeAsk(db, plus(32), 60, 3)).toMatchObject({ attempts: 3 });
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(33), 3, 0, { refundTry: false })).toBe('failed');
+
+      await activeVersion(1);
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(2), amount: '1000000' }], NOW)).toBe(1);
+      const key = { campaignId: CAMPAIGN, wallet: wallet(2), version: 1 };
+      expect(await takeRelay(db, plus(40), 60)).toMatchObject({ attempts: 1 });
+      await expect(markRelay(db, key, { status: 'pending', refundTry: 'yes' as unknown as boolean }, plus(40))).rejects.toThrow(StoreError);
+      expect(await markRelay(db, key, { status: 'pending', retryAfterSeconds: 30, refundTry: true }, plus(40))).toBe('pending');
+      const relayAttempts = async () =>
+        (await db.query<{ attempts: number }>('SELECT attempts FROM claim_relays WHERE wallet = $1', [wallet(2)]))[0]?.attempts;
+      expect(await relayAttempts()).toBe(0);
+      expect(await takeRelay(db, plus(69), 60)).toBeNull();
+      expect(await takeRelay(db, plus(70), 60)).toMatchObject({ attempts: 1 });
+      // Never below zero, even for a row some other path left at zero.
+      await db.query('UPDATE claim_relays SET attempts = 0 WHERE wallet = $1', [wallet(2)]);
+      expect(await markRelay(db, key, { status: 'pending', refundTry: true }, plus(71))).toBe('pending');
+      expect(await relayAttempts()).toBe(0);
+    });
     it("addAsk answers closed outside opens_at to closes_at and on a closed campaign, and unknown for an unknown id", async () => {
       await createCampaign(db, terms({ opensAt: NOW, closesAt: plus(60) }));
       await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
@@ -690,7 +780,7 @@ for (const { name, open } of TARGETS) {
       ]);
       for (const version of versions) {
         expect(Object.keys(version).sort()).toEqual(
-          ['campaignId', 'claimableAt', 'createdAt', 'declaredTotal', 'postTx', 'root', 'status', 'version'],
+          ['campaignId', 'claimableAt', 'createdAt', 'declaredTotal', 'postNonce', 'postTx', 'root', 'status', 'version'],
         );
       }
       expect(versions[1]).toEqual({
@@ -700,6 +790,7 @@ for (const { name, open } of TARGETS) {
         declaredTotal: '0',
         status: 'active',
         postTx: HASH,
+        postNonce: null,
         claimableAt: 1_800_003_600,
         createdAt: plus(2),
       });
@@ -902,7 +993,16 @@ for (const { name, open } of TARGETS) {
       expect(await board(db, 'missing', 10)).toEqual([]);
       await expect(board(db, CAMPAIGN, 101)).rejects.toThrow(StoreError);
       await expect(board(db, CAMPAIGN, 0)).rejects.toThrow(StoreError);
-      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 4, queued: 1, decided: 3, held: 2, slotsTaken: 1, slotsLeft: 19, asksLeft: 196 });
+      expect(await counts(db, CAMPAIGN)).toEqual({
+        asked: 4,
+        queued: 1,
+        decided: 3,
+        held: 2,
+        slotsTaken: 1,
+        slotsLeft: 19,
+        asksLeft: 1_996,
+        appeals: { filed: 0, checked: 0, block: 0, reversed: 0 },
+      });
       expect(await counts(db, 'missing')).toBeNull();
     });
 

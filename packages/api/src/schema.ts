@@ -189,6 +189,7 @@ export const CampaignView = z.strictObject({
     slotsTaken: Count,
     slotsLeft: Count,
     asksLeft: Count,
+    appeals: z.strictObject({ filed: Count, checked: Count, block: Count, reversed: Count }),
   }),
   lists: z.array(ListVersionJson),
 });
@@ -206,6 +207,36 @@ const FactsJson = z.strictObject({
   missing: z.array(plainText(64)).max(16),
 });
 
+/**
+ * One appeal as anyone may see it: the store's public view, with times as ISO 8601 text. It has no field for the
+ * appeal's text, its hash, its signature or the owner's note (C40). reppoNote is another service's model text, held to
+ * the plain-text rule and 280 characters (C34).
+ */
+export const AppealJson = z.strictObject({
+  filedAt: z.iso.datetime(),
+  checkStatus: z.enum(['queued', 'checking', 'checked', 'unchecked']),
+  reppoRoute: z.enum(['ship', 'review', 'block']).nullable(),
+  reppoNote: plainText(280).nullable(),
+  reppoEvalId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/).nullable(),
+  checkedAt: z.iso.datetime().nullable(),
+  outcome: z.enum(['open', 'reversed', 'upheld']),
+  newAction: z.enum(['full', 'partial']).nullable(),
+  settledAt: z.iso.datetime().nullable(),
+});
+export type AppealJson = z.infer<typeof AppealJson>;
+
+/** The body POST /api/campaigns/:id/appeals takes, by type and size only; checkAppeal judges the values. */
+export const AppealRequest = z.strictObject({
+  wallet: z.string().max(64),
+  text: z.string().max(2_000),
+  signedAt: z.number(),
+  signature: z.string().max(200),
+});
+
+export const ExistsAppealBody = z.strictObject({ exists: z.literal(true), appeal: AppealJson });
+export const UndecidedBody = z.strictObject({ undecided: z.literal(true) });
+export const ApprovedBody = z.strictObject({ approved: z.literal(true) });
+
 /** One ask as anyone may see it: the store's public view, with times as ISO 8601 text. */
 export const AskJson = z.strictObject({
   campaignId: z.string().regex(CAMPAIGN_ID),
@@ -222,6 +253,7 @@ export const AskJson = z.strictObject({
   servRequestId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).nullable(),
   decidedAt: z.iso.datetime().nullable(),
   slot: z.int().min(1).nullable(),
+  appeal: AppealJson.nullable(),
 });
 export type AskJson = z.infer<typeof AskJson>;
 

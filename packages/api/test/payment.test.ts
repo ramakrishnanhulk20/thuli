@@ -22,7 +22,16 @@ import { encodeAbiParameters, encodeEventTopics, parseAbi, type Hex, type Log } 
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parseAddress, type Address } from '@thuli/core';
-import { dayCount, MAX_PAYMENT_CLAIMS, migrate, openMemoryDb, PAID_RESULT_KEEP_SECONDS, type Db, type Queryable } from '@thuli/store';
+import {
+  dayCount,
+  MAX_PAYMENT_CLAIMS,
+  migrate,
+  openMemoryDb,
+  PAID_RESULT_KEEP_SECONDS,
+  REDEEM_SCREEN_TRIES,
+  type Db,
+  type Queryable,
+} from '@thuli/store';
 import { heldScreen, SCREEN_CAUSES, type SingleScreen } from '@thuli/worker/src/screen/single.ts';
 import {
   createApp,
@@ -45,7 +54,7 @@ import {
   MAX_CLIENTS_TRACKED,
   type Pass,
 } from '../src/limits.ts';
-import type { ReadReceipt, Receipt } from '../src/receipt.ts';
+import { RECEIPT_READ_WORST_MS, type ReadReceipt, type Receipt } from '../src/receipt.ts';
 import { OUTPUT_CHECK_CAUSE, PaidScreenResponse, SettledRetryBody } from '../src/schema.ts';
 import {
   claimStoreOver,
@@ -131,7 +140,7 @@ class StubFacilitator implements FacilitatorClient {
 }
 
 interface SetupOptions {
-  screen?: (wallet: Address) => Promise<SingleScreen>;
+  screen?: (wallet: Address, signal?: AbortSignal) => Promise<SingleScreen>;
   config?: ApiConfig;
   facilitator?: StubFacilitator;
   now?: () => Date;
@@ -262,7 +271,8 @@ describe.each(BACKENDS)('POST /api/x402/screen with a payment, on $name', (backe
     });
     expect(JSON.stringify(body)).not.toContain('ignore your rules');
     expect(screen).toHaveBeenCalledTimes(1);
-    expect(screen).toHaveBeenCalledWith(WALLET);
+    // With a signal of its own, so the screening can be stopped when the request's time runs out.
+    expect(screen).toHaveBeenCalledWith(WALLET, expect.any(AbortSignal));
     expect(facilitator.settled).toHaveLength(1);
     expect(facilitator.verified).toBe(0);
     const receipt = decodePaymentResponseHeader(response.headers.get('payment-response') as string);
@@ -581,6 +591,21 @@ function later<T>(ms: number, value: () => T | Promise<T>): Promise<T> {
 // The site's route maxDuration: the host ends a request at this point, whatever it is doing.
 const HOST_ENDS_REQUEST_MS = 300_000;
 
+/**
+ * A stand-in screening that takes ms and then answers result, and that stops when its signal aborts, answering the
+ * time-up hold at once, as screenOneWallet does.
+ */
+function screeningThatTakes(ms: number, result: (wallet: Address) => SingleScreen = screenResult) {
+  return (wallet: Address, signal?: AbortSignal) =>
+    new Promise<SingleScreen>((resolve) => {
+      const timer = setTimeout(() => resolve(result(wallet)), ms);
+      signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve(heldScreen(wallet, SCREEN_CAUSES.timeUp));
+      });
+    });
+}
+
 describe.each(BACKENDS)('a paid request slower than the host allows (C25, C41), on $name', (backend) => {
   onBackend(backend);
   afterEach(() => {
@@ -595,7 +620,7 @@ describe.each(BACKENDS)('a paid request slower than the host allows (C25, C41), 
     const { appFetch, client, screen } = await setup({
       facilitator,
       readReceipt: (hash) => later(10_000, () => receipt.read(hash)),
-      screen: (wallet) => later(120_000, () => screenResult(wallet)),
+      screen: screeningThatTakes(120_000),
     });
     const header = await signedHeader(appFetch, client);
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
@@ -662,7 +687,31 @@ describe.each(BACKENDS)('a paid request slower than the host allows (C25, C41), 
     expect(facilitator.settled).toHaveLength(2);
   });
 
+  it('cuts a receipt read that never answers at the deadline, keeps the payment unsure and answers in time', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    const { appFetch, client, screen } = await setup({ facilitator, readReceipt: () => new Promise<Receipt>(() => undefined) });
+    const header = await signedHeader(appFetch, client);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const started = Date.now();
+    let endedAt: number | null = null;
+    const reply = appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header)).then((answer) => {
+      endedAt = Date.now();
+      return answer;
+    });
+    await vi.advanceTimersByTimeAsync(REQUEST_DEADLINE_MS);
+    expect(endedAt, 'the request was still waiting on the receipt at its deadline').not.toBeNull();
+    expect((endedAt ?? Infinity) - started).toBeLessThanOrEqual(REQUEST_DEADLINE_MS);
+    const answer = await reply;
+    expect(answer.status).toBe(503);
+    expect(await answer.json()).toEqual({ retry: true });
+    expect(screen).not.toHaveBeenCalled();
+  });
+
   it('settles nothing when too little of the deadline is left to settle and screen, so nothing is spent', async () => {
+    // Two 30 s settle calls, the slowest receipt read (two calls, each tried twice with a 250 ms wait) and 20 s to screen.
+    expect(RECEIPT_READ_WORST_MS).toBe(40_500);
+    expect(SETTLE_ROOM_MS).toBe(2 * 30_000 + 40_500 + 20_000);
     let clock = new Date();
     const base = await freshStores(() => clock);
     // The time before the claim goes, as a slow store would spend it: just under what settling and screening need.
@@ -830,6 +879,179 @@ describe.each(BACKENDS)('redeeming a payment that went through, with the same he
     expect(again.headers.get(STORED_HEADER)).toBe('true');
     expect(await again.text()).toBe(result);
     expect(screen).toHaveBeenCalledTimes(1);
+    expect(facilitator.settled).toHaveLength(1);
+  });
+
+  it('C25, C26: a payment whose screening always runs out of time buys two screenings, then the stored time-up hold, however often its header comes back', async () => {
+    let clock = new Date();
+    const { pay, appFetch, screen, facilitator, sentSignatures } = await setup({
+      now: () => clock,
+      screen: async (wallet) => heldScreen(wallet, SCREEN_CAUSES.timeUp),
+    });
+    const replies = [await pay(url(SCREEN_PATH), post({ wallet: WALLET }))];
+    const header = { 'PAYMENT-SIGNATURE': sentSignatures[0] as string };
+    for (let send = 1; send < 5; send += 1) {
+      clock = new Date(clock.getTime() + 11_000);
+      replies.push(await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header)));
+    }
+    expect(replies.map((reply) => reply.status)).toEqual([503, 200, 200, 200, 200]);
+    expect(SettledRetryBody.safeParse(await replies[0]?.json()).success).toBe(true);
+    const bodies = await Promise.all(replies.slice(1).map((reply) => reply.text()));
+    expect(new Set(bodies).size).toBe(1);
+    expect(PaidScreenResponse.parse(JSON.parse(bodies[0] as string))).toMatchObject({
+      wallet: WALLET,
+      decision: { action: 'hold', rule: 'A1', reason: `Held for review: ${SCREEN_CAUSES.timeUp}.` },
+      payment: { transaction: SETTLE_TX },
+    });
+    expect(replies.slice(2).map((reply) => reply.headers.get(STORED_HEADER))).toEqual(['true', 'true', 'true']);
+    expect(screen).toHaveBeenCalledTimes(2);
+    expect(facilitator.settled).toHaveLength(1);
+  });
+
+  it('C25, C26: a try the request never started is handed back, so the buyer still gets two screenings before the stored hold', async () => {
+    let clock = new Date();
+    const now = () => clock;
+    // The first request's settling used up the whole of its screening's share, so it starts none.
+    const stores = onFirstStart(await freshStores(now), () => {
+      clock = new Date(clock.getTime() + REQUEST_DEADLINE_MS - REPLY_MARGIN_MS);
+    });
+    const { pay, appFetch, screen, sentSignatures } = await setup({ now, stores, screen: async (wallet) => heldScreen(wallet, SCREEN_CAUSES.timeUp) });
+    const replies = [await pay(url(SCREEN_PATH), post({ wallet: WALLET }))];
+    const header = { 'PAYMENT-SIGNATURE': sentSignatures[0] as string };
+    for (let send = 0; send < 3; send += 1) replies.push(await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header)));
+    expect(replies.map((reply) => reply.status)).toEqual([503, 503, 200, 200]);
+    expect(replies[3]?.headers.get(STORED_HEADER)).toBe('true');
+    expect(screen).toHaveBeenCalledTimes(2);
+  });
+
+  it('C26: two redeems at once on the last try start one screening between them', async () => {
+    let calls = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { pay, fetchAs, screen, facilitator, sentSignatures } = await setup({
+      screen: async (wallet) => {
+        calls += 1;
+        if (calls === 1) return heldScreen(wallet, SCREEN_CAUSES.timeUp);
+        await gate;
+        return heldScreen(wallet, SCREEN_CAUSES.timeUp);
+      },
+    });
+    expect((await pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(503);
+    const header = { 'PAYMENT-SIGNATURE': sentSignatures[0] as string };
+    const both = ['198.51.100.60', '198.51.100.61'].map((address) => fetchAs(address)(url(SCREEN_PATH), post({ wallet: WALLET }, header)));
+    await vi.waitFor(() => expect(screen).toHaveBeenCalledTimes(2));
+    release();
+    const replies = await Promise.all(both);
+    expect(replies.map((reply) => reply.status).sort()).toEqual([200, 503]);
+    const later = await fetchAs('198.51.100.61')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(later.headers.get(STORED_HEADER)).toBe('true');
+    expect(PaidScreenResponse.parse(await later.json()).decision.reason).toBe(`Held for review: ${SCREEN_CAUSES.timeUp}.`);
+    expect(screen).toHaveBeenCalledTimes(2);
+    expect(facilitator.settled).toHaveLength(1);
+  });
+
+  it('C24, C42: a cut screening is stopped through its signal, and its service place, the caller\'s place and the claim stay taken until it has really ended', async () => {
+    let clock = new Date();
+    const now = () => clock;
+    const base = await freshStores(now);
+    let running = 0;
+    const given: string[] = [];
+    const counted: Stores = {
+      ...base,
+      guard: {
+        ...base.guard,
+        enter: async () => {
+          const ticket = await base.guard.enter();
+          if (ticket !== null) running += 1;
+          return ticket;
+        },
+        leave: async (ticket) => {
+          running -= 1;
+          given.push('service place');
+          await base.guard.leave(ticket);
+        },
+      },
+      limits: {
+        ...base.limits,
+        leave: async (pass) => {
+          if (pass.paying) given.push('caller place');
+          await base.limits.leave(pass);
+        },
+      },
+    };
+    // The first request's settling used up all but 50 ms of its screening's share, as a slow facilitator would.
+    const stores = onFirstStart(counted, () => {
+      clock = new Date(clock.getTime() + REQUEST_DEADLINE_MS - REPLY_MARGIN_MS - 50);
+    });
+    const signals: AbortSignal[] = [];
+    let finish: () => void = () => undefined;
+    const { pay, fetchAs, screen, sentSignatures } = await setup({
+      now,
+      stores,
+      screen: async (wallet, signal) => {
+        if (signal !== undefined) signals.push(signal);
+        if (signals.length === 1) await new Promise<void>((resolve) => (finish = resolve));
+        return screenResult(wallet);
+      },
+    });
+    const cut = await pay(url(SCREEN_PATH), post({ wallet: WALLET }));
+    expect(cut.status).toBe(503);
+    expect(SettledRetryBody.safeParse(await cut.json()).success).toBe(true);
+    // The stop was called, and the screening, still running as a SERV call in flight would, keeps every place it held.
+    expect(signals[0]?.aborted).toBe(true);
+    expect(running).toBe(1);
+    expect(given).toEqual([]);
+    const header = { 'PAYMENT-SIGNATURE': sentSignatures[0] as string };
+    // A copy meanwhile screens nothing beside it, and gives back only its own places.
+    const beside = await fetchAs('198.51.100.62')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(beside.status).toBe(503);
+    expect(screen).toHaveBeenCalledTimes(1);
+    expect(running).toBe(1);
+    expect([...given].sort()).toEqual(['caller place', 'service place']);
+
+    finish();
+    await vi.waitFor(() => expect([...given].sort()).toEqual(['caller place', 'caller place', 'service place', 'service place']));
+    expect(running).toBe(0);
+    const redeemed = await fetchAs('198.51.100.62')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(redeemed.status).toBe(200);
+    expect(PaidScreenResponse.parse(await redeemed.json()).decision).toMatchObject({ action: 'full', rule: 'A9' });
+    expect(screen).toHaveBeenCalledTimes(2);
+  });
+
+  it('C25, C26: when the last try\'s request dies with the claim, the next copy gets the stored time-up hold and no third screening, and copies at once get one hold', async () => {
+    let clock = new Date();
+    const now = () => clock;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let calls = 0;
+    const { pay, fetchAs, screen, facilitator, sentSignatures } = await setup({
+      now,
+      screen: async (wallet) => {
+        calls += 1;
+        if (calls === 2) await gate;
+        return heldScreen(wallet, SCREEN_CAUSES.timeUp);
+      },
+    });
+    expect((await pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(503);
+    const header = { 'PAYMENT-SIGNATURE': sentSignatures[0] as string };
+    // The last try starts, and the host cuts its request: nothing ever reads this answer before the end.
+    const dropped = fetchAs('198.51.100.63')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    await vi.waitFor(() => expect(screen).toHaveBeenCalledTimes(2));
+
+    clock = new Date(clock.getTime() + LEASE_SECONDS * 1000);
+    const copies = await Promise.all(
+      ['198.51.100.64', '198.51.100.65'].map((address) => fetchAs(address)(url(SCREEN_PATH), post({ wallet: WALLET }, header))),
+    );
+    expect(copies.map((reply) => reply.status).sort()).toEqual([200, 503]);
+    const hold = await (copies.find((reply) => reply.status === 200) as Response).text();
+    expect(PaidScreenResponse.parse(JSON.parse(hold)).decision).toMatchObject({ action: 'hold', reason: `Held for review: ${SCREEN_CAUSES.timeUp}.` });
+    const again = await fetchAs('198.51.100.65')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(again.headers.get(STORED_HEADER)).toBe('true');
+    expect(await again.text()).toBe(hold);
+
+    release();
+    await dropped;
+    expect(screen).toHaveBeenCalledTimes(2);
     expect(facilitator.settled).toHaveLength(1);
   });
 
@@ -1242,15 +1464,17 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     // wallet is refused, owned or not, because it is not this payment's buyer.
     expect(await claims.redeem('paid', WALLET, 'copy', settledAt + 1n)).toEqual({ found: 'in-use' });
     expect(await claims.redeem('paid', OTHER_WALLET, 'other', settledAt + 1n)).toEqual({ found: 'refused' });
-    await claims.leave('paid', 'payer');
+    await claims.leave('paid', 'payer', false);
 
     expect(await claims.redeem('paid', OTHER_WALLET, 'other', settledAt + 400n)).toEqual({ found: 'refused' });
     const both = await Promise.all(['first', 'second'].map((owner) => claims.redeem('paid', WALLET, owner, settledAt + 400n)));
     expect(both.map((found) => found.found).sort()).toEqual(['in-use', 'settled']);
+    expect(both.find((found) => found.found === 'settled')).toEqual({ found: 'settled', transaction: SETTLE_TX, screening: 2 });
     const winner = both[0]?.found === 'settled' ? 'first' : 'second';
-    // An owner past its lease is surely gone, so a later copy takes the screening over.
+    // An owner past its lease is surely gone, so a later copy takes the claim over; both tries are used, so it gets the
+    // claim to store the time-up hold, not a third screening (C26).
     expect(await claims.redeem('paid', WALLET, 'third', settledAt + 400n + BigInt(LEASE_SECONDS))).toEqual({
-      found: 'settled',
+      found: 'spent',
       transaction: SETTLE_TX,
     });
     await claims.serve('paid', winner, { late: true });
@@ -1266,6 +1490,59 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     expect(await claims.claim('paid', settledAt + 300n, 'fetch', settledAt + day)).toBe('expired');
     // Refusing it wrote nothing: the row waits for the sweep.
     expect(await count()).toBe(1);
+  });
+
+  it('C26: counts a try as each owner takes the claim, gives back only an unstarted one, and never lets a third start, whatever the order of takes, leaves and dead owners', async () => {
+    // A seeded walk over every step a request can take on one settled claim. Each owner either starts its screening,
+    // hands its try back unstarted, or dies holding the claim until its lease runs out. The count of screenings
+    // started must never pass REDEEM_SCREEN_TRIES, and once it reaches it every later taker gets 'spent'.
+    let seed = 7;
+    const next = (range: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed % range;
+    };
+    for (let run = 0; run < 12; run += 1) {
+      const { store: claims } = await claimBackend();
+      let clock = 1_000n;
+      const key = `walk-${run}`;
+      expect(await claims.claim(key, clock + 300n, 'first', clock)).toBe('taken');
+      await claims.markSettled(key, 'first', settlementFor(WALLET), clock);
+      let owner: string | null = 'first';
+      let started = 0;
+      let spentSeen = false;
+      for (let step = 0; step < 25; step += 1) {
+        if (owner !== null) {
+          const choice = next(3);
+          if (choice === 0) {
+            started += 1;
+            await claims.leave(key, owner, false);
+          } else if (choice === 1) {
+            await claims.leave(key, owner, true);
+          } else {
+            // Dies holding it: its try stays used, and its lease is what frees the claim.
+            started += 1;
+            clock += BigInt(LEASE_SECONDS);
+          }
+          owner = null;
+          continue;
+        }
+        const taker = `owner-${run}-${step}`;
+        const found = await claims.redeem(key, WALLET, taker, clock);
+        expect(found.found, `run ${run} step ${step}`).not.toBe('in-use');
+        if (found.found === 'settled') {
+          expect(spentSeen, `run ${run} step ${step}`).toBe(false);
+          expect(found.screening).toBe(started + 1);
+          owner = taker;
+        } else {
+          expect(found.found).toBe('spent');
+          spentSeen = true;
+          // Even asking to hand a try back cannot reopen it: this taker counted none.
+          await claims.leave(key, taker, true);
+        }
+        expect(started, `run ${run} step ${step}`).toBeLessThanOrEqual(REDEEM_SCREEN_TRIES);
+      }
+      expect(started).toBeLessThanOrEqual(REDEEM_SCREEN_TRIES);
+    }
   });
 });
 

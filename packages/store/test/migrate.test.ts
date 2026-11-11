@@ -7,7 +7,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { getAsk, getCampaign, listVersions, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
+import { appealTextHash, parseAddress } from '@thuli/core';
+import { addAppeal, getAppeal } from '../src/appeals.ts';
+import { counts, getAsk, getCampaign, listVersions, markListResent, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
 import { claimPayment, redeemPayment } from '../src/paymentClaims.ts';
@@ -192,6 +194,95 @@ describe('migrate', () => {
     ).rejects.toThrow(StoreError);
   });
 
+  it('a database made through 005, holding decided, failed and queued asks and a list, migrates on to appeals with every row readable', async () => {
+    for (const name of ['002_campaigns.sql', '003_retries_and_vault_block.sql', '004_paid_results.sql', '005_list_sending.sql']) {
+      await writeFile(path.join(directory, name), await readFile(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url))));
+    }
+    expect((await migrate(db, directory)).applied).toHaveLength(5);
+    const at = '2026-11-11T12:00:00.000Z';
+    const vault = '0x00000000000000000000000000000000000a11ce';
+    const held = parseAddress('0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a');
+    const failed = parseAddress('0x00000000000000000000000000000000000000b1');
+    const waiting = parseAddress('0x00000000000000000000000000000000000000b2');
+    const facts = '{"ageDays":3,"txCount":1,"accountType":"eoa","funder":null,"burstWallets":null,"groupSize":null,"missing":[]}';
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+       VALUES ('old', 'Before appeals', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{}', 'open',
+               $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz)`,
+      [vault, at],
+    );
+    // Written the way the code before this migration wrote them.
+    const signature = `0x${'ab'.repeat(65)}`;
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts, action, share_bps, rule, reason,
+                         cited_txs, not_checked, facts, decided_at)
+       VALUES ('old', $1, 1800000000, $2, $3::timestamptz, 'decided', 1, 'hold', 0, 'A9', 'Held while the funder is checked.',
+               '[]', '[]', $4::jsonb, $3::timestamptz),
+              ('old', $5, 1800000000, $2, $3::timestamptz, 'failed', 3, 'hold', 0, 'A1', 'Held for review: the screening could not finish.',
+               '[]', '[]', NULL, $3::timestamptz)`,
+      [held, signature, at, facts, failed],
+    );
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
+       VALUES ('old', $1, 1800000000, $2, $3::timestamptz, 'queued', 0)`,
+      [waiting, signature, at],
+    );
+    await db.query(
+      `INSERT INTO list_versions (campaign_id, version, root, published_list, declared_total, status, post_tx, claimable_at, created_at)
+       VALUES ('old', 1, $1, '[]', '0', 'active', $2, 1800000000, $3::timestamptz)`,
+      [`0x${'11'.repeat(32)}`, `0x${'bb'.repeat(32)}`, at],
+    );
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toHaveLength(5);
+    expect(upgraded.applied).toContain('006_appeals.sql');
+    expect(await getAsk(db, 'old', held)).toMatchObject({ status: 'decided', action: 'hold', rule: 'A9', appeal: null });
+    expect(await getAsk(db, 'old', failed)).toMatchObject({ status: 'failed', action: 'hold', rule: 'A1', appeal: null });
+    expect(await getAsk(db, 'old', waiting)).toMatchObject({ status: 'queued', appeal: null });
+    expect(await counts(db, 'old')).toMatchObject({ asked: 3, appeals: { filed: 0, checked: 0, block: 0, reversed: 0 } });
+    expect((await listVersions(db, 'old')).map((list) => [list.version, list.status])).toEqual([[1, 'active']]);
+    // An ask held before the migration can be appealed after it.
+    const text = 'My wallet is my own.';
+    expect(
+      await addAppeal(db, { campaignId: 'old', wallet: held, text, textHash: appealTextHash(text), signedAt: 1_800_000_000, signature }, new Date(at)),
+    ).toBe('queued');
+    expect(await getAppeal(db, 'old', held)).toMatchObject({ checkStatus: 'queued', outcome: 'open' });
+  });
+
+  it('a database made through 007, holding a list being sent, migrates on to the nonce with every row readable', async () => {
+    const before = ['002_campaigns.sql', '003_retries_and_vault_block.sql', '004_paid_results.sql', '005_list_sending.sql', '006_appeals.sql', '007_screening_tries.sql'];
+    for (const name of before) {
+      await writeFile(path.join(directory, name), await readFile(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url))));
+    }
+    expect((await migrate(db, directory)).applied).toHaveLength(7);
+    const at = '2026-11-11T12:00:00.000Z';
+    const hash = `0x${'bb'.repeat(32)}`;
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+       VALUES ('old', 'Before the nonce', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{}', 'open',
+               $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz)`,
+      ['0x00000000000000000000000000000000000a11ce', at],
+    );
+    // Written the way the code before this migration wrote it: sending, with a hash and no nonce.
+    await db.query(
+      `INSERT INTO list_versions (campaign_id, version, root, published_list, declared_total, status, post_tx, claimable_at, created_at)
+       VALUES ('old', 1, $1, '[]', '0', 'sending', $2, NULL, $3::timestamptz)`,
+      [`0x${'11'.repeat(32)}`, hash, at],
+    );
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toHaveLength(7);
+    expect(upgraded.applied).toContain('008_post_nonce.sql');
+    expect(await listVersions(db, 'old')).toEqual([
+      expect.objectContaining({ version: 1, status: 'sending', postTx: hash, postNonce: null, claimableAt: null }),
+    ]);
+    const other = `0x${'cc'.repeat(32)}`;
+    expect(await markListResent(db, 'old', 1, { postTx: other }, new Date(at))).toBe(true);
+    expect(await listVersions(db, 'old')).toEqual([expect.objectContaining({ status: 'sending', postTx: other, postNonce: null })]);
+  });
+
   it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {
     await migrate(db);
     const rows = await db.query<{ table_name: string; column_name: string }>(
@@ -201,7 +292,10 @@ describe('migrate', () => {
     for (const row of rows) (tables[row.table_name] ??= []).push(row.column_name);
     expect(tables).toEqual({
       schema_migrations: ['name', 'sha256', 'applied_at'],
-      payment_claims: ['key', 'state', 'owner', 'valid_before', 'updated_at', 'wallet', 'tx', 'settled_at', 'owned_until', 'result'],
+      payment_claims: [
+        'key', 'state', 'owner', 'valid_before', 'updated_at', 'wallet', 'tx', 'settled_at', 'owned_until', 'result', 'screenings',
+        'owner_counted',
+      ],
       leases: ['id', 'pool', 'expires_at'],
       rate_events: ['id', 'bucket', 'client', 'at'],
       day_counts: ['day', 'name', 'count'],
@@ -212,9 +306,18 @@ describe('migrate', () => {
       ],
       asks: [
         'campaign_id', 'wallet', 'signed_at', 'signature', 'asked_at', 'status', 'lease_until', 'attempts', 'action', 'share_bps',
-        'rule', 'reason', 'cited_txs', 'not_checked', 'facts', 'serv_request_id', 'decided_at', 'slot', 'retry_at',
+        'rule', 'reason', 'cited_txs', 'not_checked', 'facts', 'serv_request_id', 'decided_at', 'slot', 'retry_at', 'record',
+        'reversed_by_appeal',
       ],
-      list_versions: ['campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at'],
+      appeals: [
+        'campaign_id', 'wallet', 'text', 'text_hash', 'signed_at', 'signature', 'appealed_action', 'appealed_rule', 'filed_at',
+        'check_status', 'lease_until', 'attempts', 'retry_at', 'reppo_eval_id', 'reppo_route', 'reppo_note', 'credits_charged',
+        'checked_at', 'outcome', 'new_action', 'owner_note', 'settled_at',
+      ],
+      list_versions: [
+        'campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at',
+        'post_nonce',
+      ],
       claim_relays: ['campaign_id', 'wallet', 'version', 'amount', 'status', 'tx', 'attempts', 'updated_at', 'retry_at'],
     });
   });

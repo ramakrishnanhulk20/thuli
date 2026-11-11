@@ -10,8 +10,11 @@ import {
   type Address,
   type Outcome,
 } from '@thuli/core';
+import { readPublicAppeal, type PublicAppeal, type PublicAppealRow } from './appeals.ts';
 import { instant, shifted, StoreError, wholeNumber, type Db, type Queryable } from './db.ts';
-import { bumpDay } from './limits.ts';
+
+// A decision's record is a few hundred bytes; 16 KB leaves room and still bounds what one ask can store (C41).
+const MAX_RECORD_BYTES = 16_384;
 
 // Advisory lock namespace 1005 is one campaign, beside the ones db.ts lists. Every check-then-write on a campaign's
 // asks, slots and list versions holds it, so two server copies or two workers never decide on the same stale count.
@@ -32,10 +35,14 @@ export const MAX_ASK_REASON_CHARS = 400;
 export const MAX_RETRY_SECONDS = 86_400;
 /** The most campaigns openCampaigns returns, so one worker pass reads a bounded list (C41). */
 export const MAX_OPEN_CAMPAIGNS = 100;
-/** The fewest asks any campaign takes in all, so a campaign of a few slots still has room once some are held. */
-export const MIN_ASKS_PER_CAMPAIGN = 50;
-/** Asks a campaign takes per slot, past MIN_ASKS_PER_CAMPAIGN. See askCap. */
-export const ASKS_PER_SLOT = 10;
+/** Undecided asks, queued or screening, a campaign holds at once before it answers full; room returns as they are decided. */
+export const ASK_BACKLOG_CAP = 200;
+/** The fewest asks any campaign takes in all. See askLifetimeCap. */
+export const ASK_LIFETIME_MIN = 1_000;
+/** Asks a campaign takes in all per slot, past ASK_LIFETIME_MIN. See askLifetimeCap. */
+export const ASK_LIFETIME_PER_SLOT = 100;
+/** The store's day counter the worker counts the screenings it runs in, a name of its own. */
+export const CAMPAIGN_SCREENINGS_DAY_COUNTER = 'campaign-screenings';
 
 const MAX_NAME_CHARS = 80;
 const MAX_NOT_CHECKED = 16;
@@ -44,6 +51,8 @@ const MAX_NOT_CHECKED_CHARS = 64;
 const MAX_PUBLISHED_CHARS = 12_000_000;
 const MAX_LIST_ENTRIES = 100_000;
 const MAX_SLOTS = 100_000;
+/** The most rows funderLinks returns: the lifetime ask cap of the largest campaign allowed, 10,000,000. */
+export const MAX_FUNDER_LINKS = askLifetimeCap(MAX_SLOTS);
 const MAX_INTEGER = 2_147_483_647;
 const MAX_LEASE_SECONDS = 86_400;
 const MAX_UINT256 = (1n << 256n) - 1n;
@@ -74,7 +83,7 @@ export type ListStatus = 'built' | 'sending' | 'posted' | 'active' | 'superseded
 export type RelayStatus = 'pending' | 'sent' | 'confirmed' | 'failed';
 export type DecisionRule = (typeof DECISION_RULES)[number];
 
-export type AddAskResult = 'queued' | 'exists' | 'closed' | 'unknown' | 'full' | 'busy';
+export type AddAskResult = 'queued' | 'exists' | 'closed' | 'unknown' | 'full';
 export type CreateCampaignResult = 'created' | 'unchanged';
 export type ReleaseAskResult = 'queued' | 'failed';
 
@@ -164,6 +173,8 @@ export interface PublicAsk {
   servRequestId: string | null;
   decidedAt: Date | null;
   slot: number | null;
+  /** The wallet's appeal in its public view, or null when it filed none. */
+  appeal: PublicAppeal | null;
 }
 
 /** The ask takeAsk handed to one worker, which holds it until leaseUntil. */
@@ -187,12 +198,18 @@ export interface AskDecision {
   notChecked: readonly string[];
   facts: AskFactsInput;
   servRequestId: string | null;
+  /**
+   * The flat record the decision rested on, the object the worker gave SERV, kept so an appeal's outside check can be
+   * made later. Private: no public view returns it. A JSON object of at most 16 KB; left out, none is kept.
+   */
+  record?: Record<string, unknown>;
 }
 
 /**
  * asked counts every ask; queued those not yet decided, screening included; decided those with a decision, failed
  * ones included; held those whose action is hold, failed ones included; asksLeft how many more asks the campaign takes
- * before it answers full, never below 0.
+ * before it reaches its lifetime cap, never below 0. A campaign can also answer full sooner, when its slots are taken
+ * or its backlog of undecided asks is at ASK_BACKLOG_CAP.
  */
 export interface CampaignCounts {
   asked: number;
@@ -202,6 +219,8 @@ export interface CampaignCounts {
   slotsTaken: number;
   slotsLeft: number;
   asksLeft: number;
+  /** Appeals filed, those the outside check finished, those it routed to block, and those the owner reversed. */
+  appeals: { filed: number; checked: number; block: number; reversed: number };
 }
 
 export interface SlotHolder {
@@ -211,7 +230,10 @@ export interface SlotHolder {
   slot: number;
 }
 
-/** One list version without its published text, which only listText returns. claimableAt is in Unix seconds. */
+/**
+ * One list version without its published text, which only listText returns. claimableAt is in Unix seconds. postNonce
+ * is the posting transaction's nonce, for the worker; the public views do not carry it.
+ */
 export interface ListVersion {
   campaignId: string;
   version: number;
@@ -219,6 +241,7 @@ export interface ListVersion {
   declaredTotal: string;
   status: ListStatus;
   postTx: string | null;
+  postNonce: number | null;
   claimableAt: number | null;
   createdAt: Date;
 }
@@ -261,7 +284,7 @@ interface CampaignRow {
   vault_block: string | null;
 }
 
-interface AskRow {
+interface AskRow extends PublicAppealRow {
   campaign_id: string;
   wallet: string;
   asked_at: unknown;
@@ -285,6 +308,7 @@ interface ListRow {
   declared_total: string;
   status: string;
   post_tx: string | null;
+  post_nonce: string | null;
   claimable_at: string | null;
   created_at: unknown;
 }
@@ -564,6 +588,7 @@ function readPublicAsk(row: AskRow): PublicAsk {
     servRequestId: row.serv_request_id,
     decidedAt: readTimeOrNull(row.decided_at),
     slot: row.slot,
+    appeal: readPublicAppeal(row),
   };
 }
 
@@ -575,6 +600,7 @@ function readList(row: ListRow): ListVersion {
     declaredTotal: row.declared_total,
     status: row.status as ListStatus,
     postTx: row.post_tx,
+    postNonce: row.post_nonce === null ? null : Number(row.post_nonce),
     claimableAt: row.claimable_at === null ? null : Number(row.claimable_at),
     createdAt: readTime(row.created_at),
   };
@@ -685,19 +711,21 @@ export async function openCampaigns(db: Db, now: Date): Promise<Campaign[]> {
   return rows.map(readCampaign);
 }
 
-// bumpDay runs one query on the Db it is given, so the transaction's own connection can stand in for one: the day's
-// count is then written, or rolled back, together with the ask it counts.
-function inTransaction(tx: Queryable): Db {
-  return {
-    query: tx.query,
-    transaction: () => Promise.reject(new StoreError('a transaction cannot be opened inside this one')),
-    close: async () => undefined,
-  };
+// A try handed back is 1 off the attempts, none otherwise. Checked whatever else the call says, so a flag that is not
+// true or false is refused before anything is written.
+function refundOf(options: { refundTry?: unknown }): 0 | 1 {
+  if (options.refundTry === undefined) return 0;
+  if (typeof options.refundTry !== 'boolean') throw new StoreError('refundTry must be true or false');
+  return options.refundTry ? 1 : 0;
 }
 
-/** The most asks a campaign of maxSlots slots takes in all. */
-export function askCap(maxSlots: number): number {
-  return Math.max(MIN_ASKS_PER_CAMPAIGN, ASKS_PER_SLOT * maxSlots);
+/**
+ * The most asks a campaign of maxSlots slots ever takes: max(ASK_LIFETIME_MIN, ASK_LIFETIME_PER_SLOT times maxSlots).
+ * Not a limit on screenings, which the backlog cap and the worker's own day count bound, but a sanity bound on how far
+ * one campaign's rows can grow (C41).
+ */
+export function askLifetimeCap(maxSlots: number): number {
+  return Math.max(ASK_LIFETIME_MIN, ASK_LIFETIME_PER_SLOT * maxSlots);
 }
 
 /**
@@ -705,40 +733,29 @@ export function askCap(maxSlots: number): number {
  * the wallet's proof. The wallet goes through parseAddress, so every spelling of it is one ask (C1, C42). Runs in one
  * transaction under the campaign's lock, and the insert itself can never write a second ask for a wallet.
  *
- * A campaign takes no ask it cannot seat, because each queued ask costs a screening (C24): none once every slot is
- * taken, and none past askCap(max_slots) asks in all. That cap is above the slots on purpose: most honest campaigns
- * hold some wallets, and a held wallet takes no slot, so a cap equal to the slots would shut honest wallets out once a
- * few farms were held.
- *
- * With day given, the ask also counts toward that shared day ceiling, through the store's bumpDay, inside this same
- * transaction and only once the ask is certain to be queued. So the count is taken after the fact and atomically: it
- * is written with the ask or not at all, and an ask answered exists, closed or full never uses one.
- * @param day the day counter's name (1 to 40 characters) and its ceiling for one UTC day, counted across campaigns.
+ * A campaign takes no ask it cannot seat or will not reach soon (C24): none once every slot is taken; none while
+ * ASK_BACKLOG_CAP of its asks wait undecided, queued or screening, so a flood waits for the worker instead of growing
+ * without end and room comes back as asks are decided; and none past askLifetimeCap(max_slots) asks in all. The
+ * backlog counts what is waiting, not history, so a campaign whose earlier asks were all held stays open while it has
+ * slots. Asks take no day count here: the worker counts the screenings it runs in its own day bucket.
  * @returns in this order: 'unknown' when no campaign has the id; 'exists' when the wallet already asked, whatever the
  *   time or the campaign's state, and the first ask is left exactly as it was; 'closed' when the campaign's status is
- *   closed or now is before opensAt or at or after closesAt; 'full' when its slots are all taken or its asks have
- *   reached the cap; 'busy' when day is given and today's count is at its ceiling; otherwise 'queued'.
+ *   closed or now is before opensAt or at or after closesAt; 'full' when its slots are all taken, its backlog is at the
+ *   cap or its asks have reached the lifetime cap; otherwise 'queued'.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when signedAt is not whole
- *   seconds from 0, the signature is not 0x and 130 hex characters, now is not a valid Date, or day has an empty or
- *   over-long name or a ceiling that is not a whole number from 0, each before anything is written.
+ *   seconds from 0, the signature is not 0x and 130 hex characters, or now is not a valid Date, each before anything is
+ *   written.
  */
 export async function addAsk(
   db: Db,
   ask: { campaignId: string; wallet: string; signedAt: number; signature: string },
   now: Date,
-  day?: { name: string; max: number },
 ): Promise<AddAskResult> {
   const nowAt = instant(now);
   const wallet = parseAddress(ask.wallet);
   const signedAt = wholeNumber(ask.signedAt, 'signedAt', 0, Number.MAX_SAFE_INTEGER);
   if (typeof ask.signature !== 'string' || !SIGNATURE.test(ask.signature)) {
     throw new StoreError('a signature is 0x and 130 hex characters');
-  }
-  if (day !== undefined) {
-    if (typeof day.name !== 'string' || day.name.length === 0 || day.name.length > 40) {
-      throw new StoreError('the day counter name must be 1 to 40 characters');
-    }
-    wholeNumber(day.max, 'the day ceiling', 0, MAX_INTEGER);
   }
   if (!isCampaignId(ask.campaignId)) return 'unknown';
   const campaignId = ask.campaignId;
@@ -753,13 +770,19 @@ export async function addAsk(
     const [earlier] = await tx.query('SELECT 1 AS found FROM asks WHERE campaign_id = $1 AND wallet = $2', [campaignId, wallet]);
     if (earlier !== undefined) return 'exists';
     if (campaign.open !== true) return 'closed';
-    const [held] = await tx.query<{ asked: number; taken: number }>(
-      'SELECT count(*)::int AS asked, count(slot)::int AS taken FROM asks WHERE campaign_id = $1',
+    const [held] = await tx.query<{ asked: number; waiting: number; taken: number }>(
+      `SELECT count(*)::int AS asked, (count(*) FILTER (WHERE status IN ('queued', 'screening')))::int AS waiting,
+              count(slot)::int AS taken
+         FROM asks WHERE campaign_id = $1`,
       [campaignId],
     );
-    const asked = held?.asked ?? 0;
-    if ((held?.taken ?? 0) >= campaign.max_slots || asked >= askCap(campaign.max_slots)) return 'full';
-    if (day !== undefined && !(await bumpDay(inTransaction(tx), day.name, day.max, now))) return 'busy';
+    if (
+      (held?.taken ?? 0) >= campaign.max_slots ||
+      (held?.waiting ?? 0) >= ASK_BACKLOG_CAP ||
+      (held?.asked ?? 0) >= askLifetimeCap(campaign.max_slots)
+    ) {
+      return 'full';
+    }
     const added = await tx.query(
       `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
        VALUES ($1, $2, $3::bigint, $4, $5::timestamptz, 'queued', 0)
@@ -767,8 +790,8 @@ export async function addAsk(
        RETURNING wallet`,
       [campaignId, wallet, String(signedAt), ask.signature, nowAt],
     );
-    // Under the campaign's lock the wallet was just found absent, so this cannot happen; if it does, the day's count
-    // is rolled back with everything else rather than spent on an ask that was not added.
+    // Under the campaign's lock the wallet was just found absent, so this cannot happen; if it does, it is refused
+    // rather than answered as an ask that was added.
     if (added.length !== 1) throw new StoreError('the ask appeared while it was being added');
     return 'queued';
   });
@@ -841,7 +864,8 @@ export async function takeAsk(db: Db, now: Date, leaseSeconds: number, maxAttemp
  *   plain text of 1 to 400 characters (C13, C33), a cited transaction is not 0x and 64 lowercase hex or there are more
  *   than 256, notChecked holds more than 16 entries or one that is not plain text of 1 to 64 characters, the request id
  *   is malformed, facts does not have exactly the AskFacts keys or holds a value outside its shape (a funder address
- *   that is not an address included), or now is not a valid Date. The funder address is stored canonical (C1).
+ *   that is not an address included), record is given but is not a JSON object of at most 16 KB, or now is not a valid
+ *   Date. The funder address is stored canonical (C1). The record is private and no public view returns it (C40).
  */
 export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promise<{ slot: number | null } | null> {
   const nowAt = instant(now);
@@ -861,6 +885,21 @@ export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promi
   }
   notChecked.forEach((item, index) => plainTextOf(item, `notChecked ${index}`, MAX_NOT_CHECKED_CHARS));
   const facts = factsOf(decision.facts);
+  let record: string | null = null;
+  if (decision.record !== undefined) {
+    const given: unknown = decision.record;
+    if (typeof given !== 'object' || given === null || Array.isArray(given)) throw new StoreError('record must be a JSON object');
+    let json: string | undefined;
+    try {
+      json = JSON.stringify(given);
+    } catch {
+      throw new StoreError('record cannot be written as JSON');
+    }
+    if (json === undefined || Buffer.byteLength(json, 'utf8') > MAX_RECORD_BYTES) {
+      throw new StoreError(`record must be a JSON object of at most ${MAX_RECORD_BYTES} bytes`);
+    }
+    record = json;
+  }
   const servRequestId = decision.servRequestId;
   if (servRequestId !== null && (typeof servRequestId !== 'string' || !REQUEST_ID.test(servRequestId))) {
     throw new StoreError('servRequestId must be null or 1 to 128 letters, digits, dots, colons, dashes or underscores');
@@ -895,7 +934,7 @@ export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promi
       `UPDATE asks
           SET status = 'decided', lease_until = NULL, action = $3, share_bps = $4, rule = $5, reason = $6,
               cited_txs = $7::jsonb, not_checked = $8::jsonb, serv_request_id = $9, decided_at = $10::timestamptz, slot = $11,
-              facts = $12::jsonb
+              facts = $12::jsonb, record = $13::jsonb
         WHERE campaign_id = $1 AND wallet = $2`,
       [
         campaignId,
@@ -910,6 +949,7 @@ export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promi
         nowAt,
         slot,
         JSON.stringify(facts),
+        record,
       ],
     );
     return { slot };
@@ -924,10 +964,14 @@ export async function decideAsk(db: Db, decision: AskDecision, now: Date): Promi
  * finish.", no cited transactions, no facts and decided_at now. A failed ask never takes a slot. One statement, and
  * only on an ask that is screening.
  * @param retryAfterSeconds 0, the default, queues it ready at once; at most 86,400, so no ask waits more than a day (C41).
+ * @param options.refundTry true when the try failed for a reason that was not the ask's own, such as a daily budget that
+ *   is used up: the try is handed back, attempts falling by one but never below 0, in this same statement, and the ask
+ *   is judged against maxAttempts as if the try had not been made. The retry wait still applies, so a refund alone can
+ *   never make an ask loop without pause (C41). Left out or false, behaviour is unchanged.
  * @returns 'queued' or 'failed', or null when there is no such ask or it is not screening, in which case nothing changes.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when maxAttempts is not a whole
- *   number from 1 to 100, retryAfterSeconds not a whole number from 0 to 86,400, or now is not a valid Date, each before
- *   anything is written.
+ *   number from 1 to 100, retryAfterSeconds not a whole number from 0 to 86,400, refundTry is given but is not true or
+ *   false, or now is not a valid Date, each before anything is written.
  */
 export async function releaseAsk(
   db: Db,
@@ -936,28 +980,31 @@ export async function releaseAsk(
   now: Date,
   maxAttempts: number,
   retryAfterSeconds = 0,
+  options: { refundTry?: boolean } = {},
 ): Promise<ReleaseAskResult | null> {
   const nowAt = instant(now);
   const canonical = parseAddress(wallet);
   wholeNumber(maxAttempts, 'maxAttempts', 1, 100);
   const retryAt = shifted(now, wholeNumber(retryAfterSeconds, 'retryAfterSeconds', 0, MAX_RETRY_SECONDS));
+  const refund = refundOf(options);
   if (!isCampaignId(campaignId)) return null;
   const [row] = await db.query<{ status: ReleaseAskResult }>(
     `UPDATE asks
-        SET status = CASE WHEN attempts < $3::int THEN 'queued' ELSE 'failed' END,
+        SET status = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN 'queued' ELSE 'failed' END,
+            attempts = GREATEST(attempts - $7::int, 0),
             lease_until = NULL,
-            retry_at = CASE WHEN attempts < $3::int THEN $6::timestamptz ELSE NULL END,
-            action = CASE WHEN attempts < $3::int THEN NULL ELSE 'hold' END,
-            share_bps = CASE WHEN attempts < $3::int THEN NULL ELSE 0 END,
-            rule = CASE WHEN attempts < $3::int THEN NULL ELSE 'A1' END,
-            reason = CASE WHEN attempts < $3::int THEN NULL ELSE $4::text END,
-            cited_txs = CASE WHEN attempts < $3::int THEN NULL ELSE '[]'::jsonb END,
-            not_checked = CASE WHEN attempts < $3::int THEN NULL ELSE '[]'::jsonb END,
+            retry_at = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN $6::timestamptz ELSE NULL END,
+            action = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE 'hold' END,
+            share_bps = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE 0 END,
+            rule = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE 'A1' END,
+            reason = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE $4::text END,
+            cited_txs = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE '[]'::jsonb END,
+            not_checked = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE '[]'::jsonb END,
             facts = NULL,
-            decided_at = CASE WHEN attempts < $3::int THEN NULL ELSE $5::timestamptz END
+            decided_at = CASE WHEN GREATEST(attempts - $7::int, 0) < $3::int THEN NULL ELSE $5::timestamptz END
       WHERE campaign_id = $1 AND wallet = $2 AND status = 'screening'
      RETURNING status`,
-    [campaignId, canonical, maxAttempts, HELD_REASON, nowAt, retryAt],
+    [campaignId, canonical, maxAttempts, HELD_REASON, nowAt, retryAt, refund],
   );
   return row?.status ?? null;
 }
@@ -1001,9 +1048,13 @@ export async function getAsk(db: Db, campaignId: string, wallet: string): Promis
   const canonical = parseAddress(wallet);
   if (!isCampaignId(campaignId)) return null;
   const [row] = await db.query<AskRow>(
-    `SELECT campaign_id, wallet, asked_at, status, action, share_bps, rule, reason, cited_txs, not_checked, facts,
-            serv_request_id, decided_at, slot
-       FROM asks WHERE campaign_id = $1 AND wallet = $2`,
+    `SELECT a.campaign_id, a.wallet, a.asked_at, a.status, a.action, a.share_bps, a.rule, a.reason, a.cited_txs, a.not_checked,
+            a.facts, a.serv_request_id, a.decided_at, a.slot,
+            ap.filed_at AS appeal_filed_at, ap.check_status AS appeal_check_status, ap.reppo_route AS appeal_reppo_route,
+            ap.reppo_note AS appeal_reppo_note, ap.reppo_eval_id AS appeal_reppo_eval_id, ap.checked_at AS appeal_checked_at,
+            ap.outcome AS appeal_outcome, ap.new_action AS appeal_new_action, ap.settled_at AS appeal_settled_at
+       FROM asks a LEFT JOIN appeals ap ON ap.campaign_id = a.campaign_id AND ap.wallet = a.wallet
+      WHERE a.campaign_id = $1 AND a.wallet = $2`,
     [campaignId, canonical],
   );
   return row === undefined ? null : readPublicAsk(row);
@@ -1032,12 +1083,15 @@ export async function board(db: Db, campaignId: string, limit: number, beforeDec
         ORDER BY decided_at DESC, wallet
         LIMIT $3
      )
-     SELECT campaign_id, wallet, asked_at, status, action, share_bps, rule, reason, cited_txs, not_checked, facts,
-            serv_request_id, decided_at, slot
-       FROM asks
-      WHERE campaign_id = $1 AND status IN ('decided', 'failed') AND ($2::timestamptz IS NULL OR decided_at < $2::timestamptz)
-        AND decided_at >= (SELECT min(decided_at) FROM newest)
-      ORDER BY decided_at DESC, wallet
+     SELECT a.campaign_id, a.wallet, a.asked_at, a.status, a.action, a.share_bps, a.rule, a.reason, a.cited_txs, a.not_checked,
+            a.facts, a.serv_request_id, a.decided_at, a.slot,
+            ap.filed_at AS appeal_filed_at, ap.check_status AS appeal_check_status, ap.reppo_route AS appeal_reppo_route,
+            ap.reppo_note AS appeal_reppo_note, ap.reppo_eval_id AS appeal_reppo_eval_id, ap.checked_at AS appeal_checked_at,
+            ap.outcome AS appeal_outcome, ap.new_action AS appeal_new_action, ap.settled_at AS appeal_settled_at
+       FROM asks a LEFT JOIN appeals ap ON ap.campaign_id = a.campaign_id AND ap.wallet = a.wallet
+      WHERE a.campaign_id = $1 AND a.status IN ('decided', 'failed') AND ($2::timestamptz IS NULL OR a.decided_at < $2::timestamptz)
+        AND a.decided_at >= (SELECT min(decided_at) FROM newest)
+      ORDER BY a.decided_at DESC, a.wallet
       LIMIT $4`,
     [campaignId, before, limit, limit + MAX_BOARD_TIES],
   );
@@ -1046,11 +1100,12 @@ export async function board(db: Db, campaignId: string, limit: number, beforeDec
 
 /**
  * How a campaign's asks stand, as CampaignCounts defines each number. slotsLeft is max_slots less the slots taken, and
- * asksLeft is askCap(max_slots) less the asks so far.
+ * asksLeft is askLifetimeCap(max_slots) less the asks so far.
  * @returns the counts, or null when no campaign has the id.
  */
 export async function counts(db: Db, campaignId: string): Promise<CampaignCounts | null> {
   if (!isCampaignId(campaignId)) return null;
+  // One appeal per ask at most, so joining appeals never counts an ask twice.
   const [row] = await db.query<{
     max_slots: number;
     asked: number;
@@ -1058,14 +1113,24 @@ export async function counts(db: Db, campaignId: string): Promise<CampaignCounts
     decided: number;
     held: number;
     slots_taken: number;
+    appeals_filed: number;
+    appeals_checked: number;
+    appeals_block: number;
+    appeals_reversed: number;
   }>(
     `SELECT c.max_slots,
             count(a.wallet)::int AS asked,
             (count(a.wallet) FILTER (WHERE a.status IN ('queued', 'screening')))::int AS queued,
             (count(a.wallet) FILTER (WHERE a.status IN ('decided', 'failed')))::int AS decided,
             (count(a.wallet) FILTER (WHERE a.action = 'hold'))::int AS held,
-            count(a.slot)::int AS slots_taken
-       FROM campaigns c LEFT JOIN asks a ON a.campaign_id = c.id
+            count(a.slot)::int AS slots_taken,
+            count(ap.wallet)::int AS appeals_filed,
+            (count(ap.wallet) FILTER (WHERE ap.check_status = 'checked'))::int AS appeals_checked,
+            (count(ap.wallet) FILTER (WHERE ap.reppo_route = 'block'))::int AS appeals_block,
+            (count(ap.wallet) FILTER (WHERE ap.outcome = 'reversed'))::int AS appeals_reversed
+       FROM campaigns c
+       LEFT JOIN asks a ON a.campaign_id = c.id
+       LEFT JOIN appeals ap ON ap.campaign_id = a.campaign_id AND ap.wallet = a.wallet
       WHERE c.id = $1
       GROUP BY c.id, c.max_slots`,
     [campaignId],
@@ -1078,14 +1143,21 @@ export async function counts(db: Db, campaignId: string): Promise<CampaignCounts
     held: row.held,
     slotsTaken: row.slots_taken,
     slotsLeft: Math.max(0, row.max_slots - row.slots_taken),
-    asksLeft: Math.max(0, askCap(row.max_slots) - row.asked),
+    asksLeft: Math.max(0, askLifetimeCap(row.max_slots) - row.asked),
+    appeals: {
+      filed: row.appeals_filed,
+      checked: row.appeals_checked,
+      block: row.appeals_block,
+      reversed: row.appeals_reversed,
+    },
   };
 }
 
 /**
  * Every decided ask of a campaign whose facts name a first funder, oldest decision first, with that funder's canonical
  * address and kind. Failed asks carry no facts, so they never appear. Asks decided at the same instant come in wallet
- * order.
+ * order. A campaign holds at most askLifetimeCap(max_slots) asks, so this is at most that many rows; the query's own
+ * limit, MAX_FUNDER_LINKS, is that cap for the largest campaign allowed (C41).
  */
 export async function funderLinks(db: Db, campaignId: string): Promise<FunderLink[]> {
   if (!isCampaignId(campaignId)) return [];
@@ -1093,8 +1165,9 @@ export async function funderLinks(db: Db, campaignId: string): Promise<FunderLin
     `SELECT wallet, facts -> 'funder' ->> 'address' AS funder_address, facts -> 'funder' ->> 'kind' AS funder_kind, decided_at
        FROM asks
       WHERE campaign_id = $1 AND status IN ('decided', 'failed') AND jsonb_typeof(facts -> 'funder') = 'object'
-      ORDER BY decided_at, wallet`,
-    [campaignId],
+      ORDER BY decided_at, wallet
+      LIMIT $2`,
+    [campaignId, MAX_FUNDER_LINKS],
   );
   return rows.map((row) => ({
     wallet: row.wallet as Address,
@@ -1171,25 +1244,58 @@ export async function addListVersion(
  * The worker has broadcast the transaction that posts a built version's root, and records its hash before it waits for
  * the transaction to be mined. A stop or a timeout during that wait then leaves a record that the root may already be
  * on the vault, so the list is settled by markListPosted or markListUnsent and never posted a second time (C27, C32).
- * now is checked like every caller's time; the version keeps no send time of its own. One statement.
+ * The transaction's nonce is kept with its hash, because a replacement sent at the same nonce is the only other
+ * transaction that can land in its place. now is checked like every caller's time; the version keeps no send time of
+ * its own. One statement.
+ * @param sent.postNonce the posting transaction's nonce, a whole number from 0. Every new caller gives it; left out, as
+ *   callers from before it existed do, no nonce is kept.
  * @returns true when the version was built and is now sending; false, changing nothing, for any other version.
- * @throws StoreError when version is not a whole number from 1, postTx is not 0x and 64 lowercase hex, or now is not a
- *   valid Date.
+ * @throws StoreError when version is not a whole number from 1, postTx is not 0x and 64 lowercase hex, postNonce is
+ *   given but is not a whole number from 0, or now is not a valid Date, each before anything is written.
  */
 export async function markListSending(
   db: Db,
   campaignId: string,
   version: number,
-  sent: { postTx: string },
+  sent: { postTx: string; postNonce?: number },
   now: Date,
 ): Promise<boolean> {
   wholeNumber(version, 'version', 1, MAX_INTEGER);
   const postTx = txHashOf(sent.postTx, 'postTx');
+  const postNonce = sent.postNonce === undefined ? null : wholeNumber(sent.postNonce, 'postNonce', 0, Number.MAX_SAFE_INTEGER);
   instant(now);
   if (!isCampaignId(campaignId)) return false;
   const rows = await db.query(
-    `UPDATE list_versions SET status = 'sending', post_tx = $3
+    `UPDATE list_versions SET status = 'sending', post_tx = $3, post_nonce = $4::bigint
       WHERE campaign_id = $1 AND version = $2 AND status = 'built'
+     RETURNING version`,
+    [campaignId, version, postTx, postNonce === null ? null : String(postNonce)],
+  );
+  return rows.length === 1;
+}
+
+/**
+ * A sending version's transaction was replaced by one at the same nonce, a higher fee for one the network left
+ * unmined: the stored hash becomes the new one and the nonce stays, so the record still names every transaction that
+ * could land (C27, C32). now is checked like every caller's time. One statement.
+ * @returns true when the version was sending and now holds postTx; false, changing nothing, for any other version.
+ * @throws StoreError when version is not a whole number from 1, postTx is not 0x and 64 lowercase hex, or now is not a
+ *   valid Date.
+ */
+export async function markListResent(
+  db: Db,
+  campaignId: string,
+  version: number,
+  resent: { postTx: string },
+  now: Date,
+): Promise<boolean> {
+  wholeNumber(version, 'version', 1, MAX_INTEGER);
+  const postTx = txHashOf(resent.postTx, 'postTx');
+  instant(now);
+  if (!isCampaignId(campaignId)) return false;
+  const rows = await db.query(
+    `UPDATE list_versions SET post_tx = $3
+      WHERE campaign_id = $1 AND version = $2 AND status = 'sending'
      RETURNING version`,
     [campaignId, version, postTx],
   );
@@ -1198,7 +1304,7 @@ export async function markListSending(
 
 /**
  * A sending version's transaction was reverted, or the network does not know it after the worker's wait, so its root
- * never reached the vault: the version is built again, with no hash, and may be sent anew. One statement.
+ * never reached the vault: the version is built again, with no hash and no nonce, and may be sent anew. One statement.
  * @returns true when the version was sending and is now built; false, changing nothing, for any other version.
  * @throws StoreError when version is not a whole number from 1.
  */
@@ -1206,7 +1312,7 @@ export async function markListUnsent(db: Db, campaignId: string, version: number
   wholeNumber(version, 'version', 1, MAX_INTEGER);
   if (!isCampaignId(campaignId)) return false;
   const rows = await db.query(
-    `UPDATE list_versions SET status = 'built', post_tx = NULL
+    `UPDATE list_versions SET status = 'built', post_tx = NULL, post_nonce = NULL
       WHERE campaign_id = $1 AND version = $2 AND status = 'sending'
      RETURNING version`,
     [campaignId, version],
@@ -1289,7 +1395,8 @@ export async function markListCancelled(db: Db, campaignId: string, version: num
 export async function latestList(db: Db, campaignId: string): Promise<ListVersion | null> {
   if (!isCampaignId(campaignId)) return null;
   const [row] = await db.query<ListRow>(
-    `SELECT campaign_id, version, root, declared_total, status, post_tx, claimable_at::text AS claimable_at, created_at
+    `SELECT campaign_id, version, root, declared_total, status, post_tx, post_nonce::text AS post_nonce,
+            claimable_at::text AS claimable_at, created_at
        FROM list_versions WHERE campaign_id = $1 ORDER BY version DESC LIMIT 1`,
     [campaignId],
   );
@@ -1300,7 +1407,8 @@ export async function latestList(db: Db, campaignId: string): Promise<ListVersio
 export async function activeList(db: Db, campaignId: string): Promise<ListVersion | null> {
   if (!isCampaignId(campaignId)) return null;
   const [row] = await db.query<ListRow>(
-    `SELECT campaign_id, version, root, declared_total, status, post_tx, claimable_at::text AS claimable_at, created_at
+    `SELECT campaign_id, version, root, declared_total, status, post_tx, post_nonce::text AS post_nonce,
+            claimable_at::text AS claimable_at, created_at
        FROM list_versions WHERE campaign_id = $1 AND status = 'active'`,
     [campaignId],
   );
@@ -1311,7 +1419,8 @@ export async function activeList(db: Db, campaignId: string): Promise<ListVersio
 export async function listVersions(db: Db, campaignId: string): Promise<ListVersion[]> {
   if (!isCampaignId(campaignId)) return [];
   const rows = await db.query<ListRow>(
-    `SELECT campaign_id, version, root, declared_total, status, post_tx, claimable_at::text AS claimable_at, created_at
+    `SELECT campaign_id, version, root, declared_total, status, post_tx, post_nonce::text AS post_nonce,
+            claimable_at::text AS claimable_at, created_at
        FROM list_versions WHERE campaign_id = $1 ORDER BY version`,
     [campaignId],
   );
@@ -1442,15 +1551,20 @@ export async function takeRelay(db: Db, now: Date, leaseSeconds: number): Promis
  * takeRelay already failed is left failed even if a late claim landed; the vault pays each wallet only what it has not
  * yet claimed (C27), so neither case can pay twice.
  * @param result.retryAfterSeconds 0, the default, makes it ready at once; at most 86,400 (C41).
+ * @param result.refundTry with 'pending' only: true when the try failed for a reason that was not the relay's own, such
+ *   as a paused vault, so the try is handed back in this same statement, attempts falling by one but never below 0, and
+ *   the relay is judged against MAX_RELAY_ATTEMPTS as if the try had not been made. The retry wait still applies, so a
+ *   refund alone can never make a relay loop without pause (C41). Left out or false, behaviour is unchanged.
  * @returns the status the relay ended in, or null when there is no such relay or it was not sent, changing nothing.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when the status is not pending,
  *   sent, confirmed or failed, tx is not 0x and 64 lowercase hex, retryAfterSeconds is not a whole number from 0 to
- *   86,400, version is not a whole number from 1, or now is not a valid Date, each before anything is written.
+ *   86,400, refundTry is given but is not true or false, version is not a whole number from 1, or now is not a valid
+ *   Date, each before anything is written.
  */
 export async function markRelay(
   db: Db,
   key: RelayKey,
-  result: { status: RelayStatus; tx?: string | null; retryAfterSeconds?: number },
+  result: { status: RelayStatus; tx?: string | null; retryAfterSeconds?: number; refundTry?: boolean },
   now: Date,
 ): Promise<RelayStatus | null> {
   const nowAt = instant(now);
@@ -1460,16 +1574,19 @@ export async function markRelay(
   const tx = result.tx === undefined || result.tx === null ? null : txHashOf(result.tx, 'tx');
   const delay = wholeNumber(result.retryAfterSeconds ?? 0, 'retryAfterSeconds', 0, MAX_RETRY_SECONDS);
   const retryAt = result.status === 'pending' ? shifted(now, delay) : null;
+  const refundTry = refundOf(result);
+  const refund = result.status === 'pending' ? refundTry : 0;
   if (!isCampaignId(key.campaignId)) return null;
   const [row] = await db.query<{ status: RelayStatus }>(
     `UPDATE claim_relays
-        SET status = CASE WHEN $4::text = 'pending' AND attempts >= $7::int THEN 'failed' ELSE $4::text END,
+        SET status = CASE WHEN $4::text = 'pending' AND GREATEST(attempts - $9::int, 0) >= $7::int THEN 'failed' ELSE $4::text END,
+            attempts = GREATEST(attempts - $9::int, 0),
             tx = COALESCE($5::text, tx),
             updated_at = $6::timestamptz,
-            retry_at = CASE WHEN $4::text = 'pending' AND attempts < $7::int THEN $8::timestamptz ELSE NULL END
+            retry_at = CASE WHEN $4::text = 'pending' AND GREATEST(attempts - $9::int, 0) < $7::int THEN $8::timestamptz ELSE NULL END
       WHERE campaign_id = $1 AND wallet = $2 AND version = $3 AND status = 'sent'
      RETURNING status`,
-    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS, retryAt],
+    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS, retryAt, refund],
   );
   return row?.status ?? null;
 }

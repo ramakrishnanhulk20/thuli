@@ -65,8 +65,11 @@ export interface ClaimStore {
   release(key: string, owner: string): Promise<void>;
   /** Stores the result the payment bought, for every later redeem. Does nothing unless owner owns the settled key. */
   serve(key: string, owner: string, body: unknown): Promise<void>;
-  /** The screening ended with no result: the next copy of the header may screen it. Does nothing unless owner owns it. */
-  leave(key: string, owner: string): Promise<void>;
+  /**
+   * The screening ended with no result: the next copy of the header may take it. handBackTry gives back the try this
+   * owner's taking counted, for an owner that never started that screening. Does nothing unless owner owns it.
+   */
+  leave(key: string, owner: string, handBackTry: boolean): Promise<void>;
 }
 
 /** The ceilings on paid screenings across the whole service (C24, C42), by ScreenGuard's rules. Any call may reject when the store fails. */
@@ -139,7 +142,7 @@ export function claimStoreOver(claims: PaymentClaims): ClaimStore {
     keepUnsure: async (key, owner) => claims.keepUnsure(key, owner),
     release: async (key, owner) => claims.release(key, owner),
     serve: async (key, owner, body) => claims.serve(key, owner, body),
-    leave: async (key, owner) => claims.leave(key, owner),
+    leave: async (key, owner, handBackTry) => claims.leave(key, owner, handBackTry),
   };
 }
 
@@ -207,7 +210,7 @@ function postgresClaims(db: Db): ClaimStore {
     keepUnsure: (key, owner) => keepPaymentUnsure(db, key, owner),
     release: (key, owner) => releasePayment(db, key, owner),
     serve: (key, owner, body) => servePayment(db, key, owner, body),
-    leave: (key, owner) => leaveSettledPayment(db, key, owner),
+    leave: (key, owner, handBackTry) => leaveSettledPayment(db, key, owner, handBackTry),
   };
 }
 

@@ -192,20 +192,28 @@ async function decide(wallet: Address, deps: SingleScreenDeps, budget: ServBudge
  * already been paid always gets a decision back (C11, C25). At most MAX_SERV_CALLS_PER_SCREEN SERV calls are made
  * (C26), and none start after SCREEN_TIME_LIMIT_MS (C41).
  *
+ * @param signal lets a caller whose own time has run out stop the screening early, exactly as the time limit does: the
+ *   budget refuses every SERV call and retry wait from then on, and the answer is the time-up hold at once. A call
+ *   already sent may still finish, as it may at the time limit. Left out, only the time limit stops it.
  * @throws AddressError for an address that is not 40 hex characters or has a wrong checksum, before any fact is read or
  * any call is made, so a caller can refuse the request before taking payment (C1).
  */
-export async function screenOneWallet(wallet: string, deps: SingleScreenDeps): Promise<SingleScreen> {
+export async function screenOneWallet(wallet: string, deps: SingleScreenDeps, signal?: AbortSignal): Promise<SingleScreen> {
   const address = parseAddress(wallet);
   const checkedAt = new Date().toISOString();
   const budget = servBudget(deps.decide, MAX_SERV_CALLS_PER_SCREEN);
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopNow: (() => void) | undefined;
   const timeUp = new Promise<DecisionRecord>((resolve) => {
-    timer = setTimeout(() => {
+    stopNow = () => {
       budget.stop(SCREEN_CAUSES.timeUp);
       resolve(heldRecord(address, SCREEN_CAUSES.timeUp));
-    }, SCREEN_TIME_LIMIT_MS);
+    };
+    timer = setTimeout(stopNow, SCREEN_TIME_LIMIT_MS);
   });
+  const onAbort = () => stopNow?.();
+  if (signal?.aborted === true) onAbort();
+  else signal?.addEventListener('abort', onAbort, { once: true });
   try {
     const decision = await Promise.race([decide(address, deps, budget), timeUp]);
     return {
@@ -219,6 +227,7 @@ export async function screenOneWallet(wallet: string, deps: SingleScreenDeps): P
     };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
   }
 }
 

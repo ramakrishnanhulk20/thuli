@@ -15,12 +15,18 @@ export function readRulebook(): string {
  * The real screening: free facts from the Ethereum RPC and Blockscout, then SERV in auto mode with the default
  * settings, the same graph and rulebook the replay used. Reads only the worker's own variables from env.
  *
+ * The function it returns takes an optional AbortSignal, handed to screenOneWallet, so a paid request whose time has run
+ * out stops the screening's SERV calls rather than leaving it to run on.
+ *
  * @param rulebook the rulebook text, read with readRulebook unless given. A server whose files a bundler has moved
  *   passes the copy it carries instead.
  * @throws EnvError naming a missing SERV or chain variable, and ConfigError when SERV_GRAPH_ID names no graph Thuli can
  * translate or the rulebook text is empty, all before anything listens. No message holds a value (C40).
  */
-export function liveScreen(env: Record<string, string | undefined>, rulebook?: string): (wallet: Address) => Promise<SingleScreen> {
+export function liveScreen(
+  env: Record<string, string | undefined>,
+  rulebook?: string,
+): (wallet: Address, signal?: AbortSignal) => Promise<SingleScreen> {
   const workerEnv = loadEnv(env);
   const graphId = workerEnv.SERV_GRAPH_ID;
   if (graphId === undefined || graphVersion(graphId) === undefined) {
@@ -35,5 +41,5 @@ export function liveScreen(env: Record<string, string | undefined>, rulebook?: s
     viaV2: (record: Parameters<typeof decideViaV2>[0]) => decideViaV2(record, text, connection),
     sleep: (ms: number) => wait(ms),
   };
-  return (wallet) => screenOneWallet(wallet, { facts, decide, settings: DEFAULT_SETTINGS });
+  return (wallet, signal) => screenOneWallet(wallet, { facts, decide, settings: DEFAULT_SETTINGS }, signal);
 }

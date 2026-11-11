@@ -1,8 +1,15 @@
 import { createPublicClient, http, parseAbi, parseEventLogs, type Hash, type Hex, type Log } from 'viem';
 import { parseAddress, type Address } from '@thuli/core';
 
-/** The longest one read of a pending settlement's receipt may take (C41). */
+/** The longest one RPC call of the receipt reader may take, per try (C41). */
 export const RECEIPT_TIMEOUT_MS = 10_000;
+/** Each RPC call is tried once more after a failure, after this wait. Set here so the worst case below is exact. */
+const RECEIPT_RETRY_DELAY_MS = 250;
+/**
+ * The longest one receiptReader read can take: the chain-id call (made on the first read, and again after a failed
+ * one) and the receipt call, each tried twice with one wait between (C41).
+ */
+export const RECEIPT_READ_WORST_MS = 2 * (2 * RECEIPT_TIMEOUT_MS + RECEIPT_RETRY_DELAY_MS);
 // One transferWithAuthorization receipt is about 2 KB. Anything near this cap is not the receipt we asked for (C41).
 const MAX_RECEIPT_BYTES = 256 * 1024;
 
@@ -76,6 +83,7 @@ export function receiptReader(rpcUrl: string, chainId: number): ReadReceipt {
     transport: http(rpcUrl, {
       timeout: RECEIPT_TIMEOUT_MS,
       retryCount: 1,
+      retryDelay: RECEIPT_RETRY_DELAY_MS,
       maxResponseBodySize: MAX_RECEIPT_BYTES,
       fetchOptions: { redirect: 'error' },
     }),

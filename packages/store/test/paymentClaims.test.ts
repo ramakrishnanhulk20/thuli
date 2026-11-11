@@ -13,6 +13,7 @@ import {
   markPaymentSettled,
   MAX_PAYMENT_CLAIMS,
   PAID_RESULT_KEEP_SECONDS,
+  REDEEM_SCREEN_TRIES,
   redeemPayment,
   releasePayment,
   servePayment,
@@ -69,6 +70,11 @@ for (const { name, open } of TARGETS) {
       return found;
     }
 
+    async function screenings(): Promise<number | undefined> {
+      const [found] = await db.query<{ screenings: number }>('SELECT screenings FROM payment_claims WHERE key = $1', [KEY]);
+      return found?.screenings;
+    }
+
     it('C25: 20 claims on one key from different owners, started together, give exactly one taken', async () => {
       const owners = Array.from({ length: 20 }, (_, index) => `request-${index}`);
       const results = await Promise.all(owners.map((owner) => claimPayment(db, KEY, NOW + 300n, owner, at(NOW))));
@@ -108,7 +114,8 @@ for (const { name, open } of TARGETS) {
       await leaveSettledPayment(db, KEY, 'payer');
       const owners = Array.from({ length: 20 }, (_, index) => `redeem-${index}`);
       const results = await Promise.all(owners.map((owner) => redeemPayment(db, KEY, WALLET, owner, owned(NOW + 10n))));
-      expect(results.filter((result) => result.found === 'settled')).toEqual([{ found: 'settled', transaction: TX }]);
+      // The settling request's leave without a hand-back kept its try, so the winner starts the second.
+      expect(results.filter((result) => result.found === 'settled')).toEqual([{ found: 'settled', transaction: TX, screening: 2 }]);
       expect(results.filter((result) => result.found === 'in-use')).toHaveLength(19);
       const winner = owners[results.findIndex((result) => result.found === 'settled')] as string;
       expect((await row(KEY))?.owner).toBe(winner);
@@ -127,7 +134,7 @@ for (const { name, open } of TARGETS) {
       await leaveSettledPayment(db, KEY, 'payer');
       expect(await redeemPayment(db, KEY, OTHER_WALLET, 'other', owned(NOW + 1n))).toEqual({ found: 'refused' });
       expect(await redeemPayment(db, KEY, WALLET, 'late', owned(NOW + DAY))).toEqual({ found: 'none' });
-      expect(await redeemPayment(db, KEY, WALLET.toLowerCase(), 'same', owned(NOW + DAY - 1n))).toEqual({ found: 'settled', transaction: TX });
+      expect(await redeemPayment(db, KEY, WALLET.toLowerCase(), 'same', owned(NOW + DAY - 1n))).toEqual({ found: 'settled', transaction: TX, screening: 2 });
       expect(await redeemPayment(db, 'no-such-key', WALLET, 'same', owned(NOW))).toEqual({ found: 'none' });
       await expect(redeemPayment(db, KEY, 'not-an-address', 'same', owned(NOW))).rejects.toThrow();
       await expect(redeemPayment(db, KEY, WALLET, 'same', { nowSeconds: NOW, ownedUntil: NOW })).rejects.toThrow(StoreError);
@@ -139,13 +146,53 @@ for (const { name, open } of TARGETS) {
       // Its own wallet hears in-use while the owner lives; another wallet is refused all the same.
       expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST - 1n))).toEqual({ found: 'in-use' });
       expect(await redeemPayment(db, KEY, OTHER_WALLET, 'other', owned(NOW + LATEST - 1n))).toEqual({ found: 'refused' });
-      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST))).toEqual({ found: 'settled', transaction: TX });
-      await leaveSettledPayment(db, KEY, 'payer');
+      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST))).toEqual({ found: 'settled', transaction: TX, screening: 2 });
+      // The old owner can neither leave nor hand its try back nor store a result any more.
+      await leaveSettledPayment(db, KEY, 'payer', true);
       await servePayment(db, KEY, 'payer', { late: true });
       expect((await row(KEY))?.owner).toBe('copy');
+      expect(await screenings()).toBe(2);
       await leaveSettledPayment(db, KEY, 'copy');
       expect(await row(KEY)).toEqual({ state: 'settled', owner: null, valid_before: (NOW + 300n).toString() });
-      expect(await redeemPayment(db, KEY, WALLET, 'next', owned(NOW + LATEST + 1n))).toEqual({ found: 'settled', transaction: TX });
+      // Both tries are used, so the next copy owns it only to store the time-up hold, and counts nothing.
+      expect(await redeemPayment(db, KEY, WALLET, 'next', owned(NOW + LATEST + 1n))).toEqual({ found: 'spent', transaction: TX });
+      expect(await screenings()).toBe(2);
+      expect((await row(KEY))?.owner).toBe('next');
+    });
+
+    it('C26: counts one screening per taking of the claim, gives back only the owner\'s unstarted try, and answers spent at REDEEM_SCREEN_TRIES', async () => {
+      expect(REDEEM_SCREEN_TRIES).toBe(2);
+      expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
+      expect(await screenings()).toBe(0);
+      await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
+      expect(await screenings()).toBe(1);
+      // The settling request had no time to screen, so its try goes back and the next copy starts the first screening.
+      await leaveSettledPayment(db, KEY, 'stranger', true);
+      expect(await screenings()).toBe(1);
+      await leaveSettledPayment(db, KEY, 'payer', true);
+      expect(await screenings()).toBe(0);
+      expect(await redeemPayment(db, KEY, WALLET, 'one', owned(NOW + 1n))).toEqual({ found: 'settled', transaction: TX, screening: 1 });
+      await leaveSettledPayment(db, KEY, 'one');
+      expect(await redeemPayment(db, KEY, WALLET, 'two', owned(NOW + 2n))).toEqual({ found: 'settled', transaction: TX, screening: 2 });
+      await leaveSettledPayment(db, KEY, 'two');
+      // Spent: twenty copies at once get one owner between them and none starts a third screening.
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, index) => redeemPayment(db, KEY, WALLET, `late-${index}`, owned(NOW + 3n))),
+      );
+      expect(results.filter((result) => result.found === 'spent')).toEqual([{ found: 'spent', transaction: TX }]);
+      expect(results.filter((result) => result.found === 'in-use')).toHaveLength(19);
+      expect(await screenings()).toBe(2);
+      // An owner that took a spent claim counted no try, so even asking to hand one back cannot reopen a screening.
+      const spentOwner = `late-${results.findIndex((result) => result.found === 'spent')}`;
+      await leaveSettledPayment(db, KEY, spentOwner, true);
+      expect(await screenings()).toBe(2);
+      expect(await redeemPayment(db, KEY, WALLET, 'spent-again', owned(NOW + 3n))).toEqual({ found: 'spent', transaction: TX });
+      await servePayment(db, KEY, 'spent-again', { hold: 'ran out of time' });
+      expect(await redeemPayment(db, KEY, WALLET, 'after', owned(NOW + 4n))).toEqual({
+        found: 'served',
+        transaction: TX,
+        body: { hold: 'ran out of time' },
+      });
     });
 
     it('refuses a settled result that is null, a transaction that is not lowercase hex, and a result over 16 KB', async () => {
