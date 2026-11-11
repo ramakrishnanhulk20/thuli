@@ -4,6 +4,8 @@
 //
 // One block per appeal: the wallet, the ask's action and rule, the appeal's own text, the outside check and the outcome.
 // This is the only place an appeal's text is shown, and it goes to this terminal only; no page or log carries it (C40).
+// The text, the owner's note and Reppo's words are each printed as one quoted JSON string after a fixed label, so none
+// of them can pass for a line of this command's own (C34).
 // Reads DATABASE_URL and nothing else, changes nothing, and loads no private key.
 import { parseArgs } from 'node:util';
 import { CAMPAIGN_ID } from '@thuli/core';

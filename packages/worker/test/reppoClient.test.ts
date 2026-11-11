@@ -2,7 +2,15 @@
 // timed-out or lost evaluation is charged, which only Reppo's own ledger can show.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EnvError } from '../src/env.ts';
-import { evaluate, ReppoError, ReppoOutOfCredit, reppoConnectionFromEnv, SUBMIT_MAY_HAVE_LANDED } from '../src/reppo/client.ts';
+import {
+  evaluate,
+  ReppoError,
+  ReppoOutOfCredit,
+  reppoConnectionFromEnv,
+  SUBMIT_MAY_HAVE_LANDED,
+  submitCannotHaveCharged,
+  submitEvaluationOnce,
+} from '../src/reppo/client.ts';
 
 const BASE = 'https://eval.example.org/api/v1';
 const KEY = 'SECRETREPPOKEY';
@@ -201,6 +209,57 @@ describe('evaluate', () => {
       expect(seen).not.toContain(KEY);
       expect(seen).not.toContain('example.org');
     }
+  });
+});
+
+describe('submitEvaluationOnce', () => {
+  const once = { baseUrl: BASE, apiKey: KEY, timeoutMs: 30_000 };
+
+  it('makes exactly one request whatever comes back, and tells a refusal that cannot have charged from one that may have', async () => {
+    let fetchMock = replies(json({ id: ID }, 201));
+    expect(await submitEvaluationOnce('the text', once)).toBe(ID);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
+
+    const cases: [Response | Error, boolean][] = [
+      [json({}, 402), true],
+      [json({}, 400), true],
+      [json({}, 401), true],
+      [json({}, 404), true],
+      [json({}, 500), false],
+      [json({}, 503), false],
+      [json({}, 409), false],
+      [new Error('socket hang up'), false],
+      [json({ id: 'not/safe' }, 201), false],
+      [new Response('not json', { status: 201 }), false],
+    ];
+    for (const [reply, cannotHaveCharged] of cases) {
+      fetchMock = replies(reply);
+      const error = await submitEvaluationOnce('the text', once).catch((caught: unknown) => caught);
+      expect(error instanceof ReppoError || error instanceof ReppoOutOfCredit).toBe(true);
+      expect(submitCannotHaveCharged(error)).toBe(cannotHaveCharged);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
+    expect(submitCannotHaveCharged(new Error('a store failure'))).toBe(false);
+  });
+
+  it('sends nothing once its signal is aborted, and stops waiting on an abort mid-call with the outcome left unknown', async () => {
+    const stopped = new AbortController();
+    stopped.abort();
+    const none = replies();
+    const before = await submitEvaluationOnce('the text', { ...once, signal: stopped.signal }).catch((caught: unknown) => caught);
+    expect(none).not.toHaveBeenCalled();
+    expect(submitCannotHaveCharged(before)).toBe(false);
+
+    const hanging = vi.fn(async (_url: string, _init?: RequestInit) => new Promise<Response>(() => undefined));
+    vi.stubGlobal('fetch', hanging);
+    const midway = new AbortController();
+    const pending = submitEvaluationOnce('the text', { ...once, signal: midway.signal }).catch((caught: unknown) => caught);
+    midway.abort();
+    const cut = await pending;
+    expect(cut).toBeInstanceOf(ReppoError);
+    expect(submitCannotHaveCharged(cut)).toBe(false);
+    expect(hanging).toHaveBeenCalledTimes(1);
   });
 });
 

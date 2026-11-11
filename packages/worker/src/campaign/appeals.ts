@@ -14,7 +14,9 @@ import {
   type GraphRecord,
 } from '@thuli/core';
 import {
+  clearAppealSubmitting,
   getAsk,
+  markAppealSubmitting,
   markAppealUnchecked,
   MAX_OWNER_NOTE_CHARS,
   MAX_REPPO_DECISION_CHARS,
@@ -24,6 +26,7 @@ import {
   recordAppealCheck,
   releaseAppeal,
   settleAppeal,
+  settleRefusal,
   StoreError,
   takeAppeal,
   type Db,
@@ -34,17 +37,32 @@ import {
   type ReppoRoute,
   type TakenAppeal,
 } from '@thuli/store';
-import { lookUpEvaluation, ReppoError, ReppoOutOfCredit, submitEvaluation, type ReppoConnection, type ReppoEval } from '../reppo/client.ts';
+import {
+  lookUpEvaluation,
+  ReppoError,
+  ReppoOutOfCredit,
+  submitCannotHaveCharged,
+  submitEvaluationOnce,
+  type ReppoConnection,
+  type ReppoEval,
+} from '../reppo/client.ts';
 import { identifyingPart } from '../reppo/feedback.ts';
 import { LONGEST_RETRY_SECONDS, retryDelaySeconds } from './screen.ts';
 import { checkpoint, StepStopped, waitNoted, type ChainMemory } from './vault.ts';
 
-/** How long one worker holds an appeal: above the step's time limit, so a check under way never loses its appeal. */
+/**
+ * How long one worker holds an appeal. The submit always ends inside it: the take, the text and the mark take
+ * milliseconds, and the one POST then ends by APPEAL_SUBMIT_DEADLINE_MS, 30 seconds, at the latest, or sooner at the
+ * step's own 240 second limit, leaving over 260 seconds of the lease. A second worker can take the appeal only once the
+ * lease has run out, when the submit mark already stands, so it never sends (C23, C41).
+ */
 export const APPEAL_LEASE_SECONDS = 300;
 /** Tries one appeal's outside check gets before it ends unchecked (C41). */
 export const APPEAL_MAX_ATTEMPTS = 6;
 /** How long one look-up waits for Reppo, which answers in 30 to 90 seconds; past this the try is given back unfinished. */
 export const APPEAL_REPPO_WAIT_MS = 150_000;
+/** The deadline of the one POST that submits an appeal; with no retry, it is the whole submit. */
+export const APPEAL_SUBMIT_DEADLINE_MS = 30_000;
 const APPEAL_POLL_MS = 5_000;
 
 /** Why the appeal step does nothing, with no Reppo key set. */
@@ -59,6 +77,7 @@ export const APPEAL_CAUSES = Object.freeze({
   unfinished: 'the outside check had not finished',
   failed: 'the outside check could not finish',
   lost: 'the appeal was no longer being checked by this worker',
+  maybePaid: 'the outside check may already have been paid for',
 });
 
 const APPEAL_LABEL = 'appeal';
@@ -66,7 +85,8 @@ const ROUTES: readonly ReppoRoute[] = ['ship', 'review', 'block'];
 
 /** Reppo as the appeal step uses it: a submit that answers with the id before any wait, and a look-up by that id. */
 export interface AppealReppo {
-  submit(input: string): Promise<string>;
+  /** One POST with no retry, ending by its deadline or the signal; throws as submitEvaluationOnce does. */
+  submit(input: string, signal?: AbortSignal): Promise<string>;
   /** Waits for one evaluation; never submits. The signal cuts the wait short. */
   lookUp(id: string, signal?: AbortSignal): Promise<ReppoEval>;
 }
@@ -99,9 +119,7 @@ export type AppealOutcome =
 export function reppoForAppeals(connection: ReppoConnection): AppealReppo {
   const options = { ...connection, pollMs: APPEAL_POLL_MS, timeoutMs: APPEAL_REPPO_WAIT_MS };
   return {
-    // The submit's own retry waits are not cut short: a submit that may have landed must finish and hand back its id,
-    // or the next try would pay for a second evaluation (C23).
-    submit: (input) => submitEvaluation(input, options),
+    submit: (input, signal) => submitEvaluationOnce(input, { ...connection, timeoutMs: APPEAL_SUBMIT_DEADLINE_MS, signal }),
     lookUp: (id, signal) =>
       lookUpEvaluation(id, {
         ...options,
@@ -163,8 +181,10 @@ function causeOf(error: unknown): string {
  * - No stored record, a record reppoInput cannot read, or a text that still holds something identifying: the check ends
  *   unchecked and nothing is sent (C35).
  * - An evaluation id already on the appeal, from a try cut short after its submit: that evaluation is looked up and
- *   nothing is submitted again (C23). Otherwise the text is submitted and its id is kept with noteAppealEval before the
- *   wait, with no stop allowed between the two, because the evaluation is paid for once it is submitted.
+ *   nothing is submitted again (C23). A submit begun with no id kept (submitStarted) may have been paid for, so the
+ *   appeal ends unchecked with APPEAL_CAUSES.maybePaid and is never sent. Otherwise markAppealSubmitting goes first, and
+ *   only a worker whose mark landed sends, with one POST and no retry (submitOnce), so Reppo is paid at most once for any
+ *   appeal under any cut and with any number of workers.
  * - COMPLETED: recordAppealCheck with the route, noteFrom of Reppo's reason, the id, the credits charged and the
  *   verdict's score, decision and confidence, each null when the store would refuse it. A paid check always ends checked,
  *   with route null when Reppo named none Thuli knows or its verdict was out of shape (C23).
@@ -186,22 +206,31 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
   try {
     let evalId = taken.reppoEvalId;
     if (evalId === null) {
+      if (taken.submitStarted) {
+        // A submit was begun and no id was kept, so it may have been paid for, and Reppo cannot recognise a text sent
+        // twice: this appeal is never sent again. It ends unchecked and can still be settled (C23).
+        checkpoint(signal, 'ending an appeal check');
+        await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.maybePaid);
+        deps.log(`${label}: unchecked, ${APPEAL_CAUSES.maybePaid}`);
+        return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.maybePaid };
+      }
       const built = outsideInput(taken);
       if (!built.ok) {
         checkpoint(signal, 'ending an appeal check');
-        await markAppealUnchecked(deps.db, where, deps.now());
+        await markAppealUnchecked(deps.db, where, deps.now(), built.cause);
         deps.log(`${label}: unchecked, ${built.cause}${built.kind === undefined ? '' : ` (${built.kind})`}`);
         return { kind: 'unchecked', ...where, cause: built.cause };
       }
-      checkpoint(signal, 'sending an appeal to the outside check');
-      evalId = await deps.reppo.submit(built.input);
-      // No checkpoint between the submit and this record: once submitted the evaluation is paid for, so its id is always
-      // kept, abort or not, and every later try looks it up instead of paying again (C23).
-      if (!(await noteAppealEval(deps.db, where, evalId, deps.now()))) {
-        deps.log(`${label}: ${APPEAL_CAUSES.lost}, so evaluation ${evalId} was not kept`);
+      checkpoint(signal, 'marking an appeal as being sent');
+      // The durable mark goes first: of two workers holding this appeal after a lease ran out, only the one whose mark
+      // lands may send, and a cut at any later point leaves the mark for the next take to see (C23).
+      if (!(await markAppealSubmitting(deps.db, where, deps.now()))) {
+        deps.log(`${label}: ${APPEAL_CAUSES.lost}, so nothing was sent`);
         return { kind: 'dropped', ...where, cause: APPEAL_CAUSES.lost };
       }
-      deps.log(`${label}: sent to the outside check as evaluation ${evalId}`);
+      const sent = await submitOnce(deps, taken, built.input, signal);
+      if (sent.kind === 'ended') return sent.outcome;
+      evalId = sent.evalId;
     }
     checkpoint(signal, 'waiting for the outside check');
     const result = await deps.reppo.lookUp(evalId, signal);
@@ -212,6 +241,53 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
     if (error instanceof ReppoOutOfCredit) return outOfCredit(deps, taken, signal);
     return giveBack(deps, taken, causeOf(error), signal);
   }
+}
+
+/**
+ * The one POST of a marked appeal, and what it leaves in the store for each way it can end (C23):
+ * - an evaluation id: kept at once with noteAppealEval, before any wait, with no stop allowed between the two;
+ * - a refusal that cannot have charged (402, 400, 401, 404, by submitCannotHaveCharged): the mark is taken back with
+ *   clearAppealSubmitting, so a later run may send; a 402 then waits the longest wait with its try handed back, the
+ *   others the usual wait;
+ * - anything else, no reply, the deadline, the signal, a 5xx, a 409 or a reply out of shape: the submit may have been
+ *   charged, so the mark stays and the appeal is given back; its next take ends it unchecked and nothing is sent again.
+ * When noteAppealEval fails after an id came back, the mark stays too and the appeal ends the same way: one check is paid
+ * for and its verdict lost, the lesser harm than paying twice. That line names the id, so the operator can look it up.
+ */
+async function submitOnce(
+  deps: AppealDeps,
+  taken: TakenAppeal,
+  input: string,
+  signal: AbortSignal | undefined,
+): Promise<{ kind: 'sent'; evalId: string } | { kind: 'ended'; outcome: AppealOutcome }> {
+  const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
+  const label = `appeal ${taken.campaignId} ${taken.wallet}`;
+  let evalId: string;
+  try {
+    evalId = await deps.reppo.submit(input, signal);
+  } catch (error) {
+    if (!submitCannotHaveCharged(error)) {
+      return { kind: 'ended', outcome: await giveBack(deps, taken, `${causeOf(error)}, so it is never sent again`, signal) };
+    }
+    checkpoint(signal, 'taking back a submit mark');
+    await clearAppealSubmitting(deps.db, where, deps.now());
+    const outcome = error instanceof ReppoOutOfCredit ? await outOfCredit(deps, taken, signal) : await giveBack(deps, taken, causeOf(error), signal);
+    return { kind: 'ended', outcome };
+  }
+  // No checkpoint between the submit and this record: the evaluation may be paid for already, so its id is kept, abort
+  // or not, and every later try looks it up instead of paying again.
+  let kept = false;
+  try {
+    kept = await noteAppealEval(deps.db, where, evalId, deps.now());
+  } catch {
+    kept = false;
+  }
+  if (!kept) {
+    deps.log(`${label}: evaluation ${evalId} could not be kept, so this appeal ends unchecked; look the evaluation up by hand`);
+    return { kind: 'ended', outcome: { kind: 'dropped', ...where, cause: APPEAL_CAUSES.lost } };
+  }
+  deps.log(`${label}: sent to the outside check as evaluation ${evalId}`);
+  return { kind: 'sent', evalId };
 }
 
 async function recordCheck(
@@ -285,22 +361,30 @@ async function outOfCredit(deps: AppealDeps, taken: TakenAppeal, signal: AbortSi
   return { kind: 'released', ...where, cause: APPEAL_CAUSES.outOfCredit, status };
 }
 
+// Text that came from outside Thuli's code, the appellant's, the owner's or Reppo's, is printed as a JSON string after a
+// fixed label: quotes, backslashes and any break become escapes, so it stays on its one line and can never pass for a
+// line of this command's own (C34, C40). Ids, routes, numbers and fixed words are Thuli's own and print as they are.
+const quoted = (text: string) => JSON.stringify(text);
+
 function appealLines(appeal: OwnerAppeal, ask: PublicAsk | null, place: number, total: number): string[] {
   const check = [
     appeal.checkStatus,
     ...(appeal.reppoRoute === null ? [] : [`route ${appeal.reppoRoute}`]),
     ...(appeal.reppoEvalId === null ? [] : [`evaluation ${appeal.reppoEvalId}`]),
     ...(appeal.creditsCharged === null ? [] : [`${appeal.creditsCharged} credits`]),
+    ...(appeal.reppoScore === null ? [] : [`score ${appeal.reppoScore}`]),
+    ...(appeal.reppoConfidence === null ? [] : [`confidence ${appeal.reppoConfidence}`]),
+    ...(appeal.reppoDecision === null ? [] : [`decision ${quoted(appeal.reppoDecision)}`]),
   ].join(', ');
   const outcome = appeal.outcome === 'reversed' && appeal.newAction !== null ? `reversed to ${appeal.newAction}` : appeal.outcome;
   return [
     `appeal ${place} of ${total}: ${appeal.wallet}`,
     `  ask: ${ask?.action ?? 'unknown'} under ${ask?.rule ?? 'unknown'} (appealed: ${appeal.appealedAction} under ${appeal.appealedRule})`,
-    `  text: ${appeal.text}`,
+    `  text: ${quoted(appeal.text)}`,
     `  outside check: ${check}`,
-    `  note: ${appeal.reppoNote ?? 'none'}`,
+    `  note: ${appeal.reppoNote === null ? 'none' : quoted(appeal.reppoNote)}`,
     `  outcome: ${outcome}`,
-    ...(appeal.ownerNote === null ? [] : [`  owner note: ${appeal.ownerNote}`]),
+    ...(appeal.ownerNote === null ? [] : [`  owner note: ${quoted(appeal.ownerNote)}`]),
   ];
 }
 
@@ -359,11 +443,13 @@ export function parseSettleArgs(raw: {
 }
 
 /**
- * appeal:settle for one appeal: the appeal as it stands, then, dry, what it would be settled as, or with write the store's
- * settleAppeal, the only path that changes an ask after its screening, and only toward an approval the owner chose (C11).
- * The store gives the reversed ask the next free slot or none (C44), and refuses with a fixed cause, passed on as is.
+ * appeal:settle for one appeal: the appeal as it stands, then, dry, the store's settleRefusal, which runs the very checks
+ * settleAppeal does and writes nothing, so the dry run prints the refusal or the slot the settlement would leave (C11);
+ * or, with write, settleAppeal, the only path that changes an ask after its screening, and only toward an approval the
+ * owner chose. The store gives the reversed ask the next free slot or none (C44), and refuses with a fixed cause, passed
+ * on as is. Between a dry run and a write the appeal or the ask can still change, which the write then refuses.
  *
- * @returns ok with the lines to print, or not ok when there is no such appeal or the store refused.
+ * @returns ok with the lines to print, or not ok when there is no such appeal or the store refused or would refuse.
  */
 export async function settleAppealCommand(db: Db, args: SettleArgs, write: boolean, now: Date): Promise<{ ok: boolean; lines: string[] }> {
   const appeal = (await ownerAppeals(db, args.campaignId)).find((one) => one.wallet === args.wallet);
@@ -372,7 +458,14 @@ export async function settleAppealCommand(db: Db, args: SettleArgs, write: boole
     `appeal ${args.campaignId} ${args.wallet}: ${appeal.appealedAction} under ${appeal.appealedRule} appealed, ` +
     `outside check ${appeal.checkStatus}${appeal.reppoRoute === null ? '' : ` with route ${appeal.reppoRoute}`}, outcome ${appeal.outcome}`;
   const what = args.outcome === 'reversed' ? `reversed to ${args.newAction}` : 'upheld';
-  if (!write) return { ok: true, lines: [head, `it would be settled as ${what}; add --write to do it`] };
+  if (!write) {
+    // The store's own checks, run under the same lock and writing nothing, so the dry run says what --write would do.
+    const preview = await settleRefusal(db, args);
+    if (preview.refused !== null) return { ok: false, lines: [head, `it would be refused: ${preview.refused}`] };
+    if (args.outcome === 'upheld') return { ok: true, lines: [head, 'it would be settled as upheld, the ask unchanged; add --write to do it'] };
+    const slot = preview.slot === null ? 'with no slot, since every slot is taken' : `holding slot ${preview.slot}`;
+    return { ok: true, lines: [head, `it would be settled as ${what}, ${slot}; add --write to do it`] };
+  }
   const result = await settleAppeal(db, args, now);
   if ('refused' in result) return { ok: false, lines: [head, `refused: ${result.refused}`] };
   if (args.outcome === 'upheld') return { ok: true, lines: [head, 'settled as upheld; the ask is unchanged'] };

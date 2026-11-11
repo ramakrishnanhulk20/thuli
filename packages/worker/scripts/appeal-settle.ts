@@ -3,7 +3,8 @@
 //   npm run appeal:settle -- --id CAMPAIGN --wallet ADDRESS --outcome reversed|upheld [--action full|partial]
 //                            [--note "..."] [--write]
 //
-// Without --write it prints the appeal and what it would be settled as. With --write a reversal makes the ask the chosen
+// Without --write it prints the appeal and the store's own answer to it, written nowhere: the cause it would be refused
+// with, or what it would be settled as and the slot it would hold. With --write a reversal makes the ask the chosen
 // approval and gives it the next free slot, which the worker's publish step then lists and pays; upheld changes nothing
 // but the appeal. The outside check is advice and does not decide it (C11). Reads DATABASE_URL and nothing else, and
 // loads no private key.

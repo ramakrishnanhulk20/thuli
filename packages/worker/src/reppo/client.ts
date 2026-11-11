@@ -163,7 +163,7 @@ const FINAL_STATUS: Record<EvalReply['status'], ReppoEval['status']> = {
 };
 
 // The key goes only into this header. Nothing here logs a request, and every error is words and a status (C40).
-function headersFor(conn: Required<ReppoOptions>): Record<string, string> {
+function headersFor(conn: Pick<ReppoConnection, 'apiKey'>): Record<string, string> {
   return { authorization: `Bearer ${conn.apiKey}`, 'content-type': 'application/json', accept: 'application/json' };
 }
 
@@ -238,6 +238,67 @@ export async function submitEvaluation(input: string, opts: ReppoOptions): Promi
   const conn = withDefaults(opts);
   checkInput(input);
   return submit(input, conn, headersFor(conn));
+}
+
+// Statuses with which Reppo refuses a submit before any evaluation exists, so nothing can have been charged.
+const REFUSED_BEFORE_CHARGE: readonly number[] = [400, 401, 404];
+
+/** The words of every single-try submit whose outcome is unknown: it may have reached Reppo and been charged. */
+export const SUBMIT_OUTCOME_UNKNOWN = 'the Reppo submit got no answer it could read, so it may have been charged';
+
+// Settles with the work, or rejects as soon as the signal aborts; the work itself is left to end on its own deadline.
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Submits one text as a 'response' evaluation with exactly one POST: no retry, no resubmit on a 409, no wait. For a
+ * caller that marked the submit first and must never pay twice, since Reppo cannot recognise a text sent again (C23).
+ * The POST ends by timeoutMs at the latest, and an aborted signal ends the wait at once or, before the call, sends
+ * nothing (C41).
+ *
+ * @returns the evaluation id Reppo answered with.
+ * @throws ReppoOutOfCredit on a 402, and ReppoError with the status on a 400, 401 or 404: Reppo refused before any
+ *   evaluation existed (submitCannotHaveCharged). Any other outcome, no answer, the deadline, the signal, a 5xx, a 409,
+ *   another status or a reply out of shape, throws ReppoError with SUBMIT_OUTCOME_UNKNOWN or the status: the submit may
+ *   have been charged. ReppoError as evaluate throws it for an input that is empty or too large, before any call.
+ */
+export async function submitEvaluationOnce(input: string, opts: ReppoConnection & { timeoutMs: number; signal?: AbortSignal }): Promise<string> {
+  checkInput(input);
+  if (!(opts.timeoutMs > 0)) throw new RangeError('timeoutMs must be above 0');
+  if (opts.signal?.aborted === true) throw new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
+  const init = { method: 'POST', headers: headersFor(opts), body: JSON.stringify({ taskType: 'response', input }) };
+  let reply: JsonReply;
+  try {
+    reply = await untilAborted(fetchJsonCapped(`${opts.baseUrl}/agents/evals`, init, { ...LIMITS, timeoutMs: opts.timeoutMs }), opts.signal);
+  } catch {
+    // fetch's own failure text can quote the URL, so nothing of it is copied (C40).
+    throw new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
+  }
+  if (!reply.ok) refuse(reply);
+  const submitted = Submitted.safeParse(reply.json);
+  if (!submitted.success) throw new ReppoError('Reppo gave an evaluation id that is not safe to use, so it may have been charged', null);
+  return submitted.data.id;
+}
+
+/** True only for a submitEvaluationOnce error that proves Reppo refused before any evaluation existed. Pure. */
+export function submitCannotHaveCharged(error: unknown): boolean {
+  if (error instanceof ReppoOutOfCredit) return true;
+  return error instanceof ReppoError && error.status !== null && REFUSED_BEFORE_CHARGE.includes(error.status);
 }
 
 /**

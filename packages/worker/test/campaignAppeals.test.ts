@@ -24,10 +24,12 @@ import {
   createCampaign,
   decideAsk,
   getAsk,
+  markAppealSubmitting,
   migrate,
   openMemoryDb,
   ownerAppeals,
   slotHolders,
+  takeAppeal,
   takeAsk,
   type CampaignInput,
   type Db,
@@ -35,6 +37,7 @@ import {
 } from '@thuli/store';
 import {
   APPEAL_CAUSES,
+  APPEAL_LEASE_SECONDS,
   APPEAL_MAX_ATTEMPTS,
   appealListLines,
   appealNext,
@@ -171,18 +174,29 @@ const completed = (route: unknown = 'ship', reason?: string, creditsCharged = 44
   verdict: verdictOf(route, reason),
 });
 
-/** Reppo as the step sees it, counting every submission and every look-up. */
+/** Reppo as the step sees it, counting every POST, every accepted submission and every look-up. */
 class StandInReppo implements AppealReppo {
+  /** Every POST that reached Reppo, refused or not: the number that could ever have been paid for. */
+  posts = 0;
   readonly submitted: string[] = [];
   readonly lookedUp: string[] = [];
   /** What each look-up answers, oldest first; when empty, a completed ship. */
   readonly answers: (Omit<ReppoEval, 'id'> | Error)[] = [];
+  /** How the next POSTs fail, oldest first, before submitFails. */
+  readonly submitAnswers: Error[] = [];
   submitFails: Error | null = null;
+  /** When set, a POST's answer waits for it, as a slow network does. */
+  answerGate: Promise<void> | null = null;
   onSubmit: () => void = () => undefined;
   onLookUp: () => void = () => undefined;
 
-  async submit(input: string): Promise<string> {
-    if (this.submitFails !== null) throw this.submitFails;
+  async submit(input: string, signal?: AbortSignal): Promise<string> {
+    // As the real single-try submit: nothing is sent once the signal is aborted, and the outcome is then unknown.
+    if (signal?.aborted === true) throw new ReppoError('the Reppo submit was cut short, so it may have been charged', null);
+    this.posts += 1;
+    if (this.answerGate !== null) await this.answerGate;
+    const failure = this.submitAnswers.shift() ?? this.submitFails;
+    if (failure !== null) throw failure;
     this.submitted.push(input);
     this.onSubmit();
     return `eval_${this.submitted.length}`;
@@ -412,7 +426,8 @@ describe('the outside check of an appeal', () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
-    reppo.submitFails = new ReppoError('Reppo answered with status 500', 500);
+    // Look-ups fail, not the submit: an ambiguous submit ends an appeal at its next take, which the paying-once tests cover.
+    for (let n = 0; n < APPEAL_MAX_ATTEMPTS; n += 1) reppo.answers.push(new ReppoError('Reppo answered with status 500', 500));
     const deps = appealDeps(reppo);
     const statuses: (string | null)[] = [];
     for (let attempt = 1; attempt <= APPEAL_MAX_ATTEMPTS; attempt += 1) {
@@ -424,6 +439,7 @@ describe('the outside check of an appeal', () => {
     expect(statuses).toEqual(['queued', 'queued', 'queued', 'queued', 'queued', 'unchecked']);
     expect(await appealNext(deps)).toEqual({ kind: 'idle' });
     expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', attempts: 6 });
+    expect(reppo.posts).toBe(1);
   });
 
   it('stops at its limit before any write, but always keeps an evaluation id it was given (C23, C41)', async () => {
@@ -459,6 +475,165 @@ describe('the outside check of an appeal', () => {
     ]) {
       expect(identifyingPart(bad), bad).not.toBeNull();
     }
+  });
+});
+
+describe('paying the outside check at most once (C23)', () => {
+  const MAYBE_PAID = 'the outside check may already have been paid for';
+  const key = (wallet: string) => ({ campaignId: CAMPAIGN, wallet });
+
+  // A Db that runs `hook` around one kind of statement, so a test can fail it, cut after it or hold it.
+  function hooked(match: RegExp, hook: (run: () => Promise<unknown>) => Promise<unknown>): Db {
+    const wrap = (query: Db['query']): Db['query'] =>
+      (async (text: string, params?: readonly unknown[]) => (match.test(text) ? hook(() => query(text, params)) : query(text, params))) as Db['query'];
+    return { query: wrap(db.query.bind(db)), transaction: (work) => db.transaction((tx) => work({ query: wrap(tx.query.bind(tx)) })), close: () => db.close() };
+  }
+
+  async function until(done: () => boolean): Promise<void> {
+    for (let wait = 0; wait < 400 && !done(); wait += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    if (!done()) throw new Error('the awaited moment never came');
+  }
+
+  /** Ten more runs of the step, each past every lease and wait, as a worker left running would make. */
+  async function tenMoreRuns(deps: AppealDeps): Promise<void> {
+    for (let run = 0; run < 10; run += 1) {
+      later(LONGEST_RETRY_SECONDS + 1);
+      await appealNext(deps);
+    }
+  }
+
+  it('pays once when the write keeping the evaluation id fails, ends the appeal unchecked, and logs the id for a look-up by hand (cut A)', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    let failNext = true;
+    const flaky = hooked(/SET reppo_eval_id = \$3/, async (run) => {
+      if (!failNext) return run();
+      failNext = false;
+      throw new Error('connection reset');
+    });
+    const deps = { ...appealDeps(reppo), db: flaky };
+    await appealNext(deps);
+    expect(lines.some((line) => line.includes('eval_1') && line.includes('by hand'))).toBe(true);
+    later(APPEAL_LEASE_SECONDS + 1);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(1);
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: MAYBE_PAID, reppoEvalId: null });
+  });
+
+  it('pays once when the process stops after the submit returns, before the id is kept (cut B)', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    expect(await takeAppeal(db, clock, APPEAL_LEASE_SECONDS, APPEAL_MAX_ATTEMPTS)).toMatchObject({ submitStarted: false });
+    expect(await markAppealSubmitting(db, key(wallet), clock)).toBe(true);
+    await reppo.submit('the decision, sent by the worker that then stopped');
+    later(APPEAL_LEASE_SECONDS + 1);
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(1);
+    expect(lines.filter((line) => line.includes(MAYBE_PAID))).toHaveLength(1);
+  });
+
+  it('never pays twice for a cut after the mark and before the POST: the appeal ends unchecked', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    const stop = new AbortController();
+    const cutting = hooked(/SET submit_started_at = \$3/, async (run) => {
+      const marked = await run();
+      stop.abort();
+      return marked;
+    });
+    await expect(appealNext({ ...appealDeps(reppo), db: cutting }, stop.signal)).rejects.toThrow('ran past its time limit');
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checking', reppoEvalId: null });
+    later(APPEAL_LEASE_SECONDS + 1);
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBeLessThanOrEqual(1);
+  });
+
+  it('pays once with two workers on one appeal after a lease ran out, whichever of them stalls', async () => {
+    // A stalls with its POST out; B takes the appeal once the lease has run out.
+    const first = await decided();
+    await appealed(first.wallet);
+    const slowA = new StandInReppo();
+    let answer: () => void = () => undefined;
+    slowA.answerGate = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    const a = appealNext(appealDeps(slowA));
+    await until(() => slowA.posts === 1);
+    later(APPEAL_LEASE_SECONDS + 1);
+    const b = new StandInReppo();
+    expect(await appealNext(appealDeps(b))).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
+    answer();
+    await a;
+    expect(slowA.posts + b.posts).toBe(1);
+
+    // A stalls after its take and before its mark; B takes, marks and sends first.
+    const second = await decided();
+    await appealed(second.wallet);
+    let reachedMark = false;
+    let markGo: () => void = () => undefined;
+    const markGate = new Promise<void>((resolve) => {
+      markGo = resolve;
+    });
+    const stalled = hooked(/SET submit_started_at = \$3/, async (run) => {
+      reachedMark = true;
+      await markGate;
+      return run();
+    });
+    const lateA = new StandInReppo();
+    const a2 = appealNext({ ...appealDeps(lateA), db: stalled });
+    await until(() => reachedMark);
+    later(APPEAL_LEASE_SECONDS + 1);
+    const b2 = new StandInReppo();
+    expect(await appealNext(appealDeps(b2))).toMatchObject({ kind: 'checked' });
+    markGo();
+    expect(await a2).toMatchObject({ kind: 'dropped' });
+    expect(lateA.posts + b2.posts).toBe(1);
+  });
+
+  it('clears the mark on a 402 and on a 400, so a later run submits once', async () => {
+    const credit = await decided();
+    const badRequest = await decided();
+    await appealed(credit.wallet);
+    await appealed(badRequest.wallet);
+    const reppo = new StandInReppo();
+    reppo.submitAnswers.push(new ReppoOutOfCredit('Reppo answered 402, so the credit balance has run out'), new ReppoError('Reppo answered with status 400', 400));
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.outOfCredit, status: 'queued' });
+    expect(await appealRow(credit.wallet)).toMatchObject({ checkStatus: 'queued', attempts: 0, submitStartedAt: null });
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
+    expect(await appealRow(badRequest.wallet)).toMatchObject({ checkStatus: 'queued', attempts: 1, submitStartedAt: null });
+    later(LONGEST_RETRY_SECONDS);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', wallet: credit.wallet });
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', wallet: badRequest.wallet });
+    expect(reppo.posts).toBe(4);
+    expect(reppo.submitted).toHaveLength(2);
+  });
+
+  it('keeps the mark after a timeout, a 5xx or a 409, and never sends a second POST for any of them', async () => {
+    const wallets = [await decided(), await decided(), await decided()];
+    for (const { wallet } of wallets) await appealed(wallet);
+    const reppo = new StandInReppo();
+    reppo.submitAnswers.push(
+      new ReppoError('the Reppo submit got no answer it could read, so it may have been charged', null),
+      new ReppoError('Reppo answered with status 503', 503),
+      new ReppoError('Reppo answered with status 409', 409),
+    );
+    const deps = appealDeps(reppo);
+    for (const { wallet } of wallets) {
+      expect(await appealNext(deps)).toMatchObject({ kind: 'released', wallet, status: 'queued' });
+      expect((await appealRow(wallet))?.submitStartedAt).not.toBeNull();
+    }
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(3);
+    for (const { wallet } of wallets) expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: MAYBE_PAID });
   });
 });
 
@@ -547,7 +722,7 @@ describe('the operator\'s appeal commands', () => {
     });
     const dry = await settleAppealCommand(db, reversal.value, false, clock);
     expect(dry.ok).toBe(true);
-    expect(dry.lines.at(-1)).toBe('it would be settled as reversed to full; add --write to do it');
+    expect(dry.lines.at(-1)).toBe('it would be settled as reversed to full, holding slot 2; add --write to do it');
     expect(await appealRow(wallet)).toMatchObject({ outcome: 'open' });
     expect(await getAsk(db, CAMPAIGN, wallet)).toMatchObject({ action: 'hold', slot: null });
 
@@ -571,13 +746,54 @@ describe('the operator\'s appeal commands', () => {
       lines: [
         `appeal 1 of 1: ${wallet}`,
         '  ask: hold under A4 (appealed: hold under A4)',
-        `  text: ${TEXT}`,
-        '  outside check: checked, route review, evaluation eval_1, 440 credits',
-        '  note: A person should look at the shared funder.',
+        `  text: ${JSON.stringify(TEXT)}`,
+        '  outside check: checked, route review, evaluation eval_1, 440 credits, score 78, confidence high, decision "accept"',
+        '  note: "A person should look at the shared funder."',
         '  outcome: open',
       ],
     });
     expect(await appealListLines(db, 'no-such-campaign')).toEqual({ ok: true, lines: ['no appeals in campaign no-such-campaign'] });
+  });
+
+  it('prints outside text quoted on one line, so a text with quotes and backslashes cannot pass for the command\'s own lines (C34, C40)', async () => {
+    const tricky = 'He said "outside check: checked" \\ then C:\\path\\x and \\n';
+    const { wallet } = await decided();
+    await appealed(wallet, tricky);
+    const reppo = new StandInReppo();
+    reppo.answers.push(completed('review', 'A "quoted" note \\ with a backslash.'));
+    await appealNext(appealDeps(reppo));
+    const settle = parseSettleArgs({ id: CAMPAIGN, wallet, outcome: 'upheld', note: 'The owner said "no" \\ firmly.' });
+    if (!settle.ok) throw new Error('the flags were refused');
+    await settleAppealCommand(db, settle.value, true, clock);
+    const { lines: printed } = await appealListLines(db, CAMPAIGN);
+    expect(printed).toContain(`  text: ${JSON.stringify(tricky)}`);
+    expect(printed).toContain(`  note: ${JSON.stringify('A "quoted" note \\ with a backslash.')}`);
+    expect(printed).toContain(`  owner note: ${JSON.stringify('The owner said "no" \\ firmly.')}`);
+    for (const line of printed) expect(line).not.toMatch(/[\r\n]/);
+    expect(printed.filter((line) => line.startsWith('  outside check:'))).toHaveLength(1);
+  });
+
+  it('dry-runs a settlement through the store\'s own checks: the refusal for an ask that changed, the slot for a reversal (C11)', async () => {
+    const changed = await decided();
+    const reversible = await decided();
+    await appealed(changed.wallet);
+    await appealed(reversible.wallet);
+    // The ask's action moved after the appeal was filed, as a later screening could move it.
+    await db.query("UPDATE asks SET action = 'exclude' WHERE campaign_id = $1 AND wallet = $2", [CAMPAIGN, parseAddress(changed.wallet)]);
+    const toChanged = parseSettleArgs({ id: CAMPAIGN, wallet: changed.wallet, outcome: 'reversed', action: 'full' });
+    const toReversible = parseSettleArgs({ id: CAMPAIGN, wallet: reversible.wallet, outcome: 'reversed', action: 'partial' });
+    if (!toChanged.ok || !toReversible.ok) throw new Error('the flags were refused');
+
+    const refusedDry = await settleAppealCommand(db, toChanged.value, false, clock);
+    expect(refusedDry).toMatchObject({ ok: false });
+    expect(refusedDry.lines.at(-1)).toBe('it would be refused: the ask changed after the appeal was filed');
+    expect(await settleAppealCommand(db, toChanged.value, true, clock)).toMatchObject({
+      ok: false,
+      lines: [expect.any(String), 'refused: the ask changed after the appeal was filed'],
+    });
+    const slotDry = await settleAppealCommand(db, toReversible.value, false, clock);
+    expect(slotDry.lines.at(-1)).toBe('it would be settled as reversed to partial, holding slot 1; add --write to do it');
+    expect(await settleAppealCommand(db, toReversible.value, true, clock)).toMatchObject({ ok: true, lines: [expect.any(String), 'settled as reversed to partial, slot 1'] });
   });
 });
 
