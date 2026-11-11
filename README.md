@@ -1,0 +1,682 @@
+# Thuli
+
+Thuli screens an airdrop or reward claim list for farm wallets, gives a reason for every wallet it holds back, and pays the approved wallets from a vault on Base where Thuli's own key can post a list and nothing else.
+
+Thuli is Tamil for "a drop": every drop of an airdrop should land in a real hand.
+
+| 99.03% | 1.00% (95% interval 0.61% to 1.64%) | 0.05 cents |
+| --- | --- | --- |
+| of the labelled farm wallets held in the ROBO replay | of Hop control wallets held by mistake, current rulebook | of SERV credit per wallet screened, realised |
+
+Each number has its limits stated in [What was measured](#what-was-measured).
+
+Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. Everything on chain is Base Sepolia with test USDC, which has no value. The site is not hosted yet, so this repository is how you see it: each claim below comes with a command you can run on a fresh clone.
+
+[Docs](packages/web/content/docs/index.mdx) (the `/docs` route of the app) | [Architecture](ARCHITECTURE.md) | [Threat model](docs/security/threat-model.md) | [Licence](LICENSE)
+
+## Deployments
+
+Base Sepolia is Base's public test network, chain id `84532`. Base mainnet is not deployed: there is no mainnet record, and the deploy script refuses every chain except Base Sepolia.
+
+| Network | Contract | Address | Verified source |
+| --- | --- | --- | --- |
+| Base Sepolia | ThuliVaultFactory | [`0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56`](https://sepolia.basescan.org/address/0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56) | [Blockscout](https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56), [Basescan](https://sepolia.basescan.org/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56#code) |
+| Base Sepolia | ThuliVault, the proof vault | [`0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034) | [Basescan](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034#code) |
+
+The factory was deployed in block `57247894` (record: [`base-sepolia.json`](packages/contracts/deployments/base-sepolia.json)). The factory made the proof vault in block `57248098`, and the run that used it is recorded in [`base-sepolia-proof.json`](packages/contracts/deployments/base-sepolia-proof.json). The proof vault pays Base Sepolia test USDC (`0x036CbD53842c5426634e7929541eC2318f3dCF7e`), caps each wallet at 1 USDC, holds 2 USDC and delays every list by one hour. The factory's source is verified on Blockscout and Basescan, and the proof vault's on Basescan. The vault's source is also in the repository: [`ThuliVault.sol`](packages/contracts/src/ThuliVault.sol). Basescan shows a bot check to scripts, so those links are for a browser. `npm run vault:verify` verifies contracts on Basescan and needs an explorer API key (see the commands table). You can check the proof record against the chain yourself: step 3 of the judge path below.
+
+## What Thuli does
+
+Reward drops attract farmers: one operator running many wallets to collect many rewards. In the ROBO airdrop on Ethereum, the 11,282 wallets (in 482 families) on a farm list published by the analytics firm Bitquery took 87.43% of all the ROBO that was claimed. A project that pays without screening pays for that.
+
+Thuli turns each wallet into one of four outcomes: paid in full, cut to a partial reward, held for review, or excluded. A hold means a person reviews the wallet. It is an assessment of on-chain behaviour, not a verdict that the wallet is a farm. Four steps decide it:
+
+1. Plain code reads public Ethereum data for the wallet at a fixed point in time and works out facts: its age, how many transactions it has sent, whether it is a contract, who first funded it, and whether other claim wallets share that funder or sweep into the same collector address.
+2. Nine fixed checks in code (A1 to A9) set a start and a ceiling. The ceiling is the most generous outcome the facts allow, and it is set before any model runs.
+3. SERV Reasoning, OpenServ's model service, reads the facts and a written rulebook ([`thuli-rulebook.md`](packages/rulebook/thuli-rulebook.md)) and returns an outcome, a reason of at most 280 characters and the transactions it cites. It can lower a wallet to a hold. It can never go above the ceiling.
+4. Code checks the answer as if a stranger wrote it: a fixed shape, plain text only, and every cited transaction must be one Thuli itself fetched for that wallet. A failed check becomes a hold with the cause in words. Doubt means hold.
+
+Approved wallets go on a claim list. The list becomes one short fingerprint, a Merkle root, posted to the project's own vault on Base (today Base Sepolia, with test USDC). The root waits out a delay the project chose, from 1 hour to 30 days, during which the project can cancel it. Then each approved wallet is paid, and Thuli's worker can submit the claim so the wallet pays no gas.
+
+Compared with a bare list of addresses or a bare score:
+
+| | A bare blocklist or one score | Thuli |
+| --- | --- | --- |
+| A reason for every wallet | A yes or no, or a number | A rule code, a plain-text reason and the transactions it cites, for each wallet (open `/replay`) |
+| A ceiling the model cannot exceed | Not part of a list or a score | Set in code before the model runs. The final outcome is the less generous of the model's answer and the ceiling |
+| An outside check | Not part of a list or a score | Reppo's judges scored 49 of Thuli's decisions, blocked 11 of them, and one rule changed because of it |
+| Money the screener cannot take | Not part of a list or a score | In the vault, Thuli's key can post a list and cannot withdraw, cancel, pause or change anything else. The owner can cancel any list during its delay. The vault page states the loss if that key is stolen |
+| A public replay with the misses shown | Not part of a list or a score | Every wallet of a past airdrop, decided and explained, with the false holds measured on a control group and a limits page that lists what Thuli does not catch |
+
+The middle column describes a bare list of addresses or a bare number, not any named product.
+
+## What was measured
+
+These are two runs on past data and one cost. None of them is a promise about your campaign.
+
+| What was measured | Result | What it does not show |
+| --- | --- | --- |
+| ROBO replay: farm-list wallets held. All 35,323 wallets that claimed the airdrop on Ethereum (35,402 claims), screened with chain data from before the first claim | 11,173 of 11,282 held, 99.03% | The farm list is one firm's analysis (Bitquery), built from where the tokens moved months after the claim. The run tests whether claim-time facts find wallets later shown to move together. It does not prove that every farmer is on the list. |
+| Hop control sample: wallets held by mistake under the current rulebook. A random 1,500 of the 21,174 wallets Hop Protocol kept in its 2022 airdrop and never named in a candidate group | 15 of 1,500 held, 1.00%, 95% interval 0.61% to 1.64%. Before the rulebook change: 38 of 1,500, 2.53%, interval 1.85% to 3.46% | A wallet Hop kept is not proved to be a real person, and the rate comes from a sample. Read it as an estimate. |
+| Hop, code only: the fixed checks with no model, on the probably-real Hop wallets that have Ethereum history | 119 of 20,420 held, 0.58%, 95% interval 0.49% to 0.70% | It scores the code's starting point, not the final decisions, so it is a different number from the 1.00% above. |
+| ROBO replay: wallets not on the farm list that were held or excluded | 283 held and 66 excluded, 349 of 24,041 | An upper bound on false holds, not a measured rate. The farm list may miss farmers. |
+| Realised: SERV credit spent on the whole ROBO run | $17.51, about 0.05 cents a wallet | SERV credit only. Reppo's evaluation credit and any server cost are not counted. |
+| Unrealised, replay only: money held back from the farm list | $12,007,754 of $12,064,999 claimed, with ROBO at the claim-day price of $0.0419 | Nothing was sold or paid, and a real sale would move the price. |
+| Cost of the rulebook change: share held in a sample of 500 wallets Hop removed whose start was A8 or A9 | 11.20% before, 3.00% after | A cost, not a gain: the change gave up some correct holds. |
+
+A 95% interval is the range the true rate probably falls in.
+
+### The feedback loop
+
+Reppo's outside judges read 49 of Thuli's own decisions, chosen by group and not at random, with every address, hash and amount removed. They blocked 11, all holds the model had made because a funder was shared with other wallets. One rule changed: version 2 of the rulebook says a shared funder alone cannot hold a wallet, because how many wallets a funder paid is a count and not a trail. Both versions were then scored on the same stored model replies with no model called, so the only difference is that rule: version 2 no longer makes 10 of the 11 blocked decisions, false holds on the Hop sample fell as shown in the table, and the 99.03% catch rate did not change. No Reppo verdict exists yet on a version 2 decision.
+
+## Features
+
+Everything on chain below is Base Sepolia with test money.
+
+For a project that is about to pay rewards:
+
+- Screen a list. The replay screens a whole claim list at once, and a live campaign screens each wallet's ask as it arrives. A project cannot yet upload its own list through a form; it registers a campaign with two commands (see [What is not built yet](#what-is-not-built-yet)).
+- A vault only approved wallets can claim from. Each campaign gets its own vault from the factory. The project funds it. A wallet is paid its approved total minus what it already received, never above the per-wallet cap fixed at creation, and the total paid never passes the deposit.
+- A cancel window. Every new list waits the delay the project set. In that time the project can cancel the list, replace Thuli's key (which also drops a waiting list) or pause the vault. The project withdraws what is left only after the end.
+
+For a wallet:
+
+- A free check. Paste any Ethereum address at `/check`, or call `POST /api/check`. No sign-in and no payment, up to 5 new checks an hour for each visitor.
+- A reason. Every decision shows the outcome, the rule, a plain-text reason, the transactions it cites and the list of facts the screening did not measure.
+- A live campaign with no gas. A wallet signs a four-line text message, which costs nothing and moves nothing. Thuli screens it in public. If it is approved it takes a slot, and after the vault's delay the worker submits the claim from its own key and pays the gas. On Base Sepolia with test USDC.
+
+For another agent or a developer:
+
+- A paid API over x402, a standard that puts payment inside an HTTP request. `POST /api/x402/screen` costs $0.05 in USDC (exactly `50000` base units) for one wallet. The payment settles before the screening runs, and one payment buys one screening. It has been proved only on Base Sepolia, with test USDC.
+- Public replay files under [`packages/web/public/replay`](packages/web/public/replay): the summary, one entry per claim wallet, one file per linked family, the rulebook scorecard and the Hop control numbers. No file holds a raw model reply.
+- A page of ten live attacks at `/break`: five simulated calls against the proof vault, four requests to the site's own routes, and one check that a reason is shown as plain text.
+
+## How it fits together
+
+The system as it runs today. Solid lines are built. Every dashed line leads into the planned box, and nothing in that box is built.
+
+```mermaid
+flowchart TB
+  subgraph People["Who comes in"]
+    VIS["Visitor or judge"]
+    AGT["Paying agent"]
+    WAL["Wallet"]
+  end
+
+  subgraph Web["Web app on Next.js, holds no private key"]
+    PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
+    FILES["Static replay files"]
+    ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
+  end
+
+  API["API package: free check, paid screen, campaign routes"]
+  FAC["x402 facilitator"]
+  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays")]
+
+  subgraph Worker["Worker, run as scripts"]
+    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims"]
+    SCRIPTS["Replay, scoring and export scripts"]
+  end
+
+  subgraph Screening["Screening code"]
+    FACTS["Facts from public Ethereum reads"]
+    LIMITS["Start and ceiling set in code"]
+    ASK["Ask SERV with the rules graph or the rulebook"]
+    CHECKS["Output checks in code"]
+  end
+
+  ETH["Ethereum RPC and Blockscout"]
+  SERV["SERV Reasoning"]
+  REPPO["Reppo evaluation API"]
+
+  subgraph Base["Base Sepolia"]
+    FACTORY["ThuliVaultFactory"]
+    VAULT["ThuliVault, one per campaign"]
+  end
+
+  subgraph Planned["Planned, not built"]
+    P1["Planned: paid data through Kite Passport, Nansen and Allium"]
+    P2["Planned: Dolphin summaries"]
+    P3["Planned: owner sign-in and campaign upload"]
+    P4["Planned: public appeal routes"]
+    P5["Planned: hosted worker and database"]
+    P6["Planned: Base mainnet"]
+  end
+
+  VIS --> PAGES
+  AGT -->|"pays 0.05 USDC over x402"| ROUTES
+  WAL -->|"signed ask, ticket"| ROUTES
+  PAGES -->|"reads"| FILES
+  PAGES -->|"free check"| ROUTES
+  ROUTES -->|"all but /api/search"| API
+  API -->|"settles payments"| FAC
+  API --> DB
+  API -->|"screens one wallet"| FACTS
+  API -->|"claimed, claimable"| VAULT
+  DB <-->|"asks, decisions, lists, relays"| LOOP
+  DB ~~~ SCRIPTS
+  LOOP -->|"screens each ask"| FACTS
+  LOOP -->|"VaultCreated log"| FACTORY
+  LOOP -->|"postRoot, claim"| VAULT
+  FACTORY -->|"creates"| VAULT
+  VAULT -->|"pays"| WAL
+  SCRIPTS -->|"replays a claim list"| FACTS
+  SCRIPTS -->|"writes"| FILES
+  SCRIPTS -->|"feedback"| REPPO
+  FACTS -->|"public reads"| ETH
+  FACTS --> LIMITS
+  LIMITS --> ASK
+  ASK <--> SERV
+  ASK --> CHECKS
+
+  FACTS -.-> P1
+  FACTS -.-> P2
+  API -.-> P3
+  API -.-> P4
+  LOOP -.-> P5
+  VAULT -.-> P6
+
+  classDef planned stroke-dasharray: 5 5
+  class P1,P2,P3,P4,P5,P6 planned
+```
+
+One wallet from its signed ask to its payout, as the API, the store and the worker do it. Every step is in the code, and the worker runs as a script on one machine.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W as Wallet
+  participant API as Campaign routes
+  participant DB as Postgres store
+  participant K as Worker
+  participant ETH as Ethereum RPC and Blockscout
+  participant SV as SERV Reasoning
+  participant V as Vault on Base Sepolia
+
+  W->>W: Sign the ask text as a personal message
+  W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
+  API->>API: checkAsk: a valid address, signed in the last 600 seconds
+  API->>ETH: Read the wallet's code, a contract cannot ask yet
+  API->>API: The signature must match the rebuilt ask text
+  API->>DB: Store the ask as queued, the first ask per wallet stands
+  API-->>W: 202 queued
+  K->>DB: Take the oldest queued ask, leased for 300 seconds
+  K->>ETH: Read the wallet's facts at the latest finalized block
+  K->>DB: Read the first funders of the campaign's other asks
+  K->>K: Link asks that share a funder, set start and ceiling in code
+  K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
+  SV-->>K: Action, rule, reason, cited transactions
+  K->>K: Output checks, never above the ceiling
+  K->>DB: Store the decision, an approved wallet takes the next free slot
+  K->>DB: Build the list from the slot holders, store it as a new list version
+  K->>K: Read the stored text back and rebuild the root from it
+  K->>V: Check the vault against the factory log, then postRoot
+  K->>DB: Mark the version posted with its transaction
+  V->>V: The root waits out its delay, and the owner can cancel it
+  K->>V: Read state, and claimable for every listed wallet
+  K->>DB: Mark the version active, queue a relay for each wallet still owed
+  K->>DB: Take the oldest waiting relay
+  K->>V: Simulate, then send claim(account, cumulativeAmount, proof) from the agent key
+  V-->>W: Pay the capped leaf amount minus what this wallet already received
+  K->>DB: Mark the relay confirmed
+  W->>API: GET /api/campaigns/:id/asks/:wallet
+  API-->>W: The decision, and a claim ticket once the list is active
+```
+
+The packages and their main modules. An arrow points from a module to one it imports. The one dashed line is not an import: core's leaf and the vault hash a claim the same way, so a list built in TypeScript proves on chain.
+
+```mermaid
+flowchart TB
+  subgraph web["packages/web"]
+    PAGES["pages and components"]
+    THULIAPI["lib/server/thuliApi"]
+    RFILES["public/replay files"]
+  end
+
+  subgraph api["packages/api"]
+    SITE["site, server, live"]
+    APP["app, schema, receipt"]
+    ACAMP["campaigns"]
+    AREST["stores, claims, limits, guard, config"]
+  end
+
+  subgraph worker["packages/worker"]
+    CAMPW["campaign: loop, screen, facts, publish, relay, vault"]
+    SINGLE["screen/single"]
+    REPLAY["replay: decide, runner, scoring, export"]
+    REPPO["reppo: client, feedback"]
+    SERVC["serv/client"]
+    READ["facts/basic and chain readers"]
+    VAULTW["vault: root, claimList, proof, chain, abi"]
+  end
+
+  subgraph store["packages/store"]
+    SCAMP["campaigns"]
+    SROWS["paymentClaims, limits, checkCache, sweep"]
+    SDB["db, migrate"]
+  end
+
+  subgraph core["packages/core"]
+    SIGN["ask, appeal"]
+    DEC["start, ceiling, decision, graph"]
+    FACTS["facts, factsEngine, settings"]
+    LEAF["leaf"]
+    MONEY["money"]
+    ADDR["address, chains"]
+  end
+
+  subgraph contracts["packages/contracts"]
+    VF["ThuliVaultFactory"]
+    VA["ThuliVault"]
+    OZ["OpenZeppelin: Ownable2Step, Pausable, ReentrancyGuard, SafeERC20, MerkleProof, Math, SafeCast"]
+  end
+
+  PAGES --> RFILES
+  THULIAPI --> SITE
+  SITE --> APP
+  SITE --> SINGLE
+  APP --> ACAMP
+  APP --> AREST
+  AREST --> SROWS
+  ACAMP --> SCAMP
+  ACAMP --> SIGN
+  ACAMP --> VAULTW
+  CAMPW --> SINGLE
+  CAMPW --> REPLAY
+  CAMPW --> VAULTW
+  CAMPW --> SCAMP
+  SINGLE --> READ
+  SINGLE --> REPLAY
+  REPLAY --> SERVC
+  REPLAY --> READ
+  REPLAY --> DEC
+  REPPO --> REPLAY
+  READ --> FACTS
+  SERVC --> DEC
+  VAULTW --> LEAF
+  VAULTW --> MONEY
+  SCAMP --> SDB
+  SROWS --> SDB
+  SCAMP --> DEC
+  SIGN --> DEC
+  DEC --> FACTS
+  FACTS --> ADDR
+  LEAF --> ADDR
+  VF --> VA
+  VA --> OZ
+  LEAF -.-|"same encoding"| VA
+```
+
+## The two-minute judge path
+
+This needs no key and no wallet. You need git and Node 26 or newer. The output below is from a fresh clone on 11 November 2026.
+
+1. Clone and install.
+
+   ```bash
+   git clone <repository-url> thuli
+   cd thuli
+   npm install
+   ```
+
+   Expect `added 603 packages, and audited 615 packages in 45s` and exit code 0. npm also prints a dependency audit summary (7 findings reported that day) and a note about esbuild's install script. Neither stops the install.
+
+2. Run the tests.
+
+   ```bash
+   npx vitest run
+   ```
+
+   Expect:
+
+   ```text
+    Test Files  66 passed (66)
+         Tests  1519 passed | 48 skipped (1567)
+   ```
+
+   It takes about 40 seconds. The 48 skipped tests need things a fresh clone does not have: a real Postgres for 41 of them (set `STORE_TEST_URL`; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
+
+3. Check the vault proof against Base Sepolia.
+
+   ```bash
+   npm run prove:vault -- verify
+   ```
+
+   This reads the committed proof record and checks it against the chain, line by line. It sends nothing and loads no key. Expect 14 `pass` lines and exit code 0:
+
+   ```text
+   Checking packages/contracts/deployments/base-sepolia-proof.json against Base Sepolia at block 57373245:
+     pass  factory                  the record names the factory in base-sepolia.json, 0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56
+     pass  createVault transaction  0xda041583c1c4170d470e537c7d36f41fc1912b398758a3612d492960e45bd13c succeeded in block 57248098, ...
+     ...
+     pass  claimed(paid)            claimed(0xFE2B7D1707A725E2D8D6040506D26a28A98a5CdD) is 1000000, at least the recorded 1000000
+     pass  claimed(refused)         claimed(0xb2864c5C992f22E6d8A6A47945c0E897C440DAf7) is 0
+   Not checked: that the refused wallet's claim reverts. That needs the private claim list behind the root, so only the record phase repeats it.
+   All 14 checks pass. The vault on Basescan: https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034
+   ```
+
+   The block number will be later on your run. The command uses Base's public RPC `https://sepolia.base.org`, which is rate limited. If it refuses, set `BASE_SEPOLIA_RPC_URL` to an https endpoint of your own. What this shows: one approved wallet was paid exactly 1 test USDC, and a wallet left off the list has been paid nothing. What it does not show: that the left-off wallet's claim reverts. The `/break` page runs that refusal for you.
+
+4. Open the site on your machine and look at the replay, the versions page and the break page.
+
+   ```bash
+   npm run web:dev
+   ```
+
+   Open `http://localhost:3000`. These three pages need no key.
+
+   - `/replay` has the heading "The ROBO airdrop, replayed." and the line "35,323 wallets claimed this airdrop. This is what Thuli's rulebook v2 decides for each one, using only chain data from before the first claim. No money moved." Under it are four counts: Held for review 11,456, Excluded 66, Cut to a partial reward 22,867, Paid in full 934. Open `/replay?wallet=0x041f77015fe51c51ae49a7f2f3ff86c641fa190a` to read one wallet: it is held on rule A4 as one of 19 linked wallets, with its reason and the transaction the reason cites.
+   - `/versions` has the heading "Every rulebook version, scored the same way." and a scorecard: farm wallets caught 11,173 of 11,282 under both versions, real users held by mistake 38 of 1,500 under version 1 and 15 of 1,500 under version 2, and blocked decisions no longer made 0 of 11 and 10 of 11.
+   - `/break` has the heading "Attack it yourself." and a button "Run all 10 attacks". The five vault attacks run as simulated calls from your browser against the proof vault, through Base Sepolia's public RPC, and the markup check runs in the page. Above the rows, a line says whether the list root rebuilt in your browser matches the vault's active root. Each attack should read as refused, and the tally counts only the rows that ran. The four rows that attack the site's own routes need the site's settings from `.env.web.example`, and show as not run without them.
+
+   `npm run web:build` builds the same site for production and finishes with exit code 0 and 33 pages.
+
+Optional steps that need a tool or a test key:
+
+- Contract tests. Install Foundry from [getfoundry.sh](https://getfoundry.sh), run `npm install --prefix packages/contracts`, then `npm run contracts:test`. Expect `77 tests passed, 0 failed, 2 skipped (79 total tests)`.
+- A live check of any wallet at `/check`. It calls SERV, so it needs a SERV API key: make one under "API keys" at [console.openserv.ai](https://console.openserv.ai). Copy `.env.web.example` to `packages/web/.env.local` and fill the values listed in the Quick start. It shows a decision, a rule, a reason and the transactions behind it within about two minutes.
+- The paid route, `npm run prove:paid`. It needs the SERV values in `.env.api`, and a throwaway test key in `.env.payer` as `PAYER_PRIVATE_KEY` (make one with Foundry's `cast wallet new`) holding at least 5 cents of Base Sepolia test USDC from [Circle's faucet](https://faucet.circle.com). It pays for one screening, replays the same payment 10 times, expects every copy to fail, and checks that exactly 5 cents left the wallet.
+- The whole campaign path on a local copy of Base Sepolia, `npm run rehearse:campaign`. It needs Foundry's `anvil` and the SERV, Ethereum and Base Sepolia values in `.env`. Six throwaway keys ask, live SERV screens them, the approved wallets take three slots and the worker submits their claims. It prints `pass` or `FAIL` for each check and sends no transaction to a public network.
+
+## Quick start
+
+Prerequisites:
+
+- Node.js 26 or newer (`engines` in `package.json`), with npm. The output in this file is from Node 26.7.0 and npm 11.19.0.
+- Foundry, only for the contract tests and for `rehearse:campaign`. The output in this file is from forge 1.8.6.
+- A Postgres you can reach, only for `npm run db:migrate`, the worker and `campaign:create --write`. The tests, the site and the standalone API need none.
+- A SERV API key, for anything that screens a wallet live.
+
+Install:
+
+```bash
+npm install
+npm install --prefix packages/contracts
+```
+
+The second line is needed only for the contract tests.
+
+Environment files. Each is a file you create, and none is committed. Only names are listed here.
+
+| Create this file | Copy it from | Used by | Names that matter |
+| --- | --- | --- | --- |
+| `.env` | `.env.example` | the replay, scoring, vault proof and worker scripts, and `db:migrate` | `SERV_API_KEY`, `SERV_BASE_URL`, `SERV_GRAPH_ID`, `ETH_RPC_URL`, `BLOCKSCOUT_ETH_API` for screening. `BASE_SEPOLIA_RPC_URL` for vault commands (the public endpoint is used when it is empty). `DATABASE_URL` for the database. `WORKER_PRIVATE_KEY` and `PAYER_PRIVATE_KEY` for sending Base Sepolia transactions, test keys only. `EXPLORER_API_KEY` (an Etherscan API key) for `vault:deploy` and `vault:verify`. `REPPO_API_KEY` for Reppo feedback runs |
+| `.env.api` | `.env.api.example` | `npm run api:dev`, the standalone paid and free API | `X402_NETWORK`, `PAYTO_ADDRESS_TESTNET` (an address, never a key), `SERV_API_KEY`, `SERV_BASE_URL`, `SERV_GRAPH_ID`, `ETH_RPC_URL`, `BLOCKSCOUT_ETH_API`, `DATABASE_URL`, `TRUSTED_CLIENT_HEADER`, `PORT`. On Base mainnet only: `CDP_API_KEY_ID`, `CDP_API_KEY_SECRET`, `PUBLIC_ORIGIN`, `BASE_RPC_URL`. It refuses to start if any name ending in `PRIVATE_KEY` is set |
+| `packages/web/.env.local` | `.env.web.example` | `npm run web:dev`, and the site's `/api/check`, `/api/x402` and `/api/campaigns` routes | the same payment, SERV and Ethereum names, plus `DEMO_CAMPAIGN_ID` (the campaign the `/campaign` page shows) and `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID`. Never a name ending in `PRIVATE_KEY` |
+| `.env.payer` | none, create it | `npm run prove:paid`, `npm run vault:create` | `PAYER_PRIVATE_KEY`, a test wallet key |
+
+The replay, decide, feedback and scoring scripts, `prove:slice`, `appeal:demo` and `vault:deploy` load `.env` as required, so they stop at once with `node: .env: not found` (exit code 9) until you create it. `prove:vault`, `db:migrate`, `worker`, `vault:create` and `campaign:create` carry on without it. `api:dev` stops the same way without `.env.api`, and `prove:paid` without `.env.api` and `.env.payer`.
+
+`X402_NETWORK` has no default, so testnet is a choice you make: `base-sepolia` for test USDC or `base` for real USDC. The paid route has been proved only on `base-sepolia`.
+
+The local database. `npm run db:migrate` needs `DATABASE_URL` set, as a `postgres://` or `postgresql://` connection string, in `.env` or in your shell. It applies the SQL files in [`packages/store/migrations`](packages/store/migrations), prints what it applied, and is safe to run again. With `DATABASE_URL` unset it stops with exit code 2 and the line `DATABASE_URL is not set. Put a postgres:// connection string in .env.` The site alone needs no database locally: leave `DATABASE_URL` empty and it runs an in-process one whose contents are lost on restart.
+
+Commands, all from the root `package.json`:
+
+| Command | What it does |
+| --- | --- |
+| `npm test` | Runs `vitest run`: every test under `packages/*/test`. |
+| `npm run test:db` | Runs the store and API tests one file at a time. They use an in-memory Postgres, and a real one too when `STORE_TEST_URL` is set. Those tests empty the payment, cache and campaign tables, so point it at a scratch database. |
+| `npm run typecheck` | Runs the TypeScript compiler over core, worker, API, store and web. Writes no files. |
+| `npm run contracts:test` | Runs `forge test --root packages/contracts`. Needs Foundry. |
+| `npm run contracts:lint` | Runs solhint over the Solidity. Needs `npm install --prefix packages/contracts`. |
+| `npm run web:dev` | Starts the site on `http://localhost:3000`. |
+| `npm run web:build` | Builds the site for production. |
+| `npm run api:dev` | Starts the standalone paid and free API on port 8787, or on `PORT`. Needs `.env.api`. |
+| `npm run prove:vault -- verify` | Checks the committed vault proof against Base Sepolia, 14 checks, no key. The other phases (`setup`, `claim`, `record`) need two test keys and are not for strangers. |
+| `npm run prove:paid` | Pays for one screening, replays the payment 10 times and checks that exactly 5 cents left the wallet. Needs a funded test key and the SERV values. |
+| `npm run vault:deploy` | Deploys the factory to Base Sepolia and records it. Refuses every other chain. Needs the worker key and an explorer key. |
+| `npm run vault:verify` | Verifies the factory and the proof vault on Basescan through the Etherscan API, plus any vault made by a `createVault` transaction you name with `--vault-tx`. Sends no transaction. Needs Foundry and an explorer API key (`EXPLORER_API_KEY`); it refuses without one, with exit code 1. |
+| `npm run vault:create` | Makes and funds one campaign vault from the committed factory. Without `--send` it prints the plan and signs nothing. |
+| `npm run campaign:create` | Registers a campaign from its vault's creation transaction. Without `--write` it stores nothing. It signs nothing. |
+| `npm run worker` | Runs the campaign worker: screens asks, posts lists to the vault, submits claims. `-- --once` runs one pass and exits. |
+| `npm run rehearse:campaign` | Runs the worker end to end on a local fork of Base Sepolia. Needs `anvil` and live SERV. |
+| `npm run db:migrate` | Brings the Postgres at `DATABASE_URL` up to date. |
+| `npm run prove:slice` | Runs one wallet through the pipeline at the block before the first ROBO claim. Takes `--wallet`, and needs the SERV and RPC values. |
+| `npm run replay:robo`, `npm run replay:hop` | Read chain facts for every wallet of the ROBO or Hop replay. Need the stored claim and answer-key files, which are not in the repository. |
+| `npm run decide:robo`, `npm run decide:hop` | Ask SERV for a decision on every replay row. Spend SERV credit and need the stored replay data. |
+| `npm run feedback:reppo` | Sends decisions to Reppo's evaluation service with addresses, hashes and amounts removed. Spends Reppo credit. |
+| `npm run versions:score` | Scores rulebook version 1 against version 2 on the stored model replies. Refuses all network access. |
+| `npm run export:replay` | Rebuilds the replay offline and writes the files under `packages/web/public/replay`. |
+| `npm run appeal:demo` | Walks one appeal through its checks with a throwaway test wallet. Calls SERV and writes a local file. |
+
+## The paid API
+
+`POST /api/x402/screen` takes `{"wallet": "0x..."}`: one key, at most 1 KB. Without a payment it answers 402. The terms come back in the `PAYMENT-REQUIRED` header as base64 JSON, and the body is `{"error": "Payment required"}`. These examples are captured from a local build of the site and kept in [`packages/api/examples`](packages/api/examples).
+
+The request, which needs the site running with its settings:
+
+```bash
+curl -i -X POST http://localhost:3000/api/x402/screen \
+  -H 'content-type: application/json' \
+  -d '{"wallet": "0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a"}'
+```
+
+The 402 answer, decoded from `PAYMENT-REQUIRED` ([`payment-required.json`](packages/api/examples/payment-required.json)), with the discovery listing cut:
+
+```json
+{
+  "x402Version": 2,
+  "error": "Payment required",
+  "resource": {
+    "url": "http://localhost:3300/api/x402/screen",
+    "description": "Screens one Ethereum wallet with Thuli's airdrop rulebook v2 and returns a decision (full, partial, hold or exclude) with the rule, a plain reason and the transactions behind it. One wallet on its own, no claim list.",
+    "mimeType": "application/json"
+  },
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:84532",
+      "amount": "50000",
+      "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+      "payTo": "0x93d50219322Bf8B7145FE3780a087ec1EC564C2e",
+      "maxTimeoutSeconds": 300,
+      "extra": {
+        "name": "USDC",
+        "version": "2",
+        "paymentFlow": "upfront"
+      }
+    }
+  ],
+  "extensions": {
+    "bazaar": { "...": "input example and JSON schema of the success body" }
+  }
+}
+```
+
+That asks for `50000` base units, which is 5 cents, of Base Sepolia test USDC. A client signs that payment and asks again with a `PAYMENT-SIGNATURE` header. The x402 libraries do this for you. The committed worked example is [`packages/api/scripts/prove-paid.ts`](packages/api/scripts/prove-paid.ts), which uses `x402Client`, `ExactEvmScheme` and `wrapFetchWithPayment` from the `@x402/*` packages.
+
+The paid answer, a 200 with a `PAYMENT-RESPONSE` header ([`paid-screen-response.json`](packages/api/examples/paid-screen-response.json)):
+
+```json
+{
+  "wallet": "0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a",
+  "checkedAt": "2026-11-11T07:49:55.310Z",
+  "scope": "one wallet on Ethereum, no claim list",
+  "rulebook": "v2",
+  "decision": {
+    "action": "partial",
+    "shareBps": 5000,
+    "rule": "A8",
+    "reason": "A8: The wallet is 261 days old with 3 pre-snapshot activities. No linked group, shared funding, shared collector, wallet-made links, or shared exchange claimants are recorded; the funder is unknown and its claimant count is unreadable.",
+    "citedTxs": []
+  },
+  "servRequestId": "0fc3aea3-9a57-41e1-9d4b-c474c3df9899",
+  "notChecked": [
+    "group",
+    "sharedDepositAddress",
+    "fundingBurst",
+    "claimPaidToOtherAddress"
+  ],
+  "payment": {
+    "network": "eip155:84532",
+    "payer": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
+    "transaction": "0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1"
+  }
+}
+```
+
+Realised, with test USDC that has no value: that payment settled in [this Base Sepolia transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1), and ten copies of the same payment header sent afterwards bought nothing. This wallet is held on rule A4 in the ROBO replay, as one of 19 linked wallets. Screened alone, it has no list around it, so the paid route cannot see the group. It answered partial on rule A8 and listed `group` under `notChecked`. Read a `full` or `partial` answer from this route as "its own history raised no hold", not as "it belongs to no group".
+
+A paid request always gets a decision. If the screening fails, the body is a hold on rule `A1` whose reason names the cause. Limits: one paid request in flight per caller, 20 requests per caller per minute, 12 SERV calls and 120 seconds per screening.
+
+The free check, `POST /api/check`, takes the same body, needs no payment and answers with the same fields, without `payment` and with `cached`. Real answer ([`free-check-response.json`](packages/api/examples/free-check-response.json)):
+
+```json
+{
+  "wallet": "0x59170D55BbA35AF1f1f9c3D6B1f678fbb68A760E",
+  "checkedAt": "2026-11-11T07:46:49.853Z",
+  "scope": "one wallet on Ethereum, no claim list",
+  "rulebook": "v2",
+  "decision": {
+    "action": "full",
+    "shareBps": 10000,
+    "rule": "A9",
+    "reason": "A9: The wallet is 1,353 days old with 56 pre-snapshot activities. No linked claim-wallet group, shared funding, shared-collector sweeps, wallet-made group links, shared exchange claimants, or onward claim payment is recorded; first-funder details are unknown.",
+    "citedTxs": []
+  },
+  "servRequestId": "0f2e52c2-4485-417c-a183-247c9071fc49",
+  "notChecked": [
+    "group",
+    "sharedDepositAddress",
+    "fundingBurst",
+    "claimPaidToOtherAddress"
+  ],
+  "cached": false
+}
+```
+
+```bash
+curl -s -X POST http://localhost:3000/api/check \
+  -H 'content-type: application/json' \
+  -d '{"wallet": "0x59170D55BbA35AF1f1f9c3D6B1f678fbb68A760E"}'
+```
+
+A new check can take up to two minutes. While one request screens a wallet, another for the same wallet gets `202` with `{"pending": true}`. A result is cached for 24 hours. Past a caller's limit the answer is `429` with `{"busy": true}`. The full list of errors and limits is in [`paid-api.mdx`](packages/web/content/docs/paid-api.mdx) and in section 4.4 of [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Contract functions
+
+The vault and the factory are in [`packages/contracts/src`](packages/contracts/src). "Owner" is `owner()`, the project running the campaign. "Agent" is `agent()`, Thuli's list-posting key. This is a shortened table. The full one, with every error and event, is section 4.2 of [ARCHITECTURE.md](ARCHITECTURE.md).
+
+| Function | Who may call | What it does | What it refuses |
+| --- | --- | --- | --- |
+| `createVault(address token, address owner, address agent, uint256 perWalletCap, uint64 endTime, uint32 rootDelay) returns (address vault)` on the factory | anyone | Deploys one vault and logs `VaultCreated`. The factory has no owner and no settings. | A zero owner, token or agent. An agent that is the owner. A zero cap. A delay outside 1 hour to 30 days. An end earlier than now plus the delay plus 1 hour, or more than 365 days out. |
+| `deposit(uint256 amount)` | owner, before the end, after approving the vault | Pulls reward tokens into the vault. | Zero. After the end. A token that skims a fee. A short allowance or balance. |
+| `postRoot(bytes32 root, uint256 declaredTotal)` | agent only, not while paused | Posts a list root that pays after the delay. Replaces a root still waiting. | Anyone else. A paused vault. A zero root. After the end. A declared total above the deposit. A root that could not start paying before the end. |
+| `cancelRoot()` | owner, while the root is inside its delay, paused or not | Drops the waiting root. | No waiting root, or a root already claimable. |
+| `setAgent(address newAgent)` | owner | Replaces the agent key and drops any root still inside its delay. | The zero address. The owner as agent. |
+| `extendEnd(uint64 newEnd)` | owner, before the end | Moves the end later, at most 365 days out. | An end that is not later, or too far, or a campaign that has ended. |
+| `pause()` | owner | Stops claims, withdrawal, new roots and the root clock. | Pausing twice. |
+| `unpause()` | owner | Resumes, and moves the end and any waiting root later by exactly the time paused. | Unpausing a vault that is not paused. |
+| `claim(address account, uint256 cumulativeAmount, bytes32[] proof)` | anyone; the tokens go to `account` | Pays the wallet in the leaf its approved total minus what it already received, never above the cap. | A paused vault. After the end. No claimable root. A bad proof (`InvalidProof`). Nothing new to pay (`NothingToClaim`). A deposit too small (`DepositExhausted`). |
+| `withdrawAfterEnd(address to)` | owner, from the end time, not while paused | Sends the whole reward-token balance to `to`. | Before the end. While paused. The zero address. An empty vault. |
+| `rescue(address otherToken, address to, uint256 amount)` | owner | Returns a stray token. | The reward token itself. The zero address. Zero. |
+| `transferOwnership(address newOwner)`, `acceptOwnership()` | owner, then the new owner | A two-step handover. The agent can never become owner. | `AgentIsOwner`. |
+| `renounceOwnership()` | nobody | Always reverts, because a vault with no owner could never cancel a bad root. | Always (`RenounceDisabled`). |
+| `state()`, `claimable(address account, uint256 cumulativeAmount)`, `claimed(address)` | anyone | Reads: the full state, what a claim would pay now, and what a wallet has received. | |
+
+The leaf the vault hashes, which `packages/core` builds the same way:
+
+```text
+leaf = keccak256(bytes.concat(keccak256(abi.encode(uint256 chainId, address vault, address account, uint256 cumulativeAmount))))
+```
+
+The chain id and the vault address sit inside the leaf, so a proof for one vault or chain is worthless on another. Hashing twice stops an inner tree node passing as a leaf.
+
+## Tests and gas
+
+Tests, run on a fresh clone on 11 November 2026.
+
+```text
+$ npx vitest run
+ Test Files  66 passed (66)
+      Tests  1519 passed | 48 skipped (1567)
+
+$ npm run contracts:test
+Ran 6 test suites in 25.85s (73.19s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
+```
+
+The 48 skipped TypeScript tests are explained in step 2 of the judge path. After the contracts are built the ABI test also runs, and the count is 1520 passed and 47 skipped. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
+
+The 79 Foundry tests are 64 unit tests, 1 demo test (30 farm wallets cannot take more than 20 USDC, and none gets more than 1 USDC), 1 fixture test that pins one list and its proofs, 11 fuzz tests at 10,000 random cases each, 1 fork test of a full campaign on real USDC, and 1 invariant suite with 7 invariants run as 256 random call sequences, up to 64 calls deep. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens, and the fork tests do not cover Circle freezing or pausing USDC or gas prices on Base. None of this replaces an outside audit.
+
+Gas for the proof vault's five transactions, from the proof record. The record holds no gas price, so this README gives gas units and no dollar cost.
+
+| Action | Sent by | Gas used | In plain words |
+| --- | --- | --- | --- |
+| `createVault` | owner | 1,686,371 | Builds the vault. |
+| `approve` | owner | 55,437 | Lets the vault pull 2 test USDC from the owner. |
+| `deposit` | owner | 100,114 | Moves the 2 test USDC into the vault. |
+| `postRoot` | agent | 75,112 | Posts a list of one wallet. |
+| `claim` | agent | 145,907 | Pays 1 test USDC to that wallet. |
+
+## Project structure and stack
+
+```text
+ARCHITECTURE.md      architecture, and the interface the site is built against
+docs/security/       the threat model
+packages/
+  core/              shared rules: facts, start and ceiling checks, output checks,
+                     the claim leaf, ask and appeal checks, money
+  worker/            screening and replay scripts, SERV and Reppo clients,
+                     vault list builders, the campaign worker
+  api/               the Hono app: free check, paid screen over x402, campaign routes
+  store/             the Postgres store and its SQL migrations
+  web/               the Next.js site, the docs (MDX), the static replay files
+  contracts/         ThuliVault, ThuliVaultFactory, Foundry tests, deploy scripts,
+                     deployment records
+  rulebook/          the written rulebook the model reads
+```
+
+Versions are from the `package.json` files and match the lockfiles.
+
+| Part | Tool | Version |
+| --- | --- | --- |
+| Runtime | Node.js | 26 or newer (developed on 26.7.0) |
+| Language | TypeScript | 7.0.2 |
+| Tests | Vitest | 5.1.0 |
+| Script runner | tsx | 4.23.15 |
+| Chain library | viem | 2.57.11 |
+| Validation | zod | 4.6.7 |
+| Merkle trees | `@openzeppelin/merkle-tree` | 1.0.8 |
+| API server | Hono, `@hono/node-server` | 4.13.17, 2.1.6 |
+| Payments | `@x402/core`, `evm`, `extensions`, `fetch`, `hono`, `svm` | 2.30.0 |
+| Base mainnet facilitator | `@coinbase/cdp-sdk` | 1.61.0 |
+| Database | `pg`, with `@electric-sql/pglite` for tests | 8.23.1, 0.5.16 |
+| Site | Next.js, React, Tailwind CSS | 16.4.6, 19.3.1, 4.3.5 |
+| Docs | `fumadocs-core`, `fumadocs-ui`, `fumadocs-mdx`, Mermaid | 16.18.4, 16.18.4, 15.5.3, 12.3.0 |
+| Wallet connection | wagmi, `@tanstack/react-query` | 3.7.11, 5.107.1 |
+| Motion | GSAP, Lenis, Motion | 3.15.1, 1.3.27, 14.12.0 |
+| Contracts | Solidity, OpenZeppelin Contracts, forge-std | 0.8.38 (EVM `prague`), 5.7.0, v1.17.0 |
+| Contract tooling | Foundry, solhint | forge 1.8.6, 6.2.5 |
+| Model | SERV Reasoning by OpenServ | API, rules graph and written rulebook |
+| Outside evaluation | Reppo evaluation API | API |
+
+## Security
+
+The threat model was written on 27 October 2026, before any code, by a review pass that saw only a plain description of the system. It lists the attacks to expect and 47 numbered rules (C1 to C47), each naming the test or attack that shows it, and a change that touches a rule has to carry its test. The worker's key can post a list to a vault and, like anyone, submit a claim, which pays only the wallet named in the list. It cannot withdraw, cancel, pause, extend the end, replace itself or rescue a token. Every list waits a delay the owner can use to cancel it, each wallet is capped, and the total paid cannot pass the deposit. If the worker's key were stolen and nobody cancelled in time, the stated loss is whatever the deposit has not yet paid out, at most the cap per wallet, and no watcher exists yet to warn the owner. The vault protects claimants from a hacked Thuli server and from early withdrawal, and does not protect them from the project that funds it. The named limits are on the [limits page](packages/web/content/docs/limits.mdx) and under the non-goals in the [threat model](docs/security/threat-model.md) (section C.2, standard 5). No outside firm has audited Thuli: the review is a self-audit, made of the threat model, three internal review rounds and the tests, and the vault holds only test USDC.
+
+## What is not built yet
+
+This is the state of the code on 11 November 2026, from the [limits page](packages/web/content/docs/limits.mdx) and section 4.8 of [ARCHITECTURE.md](ARCHITECTURE.md).
+
+- Base mainnet contracts. Only Base Sepolia has a deployment, and the paid route has been proved only there.
+- Self-serve campaigns: owner sign-in, an owner dashboard and a way to upload a project's own claim list. Today a project registers a campaign with `npm run vault:create` and `npm run campaign:create`.
+- Public appeals. The checks that read a signed appeal, the record, a local file store and advice exist. No public route takes an appeal, contract wallets cannot appeal, and a reversal would not change the claim list or the vault root.
+- A hosted worker and a hosted database. The worker runs as a script on one machine, and no database is hosted for Thuli.
+- A general job queue. Only campaign asks and claim submissions are queued.
+- Paid data lookups through Kite Passport, Nansen or Allium, and Dolphin summaries. No code calls them.
+- A watcher that rebuilds each posted list and alerts the owner inside the vault's delay.
+- Private campaigns. The one kind of campaign that runs today is public from its first ask.
+- An external audit.
+
+A campaign screens each ask as it arrives, so it sees a group of linked wallets only as the group grows, and it links wallets through their direct first funder only. The replay, which screens a whole list at once, has neither gap. The limits page lists these and the rest.
+
+## Licence and acknowledgments
+
+MIT, see [LICENSE](LICENSE).
+
+Thuli is built on OpenServ's SERV Reasoning, which applies the rulebook and writes each reason. Reppo's evaluation service gave the outside judgement that changed the rulebook. Base is the network for the vault and for x402 payments in USDC.
+
+The replay uses public data. The ROBO airdrop is read from Ethereum. Bitquery's published analysis of the ROBO airdrop is the answer key used for scoring: it is cited and not republished. Hop Protocol's published lists of kept and removed wallets from its 2022 airdrop are the control group. Chain data is read through public Ethereum RPC and Blockscout endpoints. The source lists carry no licence that lets us republish them, so the repository holds the decisions and counts the replay produced and not the lists themselves. The contracts build on OpenZeppelin, and the paid route uses the x402 packages.
