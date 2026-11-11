@@ -2,7 +2,7 @@
 
 Thuli is Tamil for "a drop": every drop of an airdrop lands in a real hand.
 
-Picked 27 Oct 2026: a screening service with an immutable reward vault on Base (PLAN.md, Option 2). The numbered
+Picked 27 Oct 2026: a screening service with an immutable reward vault on Base. The numbered
 rules (C1 to C47) are in docs/security/threat-model.md. This file grows the interface section (addresses, ABI, the
 exact reads and writes the UI makes) as the backend lands.
 
@@ -406,8 +406,8 @@ for a signature. The proof run does the same: it rebuilds the tree from the publ
 equals `state().activeRoot`, reads `claimable`, then simulates and sends `claim`.
 
 A decision's share becomes a leaf amount through `shareOf` in `packages/core/src/money.ts`, and `buildClaimList` and
-`claimTicket` in `packages/worker/src/vault/claimList.ts` build a campaign's list and one wallet's claim ticket. What is
-still missing is a route that serves a wallet its claim ticket, and a service that posts lists. See 4.8.
+`claimTicket` in `packages/worker/src/vault/claimList.ts` build a campaign's list and one wallet's claim ticket. The
+campaign routes serve a wallet its claim ticket (4.9), and the campaign worker posts lists and submits claims (4.10).
 
 ### 4.4 The paid API
 
@@ -789,10 +789,10 @@ searching the code.
   leases, rate events, day counts, the check cache, and the live campaign's terms, asks, list versions and claim
   relays (4.9). The paid, free and campaign routes use it, shared by every server copy when `DATABASE_URL` is set.
   Appeals and general jobs have no tables yet.
-- The web app's own routes for sign-in, owner campaign management, appeals and publishing. The site serves
-  `/api/x402/*`, `/api/check*` and the public campaign routes `/api/campaigns/*` (4.9) through
-  `packages/web/lib/server/thuliApi.ts`; its only other route handler is the docs search at `/api/search`. No route
-  creates a campaign.
+- The web app's own routes for sign-in, owner campaign management and appeals. The site serves `/api/x402/*`,
+  `/api/check*` and the public campaign routes `/api/campaigns/*` (4.9) through `packages/web/lib/server/thuliApi.ts`;
+  its only other route handler is the docs search at `/api/search`. No route creates a campaign or posts a list. A
+  campaign is registered with `npm run campaign:create`, and the worker posts its lists (4.10).
 - A general job queue. Only campaign asks and claim relays are queued, each in its own table (4.9); the paid route
   screens inside the request, and the replays run as scripts.
 - Paid data through Kite Passport, and the Nansen and Allium lookups behind it. No code calls Kite, Nansen or Allium.
@@ -920,3 +920,223 @@ exactly as published; `claim_relays` holds the claims the worker submits for wal
 or a relay whose try failed waits out the retry time the worker sets before it is handed out again, so an outage
 cannot use up every attempt in seconds. Campaigns are created with `createCampaign`, which refuses different terms for
 an existing id.
+
+### 4.10 The campaign worker
+
+The campaign worker does the work no web request does. It screens each ask, posts the list of approved wallets to the
+campaign's vault, and after the vault's delay submits each wallet's claim from its own key, so the wallet is paid
+without paying gas. It is a script, `npm run worker` (`packages/worker/scripts/worker.ts`), and its code is in
+`packages/worker/src/campaign/`. Today it runs from this repository on one machine, against Base Sepolia with test
+money. Nothing hosts it (4.8). It shares Postgres with the routes in 4.9: the routes put asks in, and the worker takes
+them out.
+
+A lease, used below, is a note on a row saying one worker holds it until a set time. If that worker stops, the row is
+free again when the time passes.
+
+#### What one run does
+
+A run goes through the steps below in order. The loop starts the next run 5 seconds after a run ends (`LOOP_INTERVAL_MS`
+in `loop.ts`). Each step has a time limit (`STEP_TIMEOUTS_MS`). A step that fails or runs out of time is logged and the
+run goes on to the next step; whatever the step held is tried again when its lease runs out.
+
+| Step | What it does | Limit |
+| --- | --- | --- |
+| 1. Screen one ask | Takes the oldest ready ask of any campaign, leased for 300 seconds, screens it as described below, and stores the decision. | 180 seconds |
+| 2. Read the open campaigns | Every campaign whose status is `open`, in id order, at most 100 (`MAX_OPEN_CAMPAIGNS`). | 30 seconds |
+| 3a. Reconcile, for each campaign | Brings the list records in line with what the vault shows. Sends nothing. | 120 seconds |
+| 3b. Activate, for each campaign | Marks a posted list active once the vault's own clock has reached its claimable time and the vault pays its root, then queues one relay for each listed wallet the vault still owes. | 120 seconds |
+| 3c. Publish, for each campaign | Posts the slot holders' list to the vault when that list is not on chain yet. | 300 seconds |
+| 4. Relay one claim | Takes the oldest ready relay and submits that wallet's claim. | 300 seconds |
+
+- Reconcile runs first, so a list that was posted but never recorded is recorded before anything is built on it.
+  Activate runs before publish, so a list whose delay has just ended is marked active before the next list is posted
+  over it. If reconcile fails or runs out of time, activate and publish do not run for that campaign in that run. A
+  campaign whose row records no `vault_block` is skipped, and the reason is logged once.
+- A wallet is queued for a relay only when the vault says it is still owed something, so a wallet already paid under
+  this list or an earlier one gets none. Relays are queued once for each list version in a process. After a restart they
+  are queued again and nothing is added, because a relay already queued is left as it is.
+- Each limit is above the limits inside its step. A screening stops itself at 120 seconds and makes at most 12 SERV
+  calls. A post or a claim waits at most 180 seconds for its receipt. A Base Sepolia call times out at 30 seconds and
+  an Ethereum read at 15.
+- `SIGINT` or `SIGTERM` lets the step under way finish and then stops the loop. A second signal stops the process at
+  once. `npm run worker -- --once` makes one run of every step and exits.
+- The worker serves every campaign whose status is `open`, whatever its opening and closing times, because it keeps
+  posting lists and paying claims after the asks close. No command in this repository sets a campaign's status to
+  `closed`.
+
+#### How an ask is screened
+
+`screenNextAsk` in `screen.ts`, in order:
+
+1. The campaign is looked up. A missing campaign, a campaign on a rulebook other than the current one, or settings that
+   are not valid stop the screening, and the ask goes back to the queue (see "What happens on failure").
+2. The wallet's own facts are read on Ethereum at the latest finalized block: its age, its transactions sent, its
+   account type and its first funder, the address that sent it its first real money. They are taken into single-wallet
+   scope, as in the paid route (4.5).
+3. The first funder's kind is read from the chain. The facts reader leaves it unknown, so the worker reads the funder's
+   code and its count of transactions sent at a finalized block, when the ask is screened, and applies core's
+   `funderKind`: contract code makes it a `contract`, a plain address with 10,000 or more transactions sent
+   (`HIGH_VOLUME_NONCE`) is an `exchange`, and any other is a `wallet`. A wallet delegated by EIP-7702 keeps its own key
+   and counts as a wallet. If the funder cannot be read, the screening stops and the ask is tried again: it is never
+   linked or cleared on a guess. The replay classifies its funding roots with the same function.
+4. The family is built from the campaign's own asks (below).
+5. The code sets the start and the ceiling from the facts and the campaign's settings (checks A1 to A9), then asks SERV
+   (the rules graph first, the written rulebook if the graph fails), then runs the output checks. This is
+   `decideWallet` in auto mode, the same path as every other screening (4.5), and the decision is never above the
+   ceiling.
+6. `decideAsk` stores the decision, the reason, the cited transactions in lowercase, the public facts it rested on, the
+   SERV run id and the list of facts not checked. An approved ask (`full` or `partial`) takes the next slot number
+   while the campaign has slots left. A held or excluded ask never takes one. An answer the output checks refuse is
+   stored at once as a hold on rule A1.
+
+The family. Two asking wallets are joined when they share a first funder of kind `wallet`. An exchange or a contract
+joins nobody. A funder that also asked is in the family of the wallets it paid, and a chain in which each wallet funded
+the next is one family. A decided ask counts as a member, a held one too. An ask still waiting, or one whose screening
+failed, has no funder record, so it counts only when it is itself the first funder of a wallet in the family. The family
+size counts the wallet itself, and a group exists from two wallets up. The fan-out of the wallet's first funder is the
+number of asking wallets it paid, this one included, or none when that funder is an exchange or a contract. Then the
+usual rules decide: A4 holds a family of `groupMinSize` wallets or more, and A5 holds a funder that paid
+`funderFanoutMin` wallets or more. The defaults are 5 and 10 (`packages/core/src/settings.ts`), unless the campaign's
+row changes them. A campaign ask is never excluded for its family: exclusion under A3 needs sweep evidence, which a
+campaign cannot see, so a family can hold a wallet but not exclude it (C15).
+
+Every decision the worker stores carries the facts it could not measure (`CAMPAIGN_NOT_CHECKED` in `facts.ts`):
+
+| Not checked | Why |
+| --- | --- |
+| `sharedDepositAddress`, `sweptToSharedCollector` | They need every asking wallet's sends. |
+| `fundingBurst` | It needs every asking wallet's funding amounts and times. |
+| `claimPaidToOtherAddress` | No claim has been paid yet to be redirected. |
+| `passThroughFunding` | The first funder is the wallet's direct one. A funding that reached it through pass-through wallets is linked by the last hop only. |
+
+#### What happens on failure
+
+The wait after a failed try is `retryDelaySeconds` in `screen.ts`. Asks and relays use the same one.
+
+| Try that just failed | Wait before the next try |
+| --- | --- |
+| 1st | 10 seconds |
+| 2nd | 30 seconds |
+| 3rd | 90 seconds |
+| 4th | 270 seconds |
+| 5th and every later one | 600 seconds |
+
+An ask or relay waiting out its time never holds back the ones behind it. The store refuses any wait above 86,400
+seconds (`MAX_RETRY_SECONDS`).
+
+| | Ask | Relay |
+| --- | --- | --- |
+| Tries | 10 (`MAX_ASK_ATTEMPTS`) | 10 (`MAX_RELAY_ATTEMPTS`) |
+| Waits before it is given up | Nine, 3,400 seconds in all, so an outage of up to about 57 minutes is waited out | The same |
+| Lease | 300 seconds (`ASK_LEASE_SECONDS`) | 300 seconds (`RELAY_LEASE_SECONDS`) |
+| What a failed try is | Facts that could not be read, SERV with no answer or out of credit, the call cap of 12, the 120 second limit, a campaign that is missing or on another rulebook, settings that are not valid, funder records that could not be read, a family with more than 1,000 funders to look up, or a decision the store refused | A claim that would revert for any reason but `NothingToClaim`, a claim that reverts on chain, a failed call, or a campaign on another chain than the worker |
+| Ends as | Status `failed`: a hold on rule A1, share 0, the reason "Held for review: the screening could not finish.", no facts, never a slot | Status `failed` |
+
+A relay also ends `failed` at once, with no retry, when the list version has no published text or the wallet is not on
+that version with the amount queued. A claim that the vault answers `NothingToClaim` is marked `confirmed` without a
+transaction, because the vault has already paid the wallet everything it is owed. A broadcast claim is marked `sent`
+with its hash before the receipt wait, so a worker that stops mid-wait leaves a record, and the next try finds
+`NothingToClaim` if the claim landed.
+
+A wallet whose relay failed is still owed its reward. Once its list is active it can read its claim ticket from
+`GET /api/campaigns/:id/asks/:wallet` (4.9) and call `claim` itself, paying its own gas.
+
+#### Reconcile, and the two minute margin before a cancel
+
+Reconcile (`reconcileCheck` in `publish.ts`) reads the vault at one block and moves a list version to a status the vault
+already shows. It sends nothing, so a worker stopped between any two lines picks up where the vault stands.
+
+| Case | What the worker finds | What it records |
+| --- | --- | --- |
+| 1 | The newest version is built, and its root is the vault's pending root. The post reached the chain and the worker stopped before writing it down. | The version is posted, with no transaction hash and the vault's own claimable time. |
+| 2 | A built version's root is the root the vault pays now. | The version is posted, with the block's time. Activate then marks it active in the same run. |
+| 3 | The newest posted version's root is neither pending nor paid, no newer version ever reached the vault, and the read is at least 120 seconds after that version was posted. | The version is cancelled: the owner cancelled it with `cancelRoot`, or replaced the agent with `setAgent`. |
+
+The 120 seconds are `CANCEL_MARGIN_SECONDS`. A public RPC is load balanced, and a node a few blocks behind still shows
+the vault as it was before the worker's own post. Two minutes is far longer than that lag and far shorter than the hour
+a root waits at least (the vault's minimum root delay, 3,600 seconds), so a real cancel is still recorded long before
+the delay would have ended. Inside the margin nothing is recorded and publish posts nothing, because the newest posted
+list is missing from the read. A version with no claimable time, or a vault whose delay cannot be read, proves no cancel.
+An older posted version with a newer one on chain after it may have been replaced instead of cancelled, which the
+vault's state cannot tell apart, so it is left as it is. Cases 1 and 2 cannot be misled by a lagging node: an older
+view of the vault shows the worker's root pending or paid only if it was posted.
+
+#### Publish
+
+Publish posts nothing when no wallet holds a slot yet, when a root is pending on the vault, when the vault already pays
+exactly this list, when the slot holders are exactly the newest posted or active version, when the owner cancelled
+exactly this list, when the newest posted version is missing from the read (the margin above), or when no list on
+record rebuilds the vault's active root. Otherwise it builds the list from the slot holders in slot order (a full
+wallet at the campaign's reward, a partial wallet at its share rounded down), records it as a new version, reads the
+stored text back, and calls `postRoot`, which checks the vault against the factory's `VaultCreated` log in the recorded
+block and the campaign row (token, owner, agent and cap), that the agent is this key, that the vault is not paused and
+the root can activate before the end, that the active root rebuilds from its own published list, and that the vault can
+pay everything both lists may still owe (C32).
+
+#### What the worker's key can send
+
+Two calls, both from the agent key, and each is simulated before it is sent:
+
+| Call | Who may call it | What the worker uses it for |
+| --- | --- | --- |
+| `postRoot(bytes32 root, uint256 declaredTotal)` | The agent only | Posting a list. |
+| `claim(address account, uint256 cumulativeAmount, bytes32[] proof)` | Anyone; the vault pays the wallet in the leaf | Submitting a wallet's claim. |
+
+It never calls an owner function (`deposit`, `cancelRoot`, `setAgent`, `extendEnd`, `pause`, `unpause`,
+`withdrawAfterEnd`, `rescue`, the ownership calls), never signs anything on a wallet's behalf, and never reads the
+owner's key. Everything else it does with the vault is a read. The rehearsal below checks on a fork that every
+transaction the agent sent was a `postRoot` or a `claim` to a campaign vault, and that no log line holds a key or a
+signature.
+
+#### What it reads
+
+Names only, from `packages/worker/src/campaign/config.ts`. The worker checks all eight before it connects, and a missing
+or invalid one stops it at start with exit code 2, naming each on its own line and what it must be, never its value.
+
+| Setting | Must be |
+| --- | --- |
+| `DATABASE_URL` | A `postgres://` or `postgresql://` connection string |
+| `WORKER_PRIVATE_KEY` | `0x` and 64 hex characters: the agent key the campaign's vault names |
+| `SERV_API_KEY` | The SERV API key |
+| `SERV_BASE_URL` | An https URL |
+| `SERV_GRAPH_ID` | A graph id starting `gr_` that Thuli has a translation for |
+| `ETH_RPC_URL` | An https URL |
+| `BLOCKSCOUT_ETH_API` | An https URL |
+| `BASE_SEPOLIA_RPC_URL` | An https URL, or `http://127.0.0.1:PORT` for a local fork |
+
+It also reads two committed files: the factory record `packages/contracts/deployments/base-sepolia.json` (it must be a
+Base Sepolia record, chain 84532) and the rulebook `packages/rulebook/thuli-rulebook.md` (it must not be empty). A
+scrubber blanks every secret and URL from a log line before it is printed.
+
+The campaign's own terms do not come from these settings. They come from its database row: the reward per wallet, the
+per-wallet cap, the partial share, the number of slots, the rulebook number, the screening settings it changes from the
+defaults (only those), its opening and closing times, and `vault_block`. Starting another campaign needs no change to
+the worker.
+
+#### Commands
+
+| Command | What it does | What it needs | What it refuses |
+| --- | --- | --- | --- |
+| `npm run db:migrate` | Brings the Postgres at `DATABASE_URL` up to date with `packages/store/migrations`, and prints what it applied. Safe to run again and from two places at once. | `DATABASE_URL` | A missing value, or one that is not a postgres connection string (exit 2). |
+| `npm run vault:create -- --agent ADDRESS --cap USDC --deposit USDC [--days N] [--delay-hours N] [--send]` | Makes a campaign vault from the committed factory and funds it. Without `--send` it simulates and prints the plan and signs nothing. With `--send` the owner key sends exactly three transactions: `createVault`, `approve` of exactly the deposit, and `deposit`. Then it prints the `campaign:create` line to run next. | `PAYER_PRIVATE_KEY` (the owner's test key), the two committed records in `packages/contracts/deployments`, and, with `--send`, Base Sepolia ETH for gas. `BASE_SEPOLIA_RPC_URL` is optional: the public endpoint is used when it is unset. | An RPC that is not on chain 84532. A token that is not six decimal USDC. An agent that is the owner. An owner holding less USDC than the deposit. `--days` outside 1 to 365 (120 when left out) and `--delay-hours` outside 1 to 720 (1 when left out). An end too soon for the root delay plus the 1 hour minimum claim window. No factory contract at the recorded address. |
+| `npm run campaign:create -- --id ID --name NAME --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]` | Reads the vault's creation transaction and its `state()` from Base Sepolia, checks that they agree, and prints the campaign. With `--write` it records the campaign in the store, with every vault term taken from the chain. It signs nothing and reads no private key. Run again with the same terms it changes nothing. | `BASE_SEPOLIA_RPC_URL` is optional as above. `DATABASE_URL`, with the database migrated, for `--write`. | A transaction that failed, was not sent to the committed factory, or does not hold exactly one `VaultCreated` log from it. A `state()` that disagrees with that log on token, owner, agent, cap or delay. A token that is not Base Sepolia USDC. A reward above the cap. A vault that has ended. `--slots` outside 1 to 100,000. `--partial-share-bps` outside 1 to 9,999 (5,000 when left out). `--closes` after the vault's end less its root delay less the minimum claim window. `--opens` not before closes. Settings the screening would not accept. An id that already holds different terms. It warns, without refusing, when reward times slots is above what the vault still holds. |
+| `npm run worker` | Runs the loop above until `Ctrl+C` or `SIGTERM`. `npm run worker -- --once` makes one run and exits. | The eight settings, the two committed files, a migrated database, and Base Sepolia ETH on the agent key for gas. | Any missing or invalid setting (exit 2, with every problem listed). An RPC that is not on chain 84532. A campaign whose agent is not this key fails when it comes to posting, with the cause logged, and the other campaigns carry on. |
+| `npm run rehearse:campaign` | Runs the whole worker end to end on a private local fork of Base Sepolia made with Foundry's `anvil`. Six fresh signing keys each stand for one real Ethereum wallet whose history is read live. Live SERV screens the six asks, the approved wallets take the three slots, the fork's clock moves past the root delay, and the worker submits each claim. A second campaign shows an owner cancel and a worker stopped between a post and its record. It prints `pass` or `FAIL` for each check and exits 1 if any fails. | Foundry's `anvil`, `BASE_SEPOLIA_RPC_URL` (the fork source), `SERV_API_KEY`, `SERV_BASE_URL`, `SERV_GRAPH_ID`, `ETH_RPC_URL` and `BLOCKSCOUT_ETH_API`. It loads no key from `.env`, uses an in-memory database and sends no transaction to a public network. | A `SERV_GRAPH_ID` Thuli has no translation for. A missing `anvil`. A pair of wallets that no longer shows one shared first funder, checked before any SERV call is spent. It makes at most 6 screenings (`MAX_SCREENINGS`). |
+| `npm run test:db` | Runs the store and API tests one file at a time (`vitest run packages/store packages/api --no-file-parallelism`). The store tests run on an in-memory Postgres (PGlite). The campaign, limits, payment claim and injection tests also run on a real Postgres when `STORE_TEST_URL` is set. | Nothing. | Nothing is refused, so point `STORE_TEST_URL` at a scratch database: those tests empty its payment, cache and campaign tables. |
+
+#### Limits
+
+What this screening does not see, and what running as one process does not cover, is listed under the non-goals in
+`docs/security/threat-model.md` (section C.2, standard 5) and on the limits page of the docs. In short:
+
+- A campaign pays as asks arrive, so a family is seen only as it grows. Until it reaches the group size, each of its
+  wallets looks alone and can be approved. Screening a whole claim list at once, as the replay does, has no such gap.
+- A campaign ask is linked through the wallet's direct first funder only. The replay follows a funding back through up
+  to 6 single-use pass-through wallets (`MAX_TRACE_HOPS`).
+- A first funder with 10,000 or more transactions sent, or with contract code, links nobody.
+- The facts in the table above are not measured for a campaign.
+- The worker is meant to run as one process. Two for a few seconds never pay twice, but they can post one list twice,
+  which restarts that list's waiting time.
+- A claim the worker cannot submit in 10 tries is left for the wallet.
+- An owner's cancel is recorded only after the margin, and a cancelled list is not posted again until the slot holders
+  change. An owner who wants no further lists pauses the vault, which also stops every claim while it lasts.

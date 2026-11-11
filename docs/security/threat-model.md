@@ -344,9 +344,10 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   redirect is followed, and EIP-1271 checks run as gas-capped `eth_call`s with no lookup. Shown by: an `eth_call` to a
   fork contract that reverts with `OffchainLookup` pointing at a local listener; the listener receives nothing.
 - **C39. No internet-facing handler holds a key that moves money.** x402 income goes to a payTo address whose key is on
-  no server. The Reppo-paying key and the vault agent key live only on the worker, and publish queues a job for the
-  worker to sign. If the worker is compromised, the most lost is the open Kite session budgets plus the hot wallet's
-  float, both stated numbers. Shown by: the web app's deployed environment holds no private key and no Kite token.
+  no server. The Reppo-paying key and the vault agent key live only on the worker, and no web handler signs: the
+  campaign worker reads the approved wallets from the database and posts the list itself. If the worker is compromised,
+  the most lost is the open Kite session budgets plus the hot wallet's float, both stated numbers. Shown by: the web
+  app's deployed environment holds no private key and no Kite token.
 - **C40. Secrets are never stored, logged or returned.** API keys, the Kite token, private keys and session tokens never
   appear in the database, logs, stored model requests, receipts, error responses or the client bundle. Stored model
   requests keep bodies, not headers. Shown by: after a full run, a search of a database dump, the logs and the client
@@ -450,3 +451,32 @@ or attack that demonstrates it. A change that touches an invariant also carries 
    - Verdicts about people. The public check runs default rules, and the replay applies rules after the fact. Both are
      assessments of on-chain behaviour based on evidence, not accusations, and the pages say so.
    - Scraping of public pages. Published decisions are public by design.
+   - The campaign worker's view of a family. A campaign that pays as asks arrive sees a family only as it grows. Until
+     the family reaches the campaign's group size (`groupMinSize`, 5 unless the campaign changes it), each of its
+     wallets looks alone and can be approved, and an ask once decided is not screened again. Screening a whole claim
+     list at once, as the replay does, has no such gap (C15).
+   - Funding passed through other wallets, for campaign asks. A campaign ask is linked through the wallet's direct
+     first funder only. The replay follows a funding back through up to 6 single-use pass-through wallets
+     (`MAX_TRACE_HOPS`); a campaign ask does not.
+   - High-volume funders. A first funder with 10,000 or more transactions sent (`HIGH_VOLUME_NONCE`, read when the ask
+     is screened), or with contract code, is treated as an exchange or service and links nobody, so wallets funded
+     straight from such an address are not linked by funding (C16).
+   - Facts a campaign cannot measure. Campaign facts come from free public data: the wallet's own Ethereum history and
+     the campaign's own asks. A shared deposit address, a sweep to a shared collector, a funding burst, a claim paid to
+     another address and funding through pass-through wallets are not measured for campaign asks, and every decision
+     lists them as not checked (`CAMPAIGN_NOT_CHECKED`).
+   - More than one campaign worker. The worker is meant to run as one process. Two for a few seconds are safe for
+     money, because every amount is cumulative and the vault answers `NothingToClaim` to a second claim, so a claim
+     sent twice pays once. They can post one list twice, which restarts that list's waiting time. Two side by side for
+     long would still pay nobody twice, but each would spend reads, SERV calls and gas the other had already spent
+     (C27).
+   - A claim the worker cannot submit. After 10 tries, with waits of 10, 30, 90 and 270 seconds and then 600 each, a
+     relay is left failed. The wallet is still owed: it can claim with its own ticket from the campaign route, and pays
+     its own gas.
+   - The owner's cancel. The worker records a cancel only when the vault is read at least 120 seconds
+     (`CANCEL_MARGIN_SECONDS`) after the post, because a lagging RPC node would otherwise look like a cancel. A
+     cancelled list is not posted again until the slot holders change. An owner who wants no further lists pauses the
+     vault, which also stops every claim for as long as the pause lasts (C30).
+   - Lists posted while asks are queued. C18's refusal to publish while a wallet is queued belongs to an owner-run
+     publish step, which is not built. The campaign worker posts a list as soon as the slot holders change, without
+     waiting for queued asks, and each change is a new list version shown beside the old ones.
