@@ -242,7 +242,10 @@ export function traceFunding(
  */
 export function funderKind(state: AccountState | undefined): FunderKind {
   if (state === undefined || state.code === null || state.nonce === null) return 'unknown';
-  if (accountTypeFromCode(state.code) === 'contract') return 'contract';
+  const type = accountTypeFromCode(state.code);
+  // Code that is not hex is a damaged answer, so the nonce below says nothing reliable about this address (C11).
+  if (type === 'unknown') return 'unknown';
+  if (type === 'contract') return 'contract';
   // A high-volume sender, probably an exchange or service hot wallet. A predicate instead of a label list (C16).
   if (state.nonce >= HIGH_VOLUME_NONCE) return 'exchange';
   return 'wallet';

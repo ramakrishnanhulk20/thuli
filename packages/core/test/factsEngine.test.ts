@@ -396,6 +396,13 @@ describe('funderKind', () => {
     expect(funderKind({ nonce: null, code: '0x' })).toBe('unknown');
     expect(funderKind({ nonce: 3, code: null })).toBe('unknown');
   });
+
+  it('C11: code that cannot be read as hex is unknown, whatever the nonce, never a wallet or an exchange', () => {
+    for (const code of ['not hex', '0x6080604', '0xzz', '6080604052', '']) {
+      expect(funderKind({ nonce: 3, code })).toBe('unknown');
+      expect(funderKind({ nonce: HIGH_VOLUME_NONCE, code })).toBe('unknown');
+    }
+  });
 });
 
 describe('senderListShareBps', () => {
