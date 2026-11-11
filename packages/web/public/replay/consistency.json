@@ -1,0 +1,501 @@
+{
+  "schema": 1,
+  "runDate": "2026-11-11",
+  "rulebook": 2,
+  "seed": 11,
+  "wallets": 30,
+  "runsPerWallet": 5,
+  "totalRuns": 150,
+  "servCalls": 249,
+  "ceilingViolations": 0,
+  "strata": {
+    "full": {
+      "wallets": 10,
+      "runs": 50,
+      "allSame": {
+        "count": 10,
+        "total": 10,
+        "rate": 1,
+        "low": 0.722467,
+        "high": 1
+      },
+      "matchMode": {
+        "count": 50,
+        "total": 50,
+        "rate": 1,
+        "low": 0.928652,
+        "high": 1
+      },
+      "matchStored": {
+        "count": 50,
+        "total": 50,
+        "rate": 1,
+        "low": 0.928652,
+        "high": 1
+      },
+      "replaced": {
+        "count": 0,
+        "total": 50,
+        "rate": 0,
+        "low": 0,
+        "high": 0.071348
+      },
+      "routes": {
+        "graph": 50,
+        "v2": 0,
+        "fallback": 0
+      },
+      "servCalls": 51,
+      "ceilingViolations": 0
+    },
+    "partial": {
+      "wallets": 10,
+      "runs": 50,
+      "allSame": {
+        "count": 10,
+        "total": 10,
+        "rate": 1,
+        "low": 0.722467,
+        "high": 1
+      },
+      "matchMode": {
+        "count": 50,
+        "total": 50,
+        "rate": 1,
+        "low": 0.928652,
+        "high": 1
+      },
+      "matchStored": {
+        "count": 50,
+        "total": 50,
+        "rate": 1,
+        "low": 0.928652,
+        "high": 1
+      },
+      "replaced": {
+        "count": 0,
+        "total": 50,
+        "rate": 0,
+        "low": 0,
+        "high": 0.071348
+      },
+      "routes": {
+        "graph": 10,
+        "v2": 40,
+        "fallback": 0
+      },
+      "servCalls": 91,
+      "ceilingViolations": 0
+    },
+    "modelHold": {
+      "wallets": 10,
+      "runs": 50,
+      "allSame": {
+        "count": 10,
+        "total": 10,
+        "rate": 1,
+        "low": 0.722467,
+        "high": 1
+      },
+      "matchMode": {
+        "count": 50,
+        "total": 50,
+        "rate": 1,
+        "low": 0.928652,
+        "high": 1
+      },
+      "matchStored": {
+        "count": 10,
+        "total": 50,
+        "rate": 0.2,
+        "low": 0.112438,
+        "high": 0.330371
+      },
+      "replaced": {
+        "count": 17,
+        "total": 50,
+        "rate": 0.34,
+        "low": 0.224369,
+        "high": 0.478462
+      },
+      "routes": {
+        "graph": 10,
+        "v2": 40,
+        "fallback": 0
+      },
+      "servCalls": 107,
+      "ceilingViolations": 0
+    }
+  },
+  "overall": {
+    "wallets": 30,
+    "runs": 150,
+    "allSame": {
+      "count": 30,
+      "total": 30,
+      "rate": 1,
+      "low": 0.886487,
+      "high": 1
+    },
+    "matchMode": {
+      "count": 150,
+      "total": 150,
+      "rate": 1,
+      "low": 0.97503,
+      "high": 1
+    },
+    "matchStored": {
+      "count": 110,
+      "total": 150,
+      "rate": 0.733333,
+      "low": 0.657385,
+      "high": 0.797628
+    },
+    "replaced": {
+      "count": 17,
+      "total": 150,
+      "rate": 0.113333,
+      "low": 0.071974,
+      "high": 0.174003
+    },
+    "routes": {
+      "graph": 70,
+      "v2": 80,
+      "fallback": 0
+    },
+    "servCalls": 249,
+    "ceilingViolations": 0
+  },
+  "samples": [
+    {
+      "wallet": "0x5985feeccb3d3c4992747acbfc28ad32e4bc7b81",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x123456c4c26155b8dc40a00569014bd4940e24de",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x0bcb065a40131c070a0be38a5cfbecaaec6f8b56",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x608ba459cc0ae0cfbfa8fb77c6641333af2c8799",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x5674ba89c2dc6f8e5a3bf384fe4af4dc35bcc450",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x7d4f3004505ceca2cb53244ebab38a6e4b9578d0",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0xaf4026b6f56e1dbf7f1b4a30096b57f796d26cf7",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x2ab3ebdda59efdf2c8777db664033427e5d293fb",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x1d091b37ff0ce2f677fe3a704f43201052543c60",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x5ceac35db63a706deb29b857f986a7e393992a0a",
+      "stratum": "full",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x235ff7c006de8bb7e3755bcff97d7b9748103282",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x10f28360325a65afd934f4239ce4c3064570ad2a",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x5483195605879f96b9cddacf15b2760ed3a1410f",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x71b3c3e327926273f79ef7dc559891a6310ae1d7",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x3987f44e87b64961bfaa50dd6a5264056c733432",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x36e55dc83c26ea9d5ea099992140e34a4d4765b6",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0xc5e6b3a5c8f890847922e30eddea784863436950",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x83d5e10183389db2a8e63f7453c165a030ae9fc2",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x2b0def8209038231b7514ead11b270a9538194a6",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x76ecb3df2d1e56ada7db521db9276160ffd19dd0",
+      "stratum": "partial",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x34d6d40f33d8ecdae548ea430b9e24dfbc9a977c",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0xaf8f34dd0be53ec44200f8853203f94d914fb71a",
+      "stratum": "modelHold",
+      "actions": [
+        "hold",
+        "hold",
+        "hold",
+        "hold",
+        "hold"
+      ]
+    },
+    {
+      "wallet": "0x070d7a474c44246b89081e6bec143dc56475a1c7",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x12271ae5be5e10761782e01dacea41d5142a52dd",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0xa9a362bedd42678c3fdd52a39a652978aff60886",
+      "stratum": "modelHold",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0x67e81ea88308c9e392b76a8bcffffcb86e85b488",
+      "stratum": "modelHold",
+      "actions": [
+        "full",
+        "full",
+        "full",
+        "full",
+        "full"
+      ]
+    },
+    {
+      "wallet": "0xc4b5c4bd891e0b88cdb2c089e92a5deb5e391de4",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x1ec562c45b8b206eeec2efbde7c1280b954fd90d",
+      "stratum": "modelHold",
+      "actions": [
+        "hold",
+        "hold",
+        "hold",
+        "hold",
+        "hold"
+      ]
+    },
+    {
+      "wallet": "0xd1aca9a5bffde1ecebc760083e565d9d096cf03e",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    },
+    {
+      "wallet": "0x7a078f686925a9331b9c4669eaae79ee2f857650",
+      "stratum": "modelHold",
+      "actions": [
+        "partial",
+        "partial",
+        "partial",
+        "partial",
+        "partial"
+      ]
+    }
+  ]
+}
