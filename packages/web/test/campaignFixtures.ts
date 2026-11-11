@@ -17,6 +17,15 @@ export function fixtureWallet(index: number): string {
   return privateKeyToAccount(key).address;
 }
 
+/** How far an appeal has got: filed and not yet read, being read, each answer of the outside judges, or never checked. */
+export type AppealKind = 'queued' | 'checking' | 'ship' | 'review' | 'block' | 'unreadable' | 'unchecked';
+
+const NOTES: Record<'ship' | 'review' | 'block', string> = {
+  ship: 'The record gives no sign of a farm. The hold looks reasonable on what was read.',
+  review: 'The record is thin either way. A person should look at this wallet.',
+  block: 'The hold rests on a shared funder alone, which is not enough to hold a wallet.',
+};
+
 export type AskKind = 'queued' | 'screening' | 'full' | 'partial' | 'fullNoSlot' | 'hold' | 'exclude' | 'failed';
 
 const REASONS: Record<'full' | 'partial' | 'hold' | 'exclude' | 'failed', { rule: string; reason: string; txs: string[] }> = {
@@ -87,7 +96,7 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
     status: 'open',
     opensAt,
     closesAt,
-    counts: { asked: 14, queued: 2, decided: 12, held: 5, slotsTaken: 7, slotsLeft: 13, asksLeft: 186 },
+    counts: { asked: 14, queued: 2, decided: 12, held: 5, slotsTaken: 7, slotsLeft: 13, asksLeft: 186, appeals: { filed: 0, checked: 0, block: 0, reversed: 0 } },
     lists: lists('one'),
     ...overrides,
   });
@@ -98,6 +107,7 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
       wallet: who,
       askedAt: isoAt(now - (minutesAgo + 2) * 60_000),
       servRequestId: null,
+      appeal: null,
     };
     if (kind === 'queued' || kind === 'screening') {
       return { ...base, status: kind, action: null, shareBps: null, rule: null, reason: null, citedTxs: null, notChecked: null, facts: null, decidedAt: null, slot: null };
@@ -141,12 +151,37 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
     ...overrides,
   });
 
+  /**
+   * The public view of an appeal, in the shape the routes will send: nothing of the appellant's own words. The overrides
+   * settle it, for example { outcome: 'reversed', newAction: 'full', settledAt }.
+   */
+  const appeal = (kind: AppealKind, overrides: Record<string, unknown> = {}) => {
+    const checked = kind === 'ship' || kind === 'review' || kind === 'block' || kind === 'unreadable';
+    return {
+      filedAt: isoAt(now - 3 * 60_000),
+      checkStatus: checked ? 'checked' : kind,
+      reppoRoute: kind === 'ship' || kind === 'review' || kind === 'block' ? kind : null,
+      reppoNote: kind === 'ship' || kind === 'review' || kind === 'block' ? NOTES[kind] : null,
+      reppoEvalId: checked ? 'ev_8f3a1c92' : null,
+      checkedAt: checked ? isoAt(now - 2 * 60_000) : null,
+      outcome: 'open',
+      newAction: null,
+      settledAt: null,
+      ...overrides,
+    };
+  };
+
+  /** An ask as the routes send it once it has been appealed. */
+  const withAppeal = <T extends object>(source: T, view: ReturnType<typeof appeal>) => ({ ...source, appeal: view });
+
   /** A board page: `count` rows, newest first, the first one decided `startMinutes` ago and each next one a minute earlier. */
-  const board = (count: number, startMinutes = 1) => ({
-    asks: Array.from({ length: count }, (_, index) =>
-      ask((['full', 'hold', 'partial', 'exclude', 'full'] as const)[index % 5] as AskKind, fixtureWallet(100 + startMinutes + index), index % 5 === 0 || index % 5 === 2 ? index + 1 : null, startMinutes + index),
-    ),
+  const board = (count: number, startMinutes = 1, appealAt?: (index: number) => ReturnType<typeof appeal> | undefined) => ({
+    asks: Array.from({ length: count }, (_, index) => {
+      const row = ask((['full', 'hold', 'partial', 'exclude', 'full'] as const)[index % 5] as AskKind, fixtureWallet(100 + startMinutes + index), index % 5 === 0 || index % 5 === 2 ? index + 1 : null, startMinutes + index);
+      const view = appealAt?.(index);
+      return view === undefined ? row : withAppeal(row, view);
+    }),
   });
 
-  return { campaignId: CAMPAIGN_ID, campaign, lists, ask, ticket, board, askView: (a: ReturnType<typeof ask>, t?: ReturnType<typeof ticket>) => (t === undefined ? { ask: a } : { ask: a, ticket: t }) };
+  return { campaignId: CAMPAIGN_ID, campaign, lists, ask, appeal, withAppeal, ticket, board, askView: (a: ReturnType<typeof ask>, t?: ReturnType<typeof ticket>) => (t === undefined ? { ask: a } : { ask: a, ticket: t }) };
 }

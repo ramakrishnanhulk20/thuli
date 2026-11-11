@@ -3,10 +3,37 @@
 // connection or polling; the browser script runs those against a page with an injected test wallet.
 import { privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
-import { askBody, askMessage, isOwnKeySignature, SIGNATURE, signedAtNow } from '../lib/ask';
 import {
+  APPEAL_COUNTER_FROM,
+  APPEAL_MAX_CHARS,
+  appealBody,
+  appealMessage,
+  appealProblem,
+  appealTextHash,
+  askBody,
+  askMessage,
+  isOwnKeySignature,
+  isPlainWords,
+  prepareAppealText,
+  SIGNATURE,
+  signedAtNow,
+} from '../lib/ask';
+import {
+  APPEAL_COPY,
+  appealChip,
+  appealCountsLine,
+  appealCountsOf,
+  appealOf,
+  appealPanel,
+  appealPollDelay,
+  appealRefusalText,
+  appealStage,
+  askPollDelay,
+  boardCheckWords,
   ceilingWords,
   chainName,
+  checkedWords,
+  classifyAppealAnswer,
   choosePanel,
   classifyAskAnswer,
   currentStep,
@@ -19,6 +46,7 @@ import {
   groupText,
   isAcceptingAsks,
   isAskJson,
+  isAppealView,
   isAskView,
   isBoardPage,
   isCampaignView,
@@ -31,15 +59,19 @@ import {
   notCheckedLine,
   outcomeWords,
   payoutFor,
+  postAppeal,
   postAsk,
+  READY_TEXT,
   readyVariant,
   refusalWords,
   SLOWED_LINE,
   SLOWED_POLL_MILLISECONDS,
   showsWhatToDo,
+  settledWords,
   statusLine,
   usdc,
   walletAmount,
+  type AppealView,
   type AskJson,
   type CampaignView,
   type PanelInput,
@@ -51,7 +83,8 @@ import { buildFixtures, CAMPAIGN_ID, fixtureWallet, type AskKind } from './campa
 
 // The core and API packages are loaded by a computed path so the site's own type check does not follow into their sources.
 const loadPackage = (name: string): Promise<any> => import(/* @vite-ignore */ name);
-const { checkAsk, askMessage: coreAskMessage } = await loadPackage('@thuli/core');
+const core = await loadPackage('@thuli/core');
+const { checkAsk, askMessage: coreAskMessage } = core;
 const {
   AskJson: AskSchema,
   AskView: AskViewSchema,
@@ -62,6 +95,10 @@ const {
   ErrorBody,
   ExistsBody,
   FullBody,
+  AppealJson,
+  ApprovedBody,
+  ExistsAppealBody,
+  UndecidedBody,
   QueuedBody,
 } = await loadPackage('../../api/src/schema');
 
@@ -298,7 +335,7 @@ describe('payoutFor', () => {
 
   it('says a held, excluded or failed wallet has no reward and that appeals are not open', () => {
     for (const kind of ['hold', 'exclude', 'failed'] as const) {
-      expect(noTicket(kind)).toEqual({ lines: ['No reward is reserved for this wallet.', 'Appeals are not open yet.'], paid: false });
+      expect(noTicket(kind)).toEqual({ lines: ['No reward is reserved for this wallet.'], paid: false });
     }
   });
 
@@ -631,5 +668,440 @@ describe('a signature that is not from one key', () => {
     expect(isOwnKeySignature(signature)).toBe(true);
     expect(isOwnKeySignature(`0x${'00'.repeat(66)}${signature.slice(2)}`)).toBe(false);
     expect(isOwnKeySignature(`0x${'12'.repeat(32)}`)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------- appeals
+
+describe('the appeal message and text hash', () => {
+  const TEXTS = [
+    'Please look again.',
+    ' leading space',
+    'trailing space ',
+    '  both sides  ',
+    'தமிழ் எழுத்து',
+    'emoji 😀 and more',
+    'café against café',
+    '0xdead',
+    'a'.repeat(280),
+    '',
+    'tab\there',
+  ];
+  const stamp = 1_800_000_000;
+
+  it('hashes the text the way core does, for ASCII, non-ASCII, empty and spaced texts', async () => {
+    for (const text of TEXTS) expect(await appealTextHash(text), JSON.stringify(text)).toBe(core.appealTextHash(text));
+  });
+
+  it('builds the five lines core builds, from the same wallet, campaign, hash and time', async () => {
+    for (const text of TEXTS) {
+      const textHash = await appealTextHash(text);
+      const input = { campaignId: CAMPAIGN_ID, wallet: signer.address, textHash, signedAt: stamp };
+      const message = appealMessage(input);
+      expect(message, JSON.stringify(text)).toBe(core.appealMessage(input));
+      expect(message.split('\n')).toHaveLength(6);
+      expect(message.startsWith('Thuli appeal v1\nCampaign: ')).toBe(true);
+    }
+    const lowered = appealMessage({ campaignId: CAMPAIGN_ID, wallet: signer.address.toLowerCase(), textHash: await appealTextHash('x'), signedAt: stamp });
+    expect(lowered).toContain(`Wallet: ${signer.address}\n`);
+  });
+
+  it('refuses a campaign id, hash or time that could change the shape of the text', async () => {
+    const textHash = await appealTextHash('x');
+    expect(() => appealMessage({ campaignId: 'a\nb', wallet: signer.address, textHash, signedAt: stamp })).toThrow(RangeError);
+    expect(() => appealMessage({ campaignId: CAMPAIGN_ID, wallet: signer.address, textHash: '0xdead', signedAt: stamp })).toThrow(RangeError);
+    expect(() => appealMessage({ campaignId: CAMPAIGN_ID, wallet: signer.address, textHash, signedAt: 1.5 })).toThrow(RangeError);
+    expect(() => appealMessage({ campaignId: CAMPAIGN_ID, wallet: 'nope', textHash, signedAt: stamp })).toThrow();
+  });
+
+  it('does not trim inside the hash, as core does not: a space changes it, so only what is sent is hashed', async () => {
+    expect(core.appealTextHash(' hi ')).not.toBe(core.appealTextHash('hi'));
+    expect(await appealTextHash(' hi ')).not.toBe(await appealTextHash('hi'));
+    expect(prepareAppealText('  hi there \n')).toBe('hi there');
+    expect(await appealTextHash(prepareAppealText('  hi there '))).toBe(core.appealTextHash('hi there'));
+  });
+
+  it('is signed in a form core accepts, for the text that was sent and no other', async () => {
+    const text = prepareAppealText('  The funder is a friend of mine.  ');
+    const textHash = await appealTextHash(text);
+    const signature = await signer.signMessage({ message: appealMessage({ campaignId: CAMPAIGN_ID, wallet: signer.address, textHash, signedAt: stamp }) });
+    expect(isOwnKeySignature(signature)).toBe(true);
+    const context = { expectedCampaignId: CAMPAIGN_ID, now: stamp + 5, isContract: async () => false };
+    const sent = { campaignId: CAMPAIGN_ID, wallet: signer.address, text, signedAt: stamp, signature };
+    expect(await core.checkAppeal(sent, context)).toEqual({ ok: true, wallet: signer.address, textHash });
+    expect((await core.checkAppeal({ ...sent, text: `${text} ` }, context)).ok).toBe(false);
+    expect((await core.checkAppeal({ ...sent, text: 'another text' }, context)).ok).toBe(false);
+    expect((await core.checkAppeal({ ...sent, signedAt: stamp + 1 }, context)).ok).toBe(false);
+  });
+
+  it('builds the request body with exactly its four fields, in the order the route reads them', () => {
+    const body = JSON.parse(appealBody({ wallet: signer.address, text: 'why', signedAt: 7, signature: `0x${'a'.repeat(130)}` })) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual(['wallet', 'text', 'signedAt', 'signature']);
+  });
+});
+
+describe('the plain-words rule for an appeal', () => {
+  const TABLE = [
+    'plain words',
+    'Why is this wrong?',
+    'see HTTP://x',
+    'https://example.com/a',
+    'www.example.com',
+    'a <b>bold</b> claim',
+    'a > b',
+    'a < b',
+    '[text](link)',
+    'tab\there',
+    'new\nline',
+    'null\u0000char',
+    'bell\u0007',
+    'vertical\u000btab',
+    'delete\u007f',
+    'next line\u0085',
+    'zero​width',
+    'joiner‍join',
+    'right to left‮override',
+    'mark﻿byte',
+    'lone \ud800 surrogate',
+    'low \udc00 surrogate',
+    'emoji \u{1F600} fine',
+    'தமிழ் fine',
+    'wwwithout dot',
+    'httpx',
+    'ht tp',
+    '',
+    '   ',
+  ];
+
+  it('agrees with core on every text in the table, including the invisible and the broken ones', () => {
+    for (const text of TABLE) expect(isPlainWords(text), JSON.stringify(text)).toBe(core.isPlainText(text));
+  });
+
+  it('says why a text cannot go: empty or only spaces, or not plain, and says nothing for a good one', () => {
+    expect(appealProblem('')).toBe('empty');
+    expect(appealProblem('     ')).toBe('empty');
+    expect(appealProblem('  ')).toBe('empty');
+    expect(appealProblem('see https://x.y')).toBe('unplain');
+    expect(appealProblem('  fine words  ')).toBeNull();
+    expect(appealProblem('a'.repeat(APPEAL_MAX_CHARS))).toBeNull();
+  });
+
+  it('holds the limit at 280 characters and shows the counter from 200', () => {
+    expect(APPEAL_MAX_CHARS).toBe(280);
+    expect(APPEAL_COUNTER_FROM).toBe(200);
+  });
+});
+
+describe('which appeal state shows', () => {
+  const kinds: AskKind[] = ['queued', 'screening', 'full', 'fullNoSlot', 'partial', 'hold', 'exclude', 'failed'];
+  const views = ['queued', 'checking', 'ship', 'review', 'block', 'unreadable', 'unchecked'] as const;
+  const eligible = new Set<AskKind>(['partial', 'hold', 'exclude', 'failed']);
+  const undecided = new Set<AskKind>(['queued', 'screening']);
+  const askFor = (kind: AskKind) => fx.ask(kind, signer.address, 3) as unknown as AskJson;
+
+  it('offers the form for a held, excluded, partial or failed ask with no appeal, and nothing else', () => {
+    for (const kind of kinds) {
+      expect(appealPanel(askFor(kind)), kind).toEqual(eligible.has(kind) ? { kind: 'form' } : { kind: 'hidden' });
+    }
+  });
+
+  it('shows the filed appeal for every decided ask that has one, whatever its action now is', () => {
+    for (const kind of kinds) {
+      for (const view of views) {
+        const appeal = fx.appeal(view) as unknown as AppealView;
+        const ask = fx.withAppeal(fx.ask(kind, signer.address, 3), fx.appeal(view)) as unknown as AskJson;
+        expect(appealPanel(ask), `${kind} ${view}`).toEqual(undecided.has(kind) ? { kind: 'hidden' } : { kind: 'filed', appeal });
+      }
+    }
+  });
+
+  it('keeps showing a settled appeal after a reversal made the ask a full approval', () => {
+    const reversed = fx.appeal('block', { outcome: 'reversed', newAction: 'full', settledAt: new Date(NOW).toISOString() });
+    const ask = fx.withAppeal(fx.ask('full', signer.address, 4), reversed) as unknown as AskJson;
+    expect(appealPanel(ask)).toEqual({ kind: 'filed', appeal: reversed });
+  });
+
+  it('treats an ask with no appeal field, as an older answer sends it, as one with none', () => {
+    const { appeal: _left, ...older } = fx.ask('hold', signer.address);
+    const ask = older as unknown as AskJson;
+    expect('appeal' in ask).toBe(false);
+    expect(isAskJson(ask)).toBe(true);
+    expect(appealOf(ask)).toBeNull();
+    expect(appealPanel(ask)).toEqual({ kind: 'form' });
+    expect(appealOf({ ...ask, appeal: null })).toBeNull();
+  });
+
+  it('names the stage of a filed appeal', () => {
+    const stage = (view: (typeof views)[number]) => appealStage(fx.appeal(view) as unknown as AppealView);
+    expect(stage('queued')).toBe('judge');
+    expect(stage('checking')).toBe('judge');
+    for (const view of ['ship', 'review', 'block', 'unreadable'] as const) expect(stage(view), view).toBe('checked');
+    expect(stage('unchecked')).toBe('unchecked');
+  });
+});
+
+describe('the words of a filed appeal', () => {
+  const view = (kind: Parameters<typeof fx.appeal>[0], overrides: Record<string, unknown> = {}) => fx.appeal(kind, overrides) as unknown as AppealView;
+
+  it('says the outside judge is reading it, and that it takes about a minute', () => {
+    expect(APPEAL_COPY.filedLabel).toBe('APPEAL');
+    expect(APPEAL_COPY.withJudge).toBe('With the outside judge');
+    expect(APPEAL_COPY.judgeLine).toBe("Reppo's judges are reading Thuli's decision, with every address and amount removed. This takes about a minute.");
+  });
+
+  it('writes the answer of each route as a headline in its own colour, with the note, the advice and the check id', () => {
+    const cases = [
+      ['ship', 'The judges agreed with Thuli.', 'hold'],
+      ['review', 'The judges were split.', 'partial'],
+      ['block', 'The judges disagreed with Thuli.', 'full'],
+    ] as const;
+    for (const [kind, headline, tone] of cases) {
+      const words = checkedWords(view(kind));
+      expect(words, kind).toEqual({
+        headline,
+        tone,
+        note: view(kind).reppoNote,
+        advice: "This is advice. The campaign's owner makes the final call.",
+        evalLine: `Reppo check ${view(kind).reppoEvalId}`,
+      });
+    }
+    expect(APPEAL_COPY.checkedLabel).toBe('OUTSIDE CHECK BY REPPO');
+  });
+
+  it('says so when the judges answered in a form that could not be read, and leaves out a note or id that is not there', () => {
+    expect(checkedWords(view('unreadable'))).toEqual({
+      headline: 'The judges answered, but not in a form Thuli could read.',
+      tone: 'quiet',
+      note: null,
+      advice: "This is advice. The campaign's owner makes the final call.",
+      evalLine: `Reppo check ${view('unreadable').reppoEvalId}`,
+    });
+    expect(checkedWords(view('block', { reppoEvalId: null })).evalLine).toBeNull();
+    expect(checkedWords(view('ship', { reppoNote: null })).note).toBeNull();
+  });
+
+  it('says the outside check could not be made, and that the appeal is still with the owner', () => {
+    expect(APPEAL_COPY.uncheckedLine).toBe("The outside check could not be made. Your appeal is still with the campaign's owner.");
+  });
+
+  it('writes the owner call: reversed in full, reversed to a partial reward, upheld, and nothing while open', () => {
+    expect(settledWords(view('block'))).toBeNull();
+    expect(settledWords(view('block', { outcome: 'reversed', newAction: 'full' }))).toEqual({ headline: 'Reversed by the owner', line: 'Your request is now approved in full.', tone: 'full' });
+    expect(settledWords(view('block', { outcome: 'reversed', newAction: 'partial' }))).toEqual({ headline: 'Reversed by the owner', line: 'Your request is now approved for a partial reward.', tone: 'full' });
+    expect(settledWords(view('ship', { outcome: 'upheld' }))).toEqual({ headline: 'Upheld by the owner', line: 'The decision stands.', tone: 'ink' });
+    expect(settledWords(view('unchecked', { outcome: 'upheld' }))?.headline).toBe('Upheld by the owner');
+  });
+
+  it('writes the opened board row block: the answer and its note, the wait, the failed check, and the owner call is kept apart', () => {
+    expect(boardCheckWords(view('ship'))).toEqual({ headline: 'The judges agreed with Thuli.', note: view('ship').reppoNote });
+    expect(boardCheckWords(view('block'))).toEqual({ headline: 'The judges disagreed with Thuli.', note: view('block').reppoNote });
+    expect(boardCheckWords(view('unreadable'))).toEqual({ headline: 'The judges answered, but not in a form Thuli could read.', note: null });
+    expect(boardCheckWords(view('queued'))).toEqual({ headline: 'With the outside judge', note: null });
+    expect(boardCheckWords(view('checking'))).toEqual({ headline: 'With the outside judge', note: null });
+    expect(boardCheckWords(view('unchecked'))).toEqual({ headline: 'The check could not be made', note: null });
+    expect(APPEAL_COPY.boardLabel).toBe('OUTSIDE CHECK');
+  });
+
+  it('puts a chip on an appealed row: APPEALED, or REVERSED in the full colour', () => {
+    expect(appealChip(null)).toBeNull();
+    for (const kind of ['queued', 'checking', 'ship', 'review', 'block', 'unreadable', 'unchecked'] as const) expect(appealChip(view(kind)), kind).toEqual({ text: 'APPEALED', tone: 'quiet' });
+    expect(appealChip(view('block', { outcome: 'upheld' }))).toEqual({ text: 'APPEALED', tone: 'quiet' });
+    expect(appealChip(view('block', { outcome: 'reversed', newAction: 'full' }))).toEqual({ text: 'REVERSED', tone: 'full' });
+  });
+});
+
+describe('the appeal counts line', () => {
+  it('writes the three numbers from the route', () => {
+    expect(appealCountsLine({ filed: 3, checked: 2, block: 1, reversed: 1 })).toBe('3 appealed. The outside judges disagreed with Thuli on 1. The owner reversed 1.');
+    expect(appealCountsLine({ filed: 1500, checked: 1400, block: 1200, reversed: 1000 })).toBe('1,500 appealed. The outside judges disagreed with Thuli on 1,200. The owner reversed 1,000.');
+  });
+
+  it('is absent at zero', () => {
+    expect(appealCountsLine({ filed: 0, checked: 0, block: 0, reversed: 0 })).toBeNull();
+  });
+
+  it('reads counts that an older answer does not send as zeros, so the line is absent', () => {
+    const { appeals: _left, ...older } = (fx.campaign() as unknown as CampaignView).counts;
+    const plain = { ...(fx.campaign() as unknown as CampaignView), counts: older };
+    expect('appeals' in plain.counts).toBe(false);
+    expect(isCampaignView(plain)).toBe(true);
+    expect(appealCountsOf(plain)).toEqual({ filed: 0, checked: 0, block: 0, reversed: 0 });
+    expect(appealCountsLine(appealCountsOf(plain))).toBeNull();
+    const counts = { ...plain.counts, appeals: { filed: 4, checked: 3, block: 2, reversed: 1 } };
+    expect(appealCountsOf({ ...plain, counts })).toEqual({ filed: 4, checked: 3, block: 2, reversed: 1 });
+  });
+});
+
+describe('the appeal answers the page reads', () => {
+  const sent = { wallet: signer.address, text: 'The funder is my sister.', signedAt: 1_800_000_000, signature: `0x${'c'.repeat(130)}` };
+  const answer = (status: number, body: unknown, headers: Record<string, string> = {}) => (async () => new Response(JSON.stringify(body), { status, headers })) as unknown as typeof fetch;
+
+  it('posts exactly the four fields to the appeals route of the campaign in the path', async () => {
+    const seen: { url: string; init: RequestInit | undefined }[] = [];
+    const record = (async (url: unknown, init?: RequestInit) => {
+      seen.push({ url: String(url), init });
+      return new Response(JSON.stringify({ queued: true }), { status: 202 });
+    }) as unknown as typeof fetch;
+    expect(await postAppeal(CAMPAIGN_ID, sent, record)).toEqual({ kind: 'queued' });
+    expect(seen[0]?.url).toBe(`/api/campaigns/${CAMPAIGN_ID}/appeals`);
+    expect(seen[0]?.init).toMatchObject({ method: 'POST', cache: 'no-store' });
+    expect(JSON.parse(String(seen[0]?.init?.body))).toEqual(sent);
+    expect(Object.keys(JSON.parse(String(seen[0]?.init?.body)))).toEqual(['wallet', 'text', 'signedAt', 'signature']);
+  });
+
+  it('maps each answer of the route', async () => {
+    const filed = fx.appeal('queued') as unknown as AppealView;
+    expect(classifyAppealAnswer(202, { queued: true })).toEqual({ kind: 'queued' });
+    expect(classifyAppealAnswer(200, { exists: true, appeal: filed })).toEqual({ kind: 'exists', appeal: filed });
+    expect(classifyAppealAnswer(200, { exists: true })).toEqual({ kind: 'exists', appeal: null });
+    expect(classifyAppealAnswer(409, { undecided: true })).toEqual({ kind: 'undecided' });
+    expect(classifyAppealAnswer(409, { approved: true })).toEqual({ kind: 'approved' });
+    expect(classifyAppealAnswer(404, { error: 'no such ask' })).toEqual({ kind: 'gone' });
+    expect(classifyAppealAnswer(400, { error: 'the signature does not match this appeal' })).toEqual({ kind: 'bad', cause: 'the signature does not match this appeal' });
+    expect(classifyAppealAnswer(413, { error: 'the body is too large' })).toEqual({ kind: 'bad', cause: 'the body is too large' });
+    expect(classifyAppealAnswer(429, { busy: true })).toEqual({ kind: 'limit' });
+    expect(classifyAppealAnswer(429, { busy: true }, '7200')).toEqual({ kind: 'ceiling', retryAfter: '7200' });
+    for (const [status, body] of [[503, { busy: true }], [500, {}], [409, {}], [202, {}], [200, 'x'], [400, {}]] as const) {
+      expect(classifyAppealAnswer(status, body), `${status}`).toEqual({ kind: 'unreachable' });
+    }
+    expect(await postAppeal(CAMPAIGN_ID, sent, answer(429, { busy: true }, { 'Retry-After': '3600' }))).toEqual({ kind: 'ceiling', retryAfter: '3600' });
+    expect(await postAppeal(CAMPAIGN_ID, sent, answer(409, { approved: true }))).toEqual({ kind: 'approved' });
+    expect(await postAppeal(CAMPAIGN_ID, sent, (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch)).toEqual({ kind: 'unreachable' });
+  });
+
+  it('writes every refusal in the words of the design', () => {
+    const text = (post: Parameters<typeof appealRefusalText>[0]) => appealRefusalText(post);
+    expect(text({ kind: 'undecided' })).toBe('This request has no decision yet, so there is nothing to appeal.');
+    expect(text({ kind: 'approved' })).toBe('This request was approved in full. There is nothing to appeal.');
+    expect(text({ kind: 'limit' })).toBe('You have sent as many appeals as one caller may in an hour. Try again later.');
+    expect(text({ kind: 'ceiling', retryAfter: '7200' })).toBe('Thuli has taken all the appeals it sends to the outside judge in a day. Try again in about 2 hours.');
+    expect(text({ kind: 'ceiling', retryAfter: '1800' })).toBe('Thuli has taken all the appeals it sends to the outside judge in a day. Try again in about 30 minutes.');
+    expect(text({ kind: 'ceiling', retryAfter: 'soon' })).toBe('Thuli has taken all the appeals it sends to the outside judge in a day. Try again tomorrow.');
+    expect(text({ kind: 'bad', cause: 'the appeal text is empty' })).toBe('the appeal text is empty');
+    expect(text({ kind: 'unreachable' })).toBe('The appeal could not be sent. Nothing was signed away.');
+  });
+
+  it('has the form words of the design', () => {
+    expect(APPEAL_COPY.formLabel).toBe('DISAGREE?');
+    expect(APPEAL_COPY.formLine).toBe("Tell the campaign's owner why in one line. An outside judge then checks Thuli's decision.");
+    expect(APPEAL_COPY.placeholder).toBe('Why is this wrong?');
+    expect(APPEAL_COPY.unplain).toBe('Write plain words, with no links or markup.');
+    expect(APPEAL_COPY.button).toBe('Appeal');
+    expect(APPEAL_COPY.signing).toBe('Waiting for your wallet');
+    expect(APPEAL_COPY.sending).toBe('Sending');
+    expect(APPEAL_COPY.privacy).toBe('Your words go to the owner only. They are shown on no public page and sent to no model.');
+  });
+});
+
+describe('the appeal shapes the guards read', () => {
+  const askWith = (appeal: unknown) => ({ ...fx.ask('hold', signer.address), appeal });
+
+  it('accept an ask with a good appeal, with none, with null, and a board row with one', () => {
+    expect(isAskJson(fx.ask('hold', signer.address))).toBe(true);
+    expect(isAskJson(askWith(null))).toBe(true);
+    for (const kind of ['queued', 'checking', 'ship', 'review', 'block', 'unreadable', 'unchecked'] as const) expect(isAskJson(askWith(fx.appeal(kind))), kind).toBe(true);
+    expect(isAskJson(askWith(fx.appeal('block', { outcome: 'reversed', newAction: 'partial', settledAt: new Date(NOW).toISOString() })))).toBe(true);
+    expect(isAskView({ ask: askWith(fx.appeal('ship')) })).toBe(true);
+    expect(isBoardPage(fx.board(3, 1, () => fx.appeal('review')))).toBe(true);
+    expect(isAppealView(fx.appeal('queued'))).toBe(true);
+  });
+
+  it('refuse an appeal that is not in the shape of the contract', () => {
+    const base = fx.appeal('block') as Record<string, unknown>;
+    const damaged: [string, Record<string, unknown>][] = [
+      ['a route that is not one', { ...base, reppoRoute: 'maybe' }],
+      ['a check status that is not one', { ...base, checkStatus: 'done' }],
+      ['an outcome that is not one', { ...base, outcome: 'won' }],
+      ['a new action that is not an approval', { ...base, newAction: 'exclude' }],
+      ['a note over 280 characters', { ...base, reppoNote: 'x'.repeat(281) }],
+      ['a note that is not plain', { ...base, reppoNote: 'see https://x.y' }],
+      ['a note that is not text', { ...base, reppoNote: 5 }],
+      ['a filing time that is not a time', { ...base, filedAt: 'yesterday' }],
+      ['a check id that is not text', { ...base, reppoEvalId: 12 }],
+    ];
+    for (const [name, appeal] of damaged) expect(isAskJson(askWith(appeal)), name).toBe(false);
+    for (const key of ['filedAt', 'checkStatus', 'reppoRoute', 'reppoNote', 'reppoEvalId', 'checkedAt', 'outcome', 'newAction', 'settledAt']) {
+      const { [key]: _gone, ...rest } = base;
+      expect(isAskJson(askWith(rest)), `missing ${key}`).toBe(false);
+    }
+    expect(isAskJson(askWith('open'))).toBe(false);
+  });
+
+  it('accept a campaign with appeal counts, and one without, and refuse damaged counts', () => {
+    const counts = (campaign as unknown as CampaignView).counts;
+    const { appeals: _left, ...without } = counts;
+    expect(isCampaignView(fx.campaign())).toBe(true);
+    expect(isCampaignView(fx.campaign({ counts: without }))).toBe(true);
+    expect(isCampaignView(fx.campaign({ counts: { ...counts, appeals: { filed: 3, checked: 2, block: 1, reversed: 1 } } }))).toBe(true);
+    expect(isCampaignView(fx.campaign({ counts: { ...counts, appeals: { filed: 3, checked: 2, block: 1 } } }))).toBe(false);
+    expect(isCampaignView(fx.campaign({ counts: { ...counts, appeals: { filed: -1, checked: 0, block: 0, reversed: 0 } } }))).toBe(false);
+    expect(isCampaignView(fx.campaign({ counts: { ...counts, appeals: 'many' } }))).toBe(false);
+  });
+
+  it('are accepted by the API schema: every kind of appeal, the ask and board row that carry one, the counts, and the new bodies', () => {
+    const kinds = ['queued', 'checking', 'ship', 'review', 'block', 'unreadable', 'unchecked'] as const;
+    const settled = { outcome: 'reversed', newAction: 'full', settledAt: new Date(NOW).toISOString() };
+    for (const kind of kinds) {
+      expect(AppealJson.safeParse(fx.appeal(kind)).success, kind).toBe(true);
+      expect(AskSchema.safeParse(fx.withAppeal(fx.ask('hold', signer.address), fx.appeal(kind))).success, `ask ${kind}`).toBe(true);
+      expect(ExistsAppealBody.safeParse({ exists: true, appeal: fx.appeal(kind) }).success, `exists ${kind}`).toBe(true);
+    }
+    expect(AppealJson.safeParse(fx.appeal('block', settled)).success).toBe(true);
+    expect(AppealJson.safeParse(fx.appeal('ship', { outcome: 'upheld', settledAt: new Date(NOW).toISOString() })).success).toBe(true);
+    expect(BoardSchema.safeParse(fx.board(5, 1, (index) => (index % 2 === 0 ? fx.appeal('review') : undefined))).success).toBe(true);
+    expect(CampaignSchema.safeParse(fx.campaign({ counts: { ...campaign.counts, appeals: { filed: 3, checked: 2, block: 1, reversed: 1 } } })).success).toBe(true);
+    expect(UndecidedBody.safeParse({ undecided: true }).success).toBe(true);
+    expect(ApprovedBody.safeParse({ approved: true }).success).toBe(true);
+    expect(classifyAppealAnswer(409, { undecided: true })).toEqual({ kind: 'undecided' });
+    expect(classifyAppealAnswer(409, { approved: true })).toEqual({ kind: 'approved' });
+  });
+});
+
+describe('how often the page asks again once an appeal is filed', () => {
+  const appeal = (kind: Parameters<typeof fx.appeal>[0], overrides: Record<string, unknown> = {}) => fx.appeal(kind, overrides) as unknown as AppealView;
+
+  it('looks every 5 seconds while the outside check is queued or running, and every 30 while the owner has not settled', () => {
+    expect(appealPollDelay(appeal('queued'), false)).toBe(5000);
+    expect(appealPollDelay(appeal('checking'), false)).toBe(5000);
+    for (const kind of ['ship', 'review', 'block', 'unreadable', 'unchecked'] as const) expect(appealPollDelay(appeal(kind), false), kind).toBe(30_000);
+  });
+
+  it('stops when the owner has settled, and when there is no appeal', () => {
+    expect(appealPollDelay(appeal('block', { outcome: 'reversed', newAction: 'full' }), false)).toBeNull();
+    expect(appealPollDelay(appeal('unchecked', { outcome: 'upheld' }), false)).toBeNull();
+    expect(appealPollDelay(null, false)).toBeNull();
+  });
+
+  it('looks every 5 seconds from the moment an appeal was sent, until the ask shows it', () => {
+    expect(appealPollDelay(null, true)).toBe(5000);
+    expect(appealPollDelay(appeal('ship'), true)).toBe(30_000);
+  });
+
+  it('picks the shortest wait that applies among the ask, the reward and the appeal', () => {
+    const none = { waiting: false, approvedUnpaid: false, appeal: null, appealSent: false };
+    expect(askPollDelay(none)).toBeNull();
+    expect(askPollDelay({ ...none, waiting: true })).toBe(4000);
+    expect(askPollDelay({ ...none, approvedUnpaid: true })).toBe(10_000);
+    expect(askPollDelay({ ...none, appeal: appeal('queued') })).toBe(5000);
+    expect(askPollDelay({ ...none, appeal: appeal('ship') })).toBe(30_000);
+    expect(askPollDelay({ ...none, appeal: appeal('ship'), approvedUnpaid: true })).toBe(10_000);
+    expect(askPollDelay({ ...none, appeal: appeal('queued'), approvedUnpaid: true })).toBe(5000);
+    expect(askPollDelay({ ...none, appeal: appeal('queued'), waiting: true })).toBe(4000);
+    expect(askPollDelay({ ...none, appealSent: true })).toBe(5000);
+    expect(askPollDelay({ ...none, appeal: appeal('block', { outcome: 'upheld' }) })).toBeNull();
+  });
+});
+
+describe('the words when every slot is taken', () => {
+  it('say so in a heading and a body that send a wallet that already asked to connect it', () => {
+    expect(refusalWords('slots')).toEqual({
+      heading: 'Every slot is taken',
+      body: 'This campaign has given out all its slots, so no new request can be sent. If you already asked, connect the same wallet to see your decision.',
+    });
+  });
+
+  it('no longer promise that a wallet can still ask', () => {
+    expect('full' in READY_TEXT).toBe(false);
+    expect(JSON.stringify(READY_TEXT)).not.toMatch(/still ask/);
   });
 });

@@ -5,7 +5,24 @@ import { relativeTime } from '@/lib/check';
 import { addressLink, ETHEREUM_CHAIN, shortAddress } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
 import { formatInt } from '@/lib/format';
-import { BOARD_PAGE_SIZE, fetchBoard, funderFanoutText, funderKindWords, groupText, mergeBoard, outcomeWords, pollDelay, type AskJson } from '@/lib/campaign';
+import {
+  APPEAL_COPY,
+  appealChip,
+  appealCountsLine,
+  BOARD_PAGE_SIZE,
+  boardCheckWords,
+  fetchBoard,
+  funderFanoutText,
+  funderKindWords,
+  groupText,
+  mergeBoard,
+  outcomeWords,
+  pollDelay,
+  settledWords,
+  type AppealCounts,
+  type AppealView,
+  type AskJson,
+} from '@/lib/campaign';
 import { Drop } from '../Drop';
 import { CitedList, WhatToDo } from './Decision';
 import { useReadPause } from './useReadPause';
@@ -56,11 +73,36 @@ function Facts({ ask }: { ask: AskJson }) {
   );
 }
 
+/** What the outside judges said about an appealed row, and the owner's call once there is one. */
+function BoardCheck({ appeal }: { appeal: AppealView }) {
+  const words = boardCheckWords(appeal);
+  const settled = settledWords(appeal);
+  return (
+    <div className={styles.boardCheck} data-board-check>
+      <p className={styles.factName}>{APPEAL_COPY.boardLabel}</p>
+      <p className={styles.factValue} data-board-check-headline>
+        {words.headline}
+      </p>
+      {words.note === null ? null : (
+        <p className={styles.factValue} data-board-check-note>
+          {words.note}
+        </p>
+      )}
+      {settled === null ? null : (
+        <p className={styles.factValue} data-board-settled>
+          {settled.headline}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
   const [open, setOpen] = useState(false);
   const action = ask.action ?? 'hold';
   const detailsId = `board-${ask.wallet}`;
   const when = ask.decidedAt ?? ask.askedAt;
+  const chip = appealChip(ask.appeal ?? null);
   return (
     <li className={`${styles.row} ${styles[action]}`} data-board-row data-wallet={ask.wallet}>
       <button type="button" className={styles.rowButton} aria-expanded={open} aria-controls={detailsId} onClick={() => setOpen((value) => !value)}>
@@ -68,6 +110,11 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
         <span className={styles.rowOutcome}>
           <span className={styles.dot} aria-hidden="true" />
           {outcomeWords(action, false, 'board')}
+          {chip === null ? null : (
+            <span className={`${styles.chip} ${chip.tone === 'full' ? styles.chipReversed : ''}`} data-chip>
+              {chip.text}
+            </span>
+          )}
         </span>
         <span className={styles.rowRule}>{ask.rule === null ? '' : `RULE ${ask.rule}`}</span>
         <span className={styles.rowReason}>{ask.reason === null ? '' : displayReason(ask.reason)}</span>
@@ -83,18 +130,20 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
           <p className={styles.citedLabel}>Cited transactions</p>
           <CitedList hashes={ask.citedTxs ?? []} />
           <Facts ask={ask} />
+          {ask.appeal ? <BoardCheck appeal={ask.appeal} /> : null}
         </div>
       ) : null}
     </li>
   );
 }
 
-export function Board({ campaignId, onSlowed }: { campaignId: string; onSlowed: (route: string, slowed: boolean) => void }) {
+export function Board({ campaignId, appeals, onSlowed }: { campaignId: string; appeals: AppealCounts; onSlowed: (route: string, slowed: boolean) => void }) {
   const [rows, setRows] = useState<AskJson[] | null>(null);
   const [more, setMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const now = useNow(30_000);
   const { slowed, busy, ok, quiet } = useReadPause('board', onSlowed);
+  const countsLine = appealCountsLine(appeals);
 
   const refresh = useCallback(async () => {
     if (quiet()) return;
@@ -142,6 +191,11 @@ export function Board({ campaignId, onSlowed }: { campaignId: string; onSlowed: 
       <h2 id="board-title" className={styles.blockHeading}>
         Every decision, as it happens
       </h2>
+      {countsLine === null ? null : (
+        <p className={styles.appealCounts} data-appeal-counts>
+          {countsLine}
+        </p>
+      )}
       {rows !== null && rows.length === 0 ? (
         <p className={styles.empty} data-board-empty>
           Nobody has asked yet.

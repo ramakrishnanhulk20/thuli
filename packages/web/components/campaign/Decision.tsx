@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { shortHash, txUrl } from '@/lib/explorer';
 import { displayReason, ruleMeaning } from '@/lib/rules';
 import { NEW_WALLET_ADVICE, NOT_CHECKED_INTRO, notCheckedLine, outcomeWords, showsWhatToDo, WHAT_TO_DO_LABEL, type AskJson, type Payout } from '@/lib/campaign';
@@ -38,7 +39,7 @@ export function WhatToDo({ ask }: { ask: AskJson }) {
 }
 
 /** A decided ask as its owner sees it: the outcome, the reason, what was not checked, and what happens to the reward. */
-export function DecisionView({ ask, payout }: { ask: AskJson; payout: Payout }) {
+export function DecisionView({ ask, payout, appeal = null }: { ask: AskJson; payout: Payout; appeal?: ReactNode }) {
   if (ask.action === null || ask.rule === null || ask.reason === null) return null;
   const meaning = ruleMeaning(ask.rule);
   return (
@@ -71,6 +72,8 @@ export function DecisionView({ ask, payout }: { ask: AskJson; payout: Payout }) 
           </ul>
         </>
       )}
+
+      {appeal}
 
       <div className={styles.payout} data-payout>
         {payout.lines.map((line, index) => (

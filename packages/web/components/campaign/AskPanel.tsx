@@ -4,6 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useConnection, useDisconnect, useSignMessage } from 'wagmi';
 import { askMessage, isOwnKeySignature, signedAtNow } from '@/lib/ask';
 import {
+  appealOf,
+  appealPanel,
+  askPollDelay,
   choosePanel,
   currentStep,
   fetchAsk,
@@ -14,6 +17,7 @@ import {
   READY_TEXT,
   readyVariant,
   refusalWords,
+  REWARD_POLL_MILLISECONDS,
   UNREACHABLE_TEXT,
   type AskView,
   type CampaignView,
@@ -24,13 +28,12 @@ import {
 import { shortAddress } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { ConnectChoices } from '../wallet/ConnectButton';
+import { AppealBlock } from './Appeal';
 import { DecisionView } from './Decision';
 import { useReadPause } from './useReadPause';
 import { useVisibleInterval } from './useVisibleInterval';
 import styles from './campaign.module.css';
 
-const QUEUED_POLL_MILLISECONDS = 4000;
-const PAYOUT_POLL_MILLISECONDS = 10_000;
 // A signature is good for 600 seconds at the route; one older than this is made again rather than sent.
 const SIGNATURE_REFRESH_SECONDS = 300;
 const RESEND_LIMIT_MILLISECONDS = 540_000;
@@ -55,6 +58,8 @@ interface Session {
   cause: string;
   /** The ask cannot go ahead, and nothing the visitor can press here changes that. */
   refusal: { kind: RefusalKind; retryAfter: string | null } | null;
+  /** An appeal was taken by the route and the ask does not show it yet. */
+  appealSent: boolean;
 }
 
 const freshSession = (wallet: string): Session => ({
@@ -67,6 +72,7 @@ const freshSession = (wallet: string): Session => ({
   notice: null,
   cause: '',
   refusal: null,
+  appealSent: false,
 });
 
 interface AskPanelProps {
@@ -174,13 +180,20 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
   }, [step, onStep]);
   const checked = mine?.checked ?? false;
   const retryingFirstLookup = mine !== null && !checked && pause.slowed;
+  const wait = askPollDelay({ waiting, approvedUnpaid, appeal: ask === null ? null : appealOf(ask), appealSent: mine?.appealSent ?? false });
   useVisibleInterval(
     () => {
       if (address !== null) void lookUp(address, !checked);
     },
-    pollDelay(waiting ? QUEUED_POLL_MILLISECONDS : PAYOUT_POLL_MILLISECONDS, pause.slowed),
-    address !== null && (waiting || approvedUnpaid || retryingFirstLookup),
+    pollDelay(wait ?? REWARD_POLL_MILLISECONDS, pause.slowed),
+    address !== null && (wait !== null || retryingFirstLookup),
   );
+
+  function onAppealSent() {
+    if (address === null) return;
+    patch(address, { appealSent: true });
+    void lookUp(address, false);
+  }
 
   async function send(signed: Signed) {
     lastSigned.current = { ...signed, madeAt: Date.now() };
@@ -274,8 +287,17 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
       <div key={panel} className={styles.rise}>
         {panel === 'connect' ? (
           <>
-            <h2 id="ask-title" className={styles.panelTitle}>Ask for a slot</h2>
-            <p className={styles.panelBody}>Connect a wallet you control. You sign one short message. It costs nothing and moves nothing.</p>
+            {variant === 'full' ? (
+              <div data-refusal="slots">
+                <h2 id="ask-title" className={styles.panelTitle}>{refusalWords('slots').heading}</h2>
+                <p className={styles.panelBody}>{refusalWords('slots').body}</p>
+              </div>
+            ) : (
+              <>
+                <h2 id="ask-title" className={styles.panelTitle}>Ask for a slot</h2>
+                <p className={styles.panelBody}>Connect a wallet you control. You sign one short message. It costs nothing and moves nothing.</p>
+              </>
+            )}
             <ConnectChoices />
           </>
         ) : null}
@@ -283,11 +305,11 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
         {panel === 'checking' ? <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2> : null}
         {panel === 'checking' ? walletRow : null}
 
-        {(panel === 'ready' || panel === 'signing') && variant === 'stopped' ? (
+        {(panel === 'ready' || panel === 'signing') && (variant === 'stopped' || variant === 'full') ? (
           <>
             <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2>
             {walletRow}
-            <Refusal kind="stopped" retryAfter={null} />
+            <Refusal kind={variant === 'full' ? 'slots' : 'stopped'} retryAfter={null} />
           </>
         ) : null}
 
@@ -299,7 +321,7 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
           </>
         ) : null}
 
-        {(panel === 'ready' || panel === 'signing') && variant !== 'stopped' ? (
+        {(panel === 'ready' || panel === 'signing') && (variant === 'open' || variant === 'closed') ? (
           <>
             <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2>
             {walletRow}
@@ -307,8 +329,6 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
             <pre className={styles.message} data-message>{message}</pre>
             {variant === 'closed' ? (
               <p className={styles.panelBody} data-closed>{READY_TEXT.closed}</p>
-            ) : variant === 'full' ? (
-              <p className={styles.panelBody} data-full>{READY_TEXT.full}</p>
             ) : (
               <button type="button" className={styles.primary} disabled={signing} onClick={onSign} data-sign>
                 {signing ? 'Waiting for your wallet' : 'Sign and ask'}
@@ -343,7 +363,22 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
           <>
             <h2 id="ask-title" className={styles.visuallyHidden}>Your decision</h2>
             {walletRow}
-            <DecisionView ask={ask} payout={payoutFor({ ask, ticket: mine?.view?.ticket ?? null, campaign, now })} />
+            <DecisionView
+              ask={ask}
+              payout={payoutFor({ ask, ticket: mine?.view?.ticket ?? null, campaign, now })}
+              appeal={
+                address === null ? null : (
+                  <AppealBlock
+                    campaignId={campaignId}
+                    wallet={address}
+                    panel={appealPanel(ask)}
+                    sent={mine?.appealSent ?? false}
+                    onSent={onAppealSent}
+                    onGone={onGone}
+                  />
+                )
+              }
+            />
           </>
         ) : null}
 

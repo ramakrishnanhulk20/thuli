@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { chainName, fetchCampaign, pollDelay, SLOWED_LINE, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
+import { appealCountsOf, chainName, fetchCampaign, pollDelay, SLOWED_LINE, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
 import { addressLink, shortAddress } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { WalletProvider } from '../wallet/WalletProvider';
@@ -132,7 +132,7 @@ export function CampaignPage({ campaignId, walletConnectProjectId }: { campaignI
         </WalletProvider>
         <Steps current={step} />
       </div>
-      <Board campaignId={campaignId} onSlowed={reportSlowed} />
+      <Board campaignId={campaignId} appeals={appealCountsOf(campaign)} onSlowed={reportSlowed} />
       <Lists campaignId={campaignId} campaign={campaign} />
       <div className={styles.ownerLine} data-owner-link>
         <p className={styles.ownerText}>Running a reward drop of your own?</p>
