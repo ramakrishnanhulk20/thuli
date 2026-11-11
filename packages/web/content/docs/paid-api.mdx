@@ -38,12 +38,14 @@ Errors, in the order the route checks:
 | Status | Body | When |
 | --- | --- | --- |
 | 400 | `{"error": "the client address could not be read"}` | caller's IP unknown |
-| 429 or 503 | `{"busy": true}` | caller past a limit, or the limit store unreachable |
+| 429 or 503 | `{"busy": true}` | caller past a limit, or the limit store unreachable or too slow |
 | 413 or 400 | an `error` text | over 1 KB, not JSON, not exactly `wallet`, or a bad address |
 | 503 | `{"busy": true}` | service at a ceiling, or its stores unreachable or full |
 | 402 | an `error` text | no payment header, or one that does not match the terms |
-| 402 | `{}` | refused at settlement, with a reason such as `payment_expired` |
+| 402 | `{}` | refused at settlement. The reason is in the `PAYMENT-RESPONSE` header: `payment_expired`, `payment_valid_too_long`, or `payment_already_used` for a copy of a payment that is held, or of a settled payment sent for another wallet |
+| 503 | `{"busy": true}` | too little time left to settle and still screen, or the table of remembered payments is full. Nothing was charged |
 | 503 | `{"retry": true}` | claim not recorded or outcome unknown; resend the same header, it never pays twice |
+| 503 | `{"settled": true, "retry": true, "message": ...}` with `Retry-After: 10` | the payment settled and its result is not stored yet; send the same header again (next section) |
 | 500 | `{"error": "internal error"}` | internal fault |
 
 | Limit | Value |
@@ -55,19 +57,64 @@ Errors, in the order the route checks:
 | Screenings started on the service per UTC day | 600 (596 with a shared database) |
 | SERV calls per screening | 12 |
 | Seconds per screening, then a hold | 120 |
+| Seconds a paid request may run | 240 |
+| Screenings one payment can start | 2 |
+| Seconds a settled payment can be redeemed | 86,400 |
 
 A caller is its IP address, read from the host's trusted header. With `DATABASE_URL` set, used payments, limits and the cache live in Postgres, shared by every server copy; without it they reset on restart. `GET /api/x402/health` is free and returns the network, receiving address, price and scope.
 
+## One payment, one result, fetched again
+
+The route remembers every payment by its signed header. A payment is in one of three states:
+
+- Held. One request has claimed the payment and is asking the facilitator to settle it. A copy of the same header meanwhile is refused with `payment_already_used`.
+- Settled. The money has moved. The payment is now tied to the wallet it paid for and to the settlement transaction, and its screening is running or has not stored a result yet.
+- Served. The result is stored with the payment.
+
+A fourth marker, unsure, keeps a payment whose settlement gave no clear answer. The same header may come back and try again, one copy at a time, and it never pays twice.
+
+### Fetching a result again
+
+For 86,400 seconds, one day, from the moment a payment settled, the same `PAYMENT-SIGNATURE` header sent with the same wallet in the body redeems the payment. Nothing is settled again and nothing is charged. A served payment returns its stored result exactly as stored, with status `200` and the response header `thuli-stored-result: true`. A settled payment with no result yet is screened at that moment. The same header sent for another wallet is refused. After the day the payment is forgotten, and the header is refused as `payment_expired`.
+
+### Settled, send the same payment again
+
+Only one request screens a payment at a time. The route answers `503` with the header `Retry-After: 10` and this body when the payment has settled and one of three things holds: too little time is left to screen, the screening ran out of time and the payment has a try left, or another request is screening the same payment now.
+
+```json
+{
+  "settled": true,
+  "retry": true,
+  "message": "The payment has settled. Send the same payment header again to get the screening it bought."
+}
+```
+
+This answer hands out no new payment terms, and it does not count as a failed payment against the caller. Send the same header again after the wait.
+
+### At most two screenings per payment
+
+A payment starts at most two screenings. A screening that runs out of time stores nothing, and the same header gets one more. When the second cannot finish either, or both are already used, the route stores and returns a hold written by code for a screening that ran out of time: action `hold`, share `0`, rule `A1`, the reason `Held for review: the screening ran out of time.` and no cited transactions. A settled payment therefore always ends with a stored result.
+
+### One deadline
+
+Every paid request answers within 240 seconds of its first line, a minute below the 300 seconds the site's host allows. The facilitator gets 15 seconds to verify a payment and 30 seconds to settle it, and a settlement left pending is asked about once more. The route settles only when enough time is left to settle and still screen. Otherwise it answers `503` with `{"busy": true}` and charges nothing. After settling, the screening gets the time left less 10 seconds, at most its own 120 seconds, and none starts with under 20 seconds left.
+
+### Named limits
+
+- If the server stops, or its database fails, in the moment between the facilitator settling a payment and the settled record being written, that payment cannot be redeemed later. The settlement is on chain, and no code returns the money, so a refund would be done by hand. When only the database write fails and the request lives, the buyer still gets the result.
+- A redeem does not check the signature again. Anyone who rebuilds the header from the settlement on chain can fetch that wallet's stored result. It buys no screening the payment did not, and the free check gives any wallet's screening to anyone anyway.
+- When a settlement's outcome is unknown and keeping the payment as unsure fails too, the payment stays held by a request that is gone, so the same header cannot try again until it expires. That takes two failures at once.
+
 ## What comes back
 
-A paid success is `200` with a `PAYMENT-RESPONSE` header. The free check returns the same fields.
+A paid success is `200` with a `PAYMENT-RESPONSE` header. The free check returns the same fields. A result fetched again has the same body, plus the header `thuli-stored-result: true`.
 
 - `wallet`, `checkedAt`: checksummed address; ISO 8601 time.
 - `scope`, `rulebook`: always `one wallet on Ethereum, no claim list` and `v2`.
 - `decision.action`: `full`, `partial`, `hold` or `exclude`.
 - `decision.shareBps`: 0 to 10000; full 10000, partial 5000 by default, hold and exclude 0.
 - `decision.rule`: `A1` to `A9`, `B1` or `B2`.
-- `decision.reason`: plain text, 1 to 400 characters; show it as text only.
+- `decision.reason`: plain text, 1 to 400 characters, with no link, markup, hidden character or broken text, by the same rule every answer's text passes; show it as text only.
 - `decision.citedTxs`: up to 256 transaction hashes.
 - `servRequestId`: SERV's run id, or null.
 - `notChecked`: `group`, `sharedDepositAddress`, `fundingBurst`, `claimPaidToOtherAddress`. A lone wallet has no list to measure them against, so they are marked not checked, not counted as doubt, and a `full` or `partial` answer says only that its own history raised no hold.
@@ -133,4 +180,4 @@ This wallet is also in the ROBO replay, where it is held on rule A4 as one of 19
 
 ## The two-sided rule
 
-Nothing is served without a settled payment, and a settled payment always gets its result. The route settles first, then screens, and a second copy of one signed payment fails at settlement. A failed screening still returns a hold on rule `A1` that names the cause. Open cases are on [limits](/docs/limits).
+Nothing is served without a settled payment, and a settled payment ends with a stored result after at most two screenings. The route settles first, then screens, and a second copy of one signed payment fails at settlement. A failed screening still returns a hold on rule `A1` that names the cause, and a screening that ran out of time on the payment's last try returns the hold `Held for review: the screening ran out of time.` The named limits above and the open cases on [limits](/docs/limits) are the exceptions.

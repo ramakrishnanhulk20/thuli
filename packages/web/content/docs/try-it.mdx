@@ -20,12 +20,16 @@ The [campaign page](/campaign) shows the campaign the site is set up with. If th
 2. Press Sign and ask. The page first shows the four-line message your wallet will sign. Signing costs nothing and moves nothing.
 3. Watch the page. It shows that your wallet is being screened, then your decision with its rule, its reason, the transactions the reason cites and the things the screening did not measure. The same decision appears on the board for everyone to read.
 4. If you are approved you hold a slot. Your reward goes on the next list Thuli posts to the vault, and the page shows that list and the time it starts paying. The vault waits its delay, at least 1 hour, before it pays any list. After that the worker submits your claim and the page shows the reward as paid.
+5. If you are held, excluded or cut to a partial reward, the page shows a form headed "DISAGREE?". Write one line, press Appeal, and your wallet signs a second message. The steps behind it, and what the outside check can and cannot do, are in the appeals part of [Live campaign](/docs/campaigns).
 
 What to expect:
 
-- A brand-new wallet with no history is held. Thuli reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder to read, and a fact that cannot be read means hold, under rule A1. The board shows the rule and the reason for the hold.
+- A wallet that has never been used is turned away at the door. If it has sent no transaction and holds no balance on Ethereum, the page says "This wallet has never been used" and stores nothing. It still counts toward the visitor's 5 signed asks an hour.
+- A wallet whose history shows no incoming transfer of value has no first funder to read. A fact that cannot be read means hold, under rule A1, and the board shows the rule and the reason.
 - A wallet with some history that is young or quiet gets a partial reward, not a hold. By default that is under 30 days old or fewer than 5 transactions sent, under rule A8.
 - A wallet used only on other chains looks new, because only Ethereum mainnet is read.
+- When every slot is taken, the page says "Every slot is taken" and offers no button. When the campaign has taken all the asks it will, it says "This campaign has stopped taking requests". When 200 undecided asks are already waiting, the route answers full and the page says "This campaign is full". Nothing is stored, and signing cost nothing.
+- No appeal has been run live yet.
 
 With the repository, `npm run rehearse:campaign` runs the whole path on a local copy of Base Sepolia. Six signed asks are screened through the real decision path with live SERV, the approved wallets take the campaign's three slots, the list goes to a vault made by the real factory, the copy's clock moves past the delay, and the worker submits each claim. It needs Foundry's `anvil`, and the Base Sepolia, SERV and Ethereum settings from `.env`. It loads no key from `.env`: the owner, the agent and the six asking wallets are fresh keys made for the run, and every transaction stays inside the local copy.
 
@@ -83,4 +87,4 @@ The stored replay data is the ROBO and Hop replay rows, the stored SERV answers,
 
 You can check the vault proof without any keys or stored data. Run `npm run prove:vault -- verify`, or read the record in `packages/contracts/deployments/base-sepolia-proof.json` and look the transactions up on the Base Sepolia explorer.
 
-`prove:vault` takes four phases: `setup`, `claim`, `record` and `verify`. Only `verify` is for strangers. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.
+`prove:vault` takes four phases on Base Sepolia: `setup`, `claim`, `record` and `verify`. With `--network base --real-money` it has six phases for a small Base mainnet proof that has not been run, listed on [Contracts and addresses](/docs/contracts). Only `verify` is for strangers. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.

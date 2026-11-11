@@ -1,9 +1,9 @@
 ---
 title: Contracts and addresses
-description: The deployed factory and proof vault on Base Sepolia, the five proof transactions, how to check them, and the two commands that make a vault and register a campaign.
+description: The deployed factory and proof vault on Base Sepolia, the factory on Base mainnet, the five proof transactions, how to check them, and the commands that deploy, verify, make a vault and register a campaign.
 ---
 
-Everything here is on Base Sepolia, Base's public test network, chain id `84532`. The vault pays test USDC, which has no value. Base mainnet is not deployed yet: there is no mainnet record, and the deploy script refuses every chain except Base Sepolia.
+Every vault, the proof and the campaign are on Base Sepolia, Base's public test network, chain id `84532`. The vaults pay test USDC, which has no value. The one thing on Base mainnet is the factory contract, described in the section after the proof tables. No vault has been made from it.
 
 | What | Value |
 | --- | --- |
@@ -18,6 +18,17 @@ Everything here is on Base Sepolia, Base's public test network, chain id `84532`
 | Root | `0x1d575779216ee7c9f5a6883fda38a3d538a05fc4bab059498ace8ba5cae221c1`, claimable from unix `1794375097` (11 Nov 2026, 05:31:37 UTC) |
 
 The deploy record writes the factory address in lowercase and the proof record in checksum case. They are the same address.
+
+## The factory on Base mainnet
+
+The factory contract was deployed on Base mainnet, chain id `8453`, on 11 November 2026. The record is `packages/contracts/deployments/base.json`.
+
+| What | Value |
+| --- | --- |
+| Factory | [`0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De`](https://basescan.org/address/0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De) |
+| Factory deploy | [0x2f008850...e9bff3](https://basescan.org/tx/0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3), block 56121245 |
+
+Its runtime code is identical to the Base Sepolia factory's. Source verification on Basescan is still pending: `npm run vault:verify -- --network base` does it. No vault has been created on Base mainnet and no real payment has been made yet. Every campaign, the proof vault and every other address on this page stay on Base Sepolia with test money.
 
 ## The five proof transactions
 
@@ -113,15 +124,16 @@ When it finishes it prints the vault's address and creation transaction, and the
 ### Register the campaign
 
 ```bash
-npm run campaign:create -- --id ID --name NAME --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]
+npm run campaign:create -- --id ID --name NAME --agent ADDRESS --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]
 ```
 
-It registers a campaign for a vault that `vault:create` made, and no vault term is typed in by hand. It reads the creation transaction named by `--vault-tx` and the vault's own `state()` from Base Sepolia, checks that the two agree, and prints the campaign. It signs nothing and reads no private key. Without `--write` it stores nothing. With `--write` it stores the campaign in the database named by `DATABASE_URL`, a `postgres://` or `postgresql://` address. If the tables are missing it says to run `npm run db:migrate` first.
+It registers a campaign for a vault that `vault:create` made, and no vault term is typed in by hand. It reads the creation transaction named by `--vault-tx` and the vault's own `state()` from Base Sepolia, checks that the two agree and that `--agent` is the vault's agent, and prints the campaign. It signs nothing and reads no private key. Without `--write` it stores nothing. With `--write` it stores the campaign in the database named by `DATABASE_URL`, a `postgres://` or `postgresql://` address. If the tables are missing it says to run `npm run db:migrate` first.
 
 | Flag | Needed | What it sets |
 | --- | --- | --- |
 | `--id ID` | yes | The campaign's id: 1 to 128 letters, digits, dots, dashes or underscores. It goes into the text a wallet signs. |
 | `--name NAME` | yes | Plain text, 1 to 80 characters. |
+| `--agent ADDRESS` | yes | The address of the worker that will serve the campaign. It must be the agent the vault names. |
 | `--vault-tx HASH` | yes | The vault's creation transaction. |
 | `--reward USDC` | yes | The full reward for one wallet. Above zero, and not above the vault's per-wallet cap. |
 | `--slots N` | yes | How many wallets can be paid, from 1 to 100,000. |
@@ -137,13 +149,27 @@ It refuses, and writes nothing, when:
 - the log holds terms the contract could never have allowed;
 - the vault's `state()` disagrees with its creation log on the token, owner, agent, cap or delay;
 - the vault's token is not Base Sepolia USDC;
+- `--agent` is not the vault's agent, so that worker could not post this campaign's lists;
 - `--reward` is above the vault's per-wallet cap;
+- the reward times the slots is more than the vault still holds, because the vault refuses a list it cannot cover. Deposit more or register fewer slots;
 - the vault has already ended;
 - `--closes` is later than the vault's end minus its delay minus the one-hour minimum claim window, which is the latest moment a list posted then could still pay;
 - `--opens` is not before the close;
 - `--settings` is not a JSON object of known settings with valid values, or it names a partial share that differs from `--partial-share-bps`;
 - the same `--id` is already stored with different terms. Running the command again with exactly the same terms changes nothing.
 
-It warns, and does not refuse, when the reward times the slots is more than the vault still holds, because the vault refuses a list above its deposit. Deposit more before that many wallets are paid.
+The worker then serves the campaign. `npm run worker` handles every open campaign in the database with the key the vault names as its agent, so a new campaign needs no change there. The worker and the commands that settle appeals and requeue failed asks are described on [Live campaign](/docs/campaigns).
 
-The worker then serves the campaign. `npm run worker` handles every open campaign in the database with the key the vault names as its agent, so a new campaign needs no change there.
+## Deploy, verify and prove commands
+
+| Command | What it does | What makes it act |
+| --- | --- | --- |
+| `npm run vault:deploy` | Deploys the factory to Base Sepolia from the worker key, verifies it, and writes the record `base-sepolia.json`. `-- --redeploy` deploys a second factory even though one is recorded. | It runs live as typed. It needs `WORKER_PRIVATE_KEY`, `BASE_SEPOLIA_RPC_URL` and `EXPLORER_API_KEY` in `.env`. |
+| `npm run vault:deploy -- --network base --real-money` | Base mainnet. Simulates the factory's creation from the owner key and signs nothing. | `--send` deploys, tries to verify on Basescan and writes `base.json`. It needs `PAYER_PRIVATE_KEY` and `BASE_RPC_URL`. |
+| `npm run vault:verify` | Verifies the factory and the proof vault on Basescan from the two committed Base Sepolia records. It sends no transaction. | It needs `EXPLORER_API_KEY`. `-- --vault-tx HASH` also verifies the vault that creation transaction made, and can be repeated. `-- --network base` verifies the Base mainnet factory, and its proof vault once a mainnet proof record exists, and also needs `BASE_RPC_URL`. |
+| `npm run prove:vault -- setup`, `claim`, `record`, `verify` | The Base Sepolia proof, described above. | Only `verify` is for strangers. |
+| `npm run prove:vault -- create`, `post`, `claim`, `withdraw`, `record`, `verify` with `--network base --real-money` | The one small Base mainnet proof: the owner creates a vault, the agent posts a list and claims after the delay, and the owner withdraws after the end. | `--send` signs, in the first four phases. `record` and `verify` only read. Each phase reads the chain first and does only what is left. |
+
+On Base mainnet the proof is fixed in code: a cap of 1 USDC, 2 USDC deposited, the contract's minimum delay of one hour, and an end three hours after creation. It pays the address in `PAYTO_ADDRESS` and reads Base mainnet through `BASE_RPC_URL`. Each phase loads only the key it signs with: the owner key `PAYER_PRIVATE_KEY` for create and withdraw, and the agent key `WORKER_PRIVATE_KEY` for post and claim.
+
+Both mainnet paths also take `--fork`. With `--fork --rpc-url http://127.0.0.1:PORT` they run against a local copy of Base mainnet made with anvil, and never reach a public RPC. `vault:deploy` then needs `--out FILE` outside `packages/contracts/deployments`. `prove:vault` needs `--state FILE` and `--deployment FILE`, and `--record FILE` for the record phase, all outside the public records, so a rehearsal never writes them. The mainnet commands exist and were rehearsed against a fork of Base mainnet. The mainnet proof has not been run: it has no record, and no mainnet vault exists.

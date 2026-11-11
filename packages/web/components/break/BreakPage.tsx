@@ -187,7 +187,7 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
         </li>
         <li>
           <Drop width={6} className={styles.itemMark} />
-          <span>A forged appeal. Appeals are checked in code and tested, but no public route takes them yet.</span>
+          <span>A forged appeal. That needs a wallet with a held decision in a campaign. The appeal route refuses a signature that does not match its text, and that check is tested.</span>
         </li>
         <li>
           <Drop width={6} className={styles.itemMark} />

@@ -9,11 +9,21 @@ No. Thuli reads on-chain behaviour and finds wallets that move together, such as
 
 ## What happens to a held wallet?
 
-A hold means a person reviews the wallet. It is not paid and not excluded, its reason names the facts and cites the transactions, and it gets no entry in the claim list. A held wallet can appeal with a signed message, one open appeal per wallet per campaign, but the public appeal route is not built yet.
+A hold means a person looks at the wallet. It is not paid and not excluded, its reason names the facts and cites the transactions, and it gets no entry in the claim list. A held wallet can appeal with a signed message, one appeal per wallet per campaign. See the appeals entry below.
+
+## Can I appeal a decision?
+
+Yes, in a campaign, if your wallet was held, excluded or cut to a partial reward, or if its screening could not finish. A full approval cannot be appealed. You file one appeal per campaign. It is one line of plain words, at most 1,000 characters at the route and 280 in the form, with no link and no markup, and your wallet signs a five-line message that holds the hash of your text.
+
+Your words go to the campaign's owner only. They are shown on no public page and sent to no model. Separately, an outside judge, Reppo, checks Thuli's decision. It is sent the wallet's facts as words and counts, the outcome and the reason, with every address, transaction hash, date, amount and rule code removed, and never your words. Its answer is a route: `ship`, `review` or `block`, meaning the judges agreed with Thuli, were split, or disagreed. That is advice. The owner makes the call, today through an operator's command: upheld, or reversed to a partial or full approval. A reversal takes the next free slot if one is left. At most 2 appeals an hour from one visitor, 10 a day for one campaign and 20 a day across all campaigns are taken. No appeal has been run live yet. The full steps are in the appeals part of [Live campaign](/docs/campaigns).
 
 ## Why was my new wallet held?
 
-Because Thuli found nothing to read. It reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder, and a fact that cannot be read means hold, under rule A1, so a person can look. A wallet that has some history but is young or quiet is not held for that. By default one that is under 30 days old or has sent fewer than 5 transactions gets a partial reward, under rule A8. A wallet used mostly on other chains looks new, because only Ethereum mainnet is read. The board shows the rule and the reason for every decision. More on [Live campaign](/docs/campaigns).
+Because Thuli found nothing to read about it. It reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder, and a fact that cannot be read means hold, under rule A1, so a person can look. A wallet that has some history but is young or quiet is not held for that. By default one that is under 30 days old or has sent fewer than 5 transactions gets a partial reward, under rule A8. A wallet used mostly on other chains looks new, because only Ethereum mainnet is read. The board shows the rule and the reason for every decision. More on [Live campaign](/docs/campaigns).
+
+## Why is a brand-new wallet turned away at the door?
+
+A wallet that has sent no transaction and holds no balance on Ethereum gets the answer `{"neverUsed": true}` when it asks. Nothing is stored or queued: it takes no slot, no place in the queue and no part of the campaign's cap on asks. It costs nothing to make a wallet like that, so Thuli will not spend a screening on it, and a free supply of new keys cannot fill a campaign's queue or run up the model bill. Signing the ask cost nothing, and the attempt only counts toward the visitor's 5 signed asks an hour. Ask with a wallet you have used for a while. The worker keeps the same rule as a second check: a wallet that reaches it with nothing to read is held by code under rule A1 with the reason "A1: This wallet has never been used on Ethereum, so there is nothing to screen.", and no model is called.
 
 ## What if two of my wallets share a funder?
 
@@ -21,11 +31,11 @@ Wallets that both asked and were first funded by the same ordinary wallet are li
 
 ## Can a project override a decision?
 
-Yes. The project owns its campaign and has the last word. A model's advice on an appeal never changes a decision; only the owner can settle it, from a signed-in session. Owner sign-in is not built yet, and a reversal does not yet change the claim list or the vault root.
+Yes. The project owns its campaign and has the last word. The outside check on an appeal is advice and never changes a decision; only the owner's settlement does, and only toward an approval. Owner sign-in is not built yet, so an operator settles an appeal with the `appeal:settle` command on the owner's word. A reversal gives the wallet a slot if one is left, and the next list the worker posts carries it. A decision made without an appeal is never changed that way.
 
 ## Can the model be talked into paying a farm?
 
-Code sets a ceiling for every wallet before the model runs, and the final decision is never more generous. The model's input holds only numbers, booleans, fixed words, addresses and hashes, with no text a stranger wrote. Its one permitted raise, rule B2, is bounded by the ceiling too, and across 35,323 wallets it never used it. The one place a stranger's words reach a model is appeal text, which carries Prompt Guard and only produces advice.
+Code sets a ceiling for every wallet before the model runs, and the final decision is never more generous. The model's input holds only numbers, booleans, fixed words, addresses and hashes, with no text a stranger wrote. Its one permitted raise, rule B2, is bounded by the ceiling too, and across 35,323 wallets it never used it. In a campaign no stranger's words reach a model: an appellant's text is read only by the person who settles the appeal. Only the `appeal:demo` script, a demonstration, sends appeal text to a model, with Prompt Guard declared, and only to produce advice.
 
 ## What if SERV is down?
 
@@ -33,7 +43,7 @@ Doubt means hold. A paid request always gets a decision: if SERV gives no answer
 
 ## Who holds the reward money?
 
-The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. The only vault so far is a proof vault on Base Sepolia with test USDC.
+The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. Every vault so far is on Base Sepolia with test USDC. The factory that makes vaults is also deployed on Base mainnet, and no vault has been made from it.
 
 ## Can Thuli take the money in a vault?
 
@@ -53,7 +63,7 @@ Yes, at [/check](/check), or with the box on the home page. Paste an Ethereum ad
 
 ## Which chains does it use?
 
-Screening reads Ethereum mainnet only. The paid route takes USDC on Base or on Base Sepolia, the test network. The vault is deployed on Base Sepolia only, and Base mainnet is not deployed yet. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
+Screening reads Ethereum mainnet only. The paid route takes USDC on Base or on Base Sepolia, the test network. Every vault is on Base Sepolia. The vault factory is also deployed on Base mainnet, with no vault made from it yet. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
 
 ## Is the rulebook public, and does that help farmers?
 
@@ -61,15 +71,15 @@ It is public, and you can read it on [the rulebook page](/docs/rulebook). It is 
 
 ## What is not built yet?
 
-As of 11 November 2026: owner sign-in, a general job queue (only campaign asks and claim submissions are queued), paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The campaign routes, the screening worker that posts each list to the vault and submits claims, and the campaign page are built, and the worker runs as a script on one machine. They are described on [Live campaign](/docs/campaigns). The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
+As of 11 November 2026: owner sign-in, a general job queue (only campaign asks, claim submissions and appeal checks are queued), paid data lookups, a deployed worker host, and any vault or payment on Base mainnet. The vault factory is deployed there, and nothing has been made from it. The campaign routes, the appeal route, the screening worker that posts each list to the vault and submits claims, and the campaign page are built, and the worker runs as a script on one machine. They are described on [Live campaign](/docs/campaigns). The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
 
 ## Is it audited?
 
-No outside firm has audited Thuli. It is self-audited: a threat model written before the code, three internal review rounds, and fuzz, invariant and fork tests on the vault. See [security](/docs/security).
+No outside firm has audited Thuli. It is self-audited: a threat model written before the code, three internal rounds of checking, and fuzz, invariant and fork tests on the vault. See [security](/docs/security).
 
 ## Can I try to break it?
 
-Yes. [/break](/break) runs ten attacks live from your browser: five against the proof vault on Base Sepolia, as simulated calls that send nothing, four against this site's own routes, and one against how a reason is shown. It cannot show a replayed payment, which needs a funded wallet, or a forged appeal, because no public route takes appeals yet. To check the vault's proof record against the chain, run `npm run prove:vault -- verify`. The steps are on [contracts](/docs/contracts).
+Yes. [/break](/break) runs ten attacks live from your browser: five against the proof vault on Base Sepolia, as simulated calls that send nothing, four against this site's own routes, and one against how a reason is shown. It does not run a replayed payment, which needs a funded wallet, or a forged appeal. To check the vault's proof record against the chain, run `npm run prove:vault -- verify`. The steps are on [contracts](/docs/contracts).
 
 ## Are the dollar figures real money?
 
