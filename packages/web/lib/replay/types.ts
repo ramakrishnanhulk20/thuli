@@ -37,7 +37,15 @@ export interface WebSummary {
   };
   robo: { claimedKey: string; keptKey: string; claimedOther: string; keptOther: string };
   usd: { claimedKey: number; keptKey: number; claimedOther: number; keptOther: number };
-  answers: { accepted: number; firstRefused: number; fixedBySecondAsk: number; stillRefused: number };
+  /** firstRefused is always fixedBySecondAsk + stillRefused + replacedByCode. refusedOnRecheck: never asked again, refused by today's checks. */
+  answers: {
+    accepted: number;
+    firstRefused: number;
+    fixedBySecondAsk: number;
+    stillRefused: number;
+    replacedByCode: number;
+    refusedOnRecheck: number;
+  };
   modes: { v3: number; v2: number };
   /** Largest first. */
   groups: WebGroup[];

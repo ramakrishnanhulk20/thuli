@@ -56,7 +56,9 @@
     "accepted": 35259,
     "firstRefused": 1679,
     "fixedBySecondAsk": 1651,
-    "stillRefused": 19
+    "stillRefused": 17,
+    "replacedByCode": 11,
+    "refusedOnRecheck": 2
   },
   "modes": {
     "v3": 13488,

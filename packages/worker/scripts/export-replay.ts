@@ -341,7 +341,7 @@ async function main(): Promise<number> {
   // Scored offline the way replay-hop.ts scores its rows for report.md, so both show the same Hop numbers.
   const hopRows = parseRows(readInput(HOP_ROWS_FILE, 'npm run replay:hop'), 'hop rows.jsonl');
   const hop = buildWebHop(scoreHop(hopRows, loadHopLists(KEYS_DIR), DEFAULT_SETTINGS), args.runDate);
-  const versions = buildWebVersions(readVersions(), args.runDate);
+  const versions = buildWebVersions(readVersions());
 
   const roboDir = path.join(args.outDir, 'robo');
   const summaryText = `${JSON.stringify(summary, null, 2)}\n`;

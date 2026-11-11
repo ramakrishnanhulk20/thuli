@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseArgs } from 'node:util';
 import { z } from 'zod';
 import { AppealRecord, DEFAULT_SETTINGS, Facts, OutcomeSchema, Start } from '@thuli/core';
 import { AnswerKeyError, loadFarmKey } from '../src/replay/answerKeys.ts';
@@ -15,10 +16,25 @@ import {
   versionsToMarkdown,
   type VersionRecords,
 } from '../src/replay/versions.ts';
+import { isCalendarDate } from '../src/replay/webExport.ts';
 import { FeedbackEntry } from '../src/reppo/feedback.ts';
 
 // The largest replay file is about 40 MB; a file far past this is not our replay output (C41).
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
+const USAGE = 'Usage: npm run versions:score [-- --run-date YYYY-MM-DD], the day of scoring, today in UTC when left out';
+
+/** The day of scoring. versions.json carries it, so the export publishes that day and never its own. */
+function readRunDate(): string {
+  let values: { 'run-date'?: string };
+  try {
+    values = parseArgs({ options: { 'run-date': { type: 'string' } }, strict: true, allowPositionals: false }).values;
+  } catch {
+    throw new UsageError(USAGE);
+  }
+  const runDate = values['run-date'] ?? new Date().toISOString().slice(0, 10);
+  if (!isCalendarDate(runDate)) throw new UsageError('--run-date must be a calendar day written YYYY-MM-DD');
+  return runDate;
+}
 
 const ROBO_DIR = path.join(REPO_ROOT, 'data', 'replay', 'robo');
 const HOP_DIR = path.join(REPO_ROOT, 'data', 'replay', 'hop');
@@ -69,6 +85,7 @@ function saveDecisions(file: string, records: DecisionRecord[]): void {
 }
 
 function main(): void {
+  const runDate = readRunDate();
   refuseNetwork();
 
   const roboRows = readStored(path.join(ROBO_DIR, 'rows.jsonl'), RowLine);
@@ -104,12 +121,12 @@ function main(): void {
   });
   // decide:hop rewrites both sample files when it finishes, so the later of the two is the day the answers were asked.
   const hopAskedOn = new Date(Math.max(fs.statSync(sampleFile).mtimeMs, fs.statSync(eliminatedFile).mtimeMs)).toISOString().slice(0, 10);
-  const report = versionsToMarkdown(comparison, { runDate: new Date().toISOString().slice(0, 10), hopAskedOn });
+  const report = versionsToMarkdown(comparison, { runDate, hopAskedOn });
 
   saveDecisions(path.join(ROBO_DIR, 'decisions-v2.jsonl'), v2.robo);
   saveDecisions(path.join(HOP_DIR, 'decisions-sample-v2.jsonl'), v2.hopSample);
   writeAtomically(path.join(FEEDBACK_DIR, 'versions.md'), report);
-  writeAtomically(path.join(FEEDBACK_DIR, 'versions.json'), `${JSON.stringify(comparison, null, 2)}\n`);
+  writeAtomically(path.join(FEEDBACK_DIR, 'versions.json'), `${JSON.stringify({ runDate, ...comparison }, null, 2)}\n`);
   console.log(report);
 }
 

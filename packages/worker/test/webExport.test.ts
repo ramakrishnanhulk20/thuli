@@ -4,6 +4,7 @@
 // numbers or fetches these files correctly.
 import { describe, expect, it } from 'vitest';
 import {
+  BURST_KEPT_CAUSE,
   computeCeiling,
   computeStart,
   DEFAULT_SETTINGS,
@@ -220,10 +221,41 @@ describe('buildWebExport', () => {
     expect(line('Key wallets: ')?.endsWith(`(${dollars(summary.usd.keptKey)} of ${dollars(summary.usd.claimedKey)})`)).toBe(true);
     expect(line('Other wallets: ')?.endsWith(`(${dollars(summary.usd.keptOther)} of ${dollars(summary.usd.claimedOther)})`)).toBe(true);
     expect(summary.usd.claimedOther).toBe(4_194);
-    expect(summary.answers).toEqual({ accepted: score.accepted, firstRefused: score.secondAsks.asked, fixedBySecondAsk: score.secondAsks.fixed, stillRefused: 1 });
+    expect(summary.answers).toEqual({
+      accepted: score.accepted,
+      firstRefused: score.secondAsks.asked,
+      fixedBySecondAsk: score.secondAsks.fixed,
+      stillRefused: 1,
+      replacedByCode: 0,
+      refusedOnRecheck: 0,
+    });
     expect(summary.modes).toEqual({ v3: score.modes.v3, v2: score.modes.v2 });
     expect(summary.run.centsPerWallet).toBe(194.556);
     expect(report).toContain(`(${summary.run.centsPerWallet.toFixed(3)} cents per wallet)`);
+  });
+
+  it('the public answer counts add up: each first answer refused is fixed, still refused or replaced by the code', () => {
+    const asked = { secondAsk: true, firstCause: TOO_LONG, accepted: false };
+    // a1 is fixed by its second ask and a9 still refused. Two second answers the code replaced, and one first answer
+    // accepted when asked that today's checks refuse, which was never asked again.
+    const records = new Map([
+      ...RECORDS,
+      [wallet('a3'), { ...recordFor(SPECS[2] as Spec), ...asked, cause: FUNDER_KEPT_CAUSE }],
+      [wallet('a7'), { ...recordFor(SPECS[6] as Spec), ...asked, cause: BURST_KEPT_CAUSE }],
+      [wallet('a8'), { ...recordFor(SPECS[7] as Spec), action: 'hold' as const, shareBps: 0, accepted: false, cause: MALFORMED_HASH_CAUSE }],
+    ]);
+    const { answers, outcomes } = build({ records }).summary;
+    expect(answers).toEqual({ accepted: 5, firstRefused: 4, fixedBySecondAsk: 1, stillRefused: 1, replacedByCode: 2, refusedOnRecheck: 1 });
+    expect(answers.firstRefused).toBe(answers.fixedBySecondAsk + answers.stillRefused + answers.replacedByCode);
+    // Every refused answer, asked twice or not, is a hold.
+    expect(outcomes.other.hold).toBe(build().summary.outcomes.other.hold + 1);
+  });
+
+  it('refuses to write answer counts that do not add up', () => {
+    // Asked a second time, yet neither accepted, refused nor replaced: it fits none of the three counts.
+    const records = withRecord('a3', { secondAsk: true, firstCause: TOO_LONG, accepted: false, cause: null });
+    expect(() => build({ records })).toThrow(ExportCheckError);
+    expect(() => build({ records })).toThrow('the answer counts do not add up: 3 first answers refused, but 1 fixed, 1 still refused and 0 replaced by the code');
   });
 
   it('names the rulebook the outcomes were decided under, and refuses one the checks do not know', () => {
@@ -489,6 +521,7 @@ describe('buildWebVersions', () => {
   });
   const verdict = { group: 'contract-hold', storedAction: 'hold', score: 43, route: 'block', confidence: 'high', v1Action: 'hold', v2Action: 'full' };
   const STORED = {
+    runDate: '2026-11-11',
     v1: score('v1', 38),
     v2: score('v2', 15),
     eliminatedHeld: { v1: { held: 56, wallets: 500, rate: 0.112 }, v2: { held: 15, wallets: 500, rate: 0.03 } },
@@ -499,11 +532,17 @@ describe('buildWebVersions', () => {
     noReply: { robo: 3, hopSample: 9, hopEliminated: 9 },
   };
 
-  it('passes every stored field through, with the run date from the flag', () => {
-    const { value, text } = buildWebVersions(STORED, '2026-11-10');
-    expect(value).toEqual({ ...STORED, runDate: '2026-11-10' });
+  it('passes every stored field through, the day the scorer wrote included, run date first', () => {
+    const { value, text } = buildWebVersions(STORED);
+    expect(value).toEqual(STORED);
     expect(JSON.parse(text)).toEqual(value);
-    expect(buildWebVersions({ ...STORED, runDate: '2020-01-01' }, '2026-11-10').value.runDate).toBe('2026-11-10');
+    expect(Object.keys(JSON.parse(text))[0]).toBe('runDate');
+    expect(buildWebVersions({ ...STORED, runDate: '2020-01-01' }).value.runDate).toBe('2020-01-01');
+  });
+
+  it('refuses a scorecard that does not say when it was scored, naming the command that writes one', () => {
+    const { runDate: _scored, ...undated } = STORED;
+    expect(() => buildWebVersions(undated)).toThrow('the stored versions.json does not say when it was scored, rerun npm run versions:score');
   });
 
   it.each([
@@ -513,13 +552,13 @@ describe('buildWebVersions', () => {
     ['free text where a label belongs', { verdicts: [{ ...verdict, group: 'held, see the funder' }] }, 'versions.json does not match its public shape'],
     ['a version under the wrong name', { v2: score('v1', 15) }, 'versions.json does not match its public shape'],
   ])('refuses %s (C33, C34)', (_label, change, message) => {
-    expect(() => buildWebVersions({ ...STORED, ...change }, '2026-11-10')).toThrow(message);
+    expect(() => buildWebVersions({ ...STORED, ...change })).toThrow(message);
   });
 
   it('refuses a stored value that is not an object, or a run date that is not a calendar day', () => {
     for (const stored of [null, [STORED], 'versions']) {
-      expect(() => buildWebVersions(stored, '2026-11-10')).toThrow('versions.json does not match its public shape');
+      expect(() => buildWebVersions(stored)).toThrow('versions.json does not match its public shape');
     }
-    expect(() => buildWebVersions(STORED, '2026-02-30')).toThrow('versions.json does not match its public shape');
+    expect(() => buildWebVersions({ ...STORED, runDate: '2026-02-30' })).toThrow('versions.json does not match its public shape');
   });
 });

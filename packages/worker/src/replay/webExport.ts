@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   ACCOUNT_TYPES,
   AppealRecord,
+  BURST_KEPT_CAUSE,
   DECISION_RULES,
   FACT_NAMES,
   FUNDER_KEPT_CAUSE,
@@ -23,7 +24,7 @@ import {
 } from '@thuli/core';
 import type { ClaimEvent } from './answerKeys.ts';
 import type { DecisionRecord } from './decide.ts';
-import { scoreDecisions, USD_PER_ROBO_AT_CLAIM, wholeDollars } from './decisionScore.ts';
+import { scoreDecisions, USD_PER_ROBO_AT_CLAIM, wholeDollars, type DecisionScore } from './decisionScore.ts';
 import type { HopCohort, HopScore } from './hopScore.ts';
 
 export const OUTCOME_CODES = { full: 0, partial: 1, hold: 2, exclude: 3 } as const;
@@ -81,7 +82,7 @@ const versionScoreShape = (name: 'v1' | 'v2') =>
     feedback: z.strictObject({ right: Count, total: Count }),
   });
 
-// Every field versions-score writes to data/feedback/versions.json today, plus the run date.
+// Every field versions-score writes to data/feedback/versions.json, the day it scored included.
 const WebVersionsShape = z.strictObject({
   runDate: CalendarDay,
   v1: versionScoreShape('v1'),
@@ -112,7 +113,7 @@ const WebVersionsShape = z.strictObject({
   noReply: z.strictObject({ robo: Count, hopSample: Count, hopEliminated: Count }),
 });
 
-/** versions.json: the rulebook v1 and v2 scorecard, as the version scorer stored it, and the day it was exported. */
+/** versions.json: the rulebook v1 and v2 scorecard as the version scorer stored it, with the day it was scored. */
 export type WebVersions = z.infer<typeof WebVersionsShape>;
 
 // Strict, so any field nobody listed here, the model's raw reply above all, stops the export instead of going public.
@@ -204,7 +205,25 @@ export interface WebSummary {
   robo: { claimedKey: string; keptKey: string; claimedOther: string; keptOther: string };
   /** Whole dollars at the claim-day value, the figures decisions-report.md prints. */
   usd: { claimedKey: number; keptKey: number; claimedOther: number; keptOther: number };
-  answers: { accepted: number; firstRefused: number; fixedBySecondAsk: number; stillRefused: number };
+  /**
+   * How the stored answers fare under today's checks. firstRefused is always fixedBySecondAsk + stillRefused +
+   * replacedByCode: the export refuses to write otherwise. Every wallet in stillRefused or refusedOnRecheck is a hold.
+   */
+  answers: {
+    /** Answers the checks accept, first or second. */
+    accepted: number;
+    /** First answers the checks refused, each of which was asked a second time. */
+    firstRefused: number;
+    /** Of those, second answers the checks accept. */
+    fixedBySecondAsk: number;
+    /** Of those, second answers the checks refuse too, or the first refusal kept when the second call failed. */
+    stillRefused: number;
+    /** Of those, second answers the code replaced with its own start, on a funding burst or a shared funder alone. */
+    replacedByCode: number;
+    /** Answers never asked a second time, because the checks accepted them or the code replaced them when they were
+     * asked, that today's checks refuse. */
+    refusedOnRecheck: number;
+  };
   modes: { v3: number; v2: number };
   /** Largest first; groups of one size in the order their first wallet appears. */
   groups: WebGroup[];
@@ -340,6 +359,40 @@ export function isCalendarDate(text: string): boolean {
   return !Number.isNaN(time) && new Date(time).toISOString().slice(0, 10) === text;
 }
 
+// The code's own start standing in for a reply. scoreDecisions does not count it as a refusal either.
+function isReplacedByCode(record: DecisionRecord): boolean {
+  return record.cause === BURST_KEPT_CAUSE || record.cause === FUNDER_KEPT_CAUSE;
+}
+
+function isRefused(record: DecisionRecord): boolean {
+  return record.cause !== null && !isReplacedByCode(record);
+}
+
+/**
+ * summary.answers for the rows' records, split so the counts add up: every first answer the checks refused was asked
+ * once more, then fixed, still refused, or replaced by the code. Refusals of answers never asked again are their own count.
+ *
+ * @throws ExportCheckError when firstRefused is not fixedBySecondAsk + stillRefused + replacedByCode.
+ */
+function answerCounts(records: DecisionRecord[], score: DecisionScore): WebSummary['answers'] {
+  const askedAgain = records.filter((record) => record.secondAsk);
+  const answers = {
+    accepted: score.accepted,
+    firstRefused: score.secondAsks.asked,
+    fixedBySecondAsk: score.secondAsks.fixed,
+    stillRefused: askedAgain.filter(isRefused).length,
+    replacedByCode: askedAgain.filter(isReplacedByCode).length,
+    refusedOnRecheck: records.filter((record) => !record.secondAsk && isRefused(record)).length,
+  };
+  const { firstRefused, fixedBySecondAsk, stillRefused, replacedByCode } = answers;
+  if (firstRefused !== fixedBySecondAsk + stillRefused + replacedByCode) {
+    throw new ExportCheckError(
+      `the answer counts do not add up: ${firstRefused} first answers refused, but ${fixedBySecondAsk} fixed, ${stillRefused} still refused and ${replacedByCode} replaced by the code`,
+    );
+  }
+  return answers;
+}
+
 function checkMeta(meta: ExportMeta): void {
   if (!isCalendarDate(meta.runDate)) throw new ExportCheckError('the run date is not a calendar day written YYYY-MM-DD');
   if (!(RULEBOOK_VERSIONS as readonly unknown[]).includes(meta.rulebook)) throw new ExportCheckError('the rulebook is not a version the checks know');
@@ -358,8 +411,9 @@ function checkMeta(meta: ExportMeta): void {
  * clock, no files.
  *
  * @throws ExportCheckError when there are no rows, meta is malformed, a row has no stored decision or its record names
- * another wallet, a label names a wallet outside the rows, or a wallet's label and its facts.group disagree: one
- * without the other, or a label shared by a different number of wallets than facts.group.size.
+ * another wallet, a label names a wallet outside the rows, a wallet's label and its facts.group disagree (one without
+ * the other, or a label shared by a different number of wallets than facts.group.size), or the answer counts do not add
+ * up (answerCounts).
  * @throws Error STALE_DECISION, and RangeError for a wallet listed twice, both from scoreDecisions.
  */
 export function buildWebExport(input: ExportInput): { summary: WebSummary; points: WebPoints } {
@@ -467,12 +521,7 @@ export function buildWebExport(input: ExportInput): { summary: WebSummary; point
       claimedOther: wholeDollars(score.robo.allOther),
       keptOther: wholeDollars(score.robo.keptOther),
     },
-    answers: {
-      accepted: score.accepted,
-      firstRefused: score.secondAsks.asked,
-      fixedBySecondAsk: score.secondAsks.fixed,
-      stillRefused: Object.values(score.refused).reduce((sum, times) => sum + times, 0),
-    },
+    answers: answerCounts(stored, score),
     modes: { v3: score.modes.v3, v2: score.modes.v2 },
     groups: sorted.map(([, tally]) => ({ size: tally.size, held: tally.held, robo: wholeRobo(tally.wei) })),
   };
@@ -760,17 +809,19 @@ export function buildWebHop(score: HopScore, runDate: string): { value: WebHop; 
 }
 
 /**
- * versions.json from the stored version comparison (data/feedback/versions.json) and the run date. The stored value goes
- * through a strict shape that names every field it holds, so a field added to the scorecard later stops the export until
- * someone decides it may go public. Pure: no network, no clock, no files.
+ * versions.json from the stored version comparison (data/feedback/versions.json). Its run date is the one the scorer
+ * wrote, the day the scorecard was scored. The export's own date never replaces it, because copying a scorecard does
+ * not make it newer. The stored value goes through a strict shape that names every field it holds, so a field added to
+ * the scorecard later stops the export until someone decides it may go public. Pure: no network, no clock, no files.
  *
  * @returns The value and the exact text to write.
- * @throws ExportCheckError when the stored value is not an object or not in that shape, the run date is not a calendar
- * day, or the text holds 0x and 8 or more hex characters.
+ * @throws ExportCheckError when the stored value is not an object or not in that shape, a missing run date or one that
+ * is not a calendar day included, or the text holds 0x and 8 or more hex characters.
  */
-export function buildWebVersions(stored: unknown, runDate: string): { value: WebVersions; text: string } {
+export function buildWebVersions(stored: unknown): { value: WebVersions; text: string } {
   if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) {
     throw new ExportCheckError('versions.json does not match its public shape');
   }
-  return publicText('versions.json', { ...stored, runDate }, WebVersionsShape);
+  if (!('runDate' in stored)) throw new ExportCheckError('the stored versions.json does not say when it was scored, rerun npm run versions:score');
+  return publicText('versions.json', stored, WebVersionsShape);
 }
