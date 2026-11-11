@@ -305,7 +305,7 @@ or attack that demonstrates it. A change that touches an invariant also carries 
 - **C31. The owner cannot pull funds out from under claimants.** Only the owner can withdraw, only after the campaign
   ends, and the end time can never move earlier. A pause moves the end later by exactly the time spent paused, and no
   withdrawal runs while paused, so pausing cannot run out the claim window. Claims pay only the address in the leaf.
-  Non-goal, by Ram's decision on 11 Nov: the vault protects claimants from a hacked Thuli server and from early
+  Non-goal, decided on 11 Nov: the vault protects claimants from a hacked Thuli server and from early
   withdrawal, not from the project that funds it. The owner may name a new agent, and a list that agent posts replaces the
   old one after the root delay. Every agent change and every root is public on chain, so claimants get that delay as
   notice. The owner can swap a stolen agent key this way and keep the campaign running.
@@ -381,8 +381,8 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   wallet made itself. A clean hold with neither, on a wallet heading to a reward, is replaced by the code's start with a
   code-written reason. Reppo's judges accepted 0 of 15 such holds and blocked 11, and among exchange-funded wallets the hold
   had no signal (1.25% of probably-real wallets against 1.13% of eliminated ones). A reply failing C13 still holds under C11.
-  Non-goal: this gives up holds that were sometimes right: on Hop's eliminated A8 and A9 sample, 10.6% held fell to 2.2%, by
-  Ram's decision on 6 Nov. The verdict still flags those wallets for the feedback set. Shown by: a clean hold on an A9 wallet
+  Non-goal: this gives up holds that were sometimes right: on Hop's eliminated A8 and A9 sample, holds fell from 11.2% to
+  3.0% on the 11 Nov scorecard, a cost accepted when the rule was adopted on 6 Nov. The verdict still flags those wallets for the feedback set. Shown by: a clean hold on an A9 wallet
   with any funder and no link ends at the start, and with a link of its own stays a hold.
 
 
