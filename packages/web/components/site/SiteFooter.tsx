@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import { motion } from 'motion/react';
 import { BASE_SEPOLIA } from '@/lib/contracts';
 import { Drop } from '../Drop';
@@ -37,6 +38,10 @@ export function Credits({ className }: { className?: string }) {
 }
 
 export function SiteFooter() {
+  const pathname = usePathname();
+  // The docs have their own page frame and no site footer.
+  if (pathname === '/docs' || pathname.startsWith('/docs/')) return null;
+
   const { factory, explorer } = BASE_SEPOLIA;
   const shortFactory = `${factory.slice(0, 6)}…${factory.slice(-4)}`;
 

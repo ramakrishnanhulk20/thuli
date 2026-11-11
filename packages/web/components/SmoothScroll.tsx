@@ -10,9 +10,11 @@ export function SmoothScroll({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const lenisRef = useRef<Lenis | null>(null);
   const lastPathname = useRef(pathname);
+  // The docs scroll inside Fumadocs' own areas, so Lenis stops there and starts again on the way out.
+  const inDocs = pathname === '/docs' || pathname.startsWith('/docs/');
 
   useEffect(() => {
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (inDocs || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
 
     gsap.registerPlugin(ScrollTrigger);
 
@@ -29,7 +31,7 @@ export function SmoothScroll({ children }: { children: ReactNode }) {
       lenis.destroy();
       lenisRef.current = null;
     };
-  }, []);
+  }, [inDocs]);
 
   useEffect(() => {
     if (lastPathname.current === pathname) return;

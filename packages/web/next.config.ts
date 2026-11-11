@@ -1,8 +1,11 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createMDX } from 'fumadocs-mdx/next';
 import type { NextConfig } from 'next';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+const withMDX = createMDX();
 
 const config: NextConfig = {
   // A verification build must never share the folder the running dev server uses.
@@ -23,4 +26,4 @@ const config: NextConfig = {
   },
 };
 
-export default config;
+export default withMDX(config);

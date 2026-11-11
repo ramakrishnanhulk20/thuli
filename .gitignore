@@ -39,6 +39,9 @@ data/
 !.env.api.example
 !.env.web.example
 
+# Written by Fumadocs from content/docs
+.source/
+
 # Written by the Next.js dev server and build
 packages/web/AGENTS.md
 next-env.d.ts
