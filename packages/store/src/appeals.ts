@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   appealTextHash,
   CAMPAIGN_ID,
+  isOneLine,
   isPlainText,
   MAX_APPEAL_CHARS,
   OUTCOMES,
@@ -39,9 +40,17 @@ export const MAX_OWNER_NOTE_CHARS = 1_000;
 export const MAX_CHECK_NOTE_CHARS = 120;
 /** The cause takeAppeal keeps on an appeal it ends because the ask no longer has the appealed action and rule. */
 export const APPEAL_DECISION_CHANGED = 'the decision changed after the appeal';
+/** How long a check that holds an evaluation id is followed, in seconds from its submit mark: a day. */
+export const APPEAL_LOOKUP_MAX_SECONDS = 86_400;
+/** The cause kept on a check whose evaluation did not finish within APPEAL_LOOKUP_MAX_SECONDS. */
+export const APPEAL_LOOKUP_EXPIRED = 'the outside check did not finish in a day';
 
 // The same ceilings asks and relays have (C41): a lease or a retry wait of at most a day, at most 100 attempts.
 const MAX_WAIT_SECONDS = 86_400;
+// takeAppeal judges at most 1,000 waiting appeals a call, so ending a long run of appeals that can never be checked is
+// bounded work per call (C41); the next call carries on where it stopped. It locks them one at a time, so takers
+// running together each hold only the appeal they are judging and never skip one another's whole backlog.
+const TAKE_LOOK_MAX = 1_000;
 const MAX_ATTEMPTS = 100;
 const MAX_INTEGER = 2_147_483_647;
 const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
@@ -248,6 +257,70 @@ function isCampaignId(id: unknown): id is string {
   return typeof id === 'string' && CAMPAIGN_ID.test(id);
 }
 
+/**
+ * True when the ask still has the decision that was appealed: the same action and the same rule. The one comparison
+ * takeAppeal and settleAppeal both judge an appeal's ask by (C11, C17). Pure.
+ */
+export function sameDecision(appealed: { action: string; rule: string }, ask: { action: string; rule: string }): boolean {
+  return appealed.action === ask.action && appealed.rule === ask.rule;
+}
+
+/** A waiting appeal as takeAppeal reads it, with its ask's decision as it stands now. */
+interface WaitingRow {
+  campaign_id: string;
+  wallet: string;
+  attempts: number;
+  reppo_eval_id: string | null;
+  submit_started_at: unknown;
+  filed_at: unknown;
+  outcome: string;
+  appealed_action: string;
+  appealed_rule: string;
+  action: string | null;
+  rule: string | null;
+}
+
+// An ask with no decision at all, one requeued before an appeal stopped that, cannot hold the appealed one.
+function holdsAppealedDecision(row: Pick<WaitingRow, 'appealed_action' | 'appealed_rule' | 'action' | 'rule'>): boolean {
+  return (
+    row.action !== null &&
+    row.rule !== null &&
+    sameDecision({ action: row.appealed_action, rule: row.appealed_rule }, { action: row.action, rule: row.rule })
+  );
+}
+
+/**
+ * Whether a check has run too long, with the cause it keeps, or null. One that holds an evaluation id was paid for, so
+ * no count of tries ends it: it is followed until APPEAL_LOOKUP_MAX_SECONDS after its submit mark, or after its filing
+ * when it has no mark, which 010 makes impossible and which can only end the wait sooner (C23, C41). Any other check
+ * ends at maxAttempts tries. takeAppeal and releaseAppeal both judge by this. Pure.
+ */
+function overdue(
+  row: { reppoEvalId: string | null; attempts: number; submitStartedAt: Date | null; filedAt: Date },
+  now: Date,
+  maxAttempts: number,
+): { cause: string | null } | null {
+  if (row.reppoEvalId !== null) {
+    const from = row.submitStartedAt ?? row.filedAt;
+    return now.getTime() - from.getTime() > APPEAL_LOOKUP_MAX_SECONDS * 1000 ? { cause: APPEAL_LOOKUP_EXPIRED } : null;
+  }
+  return row.attempts >= maxAttempts ? { cause: null } : null;
+}
+
+/** Why takeAppeal ends a waiting appeal instead of handing it out, with the cause it keeps, or null to hand it out. */
+function endOf(row: WaitingRow, now: Date, maxAttempts: number): { cause: string | null } | null {
+  // A backstop against writers other than the appeal's own: the owner's reversal changes the ask on purpose and is
+  // still checked, and a check that holds an evaluation id was paid for, so this guard never ends it (C11, C17, C23).
+  if (row.reppo_eval_id === null && row.outcome !== 'reversed' && !holdsAppealedDecision(row)) return { cause: APPEAL_DECISION_CHANGED };
+  const check = {
+    reppoEvalId: row.reppo_eval_id,
+    attempts: row.attempts,
+    submitStartedAt: readTimeOrNull(row.submit_started_at),
+    filedAt: readTime(row.filed_at),
+  };
+  return overdue(check, now, maxAttempts);
+}
+
 function plainOrNull(value: unknown, label: string, most: number): string | null {
   if (value === null) return null;
   if (typeof value !== 'string' || value.length === 0 || value.length > most || !isPlainText(value)) {
@@ -256,17 +329,18 @@ function plainOrNull(value: unknown, label: string, most: number): string | null
   return value;
 }
 
-// Any C0 or C1 control character (tab, line feed, carriage return, vertical tab, form feed and NEL among them) and the
-// Unicode line and paragraph separators U+2028 and U+2029.
-const LINE_BREAKING = /[\p{Cc}\p{Zl}\p{Zp}]/u;
-
 /**
- * Plain text that prints as one line: core's isPlainText (no markup, link or format character) and nothing that can
- * start a new line or jump the cursor, so a stored text can never pose as another line of the operator's list (C34).
- * Not covered: characters that only look like a break, such as a run of spaces, which still print on the one line.
+ * An appeal's text, the outside judge's words and the store's own causes are printed for the operator line by line, so
+ * each must be core's plain text and core's one line, the rule the appeal form uses too: no markup, link or format
+ * character, and nothing that starts a new line (C34). Throws as plainOrNull does. Not covered: characters that only
+ * look like a break, such as a run of spaces, which still print on the one line.
  */
-function isOneLine(text: string): boolean {
-  return isPlainText(text) && !LINE_BREAKING.test(text);
+function oneLineOrNull(value: unknown, label: string, most: number): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || value.length === 0 || value.length > most || !isPlainText(value) || !isOneLine(value)) {
+    throw new StoreError(`${label} must be null or one line of plain text of 1 to ${most} characters`);
+  }
+  return value;
 }
 
 // Score and confidence are held to core's ReppoVerdict, the schema the worker read them with, so the store and the
@@ -317,6 +391,39 @@ export function campaignAppealsCounter(campaignId: string): string {
   return `appeals:${createHash('sha256').update(campaignId, 'utf8').digest('hex').slice(0, 32)}`;
 }
 
+/** Whether a wallet may appeal its ask now, or which of addAppeal's refusals it would meet. */
+export type AppealStanding = 'open' | 'exists' | 'unknown' | 'undecided' | 'approved';
+
+// addAppeal's own tests of the ask, in its order, for the ask as read and whether it already has an appeal. Both
+// addAppeal and appealStanding answer by this one function. Pure.
+function standingOf(ask: { status: string; action: string | null; rule: string | null } | undefined, appealed: boolean): AppealStanding {
+  if (ask === undefined) return 'unknown';
+  if (appealed) return 'exists';
+  if ((ask.status !== 'decided' && ask.status !== 'failed') || ask.action === null || ask.rule === null) return 'undecided';
+  if (ask.action === 'full') return 'approved';
+  return 'open';
+}
+
+/**
+ * What addAppeal would answer for this wallet's ask, short of the day's counts: 'unknown', 'exists', 'undecided' or
+ * 'approved' by addAppeal's own tests (standingOf), and 'open' when none of them refuses. For the API to ask before it
+ * spends a chain read on an appeal. One statement: it takes no lock, writes nothing and counts nothing, so addAppeal,
+ * under the campaign's lock, stays the authority; 'open' here can still meet 'busy' or a change there. The wallet goes
+ * through parseAddress, so any spelling reads the one ask (C1).
+ * @throws AddressError from @thuli/core when the wallet is not an address.
+ */
+export async function appealStanding(db: Db, campaignId: string, wallet: string): Promise<AppealStanding> {
+  const canonical = parseAddress(wallet);
+  if (!isCampaignId(campaignId)) return 'unknown';
+  const [ask] = await db.query<{ status: string; action: string | null; rule: string | null; appealed: boolean }>(
+    `SELECT a.status, a.action, a.rule,
+            EXISTS (SELECT 1 FROM appeals ap WHERE ap.campaign_id = a.campaign_id AND ap.wallet = a.wallet) AS appealed
+       FROM asks a WHERE a.campaign_id = $1 AND a.wallet = $2`,
+    [campaignId, canonical],
+  );
+  return standingOf(ask, ask?.appealed === true);
+}
+
 // Thrown inside addAppeal's transaction when the day's appeals across every campaign are used after this campaign's
 // share was counted, so the rollback takes that count back too; it never leaves addAppeal.
 class AppealDayUsed extends Error {}
@@ -342,7 +449,7 @@ export async function addAppeal(db: Db, appeal: AppealInput, now: Date): Promise
   const nowAt = instant(now);
   const wallet = parseAddress(appeal.wallet);
   const { text } = appeal;
-  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_APPEAL_CHARS || !isOneLine(text)) {
+  if (typeof text !== 'string' || text.length === 0 || text.length > MAX_APPEAL_CHARS || !isPlainText(text) || !isOneLine(text)) {
     throw new StoreError(`the appeal text must be one line of plain text of 1 to ${MAX_APPEAL_CHARS} characters`);
   }
   // Rebuilt here rather than trusted, so the stored hash always says exactly what the stored text is (C8).
@@ -377,9 +484,8 @@ async function fileAppeal(
     );
     if (ask === undefined) return 'unknown';
     const [earlier] = await tx.query('SELECT 1 AS found FROM appeals WHERE campaign_id = $1 AND wallet = $2', [campaignId, wallet]);
-    if (earlier !== undefined) return 'exists';
-    if ((ask.status !== 'decided' && ask.status !== 'failed') || ask.action === null || ask.rule === null) return 'undecided';
-    if (ask.action === 'full') return 'approved';
+    const standing = standingOf(ask, earlier !== undefined);
+    if (standing !== 'open') return standing;
     if (!(await bumpDay(inTransaction(tx), campaignAppealsCounter(campaignId), APPEALS_PER_CAMPAIGN_DAY, now))) return 'busy';
     if (!(await bumpDay(inTransaction(tx), APPEALS_DAY_COUNTER, APPEALS_DAY_MAX, now))) throw new AppealDayUsed();
     const added = await tx.query(
@@ -400,16 +506,20 @@ async function fileAppeal(
 /**
  * Hands the oldest ready appeal, from any campaign, to one worker for the outside check: one queued with no retry time
  * or one at or before now, or checking with a lease at or before now. It is marked checking with lease_until now plus
- * leaseSeconds and one more attempt. In the same transaction, before the take:
- * - a waiting appeal whose ask no longer has the action and rule that were appealed ends unchecked with the cause
- *   APPEAL_DECISION_CHANGED, whatever its attempts or retry time, because the outside check would judge a decision
- *   nobody appealed (C11, C17);
- * - a waiting appeal that has already had maxAttempts ends unchecked, never checked (C41).
- * The take itself is one statement that selects only an appeal whose ask still has the appealed action and rule, reads
- * the ask in that same statement, and skips rows another caller has locked, so two workers calling at once never get
- * the same appeal and an ask changed in between is never handed out. Any evaluation id already noted comes back, so an
- * unfinished evaluation is looked up again, and submitStarted says whether a submit was begun (C23).
- * @returns the appeal taken, or null when none is ready.
+ * leaseSeconds and one more attempt. Ready appeals are read oldest first, one at a time and at most 1,000 a call, each
+ * row locked for this transaction and any another taker holds skipped, so two workers never get one appeal and each
+ * holds only the one it is judging. In that order, each one that can never be checked ends unchecked, until one can be
+ * handed out:
+ * - an open appeal with no evaluation id whose ask no longer has the appealed action and rule (sameDecision) ends with
+ *   APPEAL_DECISION_CHANGED, a backstop against other writers. The owner's reversal is the appeal's own change and is
+ *   still checked, and a check that holds an evaluation id is never ended by this guard (C11, C17, C23);
+ * - a check that holds an evaluation id was paid for and is followed whatever its attempts, ending with
+ *   APPEAL_LOOKUP_EXPIRED once APPEAL_LOOKUP_MAX_SECONDS have passed since its submit mark (C23);
+ * - any other that has already had maxAttempts ends with no cause (C41).
+ * The appeal handed out is updated in one statement that reads its ask in that same statement. Any evaluation id
+ * already noted comes back, so an unfinished evaluation is looked up again, and submitStarted says whether a submit was
+ * begun (C23).
+ * @returns the appeal taken, or null when none is ready among the appeals this call looked at.
  * @throws StoreError when leaseSeconds is not a whole number from 1 to 86,400, maxAttempts not a whole number from 1
  *   to 100, or now is not a valid Date.
  */
@@ -419,78 +529,81 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
   const nowAt = instant(now);
   const leaseUntil = shifted(now, leaseSeconds);
   return db.transaction(async (tx) => {
-    await tx.query(
-      `UPDATE appeals
-          SET check_status = 'unchecked', lease_until = NULL, retry_at = NULL, checked_at = $1::timestamptz, check_note = $2
-         FROM asks
-        WHERE asks.campaign_id = appeals.campaign_id AND asks.wallet = appeals.wallet
-          AND (appeals.check_status = 'queued' OR (appeals.check_status = 'checking' AND appeals.lease_until <= $1::timestamptz))
-          AND (asks.action IS DISTINCT FROM appeals.appealed_action OR asks.rule IS DISTINCT FROM appeals.appealed_rule)`,
-      [nowAt, APPEAL_DECISION_CHANGED],
-    );
-    await tx.query(
-      `UPDATE appeals SET check_status = 'unchecked', lease_until = NULL, retry_at = NULL, checked_at = $1::timestamptz
-        WHERE attempts >= $2::int AND (check_status = 'queued' OR (check_status = 'checking' AND lease_until <= $1::timestamptz))`,
-      [nowAt, maxAttempts],
-    );
-    const [taken] = await tx.query<{
-      campaign_id: string;
-      wallet: string;
-      attempts: number;
-      lease_until: unknown;
-      reppo_eval_id: string | null;
-      submit_started: boolean;
-      appealed_action: string;
-      appealed_rule: string;
-      action: string;
-      rule: string;
-      reason: string;
-      record: unknown;
-    }>(
-      `WITH next AS (
-         SELECT ap.campaign_id, ap.wallet, a.action, a.rule, a.reason, a.record
+    for (let looked = 0; looked < TAKE_LOOK_MAX; looked += 1) {
+      const [row] = await tx.query<WaitingRow>(
+        `SELECT ap.campaign_id, ap.wallet, ap.attempts, ap.reppo_eval_id, ap.submit_started_at, ap.filed_at, ap.outcome,
+                ap.appealed_action, ap.appealed_rule, a.action, a.rule
            FROM appeals ap
            JOIN asks a ON a.campaign_id = ap.campaign_id AND a.wallet = ap.wallet
-          WHERE ap.attempts < $3::int
-            AND ((ap.check_status = 'queued' AND (ap.retry_at IS NULL OR ap.retry_at <= $1::timestamptz))
-                 OR (ap.check_status = 'checking' AND ap.lease_until <= $1::timestamptz))
-            AND a.action = ap.appealed_action AND a.rule = ap.appealed_rule
+          WHERE (ap.check_status = 'queued' AND (ap.retry_at IS NULL OR ap.retry_at <= $1::timestamptz))
+             OR (ap.check_status = 'checking' AND ap.lease_until <= $1::timestamptz)
           ORDER BY ap.filed_at, ap.campaign_id, ap.wallet
           LIMIT 1
-          FOR UPDATE OF ap SKIP LOCKED
-       )
-       UPDATE appeals SET check_status = 'checking', lease_until = $2::timestamptz, retry_at = NULL, attempts = appeals.attempts + 1
-         FROM next
-        WHERE appeals.campaign_id = next.campaign_id AND appeals.wallet = next.wallet
-       RETURNING appeals.campaign_id, appeals.wallet, appeals.attempts, appeals.lease_until, appeals.reppo_eval_id,
-                 appeals.submit_started_at IS NOT NULL AS submit_started, appeals.appealed_action, appeals.appealed_rule,
-                 next.action, next.rule, next.reason, next.record`,
-      [nowAt, leaseUntil, maxAttempts],
-    );
-    if (taken === undefined) return null;
-    return {
-      campaignId: taken.campaign_id,
-      wallet: taken.wallet as Address,
-      attempts: taken.attempts,
-      leaseUntil: readTime(taken.lease_until),
-      reppoEvalId: taken.reppo_eval_id,
-      submitStarted: taken.submit_started === true,
-      appealedAction: taken.appealed_action as Outcome,
-      appealedRule: taken.appealed_rule,
-      action: taken.action as Outcome,
-      rule: taken.rule,
-      reason: taken.reason,
-      record: taken.record === null || taken.record === undefined ? null : (taken.record as Record<string, unknown>),
-    };
+          FOR UPDATE OF ap SKIP LOCKED`,
+        [nowAt],
+      );
+      if (row === undefined) return null;
+      const end = endOf(row, now, maxAttempts);
+      if (end !== null) {
+        await tx.query(
+          `UPDATE appeals
+              SET check_status = 'unchecked', lease_until = NULL, retry_at = NULL, checked_at = $3::timestamptz, check_note = $4
+            WHERE campaign_id = $1 AND wallet = $2`,
+          [row.campaign_id, row.wallet, nowAt, end.cause],
+        );
+        continue;
+      }
+      const [taken] = await tx.query<{
+        campaign_id: string;
+        wallet: string;
+        attempts: number;
+        lease_until: unknown;
+        reppo_eval_id: string | null;
+        submit_started: boolean;
+        appealed_action: string;
+        appealed_rule: string;
+        action: string;
+        rule: string;
+        reason: string;
+        record: unknown;
+      }>(
+        `UPDATE appeals SET check_status = 'checking', lease_until = $3::timestamptz, retry_at = NULL, attempts = appeals.attempts + 1
+           FROM asks
+          WHERE appeals.campaign_id = $1 AND appeals.wallet = $2
+            AND asks.campaign_id = appeals.campaign_id AND asks.wallet = appeals.wallet
+         RETURNING appeals.campaign_id, appeals.wallet, appeals.attempts, appeals.lease_until, appeals.reppo_eval_id,
+                   appeals.submit_started_at IS NOT NULL AS submit_started, appeals.appealed_action, appeals.appealed_rule,
+                   asks.action, asks.rule, asks.reason, asks.record`,
+        [row.campaign_id, row.wallet, leaseUntil],
+      );
+      if (taken === undefined) throw new StoreError('an appeal was locked for the take and then not found');
+      return {
+        campaignId: taken.campaign_id,
+        wallet: taken.wallet as Address,
+        attempts: taken.attempts,
+        leaseUntil: readTime(taken.lease_until),
+        reppoEvalId: taken.reppo_eval_id,
+        submitStarted: taken.submit_started === true,
+        appealedAction: taken.appealed_action as Outcome,
+        appealedRule: taken.appealed_rule,
+        action: taken.action as Outcome,
+        rule: taken.rule,
+        reason: taken.reason,
+        record: taken.record === null || taken.record === undefined ? null : (taken.record as Record<string, unknown>),
+      };
+    }
+    return null;
   });
 }
 
 /**
- * Gives back an appeal whose outside check could not finish. Below maxAttempts it is queued again, and takeAppeal
- * leaves it be until now plus retryAfterSeconds, so an outage is waited out; any evaluation id stays on it. At or past
- * maxAttempts it ends unchecked (C41). One statement, and only on an appeal that is checking.
+ * Gives back an appeal whose outside check could not finish. Unless it has run too long it is queued again, and
+ * takeAppeal leaves it be until now plus retryAfterSeconds, so an outage is waited out; any evaluation id stays on it.
+ * Too long is takeAppeal's own rule (overdue): one with an evaluation id was paid for and is queued again whatever its
+ * tries, ending unchecked with APPEAL_LOOKUP_EXPIRED only a day after its submit (C23); any other ends unchecked at or
+ * past maxAttempts (C41). One transaction, and only on an appeal that is checking.
  * @param options.refundTry true when the try failed for a reason that was not the appeal's own, such as an outside
- *   service out of credit: the try is handed back in this same statement, attempts falling by one but never below 0,
+ *   service out of credit: the try is handed back in this same transaction, attempts falling by one but never below 0,
  *   and the appeal is judged against maxAttempts as if the try had not been made. The retry wait still applies, so a
  *   refund alone can never make an appeal loop without pause (C41). Left out or false, behaviour is unchanged.
  * @returns 'queued' or 'unchecked', or null when there is no such appeal or it is not checking, changing nothing.
@@ -514,18 +627,36 @@ export async function releaseAppeal(
   if (refundTry !== undefined && typeof refundTry !== 'boolean') throw new StoreError('refundTry must be true or false');
   const refund = refundTry === true ? 1 : 0;
   if (campaignId === null) return null;
-  const [row] = await db.query<{ check_status: ReleaseAppealResult }>(
-    `UPDATE appeals
-        SET check_status = CASE WHEN GREATEST(attempts - $6::int, 0) < $3::int THEN 'queued' ELSE 'unchecked' END,
-            attempts = GREATEST(attempts - $6::int, 0),
-            lease_until = NULL,
-            retry_at = CASE WHEN GREATEST(attempts - $6::int, 0) < $3::int THEN $5::timestamptz ELSE NULL END,
-            checked_at = CASE WHEN GREATEST(attempts - $6::int, 0) < $3::int THEN NULL ELSE $4::timestamptz END
-      WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking'
-     RETURNING check_status`,
-    [campaignId, wallet, maxAttempts, nowAt, retryAt, refund],
-  );
-  return row?.check_status ?? null;
+  return db.transaction(async (tx): Promise<ReleaseAppealResult | null> => {
+    const [row] = await tx.query<{ attempts: number; reppo_eval_id: string | null; submit_started_at: unknown; filed_at: unknown }>(
+      `SELECT attempts, reppo_eval_id, submit_started_at, filed_at FROM appeals
+        WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking'
+          FOR UPDATE`,
+      [campaignId, wallet],
+    );
+    if (row === undefined) return null;
+    const attempts = Math.max(row.attempts - refund, 0);
+    const end = overdue(
+      { reppoEvalId: row.reppo_eval_id, attempts, submitStartedAt: readTimeOrNull(row.submit_started_at), filedAt: readTime(row.filed_at) },
+      now,
+      maxAttempts,
+    );
+    if (end === null) {
+      await tx.query(
+        `UPDATE appeals SET check_status = 'queued', attempts = $3, lease_until = NULL, retry_at = $4::timestamptz
+          WHERE campaign_id = $1 AND wallet = $2`,
+        [campaignId, wallet, attempts, retryAt],
+      );
+      return 'queued';
+    }
+    await tx.query(
+      `UPDATE appeals
+          SET check_status = 'unchecked', attempts = $3, lease_until = NULL, retry_at = NULL, checked_at = $4::timestamptz, check_note = $5
+        WHERE campaign_id = $1 AND wallet = $2`,
+      [campaignId, wallet, attempts, nowAt, end.cause],
+    );
+    return 'unchecked';
+  });
 }
 
 /**
@@ -606,20 +737,20 @@ export async function noteAppealEval(db: Db, key: AppealKey, evalId: string, now
  * One statement.
  * @returns true when the appeal was checking and is now checked; false, changing nothing, otherwise.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when evalId is malformed, route is
- *   not null, ship, review or block, note is neither null nor plain text of 1 to 280 characters, creditsCharged is not
- *   a whole number from 0, score is not a whole number from 0 to 100, decision is not plain text of 1 to 64
- *   characters, confidence is not low, medium or high (each of the last three may be null or left out), or now is not
- *   a valid Date, each before anything is written.
+ *   not null, ship, review or block, note is neither null nor one line of plain text of 1 to 280 characters,
+ *   creditsCharged is not a whole number from 0, score is not a whole number from 0 to 100, decision is not one line of
+ *   plain text of 1 to 64 characters, confidence is not low, medium or high (each of the last three may be null or left
+ *   out), or now is not a valid Date, each before anything is written.
  */
 export async function recordAppealCheck(db: Db, key: AppealKey, check: AppealCheck, now: Date): Promise<boolean> {
   const nowAt = instant(now);
   const { campaignId, wallet } = keyOf(key);
   const evalId = evalIdOf(check.evalId);
   if (check.route !== null && !ROUTES.includes(check.route)) throw new StoreError('route must be null, ship, review or block');
-  const note = plainOrNull(check.note, 'note', MAX_REPPO_NOTE_CHARS);
+  const note = oneLineOrNull(check.note, 'note', MAX_REPPO_NOTE_CHARS);
   const credits = wholeNumber(check.creditsCharged, 'creditsCharged', 0, MAX_INTEGER);
   const score = scoreOf(check.score);
-  const decision = plainOrNull(check.decision ?? null, 'decision', MAX_REPPO_DECISION_CHARS);
+  const decision = oneLineOrNull(check.decision ?? null, 'decision', MAX_REPPO_DECISION_CHARS);
   const confidence = confidenceOf(check.confidence);
   if (campaignId === null) return false;
   const rows = await db.query(
@@ -645,9 +776,7 @@ export async function recordAppealCheck(db: Db, key: AppealKey, check: AppealChe
 export async function markAppealUnchecked(db: Db, key: AppealKey, now: Date, cause: string | null = null): Promise<boolean> {
   const nowAt = instant(now);
   const { campaignId, wallet } = keyOf(key);
-  if (cause !== null && (typeof cause !== 'string' || cause.length === 0 || cause.length > MAX_CHECK_NOTE_CHARS || !isOneLine(cause))) {
-    throw new StoreError(`cause must be null or one line of plain text of 1 to ${MAX_CHECK_NOTE_CHARS} characters`);
-  }
+  oneLineOrNull(cause, 'cause', MAX_CHECK_NOTE_CHARS);
   if (campaignId === null) return false;
   const rows = await db.query(
     `UPDATE appeals SET check_status = 'unchecked', lease_until = NULL, retry_at = NULL, checked_at = $3::timestamptz, check_note = $4
@@ -683,14 +812,14 @@ async function planSettlement(
   outcome: 'reversed' | 'upheld',
   newAction: 'full' | 'partial' | null,
 ): Promise<SettlePlan> {
-  const [appeal] = await tx.query<{ outcome: string; appealed_action: string }>(
-    'SELECT outcome, appealed_action FROM appeals WHERE campaign_id = $1 AND wallet = $2 FOR UPDATE',
+  const [appeal] = await tx.query<{ outcome: string; appealed_action: string; appealed_rule: string }>(
+    'SELECT outcome, appealed_action, appealed_rule FROM appeals WHERE campaign_id = $1 AND wallet = $2 FOR UPDATE',
     [campaignId, wallet],
   );
   if (appeal === undefined) return { refused: 'no appeal from this wallet' };
   if (appeal.outcome !== 'open') return { refused: 'the appeal is already settled' };
-  const [ask] = await tx.query<{ action: string | null; slot: number | null }>(
-    'SELECT action, slot FROM asks WHERE campaign_id = $1 AND wallet = $2 FOR UPDATE',
+  const [ask] = await tx.query<{ action: string | null; rule: string | null; slot: number | null }>(
+    'SELECT action, rule, slot FROM asks WHERE campaign_id = $1 AND wallet = $2 FOR UPDATE',
     [campaignId, wallet],
   );
   if (ask === undefined) throw new StoreError('an appeal names an ask that is not there');
@@ -703,7 +832,8 @@ async function planSettlement(
   if (!(OUTCOMES.indexOf(newAction) < OUTCOMES.indexOf(appeal.appealed_action as Outcome))) {
     return { refused: 'the new action must be more generous than the appealed one' };
   }
-  if (ask.action !== appeal.appealed_action) return { refused: 'the ask changed after the appeal was filed' };
+  const asAppealed = { appealed_action: appeal.appealed_action, appealed_rule: appeal.appealed_rule, action: ask.action, rule: ask.rule };
+  if (!holdsAppealedDecision(asAppealed)) return { refused: 'the ask changed after the appeal was filed' };
   const [terms] = await tx.query<{ max_slots: number; partial_share_bps: number }>(
     'SELECT max_slots, partial_share_bps FROM campaigns WHERE id = $1',
     [campaignId],
@@ -727,12 +857,13 @@ async function planSettlement(
  * is never read here. Works whether or not the check finished. One transaction under the campaign's lock, refusing by
  * the same checks settleRefusal reports.
  * - 'upheld' changes nothing but the appeal.
- * - 'reversed' needs newAction full or partial, more generous than the appealed action, and an ask whose action still
- *   equals it. The ask's action and share become the new ones (share 10,000 for full, the campaign's partial share for
- *   partial) and it is marked reversed_by_appeal, keeping its rule and reason as the record of what was appealed; a
- *   failed ask becomes decided. An ask with no slot takes the next number while the campaign has fewer slot holders
- *   than max_slots, by decideAsk's rule (C44); an ask that already holds one, a partial raised to full, keeps it. The
- *   next published list then carries it like any slot holder (C27).
+ * - 'reversed' needs newAction full or partial, more generous than the appealed action, and an ask that still has the
+ *   appealed action and rule (sameDecision). The ask's action and share become the new ones (share 10,000 for full,
+ *   the campaign's partial share for partial) and it is marked reversed_by_appeal, keeping its rule and reason as the
+ *   record of what was appealed; a failed ask becomes decided. An ask with no slot takes the next number while the
+ *   campaign has fewer slot holders than max_slots, by decideAsk's rule (C44); an ask that already holds one, a partial
+ *   raised to full, keeps it. The next published list then carries it like any slot holder (C27). The appeal is still
+ *   handed out for its outside check afterwards; takeAppeal's guard never ends a reversed appeal.
  * @returns the ask's slot after settling, or { refused } with a fixed cause, in which case nothing changes.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when outcome is not reversed or
  *   upheld, newAction is not null, full or partial, ownerNote is neither null nor plain text of 1 to 1,000 characters,
@@ -818,8 +949,8 @@ export async function getAppeal(db: Db, campaignId: string, wallet: string): Pro
 
 /**
  * Every appeal of a campaign in full, oldest first, text, owner note, Reppo's score, decision and confidence, the submit
- * mark and the check's cause included, for the operator's command that lists and settles them. Never for a route or a log (C40), and the signature is not returned even here. At most one row per
- * ask, so at most the campaign's ask cap.
+ * mark and the check's cause included, for the operator's command that lists and settles them. Never for a route or a
+ * log (C40), and the signature is not returned even here. At most one row per ask, so at most the campaign's ask cap.
  */
 export async function ownerAppeals(db: Db, campaignId: string): Promise<OwnerAppeal[]> {
   if (!isCampaignId(campaignId)) return [];

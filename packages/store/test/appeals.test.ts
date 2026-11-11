@@ -9,9 +9,13 @@ import { appealTextHash, parseAddress, type Outcome } from '@thuli/core';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   addAppeal,
+  APPEAL_DECISION_CHANGED,
+  APPEAL_LOOKUP_EXPIRED,
+  APPEAL_LOOKUP_MAX_SECONDS,
   APPEALS_DAY_COUNTER,
   APPEALS_DAY_MAX,
   APPEALS_PER_CAMPAIGN_DAY,
+  appealStanding,
   campaignAppealsCounter,
   clearAppealSubmitting,
   getAppeal,
@@ -21,6 +25,7 @@ import {
   ownerAppeals,
   recordAppealCheck,
   releaseAppeal,
+  sameDecision,
   settleAppeal,
   settleRefusal,
   takeAppeal,
@@ -648,6 +653,167 @@ for (const { name, open } of TARGETS) {
       expect(await settleRefusal(db, { campaignId: 'not a campaign!', wallet: wallet(1), outcome: 'upheld', newAction: null })).toEqual({ refused: 'no appeal from this wallet', slot: null });
     });
 
+    it("S1: the owner's reversal of an appeal whose check holds an evaluation id is still checked, and its verdict is kept", async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1), submitStarted: false });
+      expect(await markAppealSubmitting(db, key(1), plus(2))).toBe(true);
+      expect(await noteAppealEval(db, key(1), 'eval_1', plus(3))).toBe(true);
+      expect(await releaseAppeal(db, key(1), plus(4), 6, 0)).toBe('queued');
+      const reversal = { campaignId: CAMPAIGN, wallet: wallet(1), outcome: 'reversed' as const, newAction: 'full' as const, ownerNote: null };
+      expect(await settleAppeal(db, reversal, plus(5))).toEqual({ slot: 1 });
+      // The worker gets what was appealed, as before: the appealed action and rule, the stored reason and record.
+      expect(await takeAppeal(db, plus(6), 300, 6)).toMatchObject({
+        wallet: wallet(1),
+        reppoEvalId: 'eval_1',
+        submitStarted: true,
+        appealedAction: 'hold',
+        appealedRule: 'A9',
+        reason: 'Decided hold on the funder trail.',
+        record: RECORD,
+      });
+      expect(await recordAppealCheck(db, key(1), { evalId: 'eval_1', route: 'block', note: null, creditsCharged: 4 }, plus(7))).toBe(true);
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({
+        checkStatus: 'checked',
+        reppoEvalId: 'eval_1',
+        reppoRoute: 'block',
+        checkNote: null,
+        outcome: 'reversed',
+        newAction: 'full',
+      });
+    });
+
+    it("S1: an appeal the owner reversed before any submit is still handed out for its check", async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      const reversal = { campaignId: CAMPAIGN, wallet: wallet(1), outcome: 'reversed' as const, newAction: 'partial' as const, ownerNote: null };
+      expect(await settleAppeal(db, reversal, plus(1))).toEqual({ slot: 1 });
+      expect(await takeAppeal(db, plus(2), 300, 6)).toMatchObject({
+        wallet: wallet(1),
+        reppoEvalId: null,
+        submitStarted: false,
+        appealedAction: 'hold',
+        appealedRule: 'A9',
+        record: RECORD,
+      });
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'checking', checkNote: null });
+    });
+
+    it('S1: an open appeal with no evaluation id whose ask was changed by a direct row update still ends with the old cause', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2, 3]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      await db.query("UPDATE asks SET action = 'exclude' WHERE campaign_id = $1 AND wallet = $2", [CAMPAIGN, wallet(1)]);
+      await db.query("UPDATE asks SET rule = 'A4' WHERE campaign_id = $1 AND wallet = $2", [CAMPAIGN, wallet(2)]);
+      expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(3) });
+      expect((await ownerAppeals(db, CAMPAIGN)).map((row) => [row.wallet, row.checkStatus, row.checkNote])).toEqual([
+        [wallet(1), 'unchecked', APPEAL_DECISION_CHANGED],
+        [wallet(2), 'unchecked', APPEAL_DECISION_CHANGED],
+        [wallet(3), 'checking', null],
+      ]);
+      expect(APPEAL_DECISION_CHANGED).toBe('the decision changed after the appeal');
+    });
+
+    it('S2: sameDecision compares action and rule, and both takeAppeal and the settlement refuse a rule-only change by it', async () => {
+      const pairs: [{ action: string; rule: string }, { action: string; rule: string }, boolean][] = [
+        [{ action: 'hold', rule: 'A9' }, { action: 'hold', rule: 'A9' }, true],
+        [{ action: 'exclude', rule: 'A3' }, { action: 'exclude', rule: 'A3' }, true],
+        [{ action: 'hold', rule: 'A9' }, { action: 'hold', rule: 'A4' }, false],
+        [{ action: 'hold', rule: 'A9' }, { action: 'full', rule: 'A9' }, false],
+        [{ action: 'partial', rule: 'A5' }, { action: 'exclude', rule: 'A3' }, false],
+        [{ action: 'hold', rule: 'A1' }, { action: 'hold', rule: 'a1' }, false],
+        [{ action: 'hold', rule: 'A1' }, { action: 'Hold', rule: 'A1' }, false],
+      ];
+      for (const [appealed, ask, same] of pairs) expect({ appealed, ask, same: sameDecision(appealed, ask) }).toEqual({ appealed, ask, same });
+      await createCampaign(db, terms());
+      for (const n of [1, 2]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      for (const n of [1, 2]) await db.query("UPDATE asks SET rule = 'A4' WHERE campaign_id = $1 AND wallet = $2", [CAMPAIGN, wallet(n)]);
+      const reversal = { campaignId: CAMPAIGN, wallet: wallet(1), outcome: 'reversed' as const, newAction: 'full' as const };
+      expect(await settleRefusal(db, reversal)).toEqual({ refused: 'the ask changed after the appeal was filed', slot: null });
+      expect(await settleAppeal(db, { ...reversal, ownerNote: null }, plus(3))).toEqual({ refused: 'the ask changed after the appeal was filed' });
+      expect(await askRow(1)).toMatchObject({ action: 'hold', rule: 'A4', slot: null, reversed_by_appeal: false });
+      expect(await takeAppeal(db, plus(4), 300, 6)).toBeNull();
+      expect((await ownerAppeals(db, CAMPAIGN)).map((row) => row.checkNote)).toEqual([APPEAL_DECISION_CHANGED, APPEAL_DECISION_CHANGED]);
+    });
+
+    it("S3: the outside judge's note and decision and a check's cause are one line, refused like a note that is not plain text", async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      const check = { evalId: 'eval_1', route: 'review' as const, note: null, creditsCharged: 4 };
+      await expect(recordAppealCheck(db, key(1), { ...check, note: '<b>fine</b>' }, plus(2))).rejects.toThrow(StoreError);
+      for (const broken of ['one\u2028two', 'one\u2029two', 'one\ntwo', 'one\u0085two']) {
+        await expect(recordAppealCheck(db, key(1), { ...check, note: broken }, plus(2))).rejects.toThrow(StoreError);
+        await expect(recordAppealCheck(db, key(1), { ...check, decision: broken }, plus(2))).rejects.toThrow(StoreError);
+        await expect(markAppealUnchecked(db, key(1), plus(2), broken)).rejects.toThrow(StoreError);
+      }
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'checking', reppoNote: null, reppoDecision: null, checkNote: null });
+      expect(await recordAppealCheck(db, key(1), { ...check, note: 'One line from the judges.', decision: 'accept' }, plus(3))).toBe(true);
+    });
+
+    it('S4: a paid check is followed past its attempts for a day from its submit, then ends unchecked with the exact cause', async () => {
+      expect([APPEAL_LOOKUP_MAX_SECONDS, APPEAL_LOOKUP_EXPIRED]).toEqual([86_400, 'the outside check did not finish in a day']);
+      const day = APPEAL_LOOKUP_MAX_SECONDS;
+      await createCampaign(db, terms());
+      for (const n of [1, 2]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      expect(await markAppealSubmitting(db, key(1), plus(2))).toBe(true);
+      expect(await noteAppealEval(db, key(1), 'eval_1', plus(3))).toBe(true);
+      expect(await releaseAppeal(db, key(1), plus(3), 6, 0)).toBe('queued');
+      await db.query('UPDATE appeals SET attempts = 7 WHERE wallet = $1', [wallet(1)]);
+      // Past maxAttempts of 6 and inside the day: still taken, and a release queues it again rather than ending it.
+      expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(1), attempts: 8, reppoEvalId: 'eval_1' });
+      expect(await releaseAppeal(db, key(1), plus(11), 6, 0)).toBe('queued');
+      // Exactly a day after the submit mark it is still followed; a second later takeAppeal ends it.
+      expect(await takeAppeal(db, plus(2 + day), 300, 6)).toMatchObject({ wallet: wallet(1), attempts: 9 });
+      expect(await releaseAppeal(db, key(1), plus(2 + day), 6, 0)).toBe('queued');
+      expect(await takeAppeal(db, plus(3 + day), 300, 6)).toBeNull();
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'unchecked', checkNote: APPEAL_LOOKUP_EXPIRED, attempts: 9, checkedAt: plus(3 + day) });
+      // A release a day after the submit ends it the same way.
+      expect(await addAppeal(db, appeal(2), plus(4 + day))).toBe('queued');
+      expect(await takeAppeal(db, plus(5 + day), 300, 6)).toMatchObject({ wallet: wallet(2) });
+      expect(await markAppealSubmitting(db, key(2), plus(5 + day))).toBe(true);
+      expect(await noteAppealEval(db, key(2), 'eval_2', plus(6 + day))).toBe(true);
+      expect(await releaseAppeal(db, key(2), plus(6 + 2 * day), 6, 0)).toBe('unchecked');
+      expect((await ownerAppeals(db, CAMPAIGN))[1]).toMatchObject({ checkStatus: 'unchecked', checkNote: APPEAL_LOOKUP_EXPIRED });
+    });
+
+    it("S5: appealStanding answers each of its five values, equal to addAppeal's own refusal on the same rows, and writes nothing", async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold')).toEqual({ slot: null });
+      expect(await decided(2, 'full')).toEqual({ slot: 1 });
+      await failed(4);
+      expect(await decided(5, 'hold')).toEqual({ slot: null });
+      expect(await addAsk(db, { campaignId: CAMPAIGN, wallet: wallet(3), signedAt: 1_800_000_000, signature: SIGNATURE }, NOW)).toBe('queued');
+      expect(await addAppeal(db, appeal(5), NOW)).toBe('queued');
+      const snapshot = async () => JSON.stringify([await db.query('SELECT * FROM appeals ORDER BY wallet'), await db.query('SELECT * FROM day_counts ORDER BY name')]);
+      const before = await snapshot();
+      const standings: [number, string, string][] = [
+        [1, CAMPAIGN, 'open'],
+        [4, CAMPAIGN, 'open'],
+        [5, CAMPAIGN, 'exists'],
+        [9, CAMPAIGN, 'unknown'],
+        [1, 'missing', 'unknown'],
+        [1, 'not a campaign!', 'unknown'],
+        [3, CAMPAIGN, 'undecided'],
+        [2, CAMPAIGN, 'approved'],
+      ];
+      for (const [n, campaignId, standing] of standings) expect({ n, campaignId, standing: await appealStanding(db, campaignId, wallet(n)) }).toEqual({ n, campaignId, standing });
+      expect(await appealStanding(db, CAMPAIGN, wallet(1).toLowerCase())).toBe('open');
+      await expect(appealStanding(db, CAMPAIGN, 'not an address')).rejects.toThrow();
+      expect(await snapshot()).toBe(before);
+      // Every refusal is addAppeal's own answer on the same rows, and an open wallet is one addAppeal queues.
+      for (const [n, campaignId, standing] of standings) {
+        const filed = await addAppeal(db, appeal(n, { campaignId }), NOW);
+        expect({ n, campaignId, filed }).toEqual({ n, campaignId, filed: standing === 'open' ? 'queued' : standing });
+      }
+    });
+
     it('C11, C44, C27: a reversal approves the ask, takes the next slot while one is left, and slotHolders lists it once', async () => {
       await createCampaign(db, terms({ maxSlots: 2 }));
       expect(await decided(1, 'full')).toEqual({ slot: 1 });
@@ -743,6 +909,7 @@ describe('C40 public query scan', () => {
     };
     const publicReads: [keyof typeof sources, string][] = [
       ['appeals.ts', 'getAppeal'],
+      ['appeals.ts', 'appealStanding'],
       ['campaigns.ts', 'getAsk'],
       ['campaigns.ts', 'board'],
       ['campaigns.ts', 'counts'],

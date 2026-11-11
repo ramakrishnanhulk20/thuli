@@ -109,8 +109,26 @@ async function call(
   }
 }
 
+/**
+ * Statuses with which Reppo refuses a submit before any evaluation exists, so nothing was charged. Its own error table
+ * says a 409 means another evaluation is running and none was created for this one; 400, 401, 403, 404 and 429 are
+ * refusals before any work. 402 has its own error, ReppoOutOfCredit. Both submit paths read this one list, so one
+ * status has one meaning in this file. Any other status, 408 and every 5xx among them, may have created a paid
+ * evaluation (fail closed).
+ */
+export const NO_EVALUATION_CREATED: readonly number[] = [400, 401, 403, 404, 409, 429];
+// Reppo is running another evaluation: the one status the retrying submit waits out.
+const BUSY_STATUS = 409;
+
+/** Reppo refused a submit with a status in NO_EVALUATION_CREATED: no evaluation was created, so nothing was charged. */
+export class ReppoRefused extends ReppoError {}
+
+/** A submit that stopped before any request left: its input was refused, or its signal was already aborted. */
+export class ReppoNotSent extends ReppoError {}
+
 function refuse(reply: JsonReply): never {
   if (reply.status === 402) throw new ReppoOutOfCredit('Reppo answered 402, so the credit balance has run out');
+  if (NO_EVALUATION_CREATED.includes(reply.status)) throw new ReppoRefused(`Reppo answered with status ${reply.status}`, reply.status);
   throw new ReppoError(`Reppo answered with status ${reply.status}`, reply.status);
 }
 
@@ -129,11 +147,13 @@ async function submit(input: string, conn: Required<ReppoOptions>, headers: Reco
       if (!submitted.success) throw new ReppoError('Reppo gave an evaluation id that is not safe to use', null);
       return submitted.data.id;
     }
-    if (reply.status !== 409) refuse(reply);
-    // An account runs one evaluation at a time, so after a submit we never heard back from, the evaluation running is
-    // most likely that submit. Sending again would start a second paid evaluation once it ends (C23).
-    if (mayHaveLanded) throw new ReppoError(SUBMIT_MAY_HAVE_LANDED, 409);
-    if (busy === MAX_BUSY_RESUBMITS) throw new ReppoError('Reppo still had another evaluation running', 409);
+    if (reply.status !== BUSY_STATUS) refuse(reply);
+    // A busy answer is one of NO_EVALUATION_CREATED: this try created nothing, so it is waited out and sent again. But an
+    // account runs one evaluation at a time, so after a submit we never heard back from, the evaluation running is most
+    // likely that submit: it may have been charged, and sending again would start a second paid evaluation once it ends.
+    // So that error is a plain ReppoError, never ReppoRefused (C23).
+    if (mayHaveLanded) throw new ReppoError(SUBMIT_MAY_HAVE_LANDED, BUSY_STATUS);
+    if (busy === MAX_BUSY_RESUBMITS) throw new ReppoRefused('Reppo still had another evaluation running', BUSY_STATUS);
     await conn.sleep(BUSY_WAIT_MS);
   }
 }
@@ -197,7 +217,7 @@ function withDefaults(opts: ReppoOptions): Required<ReppoOptions> {
 
 function checkInput(input: string): void {
   if (input === '' || Buffer.byteLength(input) > MAX_INPUT_BYTES) {
-    throw new ReppoError(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
+    throw new ReppoNotSent(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
   }
 }
 
@@ -240,9 +260,6 @@ export async function submitEvaluation(input: string, opts: ReppoOptions): Promi
   return submit(input, conn, headersFor(conn));
 }
 
-// Statuses with which Reppo refuses a submit before any evaluation exists, so nothing can have been charged.
-const REFUSED_BEFORE_CHARGE: readonly number[] = [400, 401, 404];
-
 /** The words of every single-try submit whose outcome is unknown: it may have reached Reppo and been charged. */
 export const SUBMIT_OUTCOME_UNKNOWN = 'the Reppo submit got no answer it could read, so it may have been charged';
 
@@ -271,16 +288,20 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  * The POST ends by timeoutMs at the latest, and an aborted signal ends the wait at once or, before the call, sends
  * nothing (C41).
  *
+ * A 409 here always means another evaluation, never this text's own earlier submit: the caller marks a submit before
+ * it, keeps the mark whenever a submit might have landed, and posts nothing while the mark stands. So a 409 is read as
+ * NO_EVALUATION_CREATED says, the same as in the retrying submit.
+ *
  * @returns the evaluation id Reppo answered with.
- * @throws ReppoOutOfCredit on a 402, and ReppoError with the status on a 400, 401 or 404: Reppo refused before any
- *   evaluation existed (submitCannotHaveCharged). Any other outcome, no answer, the deadline, the signal, a 5xx, a 409,
- *   another status or a reply out of shape, throws ReppoError with SUBMIT_OUTCOME_UNKNOWN or the status: the submit may
- *   have been charged. ReppoError as evaluate throws it for an input that is empty or too large, before any call.
+ * @throws ReppoOutOfCredit on a 402; ReppoRefused on a status in NO_EVALUATION_CREATED; ReppoNotSent for an input
+ *   that is empty or too large, or a signal aborted before the call, when nothing left: none of these can have charged
+ *   (submitCannotHaveCharged). Any other outcome, no answer, the deadline, the signal mid-call, 408, a 5xx, another
+ *   status or a reply out of shape, throws a plain ReppoError: the submit may have been charged (fail closed).
  */
 export async function submitEvaluationOnce(input: string, opts: ReppoConnection & { timeoutMs: number; signal?: AbortSignal }): Promise<string> {
   checkInput(input);
   if (!(opts.timeoutMs > 0)) throw new RangeError('timeoutMs must be above 0');
-  if (opts.signal?.aborted === true) throw new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
+  if (opts.signal?.aborted === true) throw new ReppoNotSent('the Reppo submit was not sent, because the step was told to stop first', null);
   const init = { method: 'POST', headers: headersFor(opts), body: JSON.stringify({ taskType: 'response', input }) };
   let reply: JsonReply;
   try {
@@ -295,10 +316,13 @@ export async function submitEvaluationOnce(input: string, opts: ReppoConnection 
   return submitted.data.id;
 }
 
-/** True only for a submitEvaluationOnce error that proves Reppo refused before any evaluation existed. Pure. */
+/**
+ * True only for an error that proves no evaluation was created, so nothing was charged: out of credit, a refusal with
+ * a status in NO_EVALUATION_CREATED, or a submit that never left. Read by the error's class, never by a status alone,
+ * so the retrying submit's 409 after a try that may have landed stays "may have been charged". Pure.
+ */
 export function submitCannotHaveCharged(error: unknown): boolean {
-  if (error instanceof ReppoOutOfCredit) return true;
-  return error instanceof ReppoError && error.status !== null && REFUSED_BEFORE_CHARGE.includes(error.status);
+  return error instanceof ReppoOutOfCredit || error instanceof ReppoRefused || error instanceof ReppoNotSent;
 }
 
 /**

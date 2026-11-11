@@ -4,6 +4,7 @@ import { setTimeout as wait } from 'node:timers/promises';
 import { z } from 'zod';
 import {
   CAMPAIGN_ID,
+  isOneLine,
   isPlainText,
   OutcomeSchema,
   parseAddress,
@@ -41,6 +42,7 @@ import {
   lookUpEvaluation,
   ReppoError,
   ReppoOutOfCredit,
+  ReppoRefused,
   submitCannotHaveCharged,
   submitEvaluationOnce,
   type ReppoConnection,
@@ -63,6 +65,10 @@ export const APPEAL_MAX_ATTEMPTS = 6;
 export const APPEAL_REPPO_WAIT_MS = 150_000;
 /** The deadline of the one POST that submits an appeal; with no retry, it is the whole submit. */
 export const APPEAL_SUBMIT_DEADLINE_MS = 30_000;
+/** How long an appeal waits after Reppo answered its submit busy (409 or 429), having created nothing. */
+export const APPEAL_BUSY_WAIT_SECONDS = 180;
+/** How long a paid check waits between look-ups while Reppo still has its evaluation queued or running. */
+export const APPEAL_LOOKUP_WAIT_SECONDS = 300;
 const APPEAL_POLL_MS = 5_000;
 
 /** Why the appeal step does nothing, with no Reppo key set. */
@@ -78,7 +84,13 @@ export const APPEAL_CAUSES = Object.freeze({
   failed: 'the outside check could not finish',
   lost: 'the appeal was no longer being checked by this worker',
   maybePaid: 'the outside check may already have been paid for',
+  busy: 'the outside check was busy and created nothing',
+  keptRefusing: 'the outside check kept refusing the submit',
+  evaluationFailed: 'the outside check failed',
 });
+
+// The refusals that mean Reppo is busy for now, not that this appeal is wrong: both are in NO_EVALUATION_CREATED.
+const BUSY_REFUSALS: readonly number[] = [409, 429];
 
 const APPEAL_LABEL = 'appeal';
 const ROUTES: readonly ReppoRoute[] = ['ship', 'review', 'block'];
@@ -158,14 +170,15 @@ export function routeFrom(value: unknown): ReppoRoute | null {
 
 /**
  * Reppo's note as the store may keep it: cut to MAX_REPPO_NOTE_CHARS, never through a character pair, and kept only when
- * it is still plain text by core's rule, so a link or markup is never stored or shown (C13, C34). Pure.
+ * it is still plain text and one line by core's rules, so a link, markup or a line break is never stored or shown, the
+ * same rules the store holds it to (C13, C34, C58). Pure.
  */
 export function noteFrom(reason: string | null): string | null {
   if (reason === null) return null;
   let cut = reason.slice(0, MAX_REPPO_NOTE_CHARS);
   if (!cut.isWellFormed()) cut = cut.slice(0, -1);
   cut = cut.trim();
-  return cut !== '' && isPlainText(cut) ? cut : null;
+  return cut !== '' && isPlainText(cut) && isOneLine(cut) ? cut : null;
 }
 
 // Only Thuli's own and the client's errors carry fixed words; anything else is named by a fixed cause (C40).
@@ -188,9 +201,11 @@ function causeOf(error: unknown): string {
  * - COMPLETED: recordAppealCheck with the route, noteFrom of Reppo's reason, the id, the credits charged and the
  *   verdict's score, decision and confidence, each null when the store would refuse it. A paid check always ends checked,
  *   with route null when Reppo named none Thuli knows or its verdict was out of shape (C23).
- * - UNFINISHED, FAILED or any failed call: given back with retryDelaySeconds for its attempt, the id staying on it. Out
- *   of credit: given back with LONGEST_RETRY_SECONDS and its try handed back, said once (C24). The store ends an appeal
- *   that runs out of tries unchecked (C41).
+ * - A paid check is followed to its result (C56): UNFINISHED is looked up again after APPEAL_LOOKUP_WAIT_SECONDS with
+ *   its try handed back (followLater), and the store, not a count of tries, ends it a day after its submit; FAILED ends
+ *   it at once with "the outside check failed" (endFailed); a look-up that fails is given back with retryDelaySeconds.
+ * - Out of credit: given back with LONGEST_RETRY_SECONDS and its try handed back, said once (C24). A check with no
+ *   evaluation id that runs out of tries ends unchecked (C41).
  * Log lines hold ids, routes, counts and fixed words; never the appeal's text, which this step never receives, Reppo's
  * note or a key (C40). The signal is checked before every store write and before the submit (C41).
  *
@@ -235,7 +250,8 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
     checkpoint(signal, 'waiting for the outside check');
     const result = await deps.reppo.lookUp(evalId, signal);
     if (result.status === 'COMPLETED') return await recordCheck(deps, taken, evalId, result, signal);
-    return await giveBack(deps, taken, result.status === 'UNFINISHED' ? APPEAL_CAUSES.unfinished : APPEAL_CAUSES.failed, signal);
+    if (result.status === 'FAILED') return await endFailed(deps, taken, evalId, signal);
+    return await followLater(deps, taken, evalId, signal);
   } catch (error) {
     if (error instanceof StepStopped) throw error;
     if (error instanceof ReppoOutOfCredit) return outOfCredit(deps, taken, signal);
@@ -244,13 +260,15 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
 }
 
 /**
- * The one POST of a marked appeal, and what it leaves in the store for each way it can end (C23):
+ * The one POST of a marked appeal, and what it leaves in the store for each way it can end (C23, C56):
  * - an evaluation id: kept at once with noteAppealEval, before any wait, with no stop allowed between the two;
- * - a refusal that cannot have charged (402, 400, 401, 404, by submitCannotHaveCharged): the mark is taken back with
- *   clearAppealSubmitting, so a later run may send; a 402 then waits the longest wait with its try handed back, the
- *   others the usual wait;
- * - anything else, no reply, the deadline, the signal, a 5xx, a 409 or a reply out of shape: the submit may have been
- *   charged, so the mark stays and the appeal is given back; its next take ends it unchecked and nothing is sent again.
+ * - an outcome that cannot have charged (submitCannotHaveCharged: a 402, a status in NO_EVALUATION_CREATED, or a submit
+ *   that never left): the mark is taken back with clearAppealSubmitting, with no stop before it either, so an appeal
+ *   that sent nothing is never ended as paid for. Then a 402 waits the longest wait with its try handed back; a busy 409
+ *   or 429 waits APPEAL_BUSY_WAIT_SECONDS with its try counted (busyBack); the rest wait the usual wait;
+ * - anything else, no reply, the deadline, the signal mid-call, 408, a 5xx or a reply out of shape: the submit may have
+ *   been charged, so the mark stays and the appeal is given back; its next take ends it unchecked and nothing is sent
+ *   again (fail closed).
  * When noteAppealEval fails after an id came back, the mark stays too and the appeal ends the same way: one check is paid
  * for and its verdict lost, the lesser harm than paying twice. That line names the id, so the operator can look it up.
  */
@@ -269,9 +287,13 @@ async function submitOnce(
     if (!submitCannotHaveCharged(error)) {
       return { kind: 'ended', outcome: await giveBack(deps, taken, `${causeOf(error)}, so it is never sent again`, signal) };
     }
-    checkpoint(signal, 'taking back a submit mark');
+    // No checkpoint before this write: it records that this send charged nothing, and left undone it would end an
+    // appeal that paid nothing as "may already have been paid for".
     await clearAppealSubmitting(deps.db, where, deps.now());
-    const outcome = error instanceof ReppoOutOfCredit ? await outOfCredit(deps, taken, signal) : await giveBack(deps, taken, causeOf(error), signal);
+    let outcome: AppealOutcome;
+    if (error instanceof ReppoOutOfCredit) outcome = await outOfCredit(deps, taken, signal);
+    else if (error instanceof ReppoRefused && error.status !== null && BUSY_REFUSALS.includes(error.status)) outcome = await busyBack(deps, taken, signal);
+    else outcome = await giveBack(deps, taken, causeOf(error), signal);
     return { kind: 'ended', outcome };
   }
   // No checkpoint between the submit and this record: the evaluation may be paid for already, so its id is kept, abort
@@ -351,6 +373,44 @@ async function giveBack(deps: AppealDeps, taken: TakenAppeal, cause: string, sig
   return { kind: 'released', ...where, cause, status };
 }
 
+// Reppo was busy and created nothing. The try counts, so an outside check that keeps refusing ends after
+// APPEAL_MAX_ATTEMPTS tries with a cause that says so, never as paid for, because nothing was.
+async function busyBack(deps: AppealDeps, taken: TakenAppeal, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+  checkpoint(signal, 'giving an appeal back');
+  const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
+  const label = `appeal ${taken.campaignId} ${taken.wallet}`;
+  if (taken.attempts >= APPEAL_MAX_ATTEMPTS) {
+    await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.keptRefusing);
+    deps.log(`${label}: unchecked, ${APPEAL_CAUSES.keptRefusing}`);
+    return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.keptRefusing };
+  }
+  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, APPEAL_BUSY_WAIT_SECONDS);
+  deps.log(`${label}: not checked, ${APPEAL_CAUSES.busy}; queued again, next try in ${APPEAL_BUSY_WAIT_SECONDS} s`);
+  return { kind: 'released', ...where, cause: APPEAL_CAUSES.busy, status };
+}
+
+// Paid for and still queued or running at Reppo: looked up again after APPEAL_LOOKUP_WAIT_SECONDS with the try handed
+// back, so no count of tries ends it; the store follows it for a day from its submit mark (C56).
+async function followLater(deps: AppealDeps, taken: TakenAppeal, evalId: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+  checkpoint(signal, 'giving an appeal back');
+  const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
+  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, APPEAL_LOOKUP_WAIT_SECONDS, { refundTry: true });
+  deps.log(
+    `appeal ${taken.campaignId} ${taken.wallet}: ${APPEAL_CAUSES.unfinished}, so evaluation ${evalId} is looked up again in ${APPEAL_LOOKUP_WAIT_SECONDS} s`,
+  );
+  return { kind: 'released', ...where, cause: APPEAL_CAUSES.unfinished, status };
+}
+
+// Reppo ended the evaluation FAILED: it charges nothing and no verdict will come, so the check ends now, with no
+// further look-up.
+async function endFailed(deps: AppealDeps, taken: TakenAppeal, evalId: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+  checkpoint(signal, 'ending an appeal check');
+  const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
+  await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.evaluationFailed);
+  deps.log(`appeal ${taken.campaignId} ${taken.wallet}: unchecked, ${APPEAL_CAUSES.evaluationFailed}, evaluation ${evalId}`);
+  return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.evaluationFailed };
+}
+
 // No credit is no fault of the appeal: its try is handed back and it waits the longest wait, so a long outage of credit
 // neither ends appeals nor spins (C24). Said once until a check is recorded again.
 async function outOfCredit(deps: AppealDeps, taken: TakenAppeal, signal: AbortSignal | undefined): Promise<AppealOutcome> {
@@ -361,10 +421,22 @@ async function outOfCredit(deps: AppealDeps, taken: TakenAppeal, signal: AbortSi
   return { kind: 'released', ...where, cause: APPEAL_CAUSES.outOfCredit, status };
 }
 
-// Text that came from outside Thuli's code, the appellant's, the owner's or Reppo's, is printed as a JSON string after a
-// fixed label: quotes, backslashes and any break become escapes, so it stays on its one line and can never pass for a
-// line of this command's own (C34, C40). Ids, routes, numbers and fixed words are Thuli's own and print as they are.
-const quoted = (text: string) => JSON.stringify(text);
+// Every character that can still break, end or turn a line once JSON.stringify has escaped quotes, backslashes and the
+// C0 controls: the rest of the controls (DEL and the C1 range, NEL among them), the line and paragraph separators, and
+// every format character, such as a zero-width space or a direction override.
+const STILL_RAW = /[\p{Cc}\p{Zl}\p{Zp}\p{Cf}]/gu;
+const escaped = (found: string) =>
+  Array.from({ length: found.length }, (_, unit) => `\\u${found.charCodeAt(unit).toString(16).padStart(4, '0')}`).join('');
+
+/**
+ * Text that came from outside Thuli's code, the appellant's, the owner's, Reppo's or a stored cause, as one line for the
+ * operator's screen: a JSON string after a fixed label, with every character in STILL_RAW written as an escape too, so
+ * it can never start a new line, move the cursor or pass for a line of the command's own (C34, C40, C58). The one
+ * quoting function every printed outside text goes through. Ids, routes, numbers and fixed words print as they are. Pure.
+ */
+export function quoted(text: string): string {
+  return JSON.stringify(text).replace(STILL_RAW, escaped);
+}
 
 function appealLines(appeal: OwnerAppeal, ask: PublicAsk | null, place: number, total: number): string[] {
   const check = [
@@ -382,6 +454,9 @@ function appealLines(appeal: OwnerAppeal, ask: PublicAsk | null, place: number, 
     `  ask: ${ask?.action ?? 'unknown'} under ${ask?.rule ?? 'unknown'} (appealed: ${appeal.appealedAction} under ${appeal.appealedRule})`,
     `  text: ${quoted(appeal.text)}`,
     `  outside check: ${check}`,
+    ...(appeal.checkNote === null ? [] : [`  check note: ${quoted(appeal.checkNote)}`]),
+    // A mark with no evaluation id means a submit may have been charged with nothing to show for it.
+    `  submit mark: ${appeal.submitStartedAt === null ? 'none' : `set at ${appeal.submitStartedAt.toISOString()}`}`,
     `  note: ${appeal.reppoNote === null ? 'none' : quoted(appeal.reppoNote)}`,
     `  outcome: ${outcome}`,
     ...(appeal.ownerNote === null ? [] : [`  owner note: ${quoted(appeal.ownerNote)}`]),

@@ -7,6 +7,8 @@ import {
   ReppoError,
   ReppoOutOfCredit,
   reppoConnectionFromEnv,
+  NO_EVALUATION_CREATED,
+  ReppoNotSent,
   SUBMIT_MAY_HAVE_LANDED,
   submitCannotHaveCharged,
   submitEvaluationOnce,
@@ -157,6 +159,8 @@ describe('evaluate', () => {
     const error = (await evaluate('the text', opts).catch((caught: unknown) => caught)) as ReppoError;
     expect(error).toBeInstanceOf(ReppoError);
     expect(error).toMatchObject({ status: 409, message: SUBMIT_MAY_HAVE_LANDED });
+    // The same 409 status, but after a try that may have landed: one reading of the status, so never "cannot have charged".
+    expect(submitCannotHaveCharged(error)).toBe(false);
     expect(error.message).toContain('a charge may have been made');
     expect(error.message).not.toContain(ID);
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -221,18 +225,25 @@ describe('submitEvaluationOnce', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
 
+    // Reppo's own error table: 409 means another evaluation is running and none was created for this one, and 400, 401,
+    // 403, 404 and 429 refuse before any work. Everything else may have created a paid evaluation.
     const cases: [Response | Error, boolean][] = [
       [json({}, 402), true],
       [json({}, 400), true],
       [json({}, 401), true],
+      [json({}, 403), true],
       [json({}, 404), true],
+      [json({}, 409), true],
+      [json({}, 429), true],
+      [json({}, 408), false],
+      [json({}, 418), false],
       [json({}, 500), false],
       [json({}, 503), false],
-      [json({}, 409), false],
       [new Error('socket hang up'), false],
       [json({ id: 'not/safe' }, 201), false],
       [new Response('not json', { status: 201 }), false],
     ];
+    expect([...NO_EVALUATION_CREATED].sort((a, b) => a - b)).toEqual([400, 401, 403, 404, 409, 429]);
     for (const [reply, cannotHaveCharged] of cases) {
       fetchMock = replies(reply);
       const error = await submitEvaluationOnce('the text', once).catch((caught: unknown) => caught);
@@ -243,13 +254,18 @@ describe('submitEvaluationOnce', () => {
     expect(submitCannotHaveCharged(new Error('a store failure'))).toBe(false);
   });
 
-  it('sends nothing once its signal is aborted, and stops waiting on an abort mid-call with the outcome left unknown', async () => {
+  it('sends nothing for an input it refuses or once its signal is aborted, and says so; an abort mid-call leaves the outcome unknown', async () => {
+    const none = replies();
+    const empty = await submitEvaluationOnce('', once).catch((caught: unknown) => caught);
+    const tooLong = await submitEvaluationOnce('x'.repeat(50_001), once).catch((caught: unknown) => caught);
     const stopped = new AbortController();
     stopped.abort();
-    const none = replies();
     const before = await submitEvaluationOnce('the text', { ...once, signal: stopped.signal }).catch((caught: unknown) => caught);
     expect(none).not.toHaveBeenCalled();
-    expect(submitCannotHaveCharged(before)).toBe(false);
+    for (const notSent of [empty, tooLong, before]) {
+      expect(notSent).toBeInstanceOf(ReppoNotSent);
+      expect(submitCannotHaveCharged(notSent)).toBe(true);
+    }
 
     const hanging = vi.fn(async (_url: string, _init?: RequestInit) => new Promise<Response>(() => undefined));
     vi.stubGlobal('fetch', hanging);

@@ -36,8 +36,10 @@ import {
   type TakenAppeal,
 } from '@thuli/store';
 import {
+  APPEAL_BUSY_WAIT_SECONDS,
   APPEAL_CAUSES,
   APPEAL_LEASE_SECONDS,
+  APPEAL_LOOKUP_WAIT_SECONDS,
   APPEAL_MAX_ATTEMPTS,
   appealListLines,
   appealNext,
@@ -45,6 +47,7 @@ import {
   noteFrom,
   outsideInput,
   parseSettleArgs,
+  quoted,
   routeFrom,
   settleAppealCommand,
   AppealExportLine,
@@ -57,7 +60,7 @@ import { askFactsOf } from '../src/campaign/facts.ts';
 import { runOnce, type WorkerDeps } from '../src/campaign/loop.ts';
 import { LONGEST_RETRY_SECONDS, retryDelaySeconds } from '../src/campaign/screen.ts';
 import { emptyChainMemory, type CampaignVault } from '../src/campaign/vault.ts';
-import { ReppoError, ReppoOutOfCredit, type ReppoEval } from '../src/reppo/client.ts';
+import { ReppoError, ReppoNotSent, ReppoOutOfCredit, ReppoRefused, SUBMIT_OUTCOME_UNKNOWN, type ReppoEval } from '../src/reppo/client.ts';
 import { identifyingPart } from '../src/reppo/feedback.ts';
 
 // Not starting with "appeal", so the loop's own lines for the campaign are never taken for the appeal step's.
@@ -191,11 +194,12 @@ class StandInReppo implements AppealReppo {
   onLookUp: () => void = () => undefined;
 
   async submit(input: string, signal?: AbortSignal): Promise<string> {
-    // As the real single-try submit: nothing is sent once the signal is aborted, and the outcome is then unknown.
-    if (signal?.aborted === true) throw new ReppoError('the Reppo submit was cut short, so it may have been charged', null);
+    // As the real single-try submit: nothing is sent once the signal is aborted, or for an input refused before the call.
+    if (signal?.aborted === true) throw new ReppoNotSent('the Reppo submit was not sent, because the step was told to stop first', null);
+    const failure = this.submitAnswers.shift() ?? this.submitFails;
+    if (failure instanceof ReppoNotSent) throw failure;
     this.posts += 1;
     if (this.answerGate !== null) await this.answerGate;
-    const failure = this.submitAnswers.shift() ?? this.submitFails;
     if (failure !== null) throw failure;
     this.submitted.push(input);
     this.onSubmit();
@@ -310,30 +314,40 @@ describe('the outside check of an appeal', () => {
     expect(reppo.lookedUp).toEqual(['eval_1', 'eval_1']);
   });
 
-  it('gives an unfinished evaluation back with the usual wait and records it from the next try\'s look-up', async () => {
+  it('follows a paid check through seven unfinished look-ups, each 300 s apart with its try handed back, then records it (C56)', async () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
-    reppo.answers.push({ status: 'UNFINISHED', creditsCharged: 0, verdict: null }, completed('review'));
+    for (let look = 0; look < 7; look += 1) reppo.answers.push({ status: 'UNFINISHED', creditsCharged: 0, verdict: null });
+    reppo.answers.push(completed('review'));
     const deps = appealDeps(reppo);
-    expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.unfinished, status: 'queued' });
-    expect(await appealNext(deps)).toEqual({ kind: 'idle' });
-    later(retryDelaySeconds(1));
-    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', route: 'review' });
-    expect(reppo.submitted).toHaveLength(1);
+    for (let look = 0; look < 7; look += 1) {
+      expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.unfinished, status: 'queued' });
+      expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', attempts: 0, reppoEvalId: 'eval_1' });
+      expect(new Date(String(await retryAt(wallet))).getTime()).toBe(clock.getTime() + APPEAL_LOOKUP_WAIT_SECONDS * 1000);
+      expect(await appealNext(deps)).toEqual({ kind: 'idle' });
+      later(APPEAL_LOOKUP_WAIT_SECONDS);
+    }
+    expect(APPEAL_LOOKUP_WAIT_SECONDS).toBe(300);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', route: 'review', evalId: 'eval_1' });
+    expect(reppo.posts).toBe(1);
+    expect(reppo.lookedUp).toHaveLength(8);
   });
 
-  it('gives a failed evaluation back with the usual wait, keeping its id, and never submits the decision again (C23)', async () => {
+  it('ends a check whose evaluation FAILED at once, with the cause "the outside check failed", and looks it up no more', async () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
     reppo.answers.push({ status: 'FAILED', creditsCharged: 0, verdict: null }, completed('ship'));
     const deps = appealDeps(reppo);
-    expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.failed, status: 'queued' });
-    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', reppoEvalId: 'eval_1', reppoRoute: null });
-    later(retryDelaySeconds(1));
-    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', evalId: 'eval_1' });
-    expect(reppo.submitted).toHaveLength(1);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: 'the outside check failed' });
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: 'the outside check failed', reppoEvalId: 'eval_1' });
+    for (let run = 0; run < 3; run += 1) {
+      later(LONGEST_RETRY_SECONDS + 1);
+      expect(await appealNext(deps)).toEqual({ kind: 'idle' });
+    }
+    expect(reppo.lookedUp).toHaveLength(1);
+    expect(reppo.posts).toBe(1);
   });
 
   it('hands the try back when Reppo is out of credit, waits the longest wait, and says so once (C24)', async () => {
@@ -422,24 +436,36 @@ describe('the outside check of an appeal', () => {
     expect(kept.startsWith('Plain words.')).toBe(true);
   });
 
-  it(`ends an appeal unchecked after ${6} failed tries, each given back with the usual wait (C41)`, async () => {
-    const { wallet } = await decided();
-    await appealed(wallet);
-    const reppo = new StandInReppo();
-    // Look-ups fail, not the submit: an ambiguous submit ends an appeal at its next take, which the paying-once tests cover.
-    for (let n = 0; n < APPEAL_MAX_ATTEMPTS; n += 1) reppo.answers.push(new ReppoError('Reppo answered with status 500', 500));
-    const deps = appealDeps(reppo);
+  it(`ends a check with no evaluation id after ${6} refused tries, and never ends a paid one for its tries (C41, C56)`, async () => {
+    // No evaluation was ever created: six definite refusals, each a counted try, end it.
+    const refused = await decided();
+    await appealed(refused.wallet);
+    const refusing = new StandInReppo();
+    for (let n = 0; n < APPEAL_MAX_ATTEMPTS; n += 1) refusing.submitAnswers.push(new ReppoRefused('Reppo answered with status 400', 400));
+    const refusingDeps = appealDeps(refusing);
     const statuses: (string | null)[] = [];
     for (let attempt = 1; attempt <= APPEAL_MAX_ATTEMPTS; attempt += 1) {
-      const outcome = await appealNext(deps);
+      const outcome = await appealNext(refusingDeps);
       statuses.push(outcome.kind === 'released' ? outcome.status : outcome.kind);
       later(retryDelaySeconds(attempt));
     }
     expect(APPEAL_MAX_ATTEMPTS).toBe(6);
     expect(statuses).toEqual(['queued', 'queued', 'queued', 'queued', 'queued', 'unchecked']);
-    expect(await appealNext(deps)).toEqual({ kind: 'idle' });
-    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', attempts: 6 });
-    expect(reppo.posts).toBe(1);
+    expect(await appealRow(refused.wallet)).toMatchObject({ checkStatus: 'unchecked', attempts: 6, submitStartedAt: null });
+
+    // An evaluation was created and stored: failed look-ups past the try limit keep it followed, and it is recorded.
+    const paid = await decided();
+    await appealed(paid.wallet);
+    const following = new StandInReppo();
+    for (let n = 0; n < APPEAL_MAX_ATTEMPTS + 2; n += 1) following.answers.push(new ReppoError('Reppo answered with status 500', 500));
+    following.answers.push(completed('ship'));
+    const followingDeps = appealDeps(following);
+    for (let attempt = 1; attempt <= APPEAL_MAX_ATTEMPTS + 2; attempt += 1) {
+      expect(await appealNext(followingDeps)).toMatchObject({ kind: 'released', status: 'queued' });
+      later(retryDelaySeconds(attempt));
+    }
+    expect(await appealNext(followingDeps)).toMatchObject({ kind: 'checked', evalId: 'eval_1' });
+    expect(following.posts).toBe(1);
   });
 
   it('stops at its limit before any write, but always keeps an evaluation id it was given (C23, C41)', async () => {
@@ -537,7 +563,8 @@ describe('paying the outside check at most once (C23)', () => {
     expect(lines.filter((line) => line.includes(MAYBE_PAID))).toHaveLength(1);
   });
 
-  it('never pays twice for a cut after the mark and before the POST: the appeal ends unchecked', async () => {
+  it('leaves no mark and no paid-for cause when nothing was sent: a step stopped before its POST, or an input refused before it', async () => {
+    // Stopped right after the mark and before the POST: the client sends nothing and the mark is taken back.
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
@@ -548,12 +575,22 @@ describe('paying the outside check at most once (C23)', () => {
       return marked;
     });
     await expect(appealNext({ ...appealDeps(reppo), db: cutting }, stop.signal)).rejects.toThrow('ran past its time limit');
-    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checking', reppoEvalId: null });
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checking', reppoEvalId: null, submitStartedAt: null });
+    expect(reppo.posts).toBe(0);
     later(APPEAL_LEASE_SECONDS + 1);
     const deps = appealDeps(reppo);
-    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
-    await tenMoreRuns(deps);
-    expect(reppo.posts).toBeLessThanOrEqual(1);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked' });
+    expect(reppo.posts).toBe(1);
+
+    // An input the client refuses before the call: nothing left, so no mark stays.
+    const other = await decided();
+    await appealed(other.wallet);
+    const refusing = new StandInReppo();
+    refusing.submitAnswers.push(new ReppoNotSent('the input is empty or over the 50000 byte limit', null));
+    expect(await appealNext(appealDeps(refusing))).toMatchObject({ kind: 'released', status: 'queued' });
+    expect(await appealRow(other.wallet)).toMatchObject({ checkStatus: 'queued', submitStartedAt: null, checkNote: null });
+    expect(refusing.posts).toBe(0);
+    expect(lines.join('\n')).not.toContain(MAYBE_PAID);
   });
 
   it('pays once with two workers on one appeal after a lease ran out, whichever of them stalls', async () => {
@@ -604,7 +641,7 @@ describe('paying the outside check at most once (C23)', () => {
     await appealed(credit.wallet);
     await appealed(badRequest.wallet);
     const reppo = new StandInReppo();
-    reppo.submitAnswers.push(new ReppoOutOfCredit('Reppo answered 402, so the credit balance has run out'), new ReppoError('Reppo answered with status 400', 400));
+    reppo.submitAnswers.push(new ReppoOutOfCredit('Reppo answered 402, so the credit balance has run out'), new ReppoRefused('Reppo answered with status 400', 400));
     const deps = appealDeps(reppo);
     expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.outOfCredit, status: 'queued' });
     expect(await appealRow(credit.wallet)).toMatchObject({ checkStatus: 'queued', attempts: 0, submitStartedAt: null });
@@ -617,14 +654,15 @@ describe('paying the outside check at most once (C23)', () => {
     expect(reppo.submitted).toHaveLength(2);
   });
 
-  it('keeps the mark after a timeout, a 5xx or a 409, and never sends a second POST for any of them', async () => {
-    const wallets = [await decided(), await decided(), await decided()];
+  it('keeps the mark after no answer, a 408, a 500 or a reply out of shape, and never sends a second POST for any of them (fail closed)', async () => {
+    const wallets = [await decided(), await decided(), await decided(), await decided()];
     for (const { wallet } of wallets) await appealed(wallet);
     const reppo = new StandInReppo();
     reppo.submitAnswers.push(
-      new ReppoError('the Reppo submit got no answer it could read, so it may have been charged', null),
-      new ReppoError('Reppo answered with status 503', 503),
-      new ReppoError('Reppo answered with status 409', 409),
+      new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null),
+      new ReppoError('Reppo answered with status 408', 408),
+      new ReppoError('Reppo answered with status 500', 500),
+      new ReppoError('Reppo gave an evaluation id that is not safe to use, so it may have been charged', null),
     );
     const deps = appealDeps(reppo);
     for (const { wallet } of wallets) {
@@ -632,8 +670,41 @@ describe('paying the outside check at most once (C23)', () => {
       expect((await appealRow(wallet))?.submitStartedAt).not.toBeNull();
     }
     await tenMoreRuns(deps);
-    expect(reppo.posts).toBe(3);
+    expect(reppo.posts).toBe(4);
     for (const { wallet } of wallets) expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: MAYBE_PAID });
+  });
+
+  it.each([409, 429])('waits out a busy %s from the one POST: the mark cleared, 180 s, the try counted, and six end it as refused, never as paid for', async (status) => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    for (let n = 0; n < APPEAL_MAX_ATTEMPTS; n += 1) reppo.submitAnswers.push(new ReppoRefused(`Reppo answered with status ${status}`, status));
+    const deps = appealDeps(reppo);
+    for (let attempt = 1; attempt < APPEAL_MAX_ATTEMPTS; attempt += 1) {
+      expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.busy, status: 'queued' });
+      expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', attempts: attempt, submitStartedAt: null });
+      expect(new Date(String(await retryAt(wallet))).getTime()).toBe(clock.getTime() + APPEAL_BUSY_WAIT_SECONDS * 1000);
+      later(APPEAL_BUSY_WAIT_SECONDS);
+    }
+    expect(APPEAL_BUSY_WAIT_SECONDS).toBe(180);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: APPEAL_CAUSES.keptRefusing });
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: APPEAL_CAUSES.keptRefusing, submitStartedAt: null });
+    expect(reppo.posts).toBe(APPEAL_MAX_ATTEMPTS);
+    expect(lines.join('\n')).not.toContain(MAYBE_PAID);
+  });
+
+  it('treats a 403 from the one POST as a definite refusal: the mark cleared and the usual wait', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    reppo.submitAnswers.push(new ReppoRefused('Reppo answered with status 403', 403));
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: 'Reppo answered with status 403', status: 'queued' });
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', attempts: 1, submitStartedAt: null });
+    expect(new Date(String(await retryAt(wallet))).getTime()).toBe(clock.getTime() + retryDelaySeconds(1) * 1000);
+    later(retryDelaySeconds(1));
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked' });
+    expect(reppo.posts).toBe(2);
   });
 });
 
@@ -741,6 +812,7 @@ describe('the operator\'s appeal commands', () => {
     const reppo = new StandInReppo();
     reppo.answers.push(completed('review', 'A person should look at the shared funder.'));
     await appealNext(appealDeps(reppo));
+    const marked = (await appealRow(wallet))?.submitStartedAt?.toISOString();
     expect(await appealListLines(db, CAMPAIGN)).toEqual({
       ok: true,
       lines: [
@@ -748,6 +820,7 @@ describe('the operator\'s appeal commands', () => {
         '  ask: hold under A4 (appealed: hold under A4)',
         `  text: ${JSON.stringify(TEXT)}`,
         '  outside check: checked, route review, evaluation eval_1, 440 credits, score 78, confidence high, decision "accept"',
+        `  submit mark: set at ${marked}`,
         '  note: "A person should look at the shared funder."',
         '  outcome: open',
       ],
@@ -771,6 +844,54 @@ describe('the operator\'s appeal commands', () => {
     expect(printed).toContain(`  owner note: ${JSON.stringify('The owner said "no" \\ firmly.')}`);
     for (const line of printed) expect(line).not.toMatch(/[\r\n]/);
     expect(printed.filter((line) => line.startsWith('  outside check:'))).toHaveLength(1);
+  });
+
+  it.each([
+    ['line feed', '\n'],
+    ['carriage return', '\r'],
+    ['escape', '\u001b'],
+    ['delete', '\u007f'],
+    ['next line', '\u0085'],
+    ['last C1 control', '\u009f'],
+    ['line separator', '\u2028'],
+    ['paragraph separator', '\u2029'],
+    ['zero-width space', '\u200b'],
+    ['right-to-left override', '\u202e'],
+  ])('prints a %s from outside only as an escape, so the line never breaks or turns (C58)', (_name, character) => {
+    const printed = quoted(`before${character}after`);
+    expect(printed.includes(character)).toBe(false);
+    expect(printed).toMatch(/^"before\\(?:[nr]|u[0-9a-f]{4})after"$/);
+  });
+
+  it('keeps no Reppo note carrying a line separator, so it can never reach the list raw (C13, C58)', async () => {
+    expect(noteFrom('First part\u2028second part')).toBeNull();
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    reppo.answers.push(completed('review', 'First part\u2028second part'));
+    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'checked' });
+    expect(await appealRow(wallet)).toMatchObject({ reppoNote: null });
+    const { lines: printed } = await appealListLines(db, CAMPAIGN);
+    expect(printed).toContain('  note: none');
+    for (const line of printed) expect(line).not.toMatch(/[\u2028\u2029\r\n]/);
+  });
+
+  it('shows the check note and the submit mark, so the operator sees an appeal that may already have been paid for', async () => {
+    const paid = await decided();
+    const fresh = await decided();
+    await appealed(paid.wallet);
+    const reppo = new StandInReppo();
+    reppo.submitAnswers.push(new ReppoError('Reppo answered with status 500', 500));
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released' });
+    later(LONGEST_RETRY_SECONDS);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: APPEAL_CAUSES.maybePaid });
+    await appealed(fresh.wallet);
+    const { lines: printed } = await appealListLines(db, CAMPAIGN);
+    const marked = (await appealRow(paid.wallet))?.submitStartedAt?.toISOString();
+    expect(printed).toContain(`  check note: ${JSON.stringify(APPEAL_CAUSES.maybePaid)}`);
+    expect(printed).toContain(`  submit mark: set at ${marked}`);
+    expect(printed).toContain('  submit mark: none');
   });
 
   it('dry-runs a settlement through the store\'s own checks: the refusal for an ask that changed, the slot for a reversal (C11)', async () => {
