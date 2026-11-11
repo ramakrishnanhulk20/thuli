@@ -44,6 +44,8 @@ export const APPEAL_DECISION_CHANGED = 'the decision changed after the appeal';
 export const APPEAL_LOOKUP_MAX_SECONDS = 86_400;
 /** The cause kept on a check whose evaluation did not finish within APPEAL_LOOKUP_MAX_SECONDS. */
 export const APPEAL_LOOKUP_EXPIRED = 'the outside check did not finish in a day';
+/** The cause kept on a check ended while a submit to it may have been charged for with no evaluation id to show. */
+export const APPEAL_MAYBE_PAID = 'the outside check may already have been paid for';
 
 // The same ceilings asks and relays have (C41): a lease or a retry wait of at most a day, at most 100 attempts.
 const MAX_WAIT_SECONDS = 86_400;
@@ -112,6 +114,8 @@ export interface TakenAppeal {
    * that submit may have been paid for, so the text must never be submitted again (C23).
    */
   submitStarted: boolean;
+  /** How many submits so far ended unclear, each perhaps paid for with no evaluation id to show (countUnclearSubmit). */
+  unclearSubmits: number;
   appealedAction: Outcome;
   appealedRule: string;
   action: Outcome;
@@ -178,6 +182,8 @@ export interface OwnerAppeal {
   reppoConfidence: ReppoConfidence | null;
   /** When a submit to the outside check was marked as started, or null. */
   submitStartedAt: Date | null;
+  /** How many submits ended unclear, each perhaps paid for with no evaluation id to show. Never lowered (C56). */
+  unclearSubmits: number;
   /** Why the check ended unchecked, in a few fixed words, or null. */
   checkNote: string | null;
   checkedAt: Date | null;
@@ -219,6 +225,7 @@ interface OwnerRow {
   reppo_decision: string | null;
   reppo_confidence: string | null;
   submit_started_at: unknown;
+  unclear_submits: number;
   check_note: string | null;
   checked_at: unknown;
   outcome: string;
@@ -272,6 +279,7 @@ interface WaitingRow {
   attempts: number;
   reppo_eval_id: string | null;
   submit_started_at: unknown;
+  unclear_submits: number;
   filed_at: unknown;
   outcome: string;
   appealed_action: string;
@@ -293,10 +301,11 @@ function holdsAppealedDecision(row: Pick<WaitingRow, 'appealed_action' | 'appeal
  * Whether a check has run too long, with the cause it keeps, or null. One that holds an evaluation id was paid for, so
  * no count of tries ends it: it is followed until APPEAL_LOOKUP_MAX_SECONDS after its submit mark, or after its filing
  * when it has no mark, which 010 makes impossible and which can only end the wait sooner (C23, C41). Any other check
- * ends at maxAttempts tries. takeAppeal and releaseAppeal both judge by this. Pure.
+ * ends at maxAttempts tries, keeping APPEAL_MAYBE_PAID when a submit may have been charged for (its mark is set, or an
+ * unclear submit was counted) and no cause otherwise (C56). takeAppeal and releaseAppeal both judge by this. Pure.
  */
 function overdue(
-  row: { reppoEvalId: string | null; attempts: number; submitStartedAt: Date | null; filedAt: Date },
+  row: { reppoEvalId: string | null; attempts: number; submitStartedAt: Date | null; unclearSubmits: number; filedAt: Date },
   now: Date,
   maxAttempts: number,
 ): { cause: string | null } | null {
@@ -304,7 +313,8 @@ function overdue(
     const from = row.submitStartedAt ?? row.filedAt;
     return now.getTime() - from.getTime() > APPEAL_LOOKUP_MAX_SECONDS * 1000 ? { cause: APPEAL_LOOKUP_EXPIRED } : null;
   }
-  return row.attempts >= maxAttempts ? { cause: null } : null;
+  if (row.attempts < maxAttempts) return null;
+  return { cause: row.submitStartedAt !== null || row.unclearSubmits > 0 ? APPEAL_MAYBE_PAID : null };
 }
 
 /** Why takeAppeal ends a waiting appeal instead of handing it out, with the cause it keeps, or null to hand it out. */
@@ -316,6 +326,7 @@ function endOf(row: WaitingRow, now: Date, maxAttempts: number): { cause: string
     reppoEvalId: row.reppo_eval_id,
     attempts: row.attempts,
     submitStartedAt: readTimeOrNull(row.submit_started_at),
+    unclearSubmits: row.unclear_submits,
     filedAt: readTime(row.filed_at),
   };
   return overdue(check, now, maxAttempts);
@@ -515,7 +526,8 @@ async function fileAppeal(
  *   still checked, and a check that holds an evaluation id is never ended by this guard (C11, C17, C23);
  * - a check that holds an evaluation id was paid for and is followed whatever its attempts, ending with
  *   APPEAL_LOOKUP_EXPIRED once APPEAL_LOOKUP_MAX_SECONDS have passed since its submit mark (C23);
- * - any other that has already had maxAttempts ends with no cause (C41).
+ * - any other that has already had maxAttempts ends, with APPEAL_MAYBE_PAID when its submit mark is set or an unclear
+ *   submit was counted, and no cause otherwise (C41, C56).
  * The appeal handed out is updated in one statement that reads its ask in that same statement. Any evaluation id
  * already noted comes back, so an unfinished evaluation is looked up again, and submitStarted says whether a submit was
  * begun (C23).
@@ -531,8 +543,8 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
   return db.transaction(async (tx) => {
     for (let looked = 0; looked < TAKE_LOOK_MAX; looked += 1) {
       const [row] = await tx.query<WaitingRow>(
-        `SELECT ap.campaign_id, ap.wallet, ap.attempts, ap.reppo_eval_id, ap.submit_started_at, ap.filed_at, ap.outcome,
-                ap.appealed_action, ap.appealed_rule, a.action, a.rule
+        `SELECT ap.campaign_id, ap.wallet, ap.attempts, ap.reppo_eval_id, ap.submit_started_at, ap.unclear_submits, ap.filed_at,
+                ap.outcome, ap.appealed_action, ap.appealed_rule, a.action, a.rule
            FROM appeals ap
            JOIN asks a ON a.campaign_id = ap.campaign_id AND a.wallet = ap.wallet
           WHERE (ap.check_status = 'queued' AND (ap.retry_at IS NULL OR ap.retry_at <= $1::timestamptz))
@@ -560,6 +572,7 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
         lease_until: unknown;
         reppo_eval_id: string | null;
         submit_started: boolean;
+        unclear_submits: number;
         appealed_action: string;
         appealed_rule: string;
         action: string;
@@ -572,7 +585,8 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
           WHERE appeals.campaign_id = $1 AND appeals.wallet = $2
             AND asks.campaign_id = appeals.campaign_id AND asks.wallet = appeals.wallet
          RETURNING appeals.campaign_id, appeals.wallet, appeals.attempts, appeals.lease_until, appeals.reppo_eval_id,
-                   appeals.submit_started_at IS NOT NULL AS submit_started, appeals.appealed_action, appeals.appealed_rule,
+                   appeals.submit_started_at IS NOT NULL AS submit_started, appeals.unclear_submits, appeals.appealed_action,
+                   appeals.appealed_rule,
                    asks.action, asks.rule, asks.reason, asks.record`,
         [row.campaign_id, row.wallet, leaseUntil],
       );
@@ -584,6 +598,7 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
         leaseUntil: readTime(taken.lease_until),
         reppoEvalId: taken.reppo_eval_id,
         submitStarted: taken.submit_started === true,
+        unclearSubmits: taken.unclear_submits,
         appealedAction: taken.appealed_action as Outcome,
         appealedRule: taken.appealed_rule,
         action: taken.action as Outcome,
@@ -601,7 +616,8 @@ export async function takeAppeal(db: Db, now: Date, leaseSeconds: number, maxAtt
  * takeAppeal leaves it be until now plus retryAfterSeconds, so an outage is waited out; any evaluation id stays on it.
  * Too long is takeAppeal's own rule (overdue): one with an evaluation id was paid for and is queued again whatever its
  * tries, ending unchecked with APPEAL_LOOKUP_EXPIRED only a day after its submit (C23); any other ends unchecked at or
- * past maxAttempts (C41). One transaction, and only on an appeal that is checking.
+ * past maxAttempts, with APPEAL_MAYBE_PAID when its submit mark is set or an unclear submit was counted (C41, C56). One
+ * transaction, and only on an appeal that is checking.
  * @param options.refundTry true when the try failed for a reason that was not the appeal's own, such as an outside
  *   service out of credit: the try is handed back in this same transaction, attempts falling by one but never below 0,
  *   and the appeal is judged against maxAttempts as if the try had not been made. The retry wait still applies, so a
@@ -628,19 +644,28 @@ export async function releaseAppeal(
   const refund = refundTry === true ? 1 : 0;
   if (campaignId === null) return null;
   return db.transaction(async (tx): Promise<ReleaseAppealResult | null> => {
-    const [row] = await tx.query<{ attempts: number; reppo_eval_id: string | null; submit_started_at: unknown; filed_at: unknown }>(
-      `SELECT attempts, reppo_eval_id, submit_started_at, filed_at FROM appeals
+    const [row] = await tx.query<{
+      attempts: number;
+      reppo_eval_id: string | null;
+      submit_started_at: unknown;
+      unclear_submits: number;
+      filed_at: unknown;
+    }>(
+      `SELECT attempts, reppo_eval_id, submit_started_at, unclear_submits, filed_at FROM appeals
         WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking'
           FOR UPDATE`,
       [campaignId, wallet],
     );
     if (row === undefined) return null;
     const attempts = Math.max(row.attempts - refund, 0);
-    const end = overdue(
-      { reppoEvalId: row.reppo_eval_id, attempts, submitStartedAt: readTimeOrNull(row.submit_started_at), filedAt: readTime(row.filed_at) },
-      now,
-      maxAttempts,
-    );
+    const check = {
+      reppoEvalId: row.reppo_eval_id,
+      attempts,
+      submitStartedAt: readTimeOrNull(row.submit_started_at),
+      unclearSubmits: row.unclear_submits,
+      filedAt: readTime(row.filed_at),
+    };
+    const end = overdue(check, now, maxAttempts);
     if (end === null) {
       await tx.query(
         `UPDATE appeals SET check_status = 'queued', attempts = $3, lease_until = NULL, retry_at = $4::timestamptz
@@ -703,6 +728,42 @@ export async function clearAppealSubmitting(db: Db, key: AppealKey, now: Date): 
     [campaignId, wallet],
   );
   return rows.length === 1;
+}
+
+/**
+ * Counts one submit to the outside check whose outcome was unclear: the submit mark is set and no evaluation id was
+ * kept, so it may have been paid for with nothing to show. Adds 1 to unclear_submits and clears the mark, so the check
+ * may be tried again while the worker's limit allows. The count is never lowered, here or anywhere in the store, so it
+ * always says how many times the check may have been paid for (C56). For a row with no mark, or one that keeps an
+ * evaluation id, nothing changes. One statement: it locks the row and decides from the row as it stands once locked,
+ * so of two calls at once on one marked row, exactly one counts. now is checked like every caller's time.
+ * @returns counted true and the new count when this call counted; counted false and the count as it stands otherwise.
+ * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when there is no appeal from this
+ *   wallet in this campaign, or now is not a valid Date.
+ */
+export async function countUnclearSubmit(db: Db, key: AppealKey, now: Date): Promise<{ counted: boolean; unclearSubmits: number }> {
+  instant(now);
+  const { campaignId, wallet } = keyOf(key);
+  if (campaignId === null) throw new StoreError('no appeal from this wallet');
+  const [row] = await db.query<{ counted: boolean; unclear_submits: number }>(
+    `WITH held AS (
+       SELECT campaign_id, wallet, unclear_submits, submit_started_at IS NOT NULL AND reppo_eval_id IS NULL AS unclear
+         FROM appeals WHERE campaign_id = $1 AND wallet = $2
+          FOR UPDATE
+     ),
+     bumped AS (
+       UPDATE appeals SET unclear_submits = appeals.unclear_submits + 1, submit_started_at = NULL
+         FROM held
+        WHERE appeals.campaign_id = held.campaign_id AND appeals.wallet = held.wallet AND held.unclear
+       RETURNING appeals.unclear_submits
+     )
+     SELECT EXISTS (SELECT 1 FROM bumped) AS counted,
+            COALESCE((SELECT unclear_submits FROM bumped), held.unclear_submits) AS unclear_submits
+       FROM held`,
+    [campaignId, wallet],
+  );
+  if (row === undefined) throw new StoreError('no appeal from this wallet');
+  return { counted: row.counted === true, unclearSubmits: row.unclear_submits };
 }
 
 /**
@@ -957,7 +1018,8 @@ export async function ownerAppeals(db: Db, campaignId: string): Promise<OwnerApp
   const rows = await db.query<OwnerRow>(
     `SELECT campaign_id, wallet, text, text_hash, signed_at::text AS signed_at, appealed_action, appealed_rule, filed_at,
             check_status, attempts, reppo_eval_id, reppo_route, reppo_note, credits_charged, reppo_score, reppo_decision,
-            reppo_confidence, submit_started_at, check_note, checked_at, outcome, new_action, owner_note, settled_at
+            reppo_confidence, submit_started_at, unclear_submits, check_note, checked_at, outcome, new_action, owner_note,
+            settled_at
        FROM appeals WHERE campaign_id = $1
       ORDER BY filed_at, wallet`,
     [campaignId],
@@ -981,6 +1043,7 @@ export async function ownerAppeals(db: Db, campaignId: string): Promise<OwnerApp
     reppoDecision: row.reppo_decision,
     reppoConfidence: row.reppo_confidence as ReppoConfidence | null,
     submitStartedAt: readTimeOrNull(row.submit_started_at),
+    unclearSubmits: row.unclear_submits,
     checkNote: row.check_note,
     checkedAt: readTimeOrNull(row.checked_at),
     outcome: row.outcome as AppealOutcome,

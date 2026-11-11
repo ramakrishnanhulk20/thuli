@@ -12,12 +12,14 @@ import {
   APPEAL_DECISION_CHANGED,
   APPEAL_LOOKUP_EXPIRED,
   APPEAL_LOOKUP_MAX_SECONDS,
+  APPEAL_MAYBE_PAID,
   APPEALS_DAY_COUNTER,
   APPEALS_DAY_MAX,
   APPEALS_PER_CAMPAIGN_DAY,
   appealStanding,
   campaignAppealsCounter,
   clearAppealSubmitting,
+  countUnclearSubmit,
   getAppeal,
   markAppealSubmitting,
   markAppealUnchecked,
@@ -295,6 +297,7 @@ for (const { name, open } of TARGETS) {
         leaseUntil: plus(310),
         reppoEvalId: null,
         submitStarted: false,
+        unclearSubmits: 0,
         appealedAction: 'hold',
         appealedRule: 'A9',
         action: 'hold',
@@ -814,6 +817,98 @@ for (const { name, open } of TARGETS) {
       }
     });
 
+    it('C56: countUnclearSubmit counts a marked submit with no id once, clears the mark, counts again after a new mark, and is never reset', async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1), unclearSubmits: 0 });
+      expect(await markAppealSubmitting(db, key(1), plus(2))).toBe(true);
+      expect(await countUnclearSubmit(db, key(1), plus(3))).toEqual({ counted: true, unclearSubmits: 1 });
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'checking', submitStartedAt: null, unclearSubmits: 1 });
+      expect(await countUnclearSubmit(db, key(1), plus(4))).toEqual({ counted: false, unclearSubmits: 1 });
+      expect(await markAppealSubmitting(db, key(1), plus(5))).toBe(true);
+      expect(await countUnclearSubmit(db, key(1), plus(6))).toEqual({ counted: true, unclearSubmits: 2 });
+      // An evaluation id kept and a check recorded later leave the count as history.
+      expect(await markAppealSubmitting(db, key(1), plus(7))).toBe(true);
+      expect(await noteAppealEval(db, key(1), 'eval_1', plus(8))).toBe(true);
+      expect(await recordAppealCheck(db, key(1), { evalId: 'eval_1', route: 'ship', note: null, creditsCharged: 4 }, plus(9))).toBe(true);
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'checked', submitStartedAt: plus(7), unclearSubmits: 2 });
+      await expect(countUnclearSubmit(db, key(9), plus(10))).rejects.toThrow(StoreError);
+      await expect(countUnclearSubmit(db, { campaignId: 'not a campaign!', wallet: wallet(1) }, plus(10))).rejects.toThrow(StoreError);
+      await expect(countUnclearSubmit(db, key(1), new Date(Number.NaN))).rejects.toThrow(StoreError);
+    });
+
+    it('C56: countUnclearSubmit changes nothing on a row that keeps an evaluation id or has no submit mark', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      for (const n of [1, 2]) expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(n) });
+      expect(await markAppealSubmitting(db, key(1), plus(11))).toBe(true);
+      expect(await noteAppealEval(db, key(1), 'eval_1', plus(12))).toBe(true);
+      const rows = async () => JSON.stringify(await db.query('SELECT * FROM appeals ORDER BY wallet'));
+      const before = await rows();
+      for (const n of [1, 2]) expect(await countUnclearSubmit(db, key(n), plus(13))).toEqual({ counted: false, unclearSubmits: 0 });
+      expect(await rows()).toBe(before);
+    });
+
+    it('C56: ten calls at once on one marked row count it exactly once, and every one reads the count after it', async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      expect(await markAppealSubmitting(db, key(1), plus(2))).toBe(true);
+      const results = await Promise.all(Array.from({ length: 10 }, () => countUnclearSubmit(db, key(1), plus(3))));
+      expect(results.filter((result) => result.counted)).toHaveLength(1);
+      expect(results.map((result) => result.unclearSubmits)).toEqual(Array(10).fill(1));
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ unclearSubmits: 1, submitStartedAt: null });
+    });
+
+    it('C56: takeAppeal and the owner listing carry the unclear submit count, and no public view does', async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      expect(await markAppealSubmitting(db, key(1), plus(2))).toBe(true);
+      expect(await countUnclearSubmit(db, key(1), plus(3))).toEqual({ counted: true, unclearSubmits: 1 });
+      expect(await releaseAppeal(db, key(1), plus(4), 6, 0)).toBe('queued');
+      expect(await takeAppeal(db, plus(5), 300, 6)).toMatchObject({ wallet: wallet(1), attempts: 2, submitStarted: false, unclearSubmits: 1 });
+      expect((await ownerAppeals(db, CAMPAIGN))[0]?.unclearSubmits).toBe(1);
+      const views = [await getAppeal(db, CAMPAIGN, wallet(1)), (await getAsk(db, CAMPAIGN, wallet(1)))?.appeal, (await board(db, CAMPAIGN, 10))[0]?.appeal];
+      for (const view of views) expect(Object.keys(view ?? {}).sort()).toEqual(PUBLIC_APPEAL_KEYS);
+      expect(JSON.stringify([views, await counts(db, CAMPAIGN)]).toLowerCase()).not.toContain('unclear');
+    });
+
+    it('C56: an appeal with no evaluation id ended at maxAttempts keeps APPEAL_MAYBE_PAID when marked or counted, and no cause otherwise', async () => {
+      expect(APPEAL_MAYBE_PAID).toBe('the outside check may already have been paid for');
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3, 4, 5]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2, 3, 4, 5]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      // Wallet 1: marked, ended by a release at maxAttempts.
+      expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      expect(await markAppealSubmitting(db, key(1), plus(10))).toBe(true);
+      expect(await releaseAppeal(db, key(1), plus(11), 1, 0)).toBe('unchecked');
+      // Wallet 2: counted, so no longer marked, then ended by takeAppeal at maxAttempts, which hands out wallet 3 instead.
+      expect(await takeAppeal(db, plus(12), 300, 6)).toMatchObject({ wallet: wallet(2) });
+      expect(await markAppealSubmitting(db, key(2), plus(12))).toBe(true);
+      expect(await countUnclearSubmit(db, key(2), plus(12))).toEqual({ counted: true, unclearSubmits: 1 });
+      expect(await releaseAppeal(db, key(2), plus(13), 6, 0)).toBe('queued');
+      expect(await takeAppeal(db, plus(14), 300, 1)).toMatchObject({ wallet: wallet(3) });
+      // Wallet 3: neither, ended by a release at maxAttempts.
+      expect(await releaseAppeal(db, key(3), plus(15), 1, 0)).toBe('unchecked');
+      // Wallet 4 marked and wallet 5 neither, both ended by takeAppeal once their leases ran out.
+      expect(await takeAppeal(db, plus(16), 300, 6)).toMatchObject({ wallet: wallet(4) });
+      expect(await markAppealSubmitting(db, key(4), plus(16))).toBe(true);
+      expect(await takeAppeal(db, plus(17), 300, 6)).toMatchObject({ wallet: wallet(5) });
+      expect(await takeAppeal(db, plus(400), 300, 1)).toBeNull();
+      expect((await ownerAppeals(db, CAMPAIGN)).map((row) => [row.wallet, row.checkStatus, row.checkNote])).toEqual([
+        [wallet(1), 'unchecked', APPEAL_MAYBE_PAID],
+        [wallet(2), 'unchecked', APPEAL_MAYBE_PAID],
+        [wallet(3), 'unchecked', null],
+        [wallet(4), 'unchecked', APPEAL_MAYBE_PAID],
+        [wallet(5), 'unchecked', null],
+      ]);
+    });
+
     it('C11, C44, C27: a reversal approves the ask, takes the next slot while one is left, and slotHolders lists it once', async () => {
       await createCampaign(db, terms({ maxSlots: 2 }));
       expect(await decided(1, 'full')).toEqual({ slot: 1 });
@@ -914,7 +1009,7 @@ describe('C40 public query scan', () => {
       ['campaigns.ts', 'board'],
       ['campaigns.ts', 'counts'],
     ];
-    const privateColumn = /(?<![:\w])(text|text_hash|signature|owner_note|record|reppo_score|reppo_decision|reppo_confidence|check_note|submit_started_at)(?![\w(])|\*/;
+    const privateColumn = /(?<![:\w])(text|text_hash|signature|owner_note|record|reppo_score|reppo_decision|reppo_confidence|check_note|submit_started_at|unclear_submits)(?![\w(])|\*/;
     for (const [file, name] of publicReads) {
       const source = sources[file];
       const start = source.indexOf(`export async function ${name}(`);
