@@ -5,6 +5,7 @@
   "type": "module",
   "dependencies": {
     "@thuli/core": "0.1.0",
+    "@thuli/store": "0.1.0",
     "viem": "2.57.11",
     "zod": "4.6.7"
   },

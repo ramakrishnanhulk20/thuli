@@ -10,6 +10,7 @@
     "postinstall": "fumadocs-mdx"
   },
   "dependencies": {
+    "@tanstack/react-query": "5.107.1",
     "@thuli/api": "0.1.0",
     "@thuli/store": "0.1.0",
     "fumadocs-core": "16.18.4",
@@ -22,7 +23,8 @@
     "next": "16.4.6",
     "react": "19.3.1",
     "react-dom": "19.3.1",
-    "viem": "2.57.11"
+    "viem": "2.57.11",
+    "wagmi": "3.7.11"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.3.5",
