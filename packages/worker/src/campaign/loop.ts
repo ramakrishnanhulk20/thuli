@@ -3,7 +3,7 @@ import { openCampaigns, type Campaign } from '@thuli/store';
 import { publishCheck, reconcileCheck, type PublishOutcome, type ReconcileOutcome } from './publish.ts';
 import { activateCheck, relayNext, type ActivateOutcome, type RelayOutcome } from './relay.ts';
 import { screenNextAsk, type ScreenDeps, type ScreenOutcome } from './screen.ts';
-import { campaignMemory, NO_VAULT_BLOCK, safeCause, type ChainDeps } from './vault.ts';
+import { campaignMemory, NO_VAULT_BLOCK, safeCause, waitNoted, type ChainDeps } from './vault.ts';
 
 /** The pause between two runs of the loop. */
 export const LOOP_INTERVAL_MS = 5_000;
@@ -101,14 +101,8 @@ function noteFailure(deps: WorkerDeps, label: string, line: string): void {
 // A reason to wait is logged when it changes, so a quiet campaign does not write the same line every five seconds. Each
 // campaign keeps its own reasons, so one campaign's line never hides another's.
 function noteWaiting(deps: WorkerDeps, campaignId: string, label: string, outcome: { kind: string; reason?: string }): void {
-  const waiting = campaignMemory(deps.memory, campaignId).waiting;
   const reason = outcome.kind === 'skipped' ? outcome.reason : undefined;
-  if (reason === undefined) {
-    waiting.delete(label);
-    return;
-  }
-  if (waiting.get(label) === reason) return;
-  waiting.set(label, reason);
+  if (!waitNoted(campaignMemory(deps.memory, campaignId).waiting, label, reason)) return;
   deps.log(`${label === '' ? campaignId : `${label} ${campaignId}`}: waiting, ${reason}`);
 }
 

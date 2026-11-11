@@ -4,7 +4,9 @@
 // moves past the root delay, and the worker submits each claim. Then, on a second campaign whose asks a stand-in
 // screens: a post the worker sent but never recorded is cancelled by the owner and never sent again; a publish that
 // stalls and is aborted sends nothing after a newer list is posted; and the owner pauses the vault across a list's
-// activation, after which every listed wallet is paid exactly its amount.
+// activation, after which every listed wallet is paid exactly its amount. Last, on a third campaign: anvil drops a
+// post from its pool and the worker signs it again at the same nonce, never a new one; and a claim waiting while the
+// owner has paused the vault uses up none of its tries and is paid after the unpause.
 //
 //   npm run rehearse:campaign
 //
@@ -65,10 +67,10 @@ import {
 } from '@thuli/store';
 import { readFactoryRecord, scrubber } from '../src/campaign/config.ts';
 import { runOnce, type RunReport, type WorkerDeps } from '../src/campaign/loop.ts';
-import { CANCEL_MARGIN_SECONDS, CANCELLED_LIST, publishCheck } from '../src/campaign/publish.ts';
+import { CANCEL_MARGIN_SECONDS, CANCELLED_LIST, publishCheck, reconcileCheck, RESEND_AFTER_SECONDS } from '../src/campaign/publish.ts';
 import { PAUSED_VAULT } from '../src/campaign/relay.ts';
 import { activateCheck, relayNext, type RelayOutcome } from '../src/campaign/relay.ts';
-import { screenNextAsk } from '../src/campaign/screen.ts';
+import { LONGEST_RETRY_SECONDS, screenNextAsk } from '../src/campaign/screen.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
 import { loadEnv } from '../src/env.ts';
 import type { DecideDeps } from '../src/replay/decide.ts';
@@ -98,6 +100,11 @@ const CAMPAIGN_ID = 'fork-rehearsal';
 const CAMPAIGN_B = 'fork-rehearsal-restarts';
 const SLOTS_B = 3;
 const DEPOSIT_B = REWARD * BigInt(SLOTS_B);
+// The third campaign, for the lost-post and paused-claim proofs: one slot, one stand-in ask.
+const CAMPAIGN_C = 'fork-rehearsal-lost-post';
+const DEPOSIT_C = REWARD;
+// Relay runs while the vault is paused, each after the claim's longest wait.
+const PAUSED_RELAY_RUNS = 3;
 const SETTINGS = { groupMinSize: 2, funderFanoutMin: 2 };
 /** The live budget: one screening for each of the six asks, with none spare. */
 export const MAX_SCREENINGS = 6;
@@ -167,8 +174,9 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
   const agentKey = generatePrivateKey();
   const askKeys = REAL_WALLETS.map(() => generatePrivateKey());
   const askKeysB = Array.from({ length: SLOTS_B }, () => generatePrivateKey());
+  const askKeyC = generatePrivateKey();
   const signatures: string[] = [];
-  const clean = scrubber([...sources.secrets, ownerKey, agentKey, ...askKeys, ...askKeysB]);
+  const clean = scrubber([...sources.secrets, ownerKey, agentKey, ...askKeys, ...askKeysB, askKeyC]);
   const say = (line: string) => console.log(clean(line));
   const workerLines: string[] = [];
   const failures: string[] = [];
@@ -245,11 +253,12 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
     await test.setBalance({ address: owner.account.address, value: parseEther('1') });
     await test.setBalance({ address: agent.account.address, value: parseEther('1') });
     const slot = keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [owner.account.address, USDC_BALANCE_SLOT]));
-    await test.setStorageAt({ address: USDC, index: slot, value: pad(toHex(DEPOSIT + DEPOSIT_B)) });
+    const funded = DEPOSIT + DEPOSIT_B + DEPOSIT_C;
+    await test.setStorageAt({ address: USDC, index: slot, value: pad(toHex(funded)) });
     const balance = (address: Address) =>
       publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: 'balanceOf', args: [address] });
-    if ((await balance(owner.account.address)) !== DEPOSIT + DEPOSIT_B) throw new RehearsalError('the USDC balance slot has moved');
-    say(`  owner funded with 1 fork ETH and ${usdc(DEPOSIT + DEPOSIT_B)}, agent with 1 fork ETH`);
+    if ((await balance(owner.account.address)) !== funded) throw new RehearsalError('the USDC balance slot has moved');
+    say(`  owner funded with 1 fork ETH and ${usdc(funded)}, agent with 1 fork ETH`);
 
     const factory = readFactoryRecord(DEPLOYMENT_FILE);
     const code = await publicClient.getCode({ address: factory.address });
@@ -565,8 +574,8 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
       serv: { viaGraph: confirmStart, viaV2: confirmStart, sleep: async () => undefined },
       memory: emptyChainMemory(),
     };
-    const askB = async (key: Hex) => {
-      const asker = await queueAsk(CAMPAIGN_B, key, new Date());
+    const askStandIn = async (campaignId: string, key: Hex) => {
+      const asker = await queueAsk(campaignId, key, new Date());
       const funder = privateKeyToAccount(generatePrivateKey()).address;
       standInFacts.set(asker, {
         walletAgeDays: 900,
@@ -584,14 +593,17 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
       if (decided.kind !== 'decided' || decided.slot === null) throw new RehearsalError('a stand-in ask did not take a slot');
       return asker;
     };
+    const askB = (key: Hex) => askStandIn(CAMPAIGN_B, key);
     const reportFor = (run: RunReport) => (Array.isArray(run.campaigns) ? run.campaigns.find((one) => one.campaignId === CAMPAIGN_B) : undefined);
     const versionsOfB = () => listVersions(store, CAMPAIGN_B);
     const statusesB = async () => (await versionsOfB()).map((version) => version.status).join(', ');
     const agentNonce = () => publicClient.getTransactionCount({ address: agent.account.address });
-    const ownerCalls = async (functionName: 'cancelRoot' | 'pause' | 'unpause') => {
-      const call = await publicClient.simulateContract({ address: second.vault, abi: VAULT_ABI, functionName, account: owner.account });
+    const vaultOf = new Map<string, Address>([[CAMPAIGN_B, second.vault]]);
+    const ownerCalls = async (functionName: 'cancelRoot' | 'pause' | 'unpause', campaignId = CAMPAIGN_B) => {
+      const target = vaultOf.get(campaignId) as Address;
+      const call = await publicClient.simulateContract({ address: target, abi: VAULT_ABI, functionName, account: owner.account });
       await confirm(publicClient, await owner.writeContract(call.request), owner.account.address);
-      say(`  the owner called ${functionName} on the vault of ${CAMPAIGN_B}`);
+      say(`  the owner called ${functionName} on the vault of ${campaignId}`);
     };
     const moveClock = async (seconds: number, why: string) => {
       await test.increaseTime({ seconds });
@@ -689,12 +701,140 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
     }
     check(stateB.totalPaid === DEPOSIT_B && (await statusesB()) === 'cancelled, cancelled, active', `${CAMPAIGN_B}: list version 3 is active and paid ${usdc(stateB.totalPaid)}`);
 
+    say('\n== Lost-post and paused-claim proofs on a third campaign, its one ask screened by a stand-in');
+    const third = await makeVault(DEPOSIT_C);
+    vaultOf.set(CAMPAIGN_C, third.vault);
+    await createCampaign(db, {
+      id: CAMPAIGN_C,
+      name: 'Fork rehearsal, lost post',
+      chain: CHAINS['base-sepolia'].id,
+      vault: third.vault,
+      token: USDC,
+      owner: owner.account.address,
+      agent: agent.account.address,
+      rewardPerWallet: REWARD.toString(),
+      perWalletCap: REWARD.toString(),
+      partialShareBps: 5000,
+      maxSlots: 1,
+      rulebook: CURRENT_RULEBOOK,
+      settings: {},
+      status: 'open',
+      opensAt: new Date(Date.now() - 60_000),
+      closesAt: new Date(Date.now() + 86_400_000),
+      createdAt: new Date(),
+      vaultBlock: third.block,
+    });
+    const askerC = await askStandIn(CAMPAIGN_C, askKeyC);
+    // The resend wait and the relay waits run on the worker's clock, not the chain's, so this worker's clock is moved
+    // forward by hand while the chain stays live.
+    let ahead = 0;
+    const signedAtC: number[] = [];
+    const later: WorkerDeps = {
+      ...standIn,
+      chain: {
+        ...standIn.chain,
+        signPostRoot: async (...args) => {
+          const signed = await standIn.chain.signPostRoot(...args);
+          signedAtC.push(signed.nonce);
+          return signed;
+        },
+      },
+      now: () => new Date(Date.now() + ahead),
+      memory: emptyChainMemory(),
+    };
+    const versionC = async () => (await listVersions(store, CAMPAIGN_C)).at(-1);
+
+    say('\n  (iv) anvil drops a post from its pool, and the worker signs it again at the same nonce');
+    const freeNonce = await agentNonce();
+    let dropped: Hex | undefined;
+    const losesIt: WorkerDeps = {
+      ...later,
+      chain: {
+        ...later.chain,
+        broadcast: async (signed) => {
+          await later.chain.broadcast(signed);
+          await test.dropTransaction({ hash: signed.hash });
+          dropped = signed.hash;
+          say(`  anvil_dropTransaction ${signed.hash}: no node has the post now`);
+        },
+        // Looks once, so the publish does not sit out its whole receipt wait for a transaction that is gone.
+        postReceipt: (target, root, hash) => later.chain.postReceipt(target, root, hash, 0),
+      },
+    };
+    await test.setAutomine(false);
+    let lostRefused = false;
+    try {
+      await publishCheck(losesIt, CAMPAIGN_C);
+    } catch {
+      lostRefused = true;
+    } finally {
+      await test.setAutomine(true);
+    }
+    const sendingC = await versionC();
+    let goneFromNode = false;
+    try {
+      await publicClient.getTransaction({ hash: dropped as Hex });
+    } catch {
+      goneFromNode = true;
+    }
+    check(
+      lostRefused && sendingC?.status === 'sending' && sendingC.postTx === dropped?.toLowerCase() && sendingC.postNonce === freeNonce && goneFromNode && (await agentNonce()) === freeNonce,
+      `${CAMPAIGN_C}: the dropped post is recorded as sending at nonce ${freeNonce}, which no mined transaction has used`,
+    );
+    const firstLook = await reconcileCheck(later, CAMPAIGN_C);
+    ahead = (RESEND_AFTER_SECONDS + 1) * 1000;
+    const resendLook = await reconcileCheck(later, CAMPAIGN_C);
+    const afterResend = await versionC();
+    const resentHash = (afterResend?.postTx ?? dropped) as Hex;
+    const resentTx = await publicClient.getTransaction({ hash: resentHash });
+    // With nothing on the fork moving the fees, the same nonce, target and data sign to the very same bytes, so the hash
+    // may repeat; what counts is that it was signed again at its own nonce and is now on the node.
+    check(
+      [firstLook, resendLook].every((run) => run.kind === 'reconciled' && run.unsent.length === 0) &&
+        afterResend?.status === 'sending' &&
+        signedAtC.join() === `${freeNonce},${freeNonce}` &&
+        resentTx.nonce === freeNonce,
+      `${CAMPAIGN_C}: after ${RESEND_AFTER_SECONDS} s unseen it was signed again at nonce ${freeNonce} and sent as ${resentHash}, and nothing was built again ` +
+        `(signed at ${signedAtC.join(', ')}; ${afterResend?.status ?? '?'}; on the node at nonce ${resentTx.nonce})`,
+    );
+    await publicClient.waitForTransactionReceipt({ hash: resentHash, timeout: 60_000 });
+    const settledC = await reconcileCheck(later, CAMPAIGN_C);
+    check(
+      settledC.kind === 'reconciled' && settledC.posted.join() === '1' && (await agentNonce()) === freeNonce + 1,
+      `${CAMPAIGN_C}: the post sent again was mined and list version 1 is recorded as posted, the agent using one nonce for it`,
+    );
+
+    say('\n  (v) the owner pauses the vault while a claim waits, and the claim uses up none of its tries');
+    await moveClock(ROOT_DELAY, 'past the root delay');
+    const queuedC = await activateCheck(later, CAMPAIGN_C);
+    check(queuedC.kind === 'queued' && queuedC.added === 1, `${CAMPAIGN_C}: list version 1 is active and its one claim is queued`);
+    await ownerCalls('pause', CAMPAIGN_C);
+    const triesOfC = async () =>
+      (await store.query<{ attempts: number }>('SELECT attempts FROM claim_relays WHERE campaign_id = $1', [CAMPAIGN_C]))[0]?.attempts;
+    const pausedRuns: RelayOutcome[] = [];
+    for (let run = 0; run < PAUSED_RELAY_RUNS; run += 1) {
+      pausedRuns.push(await relayNext(later));
+      ahead += (LONGEST_RETRY_SECONDS + 1) * 1000;
+    }
+    check(
+      pausedRuns.every((run) => run.kind === 'relayed' && run.status === 'pending' && run.cause === PAUSED_VAULT) && (await triesOfC()) === 0,
+      `${CAMPAIGN_C}: ${PAUSED_RELAY_RUNS} relay runs while paused each gave the claim back with no try used ("${PAUSED_VAULT}")`,
+    );
+    await ownerCalls('unpause', CAMPAIGN_C);
+    const claimedC = await relayNext(later);
+    const receivedC = await balance(askerC);
+    check(
+      claimedC.kind === 'relayed' && claimedC.status === 'confirmed' && receivedC === REWARD,
+      `${CAMPAIGN_C}: after the unpause ${askerC} was paid exactly ${usdc(REWARD)} (got ${usdc(receivedC)})`,
+    );
+
     const latest = await publicClient.getBlockNumber({ cacheTime: 0 });
     const sent: string[] = [];
     const postsOfRoot = new Map<string, number>();
     const vaults = new Map<Address, string>([
       [vault, 'vault A'],
       [second.vault, 'vault B'],
+      [third.vault, 'vault C'],
     ]);
     for (let block = forkBlock + 1n; block <= latest; block += 1n) {
       const { transactions } = await publicClient.getBlock({ blockNumber: block, includeTransactions: true });
@@ -713,14 +853,15 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
         sent.push(`${call.functionName} to ${target}`);
       }
     }
-    const onlyPostAndClaim = sent.length > 0 && sent.every((line) => /^(postRoot|claim) to vault [AB]$/.test(line));
+    const onlyPostAndClaim = sent.length > 0 && sent.every((line) => /^(postRoot|claim) to vault [ABC]$/.test(line));
     check(onlyPostAndClaim, `the agent sent ${sent.length} transactions, each postRoot or claim to a campaign vault: ${sent.join(', ')}`);
     const rootB1 = unrecorded?.root ?? '';
     check(postsOfRoot.get(rootB1) === 1, `${CAMPAIGN_B}: list version 1's root was posted once in all, across the stop, the cancel and the restart`);
     check(!postsOfRoot.has(stalledRoot), `${CAMPAIGN_B}: list version 2's root, from the stopped publish, was never posted`);
     check(postsOfRoot.get(newerRoot) === 1, `${CAMPAIGN_B}: list version 3's root was posted once`);
+    check(postsOfRoot.get((sendingC?.root ?? '').toLowerCase()) === 1, `${CAMPAIGN_C}: list version 1's root was mined once, across the drop and the send at the same nonce`);
     check([...postsOfRoot.values()].every((times) => times === 1), `every root was posted once (${postsOfRoot.size} roots)`);
-    const secrets = [agentKey, ownerKey, ...askKeys, ...askKeysB].map((key) => key.slice(2).toLowerCase());
+    const secrets = [agentKey, ownerKey, ...askKeys, ...askKeysB, askKeyC].map((key) => key.slice(2).toLowerCase());
     const leaked = workerLines.some((line) => {
       const lowered = line.toLowerCase();
       return secrets.some((secret) => lowered.includes(secret)) || signatures.some((signature) => lowered.includes(signature.slice(2, 66).toLowerCase()));

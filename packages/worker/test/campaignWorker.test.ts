@@ -23,8 +23,10 @@ import {
 } from '@thuli/core';
 import {
   addAsk,
+  CAMPAIGN_SCREENINGS_DAY_COUNTER,
   counts,
   createCampaign,
+  dayCount,
   getAsk,
   latestList,
   listText,
@@ -41,8 +43,10 @@ import { NO_VAULT_BLOCK, runLoop, runOnce, type WorkerDeps } from '../src/campai
 import {
   CANCEL_MARGIN_SECONDS,
   cancelProven,
+  MAX_RESENDS,
   publishCheck,
   reconcileCheck,
+  RESEND_AFTER_SECONDS,
   SENDING_LIST,
   UNSEEN_LIST,
   UNSENT_AFTER_SECONDS,
@@ -50,6 +54,7 @@ import {
 import { activateCheck, relayNext } from '../src/campaign/relay.ts';
 import {
   CAMPAIGN_SCREEN_CAUSES,
+  CAMPAIGN_SCREENINGS_DAY_MAX,
   MAX_ASK_ATTEMPTS,
   REFUSED_ANSWER_TRIES,
   retryDelaySeconds,
@@ -111,8 +116,16 @@ class StandInVault implements CampaignVault {
   revertNextPost = false;
   /** Posts a node shows as waiting to be mined, by hash, so a read of their receipt answers pending. */
   readonly inPool = new Set<string>();
+  /** The agent's transaction count at the latest block as this vault's node sees it: every nonce below it is used. */
+  mined = 0;
+  /** Broadcasts the node accepts and then loses this many times: never mined and never shown, unless a test lands one. */
+  loseBroadcasts = 0;
+  /** Broadcasts the node keeps in its pool unmined this many times, shown as pending. */
+  holdBroadcasts = 0;
+  /** Every post signed, in order, with the nonce it was signed at. */
+  readonly signings: { hash: `0x${string}`; root: MerkleHash; nonce: number }[] = [];
   private gate: Promise<void> | null = null;
-  private readonly signedPosts = new Map<string, { root: MerkleHash; declaredTotal: bigint }>();
+  private readonly signedPosts = new Map<string, { root: MerkleHash; declaredTotal: bigint; nonce: number }>();
   private readonly postReceipts = new Map<string, { ok: boolean; claimableAt: bigint }>();
   refuseClaims: string | null = null;
   private active = NO_ROOT;
@@ -266,15 +279,64 @@ class StandInVault implements CampaignVault {
     return { hash: this.nextHash(), gasUsed: 61_000n };
   }
 
-  async signPostRoot(_vault: Address, root: MerkleHash, declaredTotal: bigint) {
-    this.calls.push('signPostRoot');
-    await this.passGate();
-    const hash = this.nextHash();
-    this.signedPosts.set(hash, { root, declaredTotal });
-    return { hash, serialized: hash };
+  // The nonce viem's pending count would give: the mined count plus the agent's posts this node holds unmined.
+  private freshNonce(): number {
+    const held = [...this.inPool].filter((hash) => (this.signedPosts.get(hash)?.nonce ?? -1) >= this.mined);
+    return this.mined + held.length;
   }
 
-  async broadcast(signed: { hash: `0x${string}`; serialized: `0x${string}` }) {
+  // Mines one post when its nonce is the next one; a post at a used nonce can never be mined.
+  private minePost(hash: string): boolean {
+    const post = this.signedPosts.get(hash);
+    if (post === undefined || post.nonce !== this.mined) return false;
+    this.useNonce();
+    if (this.revertNextPost || post.declaredTotal > this.deposited) {
+      this.revertNextPost = false;
+      this.postReceipts.set(hash, { ok: false, claimableAt: 0n });
+      return true;
+    }
+    this.settle();
+    this.pending = post.root;
+    this.pendingAt = this.now + ROOT_DELAY;
+    this.posted.push(post.root);
+    this.postReceipts.set(hash, { ok: true, claimableAt: this.pendingAt });
+    return true;
+  }
+
+  // The next nonce is used; every held post below it can never land, and the node drops it.
+  private useNonce() {
+    this.mined += 1;
+    for (const held of [...this.inPool]) {
+      if ((this.signedPosts.get(held)?.nonce ?? Number.POSITIVE_INFINITY) < this.mined) this.inPool.delete(held);
+    }
+  }
+
+  /** Another transaction from the agent is mined at its next nonce, such as one sent by hand. */
+  takeNonce() {
+    this.useNonce();
+  }
+
+  /** A lost or held post reaches a block after all, when its nonce is still the next one. */
+  land(hash: string): boolean {
+    return this.minePost(hash);
+  }
+
+  async minedNonce() {
+    this.calls.push('minedNonce');
+    return this.mined;
+  }
+
+  async signPostRoot(_vault: Address, root: MerkleHash, declaredTotal: bigint, nonce?: number) {
+    this.calls.push('signPostRoot');
+    await this.passGate();
+    const at = nonce ?? this.freshNonce();
+    const hash = this.nextHash();
+    this.signedPosts.set(hash, { root, declaredTotal, nonce: at });
+    this.signings.push({ hash, root, nonce: at });
+    return { hash, serialized: hash, nonce: at };
+  }
+
+  async broadcast(signed: { hash: `0x${string}`; serialized: `0x${string}`; nonce: number }) {
     this.calls.push('broadcast');
     if (this.stopBeforeBroadcast > 0) {
       this.stopBeforeBroadcast -= 1;
@@ -286,17 +348,18 @@ class StandInVault implements CampaignVault {
     }
     const post = this.signedPosts.get(signed.hash);
     if (post === undefined) throw new Error('no such signed transaction');
+    if (post.nonce < this.mined) throw new Error('nonce too low');
     this.sent.push('postRoot');
-    if (this.revertNextPost || post.declaredTotal > this.deposited) {
-      this.revertNextPost = false;
-      this.postReceipts.set(signed.hash, { ok: false, claimableAt: 0n });
+    if (this.loseBroadcasts > 0) {
+      this.loseBroadcasts -= 1;
       return;
     }
-    this.settle();
-    this.pending = post.root;
-    this.pendingAt = this.now + ROOT_DELAY;
-    this.posted.push(post.root);
-    this.postReceipts.set(signed.hash, { ok: true, claimableAt: this.pendingAt });
+    if (this.holdBroadcasts > 0 || post.nonce > this.mined) {
+      if (this.holdBroadcasts > 0) this.holdBroadcasts -= 1;
+      this.inPool.add(signed.hash);
+      return;
+    }
+    this.minePost(signed.hash);
     if (this.stopAfterPost > 0) {
       this.stopAfterPost -= 1;
       throw new Error('the worker stopped between the post and its record');
@@ -343,6 +406,8 @@ class StandInVault implements CampaignVault {
   async sendClaim(_vault: Address, ticket: ClaimTicket) {
     this.calls.push('sendClaim');
     this.sent.push('claim');
+    // A claim is the agent's transaction too, so it uses the agent's next nonce.
+    this.useNonce();
     const hash = this.nextHash();
     const result = this.check(ticket);
     if (!result.ok || result.amount === undefined) {
@@ -375,7 +440,9 @@ function chainOf(...vaults: StandInVault[]): CampaignVault {
     readSnapshot: (vault, accounts) => at(vault).readSnapshot(vault, accounts),
     findVaultCreated: (factory, vault, block) => at(vault).findVaultCreated(factory, vault, block),
     sendPostRoot: (vault, root, total) => at(vault).sendPostRoot(vault, root, total),
-    signPostRoot: (vault, root, total) => at(vault).signPostRoot(vault, root, total),
+    signPostRoot: (vault, root, total, nonce) => at(vault).signPostRoot(vault, root, total, nonce),
+    // Each stand-in counts its own nonces; the highest is the agent's, as one key signs for every vault.
+    minedNonce: async () => Math.max(...vaults.map((vault) => vault.mined)),
     // A stand-in hash opens with its vault's address, so a signed post goes back to the vault that signed it.
     broadcast: (signed) => {
       const owner = vaults.find((vault) => vault.address.slice(2, 10).toLowerCase() === signed.hash.slice(2, 10));
@@ -412,6 +479,21 @@ function basicRead(funder: Address, overrides: Partial<Facts> = {}): Facts {
     missing: ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'],
     ...overrides,
   };
+}
+
+const SINGLE_READ_MISSING: Facts['missing'] = ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'];
+
+// What collectBasicFacts reads for a wallet that never sent or received anything: age 0 from a history read in full,
+// no transaction sent, plain account, and no funder found, which it names in missing.
+function neverUsed(overrides: Partial<Facts> = {}): Facts {
+  return basicRead(freshFunder(), {
+    walletAgeDays: 0,
+    txCountAtSnapshot: 0,
+    firstFunder: null,
+    evidenceTxs: [],
+    missing: [...SINGLE_READ_MISSING, 'firstFunder'],
+    ...overrides,
+  });
 }
 
 function reply(answer: GraphAnswer, requestId = 'run-1'): ServReply {
@@ -813,14 +895,15 @@ describe('publishing, activating and relaying', () => {
     await ask(basicRead(freshFunder()));
     await screenAll(worker);
 
-    // The post was recorded as sending before the node refused it, so it waits out UNSENT_AFTER_SECONDS before resuming.
+    // The post was recorded as sending, with its nonce, before the node refused it. Once no node has shown it for
+    // RESEND_AFTER_SECONDS it is signed again at that nonce, and the next settle records it from its receipt.
     vault.failPost = 1;
     await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('the RPC dropped the transaction');
     expect((await listVersions(db, CAMPAIGN)).map((version) => version.status)).toEqual(['sending']);
     await reconcileCheck(worker, CAMPAIGN);
-    clock = new Date(clock.getTime() + UNSENT_AFTER_SECONDS * 1000);
-    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
-    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
+    clock = new Date(clock.getTime() + RESEND_AFTER_SECONDS * 1000);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [], unsent: [] });
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1], unsent: [] });
     expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: 'a root is pending on the vault' });
 
     await ask(basicRead(freshFunder()));
@@ -859,7 +942,8 @@ describe('publishing, activating and relaying', () => {
     await publishCheck(worker, CAMPAIGN);
     vault.advance(ROOT_DELAY);
     await activateCheck(worker, CAMPAIGN);
-    vault.refuseClaims = 'EnforcedPause';
+    // A refusal that is the claim's own uses up its tries; a pause does not (see the paused vault tests).
+    vault.refuseClaims = 'DepositExhausted';
     const statuses: (string | null)[] = [];
     for (let n = 0; n <= MAX_RELAY_ATTEMPTS; n += 1) {
       const outcome = await relayNext(worker);
@@ -1022,19 +1106,21 @@ describe('a post recorded before the network can know it', () => {
     return { vault, worker };
   }
 
-  it('builds a list again when its signed post was recorded but never sent, after the wait, and then posts it once', async () => {
+  it('signs a post again at its own nonce when it was recorded but never sent, after the wait, and posts it once', async () => {
     const { vault, worker } = await oneSlotHolder();
     vault.stopBeforeBroadcast = 1;
     await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('stopped between recording the post and sending it');
     expect(await statuses()).toEqual(['sending']);
     expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: SENDING_LIST });
     expect(await reconcileCheck(worker, CAMPAIGN)).toEqual({ kind: 'reconciled', posted: [], cancelled: [], unsent: [] });
-    clock = new Date(clock.getTime() + (UNSENT_AFTER_SECONDS - 1) * 1000);
+    clock = new Date(clock.getTime() + (RESEND_AFTER_SECONDS - 1) * 1000);
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(vault.signings).toHaveLength(1);
     clock = new Date(clock.getTime() + 1000);
-    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
-    expect(await statuses()).toEqual(['built']);
-    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(vault.signings.map((signing) => signing.nonce)).toEqual([0, 0]);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1] });
+    expect(await statuses()).toEqual(['posted']);
     expect(posts(vault)).toBe(1);
   });
 
@@ -1178,22 +1264,8 @@ describe('a refused answer', () => {
 
 describe('found by a second independent check of the worker', () => {
   const statuses = async () => (await listVersions(db, CAMPAIGN)).map((version) => version.status);
-  const SINGLE_READ_MISSING: Facts['missing'] = ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'];
 
-  // What collectBasicFacts reads for a wallet that never sent or received anything: age 0 from a history read in full,
-  // no transaction sent, plain account, and no funder found, which it names in missing.
-  function neverUsed(overrides: Partial<Facts> = {}): Facts {
-    return basicRead(freshFunder(), {
-      walletAgeDays: 0,
-      txCountAtSnapshot: 0,
-      firstFunder: null,
-      evidenceTxs: [],
-      missing: [...SINGLE_READ_MISSING, 'firstFunder'],
-      ...overrides,
-    });
-  }
-
-  it('builds no list again while its post was seen within UNSENT_AFTER_SECONDS: a sighting starts the count again (C27, C32)', async () => {
+  it('(f) keeps the earlier rule for a version stored with no nonce: built again only after UNSENT_AFTER_SECONDS unseen, never sent again (C27, C32)', async () => {
     await createCampaign(db, terms());
     const vault = new StandInVault(3n * REWARD);
     const worker = deps(vault);
@@ -1201,6 +1273,8 @@ describe('found by a second independent check of the worker', () => {
     await screenAll(worker);
     vault.stopBeforeBroadcast = 1;
     await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('stopped between recording the post and sending it');
+    // As a version recorded before the nonce was kept with its hash.
+    await db.query('UPDATE list_versions SET post_nonce = NULL WHERE campaign_id = $1', [CAMPAIGN]);
     const hash = (await latestList(db, CAMPAIGN))?.postTx as string;
     const start = clock.getTime();
     const at = (seconds: number) => {
@@ -1216,12 +1290,14 @@ describe('found by a second independent check of the worker', () => {
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
     expect(await statuses()).toEqual(['sending']);
 
-    // Missing on every read for a full, unbroken UNSENT_AFTER_SECONDS after that still builds it again, for now.
+    // Missing on every read for a full, unbroken UNSENT_AFTER_SECONDS after that builds it again.
     at(2 * UNSENT_AFTER_SECONDS);
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
     at(2 * UNSENT_AFTER_SECONDS + 1);
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
     expect(await statuses()).toEqual(['built']);
+    expect(vault.calls).not.toContain('minedNonce');
+    expect(vault.signings).toHaveLength(1);
   });
 
   it('records a claim it broadcast as sent with its hash, even when told to stop right after the send (C27)', async () => {
@@ -1294,6 +1370,282 @@ describe('found by a second independent check of the worker', () => {
     const modelled = new Set(vi.mocked(decideWallet).mock.calls.map(([row]) => row.wallet));
     expect(modelled).toEqual(new Set(wallets.map((wallet) => wallet.address)));
     expect(vi.mocked(serv.viaGraph).mock.calls.length).toBeGreaterThanOrEqual(wallets.length);
+  });
+});
+
+describe('a post the network lost, settled only on proof', () => {
+  const statuses = async () => (await listVersions(db, CAMPAIGN)).map((version) => version.status);
+  const later = (seconds: number) => {
+    clock = new Date(clock.getTime() + seconds * 1000);
+  };
+
+  // One slot holder whose first post the node accepts and then loses: version 1 is sending at nonce 0.
+  async function lostPost() {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    vault.loseBroadcasts = 1;
+    await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('not mined yet');
+    expect(await listVersions(db, CAMPAIGN)).toMatchObject([{ status: 'sending', postTx: vault.signings[0]?.hash, postNonce: 0 }]);
+    return { vault, worker };
+  }
+
+  it('(a) signs the same version again at the same nonce once no node has shown it for RESEND_AFTER_SECONDS, recording it first (C27, C32)', async () => {
+    const { vault, worker } = await lostPost();
+    const first = vault.signings[0]?.hash as `0x${string}`;
+    const recordedAtBroadcast: (string | null)[] = [];
+    const broadcast = vault.broadcast.bind(vault);
+    vault.broadcast = async (signed) => {
+      recordedAtBroadcast.push((await latestList(db, CAMPAIGN))?.postTx ?? null);
+      return broadcast(signed);
+    };
+
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    later(300);
+    vault.inPool.add(first);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    vault.inPool.delete(first);
+    // The sighting at 300 s started the wait again, so neither read sends anything.
+    later(301);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    later(RESEND_AFTER_SECONDS - 1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(vault.signings).toHaveLength(1);
+
+    later(1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [], unsent: [] });
+    const [original, again] = vault.signings;
+    expect(again).toMatchObject({ root: original?.root, nonce: original?.nonce });
+    expect(recordedAtBroadcast).toEqual([again?.hash]);
+    expect(await listVersions(db, CAMPAIGN)).toMatchObject([{ status: 'sending', postTx: again?.hash, postNonce: 0 }]);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1], unsent: [] });
+    expect(vault.posted).toEqual([original?.root]);
+  });
+
+  it('(b) builds a version again once another transaction used its nonce, and the next publish signs at a fresh nonce', async () => {
+    const { vault, worker } = await lostPost();
+    vault.takeNonce();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
+    expect(await statuses()).toEqual(['built']);
+    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
+    expect(vault.signings.map((signing) => signing.nonce)).toEqual([0, 1]);
+    expect(await listVersions(db, CAMPAIGN)).toMatchObject([{ status: 'posted' }]);
+  });
+
+  it('(c) records the post once when the lost transaction lands after its resend: only one of the two is ever mined', async () => {
+    const { vault, worker } = await lostPost();
+    await reconcileCheck(worker, CAMPAIGN);
+    later(RESEND_AFTER_SECONDS);
+    vault.holdBroadcasts = 1;
+    await reconcileCheck(worker, CAMPAIGN);
+    const [lost, resent] = vault.signings;
+    expect(resent?.nonce).toBe(lost?.nonce);
+    expect(vault.land(lost?.hash as string)).toBe(true);
+    expect(vault.land(resent?.hash as string)).toBe(false);
+
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1], unsent: [] });
+    expect(await listVersions(db, CAMPAIGN)).toMatchObject([
+      { status: 'posted', postTx: lost?.hash, claimableAt: Number(CHAIN_START + ROOT_DELAY) },
+    ]);
+    for (let run = 0; run < 3; run += 1) {
+      await reconcileCheck(worker, CAMPAIGN);
+      await publishCheck(worker, CAMPAIGN);
+    }
+    expect(vault.posted).toEqual([lost?.root]);
+    expect(vault.signings).toHaveLength(2);
+  });
+
+  it('(d) signs no other version while one is sending, even when the slot holders change', async () => {
+    const { vault, worker } = await lostPost();
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: SENDING_LIST });
+    await reconcileCheck(worker, CAMPAIGN);
+    later(RESEND_AFTER_SECONDS);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: SENDING_LIST });
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1] });
+    const first = vault.signings[0]?.root;
+    expect(vault.signings.map((signing) => signing.root)).toEqual([first, first]);
+
+    vault.advance(ROOT_DELAY);
+    await activateCheck(worker, CAMPAIGN);
+    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 2, wallets: 2 });
+    expect(vault.signings.map((signing) => signing.root === first)).toEqual([true, true, false]);
+  });
+
+  it('(e) signs a lost post again at most MAX_RESENDS times in one process, then says so once and keeps waiting', async () => {
+    const { vault, worker } = await lostPost();
+    vault.loseBroadcasts = 100;
+    for (let round = 0; round < MAX_RESENDS + 3; round += 1) {
+      await reconcileCheck(worker, CAMPAIGN);
+      later(RESEND_AFTER_SECONDS);
+      await reconcileCheck(worker, CAMPAIGN);
+    }
+    expect(MAX_RESENDS).toBe(5);
+    expect(vault.signings).toHaveLength(1 + MAX_RESENDS);
+    expect(new Set(vault.signings.map((signing) => signing.nonce))).toEqual(new Set([0]));
+    expect(lines.filter((line) => line.includes(`signed again ${MAX_RESENDS} times`))).toHaveLength(1);
+    expect(await statuses()).toEqual(['sending']);
+    vault.takeNonce();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
+  });
+});
+
+describe('a paused vault and a claim\'s tries', () => {
+  const attempts = async () =>
+    (await db.query<{ attempts: number }>('SELECT attempts FROM claim_relays WHERE campaign_id = $1', [CAMPAIGN]))[0]?.attempts;
+
+  async function queuedClaim() {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    const wallet = await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    await publishCheck(worker, CAMPAIGN);
+    vault.advance(ROOT_DELAY);
+    expect(await activateCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'queued', added: 1 });
+    expect(await attempts()).toBe(0);
+    return { vault, worker, wallet };
+  }
+
+  it('(g) uses up none of a claim\'s tries while the vault is paused, says so once, and claims it after the unpause (C44)', async () => {
+    const { vault, worker, wallet } = await queuedClaim();
+    vault.pause();
+    for (let run = 0; run < 10; run += 1) {
+      expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', status: 'pending', retryAfterSeconds: 600, cause: 'the vault is paused' });
+      expect(await relayNext(worker)).toEqual({ kind: 'idle' });
+      clock = new Date(clock.getTime() + 600_000);
+    }
+    expect(await attempts()).toBe(0);
+    // The paused flag is read before any simulation, so no claim is even simulated while the vault is paused.
+    expect(vault.calls).not.toContain('simulateClaim');
+    expect(vault.calls).not.toContain('sendClaim');
+    expect(lines.filter((line) => line.includes('the vault is paused'))).toEqual([`relay ${CAMPAIGN}: waiting, the vault is paused`]);
+    vault.unpause();
+    expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed' });
+    expect(vault.paid.get(wallet.address)).toBe(REWARD);
+  });
+
+  it('(g) gives a claim back the same way when its simulation reverts with the pause error a lagging read missed', async () => {
+    const { vault, worker, wallet } = await queuedClaim();
+    vault.refuseClaims = 'EnforcedPause';
+    for (let run = 0; run < 3; run += 1) {
+      expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', status: 'pending', retryAfterSeconds: 600 });
+      clock = new Date(clock.getTime() + 600_000);
+    }
+    expect(await attempts()).toBe(0);
+    vault.refuseClaims = null;
+    expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed' });
+  });
+});
+
+describe('the day budget for model screenings', () => {
+  const askRow = async (wallet: Wallet) =>
+    (
+      await db.query<{ status: string; attempts: number; retry_at: string | Date | null }>(
+        'SELECT status, attempts, retry_at FROM asks WHERE wallet = $1',
+        [wallet.address],
+      )
+    )[0];
+
+  it('(h) runs no model screening past the day budget: the ask keeps its tries and waits past midnight, a never-used wallet is still decided, and the next day screens again (C11, C24, C26)', async () => {
+    await createCampaign(db, terms());
+    await db.query('INSERT INTO day_counts (day, name, count) VALUES ($1::date, $2, $3)', [
+      clock.toISOString().slice(0, 10),
+      CAMPAIGN_SCREENINGS_DAY_COUNTER,
+      CAMPAIGN_SCREENINGS_DAY_MAX - 1,
+    ]);
+    const worker = deps(new StandInVault(3n * REWARD));
+    const lastOfDay = await ask(basicRead(freshFunder()));
+    const over = await ask(basicRead(freshFunder()));
+    const empty = await ask(neverUsed());
+    const overToo = await ask(basicRead(freshFunder()));
+
+    const outcomes: ScreenOutcome[] = [];
+    for (let n = 0; n < 4; n += 1) outcomes.push(await screenNextAsk(worker));
+    expect(outcomes).toEqual([
+      expect.objectContaining({ kind: 'decided', wallet: lastOfDay.address, action: 'full' }),
+      expect.objectContaining({ kind: 'released', wallet: over.address, cause: CAMPAIGN_SCREEN_CAUSES.dayBudget, status: 'queued' }),
+      expect.objectContaining({ kind: 'decided', wallet: empty.address, action: 'hold', servRequestId: null }),
+      expect.objectContaining({ kind: 'released', wallet: overToo.address, cause: CAMPAIGN_SCREEN_CAUSES.dayBudget, status: 'queued' }),
+    ]);
+    expect(decideWallet).toHaveBeenCalledTimes(1);
+    expect(await dayCount(db, CAMPAIGN_SCREENINGS_DAY_COUNTER, clock)).toBe(CAMPAIGN_SCREENINGS_DAY_MAX);
+    const midnight = Date.UTC(clock.getUTCFullYear(), clock.getUTCMonth(), clock.getUTCDate() + 1);
+    for (const wallet of [over, overToo]) {
+      const row = await askRow(wallet);
+      expect(row).toMatchObject({ status: 'queued', attempts: 0 });
+      expect(new Date(row?.retry_at as string | Date).getTime()).toBeGreaterThan(midnight);
+    }
+    expect(lines.filter((line) => line.includes(CAMPAIGN_SCREEN_CAUSES.dayBudget))).toHaveLength(1);
+    expect(await screenNextAsk(worker)).toEqual({ kind: 'idle' });
+
+    clock = new Date(midnight + 2_000);
+    await screenAll(worker);
+    for (const wallet of [over, overToo]) expect(await getAsk(db, CAMPAIGN, wallet.address)).toMatchObject({ status: 'decided', action: 'full' });
+    expect(decideWallet).toHaveBeenCalledTimes(3);
+    expect(await dayCount(db, CAMPAIGN_SCREENINGS_DAY_COUNTER, clock)).toBe(2);
+  });
+
+  it('(h) runs no screening when the day counter cannot be read, and gives the ask back with the usual wait (C11)', async () => {
+    await createCampaign(db, terms());
+    const serv = confirmingServ();
+    const broken = (query: Db['query']): Db['query'] =>
+      (async (text: string, params?: readonly unknown[]) => {
+        if (/day_counts/.test(text)) throw new Error('https://db.example/secret refused the connection');
+        return query(text, params);
+      }) as Db['query'];
+    const unreadable: Db = {
+      query: broken(db.query.bind(db)),
+      transaction: (work) => db.transaction((tx) => work({ query: broken(tx.query.bind(tx)) })),
+      close: () => db.close(),
+    };
+    const wallet = await ask(basicRead(freshFunder()));
+    const outcome = await screenNextAsk({ ...deps(new StandInVault(3n * REWARD), serv), db: unreadable });
+    expect(outcome).toMatchObject({ kind: 'released', cause: CAMPAIGN_SCREEN_CAUSES.dayCounter, status: 'queued' });
+    expect(decideWallet).not.toHaveBeenCalled();
+    expect(serv.viaGraph).not.toHaveBeenCalled();
+    expect(await askRow(wallet)).toMatchObject({ status: 'queued', attempts: 1 });
+    expect(lines.join('\n')).not.toContain('secret');
+  });
+});
+
+describe('the record a decision rested on', () => {
+  it('(i) stores the flat record the model was given, and for a code-made decision the record it would have been given, and logs neither (C40)', async () => {
+    await createCampaign(db, terms());
+    const serv = confirmingServ();
+    const modelled = await ask(basicRead(freshFunder()));
+    const empty = await ask(neverUsed());
+    await screenAll(deps(new StandInVault(3n * REWARD), serv));
+    const recordOf = async (wallet: Wallet) =>
+      (await db.query<{ record: unknown }>('SELECT record FROM asks WHERE wallet = $1', [wallet.address]))[0]?.record;
+
+    expect(vi.mocked(serv.viaGraph)).toHaveBeenCalledTimes(1);
+    expect(await recordOf(modelled)).toEqual(vi.mocked(serv.viaGraph).mock.calls[0]?.[0]);
+    expect(await recordOf(empty)).toEqual({
+      start_outcome: 'hold',
+      start_rule: 'A1',
+      wallet_age_days: 0,
+      tx_count: 0,
+      account_type: 'eoa',
+      first_funder_kind: 'none',
+      first_funder_claim_wallets: null,
+      traced_funder_kind: 'none',
+      traced_funder_claim_wallets: null,
+      group_size: 0,
+      group_same_funder: null,
+      group_swept_to_shared_collector: false,
+      group_links_made_by_wallet: false,
+      shared_deposit_claimants: 0,
+      funding_burst_wallets: 0,
+      claim_paid_to_other_address: false,
+      evidence_tx_hashes: [],
+      unreadable_facts: ['firstFunder'],
+    });
+    expect(lines.join('\n')).not.toContain('start_outcome');
   });
 });
 
@@ -1392,7 +1744,7 @@ describe('waiting out an outage', () => {
     await publishCheck(worker, CAMPAIGN);
     vault.advance(ROOT_DELAY);
     await activateCheck(worker, CAMPAIGN);
-    vault.refuseClaims = 'EnforcedPause';
+    vault.refuseClaims = 'DepositExhausted';
     expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', status: 'pending', retryAfterSeconds: 10 });
     expect(await relayNext(worker)).toEqual({ kind: 'idle' });
     clock = new Date(clock.getTime() + 10_000);

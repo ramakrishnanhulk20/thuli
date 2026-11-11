@@ -7,6 +7,7 @@ import {
   listVersions,
   markListCancelled,
   markListPosted,
+  markListResent,
   markListSending,
   markListUnsent,
   slotHolders,
@@ -24,6 +25,7 @@ import {
   vaultRecordFor,
   type ChainDeps,
   type PostReceipt,
+  type SentPost,
 } from './vault.ts';
 
 export type PublishOutcome =
@@ -64,11 +66,24 @@ export const CANCEL_MARGIN_SECONDS = 120;
 export const SENDING_LIST = 'a list is being sent to the vault; nothing more is posted until reconcile settles it from the chain';
 
 /**
- * How long a sending version's transaction may be unknown to every node before its root is taken never to have reached
- * the vault and the version is built again. Counted from when this process first found it missing, because a node
- * that has not yet heard of a broadcast looks the same as one that never will.
+ * For a version recorded before its transaction's nonce was kept: how long that transaction may be unknown to every
+ * node before its root is taken never to have reached the vault and the version is built again. Counted from when this
+ * process first found it missing, because a node that has not yet heard of a broadcast looks the same as one that
+ * never will. A version with a nonce is built again only on proof that the nonce was used (settleSending).
  */
 export const UNSENT_AFTER_SECONDS = 600;
+
+/**
+ * How long no node may show any of a sending version's transactions, counted the same way, before it is signed again
+ * at its own nonce with fees taken fresh. Any sighting starts the count again.
+ */
+export const RESEND_AFTER_SECONDS = 600;
+
+/**
+ * The most times one process signs a sending version again at its nonce. Past this nothing more is sent: it is said
+ * once, and the version waits for a receipt or for its nonce to be used.
+ */
+export const MAX_RESENDS = 5;
 
 // How long publish waits for its own post to be mined before leaving the settling to reconcile.
 const RECEIPT_WAIT_MS = 180_000;
@@ -106,31 +121,135 @@ async function rootDelayOf(deps: ChainDeps, campaign: Campaign): Promise<bigint 
 }
 
 /**
- * Whether a sending version's transaction is taken never to land, given what this read found of it. Every rule about
- * when our own post is dead lives here and only here. For now: no node knew it on every read for UNSENT_AFTER_SECONDS
- * without a break, counted from when this process first found it missing. Any sighting, pending or mined, clears that
- * count, because a transaction a node has just shown can still be mined; calling it dead then would sign the root again
- * with a fresh nonce while the first one can still land (C27, C32).
+ * True once no node has shown a sending version's transactions on every read for `seconds` without a break, counted
+ * from when this process first found them missing. Any sighting, pending or mined, clears the count, because a
+ * transaction a node has just shown can still be mined. Answering true starts the count again.
  */
-async function postNeverLands(deps: ChainDeps, campaign: Campaign, sending: ListVersion, seen: PostReceipt['state']): Promise<boolean> {
-  const missing = campaignMemory(deps.memory, campaign.id).missingSince;
-  if (seen !== 'unknown') {
-    missing.delete(sending.version);
+function unseenFor(deps: ChainDeps, campaignId: string, version: number, seen: boolean, seconds: number): boolean {
+  const missing = campaignMemory(deps.memory, campaignId).missingSince;
+  if (seen) {
+    missing.delete(version);
     return false;
   }
   const now = deps.now().getTime();
-  const since = missing.get(sending.version) ?? now;
-  missing.set(sending.version, since);
-  if (now - since < UNSENT_AFTER_SECONDS * 1000) return false;
-  missing.delete(sending.version);
+  const since = missing.get(version) ?? now;
+  missing.set(version, since);
+  if (now - since < seconds * 1000) return false;
+  missing.delete(version);
+  return true;
+}
+
+/** Forgets what this process sent for a version that is no longer sending. */
+function forgetPost(deps: ChainDeps, campaignId: string, version: number): void {
+  const mine = campaignMemory(deps.memory, campaignId);
+  mine.posts.delete(version);
+  mine.missingSince.delete(version);
+}
+
+/** What this process signed for a sending version at its stored nonce, starting from the stored hash after a restart. */
+function sentPost(deps: ChainDeps, campaignId: string, sending: ListVersion, nonce: number): SentPost {
+  const posts = campaignMemory(deps.memory, campaignId).posts;
+  const known = posts.get(sending.version);
+  if (known !== undefined && known.nonce === nonce) return known;
+  const fresh: SentPost = { nonce, hashes: [sending.postTx as Hash], resends: 0, gaveUp: false };
+  posts.set(sending.version, fresh);
+  return fresh;
+}
+
+type Mined = Extract<PostReceipt, { state: 'mined' }>;
+
+async function recordMined(
+  deps: ChainDeps,
+  campaignId: string,
+  version: number,
+  hash: Hash,
+  receipt: Mined,
+  outcome: { posted: number[]; unsent: number[] },
+  signal: AbortSignal | undefined,
+): Promise<true> {
+  checkpoint(signal, 'recording what became of a post');
+  if (!receipt.ok) {
+    if (await markListUnsent(deps.db, campaignId, version)) {
+      outcome.unsent.push(version);
+      deps.log(`reconcile ${campaignId}: the post ${hash} of list version ${version} reverted, so it is built again`);
+    }
+    forgetPost(deps, campaignId, version);
+    return true;
+  }
+  const claimableAt = Number(receipt.claimableAt);
+  if (!(await markListPosted(deps.db, campaignId, version, { postTx: hash.toLowerCase(), claimableAt }))) {
+    throw new RootError(`list version ${version} could not be recorded as posted from its receipt`);
+  }
+  forgetPost(deps, campaignId, version);
+  outcome.posted.push(version);
+  deps.log(`reconcile ${campaignId}: the post ${hash} of list version ${version} is mined, so it is recorded as posted, claimable from unix ${claimableAt}`);
+  return true;
+}
+
+async function recordUnsent(
+  deps: ChainDeps,
+  campaignId: string,
+  version: number,
+  why: string,
+  outcome: { unsent: number[] },
+  signal: AbortSignal | undefined,
+): Promise<true> {
+  checkpoint(signal, 'recording a post as unsent');
+  if (await markListUnsent(deps.db, campaignId, version)) {
+    outcome.unsent.push(version);
+    deps.log(`reconcile ${campaignId}: ${why}, so list version ${version} is built again`);
+  }
+  forgetPost(deps, campaignId, version);
   return true;
 }
 
 /**
- * Settles a version recorded as sending from what the network knows of its transaction: mined and successful, posted
- * with the claimable time the transaction's own RootPosted log holds, so the existing cancel rule applies to it after
- * its margin and its root is never sent again; mined and reverted, built again; unknown and proven never to land
- * (postNeverLands), built again; otherwise left as it is. Returns false while it stays sending.
+ * Signs a sending version's same root and declared total again at its stored nonce, with fees taken fresh, records the
+ * new hash with markListResent, and only then broadcasts it. One nonce can carry only one mined transaction, so this
+ * can replace the lost post and never add a second. At most MAX_RESENDS times in this process; after that it says so
+ * once and sends nothing more.
+ */
+async function resend(deps: ChainDeps, campaign: Campaign, sending: ListVersion, nonce: number, signal: AbortSignal | undefined): Promise<void> {
+  const id = campaign.id;
+  const version = sending.version;
+  const mine = sentPost(deps, id, sending, nonce);
+  if (mine.resends >= MAX_RESENDS) {
+    if (!mine.gaveUp) {
+      mine.gaveUp = true;
+      deps.log(
+        `reconcile ${id}: list version ${version} was signed again ${MAX_RESENDS} times at nonce ${nonce} and no node shows it, so nothing more is sent; it waits for a receipt or for the nonce to be used`,
+      );
+    }
+    return;
+  }
+  checkpoint(signal, 'signing a post again');
+  const signed = await deps.chain.signPostRoot(parseAddress(campaign.vault), sending.root as MerkleHash, BigInt(sending.declaredTotal), nonce);
+  if (signed.nonce !== nonce) throw new RootError(`list version ${version} was signed at another nonce than its own, so nothing was sent`);
+  mine.resends += 1;
+  mine.hashes.push(signed.hash);
+  checkpoint(signal, 'recording a post signed again');
+  if (!(await markListResent(deps.db, id, version, { postTx: signed.hash.toLowerCase() }, deps.now()))) {
+    throw new RootError(`list version ${version} could not be recorded as sent again, so nothing was sent`);
+  }
+  checkpoint(signal, 'sending a post again');
+  await deps.chain.broadcast(signed);
+  deps.log(
+    `reconcile ${id}: no node has shown the post of list version ${version} for ${RESEND_AFTER_SECONDS} s and nonce ${nonce} is unused, so it was signed again at that nonce and sent in ${signed.hash}`,
+  );
+}
+
+/**
+ * Settles a version recorded as sending, on proof only (C27, C32), in this order:
+ * a. a receipt for any transaction it was sent with, the stored one or an earlier one this process signed at the same
+ *    nonce: mined and successful, posted with the claimable time that receipt's own RootPosted log holds, so the
+ *    existing cancel rule applies to it after its margin and its root is never sent again; mined and reverted, built again;
+ * b. no receipt, and the agent's nonce at the latest mined block is above the stored nonce: another transaction used
+ *    that nonce, so none of this version's can ever land, and it is built again, for publish to sign anew;
+ * c. no receipt, the nonce unused, and no node has shown any of them for RESEND_AFTER_SECONDS: signed again at the same
+ *    nonce (resend). Never a new nonce and never another version while the stored nonce is unused.
+ * The nonce is read before the receipts, so a post mined between the two reads shows as its receipt, not as a used
+ * nonce. A version recorded before nonces were kept (postNonce null) keeps the earlier rule: unknown to every node for
+ * UNSENT_AFTER_SECONDS without a break, built again, and never signed again. Returns false while it stays sending.
  */
 async function settleSending(
   deps: ChainDeps,
@@ -140,35 +259,27 @@ async function settleSending(
   signal: AbortSignal | undefined,
 ): Promise<boolean> {
   const id = campaign.id;
-  if (sending.postTx === null) throw new RootError(`list version ${sending.version} is sending with no transaction on record`);
-  const hash = sending.postTx as `0x${string}`;
-  const receipt = await deps.chain.postReceipt(parseAddress(campaign.vault), sending.root as `0x${string}`, hash, 0);
-  const lost = await postNeverLands(deps, campaign, sending, receipt.state);
-  if (receipt.state === 'pending') return false;
-  if (receipt.state === 'unknown') {
-    if (!lost) return false;
-    checkpoint(signal, 'recording a post as unsent');
-    if (await markListUnsent(deps.db, id, sending.version)) {
-      outcome.unsent.push(sending.version);
-      deps.log(`reconcile ${id}: no node knows the post ${hash} of list version ${sending.version} after ${UNSENT_AFTER_SECONDS} s, so it is built again`);
-    }
-    return true;
+  const version = sending.version;
+  if (sending.postTx === null) throw new RootError(`list version ${version} is sending with no transaction on record`);
+  const vault = parseAddress(campaign.vault);
+  const nonce = sending.postNonce;
+  const used = nonce !== null && (await deps.chain.minedNonce()) > nonce;
+  const hashes = nonce === null ? [sending.postTx as Hash] : sentPost(deps, id, sending, nonce).hashes;
+  const stored = sending.postTx.toLowerCase();
+  let seen = false;
+  for (const hash of [stored as Hash, ...hashes.filter((one) => one.toLowerCase() !== stored)]) {
+    const receipt = await deps.chain.postReceipt(vault, sending.root as MerkleHash, hash, 0);
+    if (receipt.state === 'mined') return recordMined(deps, id, version, hash, receipt, outcome, signal);
+    if (receipt.state === 'pending') seen = true;
   }
-  checkpoint(signal, 'recording what became of a post');
-  if (!receipt.ok) {
-    if (await markListUnsent(deps.db, id, sending.version)) {
-      outcome.unsent.push(sending.version);
-      deps.log(`reconcile ${id}: the post ${hash} of list version ${sending.version} reverted, so it is built again`);
-    }
-    return true;
+  if (nonce === null) {
+    if (!unseenFor(deps, id, version, seen, UNSENT_AFTER_SECONDS)) return false;
+    return recordUnsent(deps, id, version, `no node knows the post ${stored} after ${UNSENT_AFTER_SECONDS} s`, outcome, signal);
   }
-  const claimableAt = Number(receipt.claimableAt);
-  if (!(await markListPosted(deps.db, id, sending.version, { postTx: null, claimableAt }))) {
-    throw new RootError(`list version ${sending.version} could not be recorded as posted from its receipt`);
-  }
-  outcome.posted.push(sending.version);
-  deps.log(`reconcile ${id}: the post ${hash} of list version ${sending.version} is mined, so it is recorded as posted, claimable from unix ${claimableAt}`);
-  return true;
+  if (used) return recordUnsent(deps, id, version, `nonce ${nonce} of its post was used by another transaction`, outcome, signal);
+  if (!unseenFor(deps, id, version, seen, RESEND_AFTER_SECONDS)) return false;
+  await resend(deps, campaign, sending, nonce, signal);
+  return false;
 }
 
 /**
@@ -281,9 +392,10 @@ interface RecordedPost {
  * The vault port postRoot is handed, whose one send records itself in the store before the network can know it (C27,
  * C32). Right before signing it reads the vault and the store again and refuses when the vault has a pending root or
  * this version is no longer the newest built one, so a step that stalled cannot post over a newer list. Then it signs,
- * records the hash with markListSending, sends the signed bytes, waits for the receipt and records the version posted
- * with the receipt's own claimable time, or built again when the post reverted. The step's signal is checked before
- * every signature, store write and send; a step stopped after the send leaves the version sending, for reconcile.
+ * records the hash and its nonce with markListSending, sends the signed bytes, waits for the receipt and records the
+ * version posted with the receipt's own claimable time, or built again when the post reverted. The step's signal is
+ * checked before every signature, store write and send; a step stopped after the send leaves the version sending, for
+ * reconcile.
  */
 function recordedPort(
   deps: ChainDeps,
@@ -311,9 +423,13 @@ function recordedPort(
       checkpoint(signal, 'signing a post');
       const signed = await deps.chain.signPostRoot(vault, root, declaredTotal);
       checkpoint(signal, 'recording a signed post');
-      if (!(await markListSending(deps.db, id, version, { postTx: signed.hash.toLowerCase() }, deps.now()))) {
+      const sent = { postTx: signed.hash.toLowerCase(), postNonce: signed.nonce };
+      if (!(await markListSending(deps.db, id, version, sent, deps.now()))) {
         throw new RootError(`list version ${version} could not be recorded as sending, so nothing was sent`);
       }
+      const mine = campaignMemory(deps.memory, id);
+      mine.posts.set(version, { nonce: signed.nonce, hashes: [signed.hash], resends: 0, gaveUp: false });
+      mine.missingSince.delete(version);
       checkpoint(signal, 'sending a post');
       await deps.chain.broadcast(signed);
       const receipt = await deps.chain.postReceipt(vault, root, signed.hash, RECEIPT_WAIT_MS);
@@ -321,12 +437,14 @@ function recordedPort(
       checkpoint(signal, 'recording a mined post');
       if (!receipt.ok) {
         await markListUnsent(deps.db, id, version);
+        forgetPost(deps, id, version);
         throw new RootError(`the post ${signed.hash} reverted, so list version ${version} is built again`);
       }
       const claimableAt = Number(receipt.claimableAt);
       if (!(await markListPosted(deps.db, id, version, { postTx: null, claimableAt }))) {
         throw new RootError(`list version ${version} could not be recorded as posted`);
       }
+      forgetPost(deps, id, version);
       result.posted = { claimableAt, gasUsed: receipt.gasUsed };
       return { hash: signed.hash, gasUsed: receipt.gasUsed };
     },

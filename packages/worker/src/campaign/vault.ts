@@ -40,6 +40,8 @@ export type ClaimSimulation = { ok: true } | { ok: false; error: string };
 export interface SignedPost {
   hash: Hash;
   serialized: Hex;
+  /** The agent's nonce it was signed at: only one transaction at this nonce can ever be mined. */
+  nonce: number;
 }
 
 /**
@@ -66,9 +68,12 @@ export interface CampaignVault extends VaultPort {
   claimedOf(vault: Address, accounts: readonly Address[], blockNumber: bigint): Promise<bigint[]>;
   /**
    * Checks postRoot with a static call from the agent, then signs it and sends nothing, so the caller can record the
-   * hash before the network can know the transaction (C27).
+   * hash before the network can know the transaction (C27). Fees are taken fresh. With `nonce` it is signed at exactly
+   * that nonce, so it replaces a lost transaction at that nonce instead of adding one; without, at the agent's next.
    */
-  signPostRoot(vault: Address, root: MerkleHash, declaredTotal: bigint): Promise<SignedPost>;
+  signPostRoot(vault: Address, root: MerkleHash, declaredTotal: bigint, nonce?: number): Promise<SignedPost>;
+  /** The agent's transaction count at the latest mined block: every nonce below it has been used by a mined transaction. */
+  minedNonce(): Promise<number>;
   /** Sends a signed postRoot exactly as signed. */
   broadcast(signed: SignedPost): Promise<void>;
   /** The post's receipt, waiting up to waitMs for it to be mined; 0 looks once. */
@@ -109,6 +114,18 @@ export interface CampaignMemory {
   waiting: Map<string, string>;
   /** When this process first found each sending version's transaction unknown to the network, in milliseconds. */
   missingSince: Map<number, number>;
+  /** What this process signed for each sending version, so a lost post's earlier transactions are looked for too. */
+  posts: Map<number, SentPost>;
+}
+
+/** The transactions one process signed for one sending version, all at one nonce, oldest first. */
+export interface SentPost {
+  nonce: number;
+  hashes: Hash[];
+  /** Times it was signed again at its nonce. */
+  resends: number;
+  /** Whether the line saying it reached MAX_RESENDS was logged. */
+  gaveUp: boolean;
 }
 
 /** Kept for the life of one process only. A restart starts it empty, which costs reads and never changes an outcome. */
@@ -116,20 +133,36 @@ export interface ChainMemory {
   campaigns: Map<string, CampaignMemory>;
   /** The cause each step last failed with, by its log label, so a failure that repeats every run is logged once. */
   failing: Map<string, string>;
+  /** The last reason a worker-wide step gave for waiting, by its log label, so a wait is logged once. */
+  waiting: Map<string, string>;
 }
 
 export function emptyChainMemory(): ChainMemory {
-  return { campaigns: new Map(), failing: new Map() };
+  return { campaigns: new Map(), failing: new Map(), waiting: new Map() };
 }
 
 /** The campaign's own memory, made empty the first time the campaign is seen. */
 export function campaignMemory(memory: ChainMemory, campaignId: string): CampaignMemory {
   let mine = memory.campaigns.get(campaignId);
   if (mine === undefined) {
-    mine = { record: null, queued: new Set(), waiting: new Map(), missingSince: new Map() };
+    mine = { record: null, queued: new Set(), waiting: new Map(), missingSince: new Map(), posts: new Map() };
     memory.campaigns.set(campaignId, mine);
   }
   return mine;
+}
+
+/**
+ * Records `reason` as the wait under `label` and answers true when it is new, so the caller logs a wait once, then
+ * again only when its reason changes. An undefined reason clears it. The one log-once rule every wait goes through.
+ */
+export function waitNoted(waiting: Map<string, string>, label: string, reason: string | undefined): boolean {
+  if (reason === undefined) {
+    waiting.delete(label);
+    return false;
+  }
+  if (waiting.get(label) === reason) return false;
+  waiting.set(label, reason);
+  return true;
 }
 
 /**
@@ -271,16 +304,19 @@ export function campaignVault(publicClient: PublicClient<Transport, Chain>, agen
       }
       return amounts;
     },
-    async signPostRoot(vault, root, declaredTotal) {
+    async signPostRoot(vault, root, declaredTotal, nonce) {
       // The same static call sendPostRoot makes first, so a post the vault would refuse is never signed.
       await publicClient.simulateContract({ address: vault, abi: VAULT_ABI, functionName: 'postRoot', args: [root, declaredTotal], account: agent.account });
       const request = await agent.prepareTransactionRequest({
         to: vault,
         data: encodeFunctionData({ abi: VAULT_ABI, functionName: 'postRoot', args: [root, declaredTotal] }),
+        ...(nonce === undefined ? {} : { nonce }),
       });
+      if (nonce !== undefined && request.nonce !== nonce) throw new ChainCallError('the post was prepared at another nonce than the one asked for');
       const serialized = await agent.signTransaction(request);
-      return { hash: keccak256(serialized), serialized };
+      return { hash: keccak256(serialized), serialized, nonce: request.nonce };
     },
+    minedNonce: () => publicClient.getTransactionCount({ address: agent.account.address, blockTag: 'latest' }),
     async broadcast(signed) {
       const hash = await publicClient.sendRawTransaction({ serializedTransaction: signed.serialized });
       if (hash.toLowerCase() !== signed.hash.toLowerCase()) throw new ChainCallError('the node answered with another hash than the one signed');

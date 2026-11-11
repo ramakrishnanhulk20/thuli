@@ -12,14 +12,18 @@ import {
 } from '@thuli/store';
 import { claimTicket } from '../vault/claimList.ts';
 import { readPublishedList, RootError } from '../vault/root.ts';
-import { retryDelaySeconds } from './screen.ts';
-import { campaignHere, campaignMemory, checkpoint, safeCause, StepStopped, type ChainDeps } from './vault.ts';
+import { LONGEST_RETRY_SECONDS, retryDelaySeconds } from './screen.ts';
+import { campaignHere, campaignMemory, checkpoint, safeCause, StepStopped, waitNoted, type ChainDeps } from './vault.ts';
 
 /** How long one worker holds a relay: above the 180 second receipt wait, so a claim in flight is never taken twice. */
 export const RELAY_LEASE_SECONDS = 300;
 
 /** Why activateCheck waits: a paused vault answers every claim and every claimable() with nothing. */
 export const PAUSED_VAULT = 'the vault is paused';
+
+// OpenZeppelin Pausable's error, which the vault reverts every claim with while paused.
+const PAUSE_ERROR = 'EnforcedPause';
+const RELAY_LABEL = 'relay';
 
 export type ActivateOutcome =
   | { kind: 'skipped'; reason: string }
@@ -103,6 +107,10 @@ export async function activateCheck(deps: ChainDeps, campaignId: string, signal?
  * from it (C32), and the vault always pays the wallet in the leaf, whoever submits (C31). The worker signs only claim
  * here, never anything on the wallet's behalf (C30, C39).
  *
+ * The vault's paused flag is read before the claim is simulated. While it is paused, or when the simulation reverts with
+ * the pause error, the relay is given back with LONGEST_RETRY_SECONDS and its try handed back, so a pause of any length
+ * never ends a listed wallet's claim (C44), and the wait is logged once for the campaign.
+ *
  * A claim is simulated before it is sent. One that would revert with NothingToClaim is confirmed without a transaction,
  * because the vault has paid that wallet everything it is owed already; any other revert, a claim that reverts on
  * chain, or any failed call gives the relay back for another try after retryDelaySeconds for its attempt, and the store
@@ -130,6 +138,15 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
     deps.log(`relay ${relay.campaignId} ${relay.wallet} list version ${relay.version}: ${outcome}, ${cause}`);
     return { kind: 'relayed', ...key, status: stored, retryAfterSeconds, tx, gasUsed, cause };
   };
+  // A pause is the owner's, not the claim's, so the try is handed back and the claim is looked at again every ten
+  // minutes until the vault pays again; the wait is said once for the campaign, not once per claim.
+  const pausedBack = async (waiting: Map<string, string>): Promise<RelayOutcome> => {
+    checkpoint(signal, 'giving a relay back');
+    const stored = await markRelay(deps.db, key, { status: 'pending', retryAfterSeconds: LONGEST_RETRY_SECONDS, refundTry: true }, deps.now());
+    if (waitNoted(waiting, RELAY_LABEL, PAUSED_VAULT)) deps.log(`relay ${relay.campaignId}: waiting, ${PAUSED_VAULT}`);
+    const retryAfterSeconds = stored === 'pending' ? LONGEST_RETRY_SECONDS : null;
+    return { kind: 'relayed', ...key, status: stored, retryAfterSeconds, tx: null, gasUsed: null, cause: PAUSED_VAULT };
+  };
 
   try {
     const here = await campaignHere(deps, relay.campaignId);
@@ -143,11 +160,15 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
       return finish('failed', 'the wallet is not on that list version with the amount queued');
     }
 
+    const waiting = campaignMemory(deps.memory, relay.campaignId).waiting;
+    if ((await deps.chain.roots(vault)).paused) return pausedBack(waiting);
     const simulated = await deps.chain.simulateClaim(vault, ticket);
     if (!simulated.ok) {
       if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet');
+      if (simulated.error === PAUSE_ERROR) return pausedBack(waiting);
       return finish('pending', `the claim would revert with ${simulated.error}`);
     }
+    waitNoted(waiting, RELAY_LABEL, undefined);
     checkpoint(signal, 'sending a claim');
     tx = await deps.chain.sendClaim(vault, ticket);
     // No checkpoint here: a claim on the network is always recorded, abort or not, so a stop never hides our own send.

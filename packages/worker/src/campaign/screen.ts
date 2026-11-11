@@ -5,6 +5,7 @@ import {
   Facts,
   funderKind,
   parseAddress,
+  toGraphRecord,
   type AccountState,
   type Address,
   type Outcome,
@@ -12,10 +13,13 @@ import {
   type Start,
 } from '@thuli/core';
 import {
+  bumpDay,
+  CAMPAIGN_SCREENINGS_DAY_COUNTER,
   decideAsk,
   funderLinks,
   getAsk,
   getCampaign,
+  MAX_RETRY_SECONDS,
   releaseAsk,
   takeAsk,
   type AskDecision,
@@ -26,7 +30,7 @@ import {
 import { decideWallet, OutOfCredit, type DecideDeps, type DecisionRecord } from '../replay/decide.ts';
 import { inSingleScope, MAX_SERV_CALLS_PER_SCREEN, SCREEN_CAUSES, SCREEN_TIME_LIMIT_MS, servBudget } from '../screen/single.ts';
 import { askFactsOf, campaignFacts, campaignSettings, familyAddressesToCheck } from './facts.ts';
-import { checkpoint } from './vault.ts';
+import { checkpoint, waitNoted, type ChainMemory } from './vault.ts';
 
 /** How long one worker holds an ask: above SCREEN_TIME_LIMIT_MS, so a live screening never loses its ask midway. */
 export const ASK_LEASE_SECONDS = 300;
@@ -37,7 +41,8 @@ export const ASK_LEASE_SECONDS = 300;
 export const MAX_ASK_ATTEMPTS = 10;
 
 const FIRST_RETRY_SECONDS = 10;
-const LONGEST_RETRY_SECONDS = 600;
+/** The longest wait retryDelaySeconds gives, so a long outage is checked every ten minutes. */
+export const LONGEST_RETRY_SECONDS = 600;
 
 /**
  * How long an ask or a relay waits before its next try, after `attempt` tries: 10 seconds times 3 to the power attempt
@@ -63,6 +68,14 @@ export const MAX_FAMILY_LOOKUPS = 1_000;
  */
 export const REFUSED_ANSWER_TRIES = 3;
 
+/**
+ * Model screenings every campaign together may run in one UTC day, counted in the store under
+ * CAMPAIGN_SCREENINGS_DAY_COUNTER right before each one calls SERV, so a flood of asks cannot run up the SERV bill:
+ * 2,000 is about one dollar of SERV a day at the replay's measured cost per screening (C24, C26). A decision made by
+ * code takes no count.
+ */
+export const CAMPAIGN_SCREENINGS_DAY_MAX = 2_000;
+
 /** Every cause an undecided ask can carry. Fixed words, so nothing from the chain, SERV or the store reaches a log (C40). */
 export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
   ...SCREEN_CAUSES,
@@ -73,7 +86,11 @@ export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
   family: 'the linked family has more funders than one screening looks up',
   refused: 'the answer was refused by the output checks',
   store: 'the decision could not be stored',
+  dayBudget: "the day's budget of model screenings is used up",
+  dayCounter: "the day's count of model screenings could not be read",
 });
+
+const SCREEN_LABEL = 'screen';
 
 export interface ScreenDeps {
   db: Db;
@@ -88,6 +105,8 @@ export interface ScreenDeps {
   serv: DecideDeps;
   now(): Date;
   log(line: string): void;
+  /** What this process has learned, so a wait that lasts hours, such as a used-up day budget, is logged once. */
+  memory: ChainMemory;
 }
 
 export type ScreenOutcome =
@@ -183,7 +202,7 @@ interface Screened {
   refused: boolean;
 }
 
-async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps): Promise<Screened> {
+async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps, signal: AbortSignal | undefined): Promise<Screened> {
   const campaign = await getCampaign(deps.db, taken.campaignId);
   if (campaign === null) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.noCampaign);
   if (campaign.rulebook !== CURRENT_RULEBOOK) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.rulebook);
@@ -201,6 +220,9 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps):
   );
   const start = computeStart(facts, settings);
   const { ceiling } = computeCeiling(facts, settings);
+  // The flat record decideWallet hands SERV, built by the same function from the same facts and start, so the stored
+  // record is exactly what the model was given, or would have been. Public facts only: no key, nothing to log (C40).
+  const record = toGraphRecord(facts, start);
   // Safe without the model: such a wallet starts on hold under A1 and its ceiling is hold before any model runs, so a
   // SERV answer could only have written the reason. Deciding it here means a free new key costs no SERV run (C24, C26),
   // and the outcome is exactly the code's start and ceiling, which approve nothing (C11, C12). Nothing was refused, so
@@ -217,30 +239,43 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps):
       notChecked,
       facts: askFactsOf(facts),
       servRequestId: null,
+      record,
     };
     return { decision, refused: false };
   }
-  const record = await decideOnce(taken.wallet, { facts, start, ceiling }, settings, serv);
+  // The day's count is taken in one store statement before SERV is called, so no two workers can pass the ceiling
+  // together. A count that cannot be read runs no screening (C11, C24, C26).
+  checkpoint(signal, 'counting a model screening');
+  let counted: boolean;
+  try {
+    counted = await bumpDay(deps.db, CAMPAIGN_SCREENINGS_DAY_COUNTER, CAMPAIGN_SCREENINGS_DAY_MAX, deps.now());
+  } catch {
+    throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.dayCounter);
+  }
+  if (!counted) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.dayBudget);
+  waitNoted(deps.memory.waiting, SCREEN_LABEL, undefined);
+  const decided = await decideOnce(taken.wallet, { facts, start, ceiling }, settings, serv);
   const decision: AskDecision = {
     campaignId: taken.campaignId,
     wallet: taken.wallet,
-    action: record.action,
-    shareBps: record.shareBps,
-    rule: record.rule,
-    reason: record.reason,
+    action: decided.action,
+    shareBps: decided.shareBps,
+    rule: decided.rule,
+    reason: decided.reason,
     // Lowercased again here, whatever the checks already did, because the store compares hashes as text (C13).
-    citedTxs: record.citedTxs.map((hash) => hash.toLowerCase()),
+    citedTxs: decided.citedTxs.map((hash) => hash.toLowerCase()),
     notChecked,
     facts: askFactsOf(facts),
-    servRequestId: record.requestId,
+    servRequestId: decided.requestId,
+    record,
   };
   // Not every answer the checks replace is refused: a burst wallet's partial and a start a shared funder alone cannot
   // hold are the code's own outcomes. Only the hold written in place of a refused answer is.
-  return { decision, refused: !record.accepted && record.action === 'hold' && record.rule === 'A1' };
+  return { decision, refused: !decided.accepted && decided.action === 'hold' && decided.rule === 'A1' };
 }
 
 /** The whole screening of one ask, held to the single screening's call cap and time limit (C26, C41). */
-async function decisionInTime(taken: TakenAsk, deps: ScreenDeps): Promise<Screened> {
+async function decisionInTime(taken: TakenAsk, deps: ScreenDeps, signal: AbortSignal | undefined): Promise<Screened> {
   const budget = servBudget(deps.serv, MAX_SERV_CALLS_PER_SCREEN);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeUp = new Promise<never>((_, reject) => {
@@ -250,10 +285,27 @@ async function decisionInTime(taken: TakenAsk, deps: ScreenDeps): Promise<Screen
     }, SCREEN_TIME_LIMIT_MS);
   });
   try {
-    return await Promise.race([decisionFor(taken, deps, budget.deps), timeUp]);
+    return await Promise.race([decisionFor(taken, deps, budget.deps, signal), timeUp]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** Seconds from now to one second past the next UTC midnight, when the day's count starts again, capped at the store's longest wait. */
+function secondsPastMidnight(now: Date): number {
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  return Math.min(MAX_RETRY_SECONDS, Math.ceil((midnight - now.getTime()) / 1000) + 1);
+}
+
+// A used-up day is no fault of the ask: its try is handed back and it waits until just after the next UTC midnight.
+// The wait is said once until a screening is counted again, not once for every ask that meets it.
+async function waitForTomorrow(taken: TakenAsk, deps: ScreenDeps, signal: AbortSignal | undefined): Promise<ScreenOutcome> {
+  checkpoint(signal, 'giving an ask back');
+  const cause = CAMPAIGN_SCREEN_CAUSES.dayBudget;
+  const wait = secondsPastMidnight(deps.now());
+  const status = await releaseAsk(deps.db, taken.campaignId, taken.wallet, deps.now(), MAX_ASK_ATTEMPTS, wait, { refundTry: true });
+  if (waitNoted(deps.memory.waiting, SCREEN_LABEL, cause)) deps.log(`screen: waiting, ${cause}; asks are screened again just after midnight UTC`);
+  return { kind: 'released', campaignId: taken.campaignId, wallet: taken.wallet, cause, status };
 }
 
 async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal: AbortSignal | undefined): Promise<ScreenOutcome> {
@@ -275,9 +327,11 @@ async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal:
  * own facts from the single-wallet reader taken into single-wallet scope, linked to the campaign's other asks by
  * campaignFacts, the code's start and ceiling, then SERV and the output checks in decideWallet. A wallet whose own facts
  * show it was never used, and whose start and ceiling are both hold under A1, is decided by code with NEVER_USED_REASON
- * and no SERV call, on its first try. The decision is stored
- * by decideAsk, which gives an approved ask the next slot while slots are left (C44), with every cited hash lowercase
- * (C13) and the public facts it rested on.
+ * and no SERV call, on its first try. Every other screening first takes one count of CAMPAIGN_SCREENINGS_DAY_MAX; when
+ * the day is used up the ask is given back, its try handed back, until just after the next UTC midnight, and when the
+ * count cannot be read it is given back like any failed try. The decision is stored by decideAsk, which gives an
+ * approved ask the next slot while slots are left (C44), with every cited hash lowercase (C13), the public facts it
+ * rested on, and, privately, the flat record the model was given or would have been (C40).
  *
  * Nothing but a checked answer becomes a decision. A campaign that is missing or names a rulebook other than
  * CURRENT_RULEBOOK, settings that are not valid, facts that cannot be read, no answer from SERV, SERV out of credit, the
@@ -298,9 +352,11 @@ export async function screenNextAsk(deps: ScreenDeps, signal?: AbortSignal): Pro
   if (taken === null) return { kind: 'idle' };
   let screened: Screened;
   try {
-    screened = await decisionInTime(taken, deps);
+    screened = await decisionInTime(taken, deps, signal);
   } catch (error) {
-    return release(taken, causeOf(error), deps, signal);
+    const cause = causeOf(error);
+    if (cause === CAMPAIGN_SCREEN_CAUSES.dayBudget) return waitForTomorrow(taken, deps, signal);
+    return release(taken, cause, deps, signal);
   }
   if (screened.refused && taken.attempts < REFUSED_ANSWER_TRIES) return release(taken, CAMPAIGN_SCREEN_CAUSES.refused, deps, signal);
   const { decision } = screened;
