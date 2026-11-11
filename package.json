@@ -33,6 +33,7 @@
     "contracts:test": "forge test --root packages/contracts",
     "contracts:lint": "npm run lint --prefix packages/contracts",
     "vault:deploy": "node --env-file=.env packages/contracts/script/deploy.mjs",
+    "vault:verify": "node --env-file-if-exists=.env packages/contracts/script/verify.mjs",
     "vault:create": "node --env-file-if-exists=.env --env-file-if-exists=.env.payer --import tsx packages/worker/scripts/create-vault.ts",
     "campaign:create": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/create-campaign.ts",
     "prove:vault": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/prove-vault.ts",

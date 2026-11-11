@@ -7,5 +7,6 @@
   "block": 57247894,
   "verifiedOn": "blockscout",
   "explorer": "https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56",
+  "basescanSource": "https://sepolia.basescan.org/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56#code",
   "recordedAt": "2026-11-11T04:31:02.879Z"
 }
