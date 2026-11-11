@@ -320,7 +320,7 @@ This needs no key and no wallet. You need git and Node 26 or newer. The output b
    npm install
    ```
 
-   Expect `added 603 packages, and audited 615 packages in 45s` and exit code 0. npm also prints a dependency audit summary (7 findings reported that day) and a note about esbuild's install script. Neither stops the install.
+   Expect `added 603 packages, and audited 615 packages in 45s` and exit code 0. npm also prints a dependency audit summary (7 findings: one advisory in `uuid` and one in a nested `zod`, counted along each path) and a note about esbuild's install script. Neither stops the install, and [the dependency audit page](docs/security/dependency-audit.md) says why neither advisory can be reached from Thuli's code and why no safe upgrade exists yet.
 
 2. Run the tests.
 
