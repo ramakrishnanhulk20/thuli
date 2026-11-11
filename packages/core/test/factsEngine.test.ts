@@ -7,6 +7,7 @@ import { computeCeiling, meetsGroupExcludeRule } from '../src/ceiling.ts';
 import { Facts } from '../src/facts.ts';
 import {
   buildReplayFacts,
+  firstActivityTime,
   funderKind,
   fundingBursts,
   fundingTransfer,
@@ -234,6 +235,42 @@ describe('walletAgeDays (C20)', () => {
     expect(walletAgeDays(wallet, pages(strangerOnly), SNAPSHOT_TIME)).toBe(0);
     expect(walletAgeDays(wallet, pages(strangerOnly, false), SNAPSHOT_TIME)).toBeNull();
     expect(walletAgeDays(wallet, pages([at(send(ROOT, wallet, 100, '1'), -1)]), SNAPSHOT_TIME)).toBeNull();
+  });
+
+  describe('firstActivityTime (C20)', () => {
+    it('is the very moment walletAgeDays counts from, on each of its fixtures', () => {
+      const fixtures: [Transfer[], number][] = [
+        [[at(send(STRANGER, wallet, 100, '0'), 400), at({ ...send(STRANGER, wallet, 101, '1'), failed: true }, 300), at(send(BINANCE_14, wallet, 200, '1'), 3)], 3],
+        [[at(send(wallet, STRANGER, 100, '0'), 50), at(send(ROOT, wallet, 200, '1'), 3)], 50],
+        [[at(send(COLLECTOR, wallet, 100, '1', 'internal'), 70), at(send(ROOT, wallet, 200, '1'), 3)], 70],
+      ];
+      for (const [transfers, days] of fixtures) {
+        const first = firstActivityTime(wallet, pages(transfers));
+        expect(first).toBe(daysAgo(days));
+        expect(Math.floor((SNAPSHOT_TIME - (first as number)) / SECONDS_PER_DAY)).toBe(walletAgeDays(wallet, pages(transfers), SNAPSHOT_TIME));
+      }
+      // The farm wallet of the live ROBO chain, read whole: its first activity is the funding transfer.
+      const ledger = [send(HOP_3, FARM_WALLET, ANCHOR_BLOCK, '0.01'), send(FARM_WALLET, STRANGER, ANCHOR_BLOCK + 5, '0.001')];
+      expect(firstActivityTime(FARM_WALLET, dataFor(FARM_WALLET, ledger))).toBe(timeOf(ANCHOR_BLOCK));
+    });
+
+    it('ignores zero-value spam sent before the first real transfer, and a failed transfer, in or out', () => {
+      const spamFirst = [at(send(STRANGER, wallet, 90, '0'), 900), at(send(STRANGER, wallet, 95, '0', 'internal'), 800), at(send(ROOT, wallet, 200, '1'), 10)];
+      expect(firstActivityTime(wallet, pages(spamFirst))).toBe(daysAgo(10));
+      const failedFirst = [
+        at({ ...send(STRANGER, wallet, 90, '5'), failed: true }, 700),
+        at({ ...send(wallet, STRANGER, 91, '1'), failed: true }, 600),
+        at(send(ROOT, wallet, 200, '1'), 10),
+      ];
+      expect(firstActivityTime(wallet, pages(failedFirst))).toBe(daysAgo(10));
+    });
+
+    it('is null with no activity to count, whether or not every page was read', () => {
+      expect(firstActivityTime(wallet, pages([]))).toBeNull();
+      expect(firstActivityTime(wallet, pages([at(send(STRANGER, wallet, 100, '0'), 400)]))).toBeNull();
+      expect(firstActivityTime(wallet, pages([at(send(STRANGER, wallet, 100, '0'), 400)], false))).toBeNull();
+      expect(firstActivityTime(wallet, pages([at({ ...send(ROOT, wallet, 100, '1'), failed: true }, 40)]))).toBeNull();
+    });
   });
 });
 

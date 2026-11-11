@@ -161,21 +161,31 @@ export function fundingTransfer(
 }
 
 /**
- * Whole days from the wallet's first activity to the snapshot: the earliest successful transfer that moved value into
- * the wallet or that the wallet sent itself, any value. Zero-value inbound transfers and failed transfers never count,
- * because anyone can send them to any address, so a stranger cannot make a wallet look old (C15). The replay and the
- * single-wallet collector both call this, so age means one thing (C20).
+ * The time, in seconds, of the wallet's first activity among the transfers read: the earliest successful transfer that
+ * moved value into the wallet or that the wallet sent itself, any value. Zero-value inbound transfers and failed
+ * transfers never count, because anyone can send them to any address, so a stranger cannot make a wallet look old
+ * (C15). null when no read transfer qualifies; whether more pages could hold one is the caller's to judge. Age and
+ * which chain is older both come from this, so first activity means one thing (C20).
+ */
+export function firstActivityTime(address: string, data: AddressData): number | null {
+  const self = lower(address);
+  let earliest: number | null = null;
+  for (const t of [...ownSends(self, data), ...incomingTo(self, data)]) {
+    if (earliest === null || t.time < earliest) earliest = t.time;
+  }
+  return earliest;
+}
+
+/**
+ * Whole days from the wallet's first activity (firstActivityTime) to the snapshot. The replay and the single-wallet
+ * collector both call this, so age means one thing (C20).
  *
  * Returns 0 for a wallet with no such transfer when every page was read, and null when a page may be missing one, or
  * when the earliest one is dated after the snapshot.
  */
 export function walletAgeDays(address: string, data: AddressData, snapshotTime: number): number | null {
-  const self = lower(address);
-  let earliest: number | undefined;
-  for (const t of [...ownSends(self, data), ...incomingTo(self, data)]) {
-    if (earliest === undefined || t.time < earliest) earliest = t.time;
-  }
-  if (earliest === undefined) return everythingRead(data) ? 0 : null;
+  const earliest = firstActivityTime(address, data);
+  if (earliest === null) return everythingRead(data) ? 0 : null;
   if (earliest > snapshotTime) return null;
   return Math.floor((snapshotTime - earliest) / SECONDS_PER_DAY);
 }
