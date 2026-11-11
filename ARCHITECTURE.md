@@ -182,6 +182,7 @@ chain but Base Sepolia.
 | Deployment record | `packages/contracts/deployments/base-sepolia.json`, written by `npm run vault:deploy` |
 | Proof vault | `0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`, created in block `57248098` |
 | Proof vault record | `packages/contracts/deployments/base-sepolia-proof.json`, rebuilt by `npm run prove:vault -- record`, which reads the run back from Base Sepolia, loads no key and sends nothing. |
+| Check the record yourself | `npm run prove:vault -- verify` checks the committed record against Base Sepolia line by line (each of the five receipts with its block, sender and gas, the VaultCreated, RootPosted, Claimed and USDC Transfer events in them, and the vault's `state()` and `claimed()` today), and needs only the two committed records and an RPC URL, the public `https://sepolia.base.org` when `BASE_SEPOLIA_RPC_URL` is unset. |
 
 The proof vault pays Base Sepolia test USDC, caps each wallet at 1 USDC, holds 2 USDC, delays every root by one hour,
 and takes claims until unix `1794976286` (18 Nov 2026, 04:31:26 UTC). Its first root lists one wallet at 1 USDC and
@@ -716,8 +717,8 @@ searching the code.
 - Postgres for campaigns, appeals and jobs. `packages/store` exists (Postgres through `pg`, with tables for payment
   claims, leases, rate events, day counts and the check cache), and the paid and free routes use it when
   `DATABASE_URL` is set, while campaigns, appeals and jobs have no tables yet.
-- The web app's own routes for sign-in, campaigns, checks, appeals and publishing. `packages/web` has no API route
-  handlers.
+- The web app's own routes for sign-in, campaigns, appeals and publishing. The site already serves `/api/x402/*` and
+  `/api/check*` through `packages/web/lib/server/thuliApi.ts` (4.4), and has no route handler for anything else.
 - The job queue. Nothing queues or takes jobs: the paid route screens inside the request, and the replays run as
   scripts.
 - Paid data through Kite Passport, and the Nansen and Allium lookups behind it. No code calls Kite, Nansen or Allium.
@@ -730,7 +731,5 @@ searching the code.
   ticket, but no route serves a wallet its claim ticket and no service posts lists.
 - Half-built: the root signer. `postRoot` in `packages/worker/src/vault/root.ts` runs every check before it posts, but
   only the vault proof script calls it. No service takes a published list and posts its root.
-- Half-built: the paid route inside the web app. It exists as the standalone Hono app in 4.4 and is not mounted in
-  the Next.js app.
 - Half-built: appeals. The checks, the record, the store and the advice exist; the public route, owner sign-in and
   rate limit do not (4.6).
