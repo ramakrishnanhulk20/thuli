@@ -1,5 +1,6 @@
 // Not covered here: whether the CDP keys are accepted by CDP (no request leaves the machine), and the facilitator's
 // own /supported answer, which the payment middleware checks at start (payment.test.ts uses a stub).
+import { inspect } from 'node:util';
 import { HTTPFacilitatorClient } from '@x402/core/server';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
@@ -130,6 +131,46 @@ describe('loadApiConfig', () => {
     expect(configError(mainnet({ BASE_RPC_URL: undefined })).message).toContain('BASE_RPC_URL');
     expect(configError(mainnet({ BASE_RPC_URL: 'http://mainnet.base.org' })).message).toContain('BASE_RPC_URL');
     expect(loadApiConfig(testnet({ BASE_RPC_URL: 'https://elsewhere.example' })).settlementRpcUrl).toBe(BASE_SEPOLIA_RPC);
+  });
+
+  it('reads an optional DATABASE_URL and refuses a malformed one without printing it (C40)', () => {
+    const databaseUrl = 'postgresql://thuli:hunter2-db-secret@db.internal.example:5432/thuli';
+    expect(loadApiConfig(testnet()).databaseUrl).toBeNull();
+    expect(loadApiConfig(testnet({ DATABASE_URL: '  ' })).databaseUrl).toBeNull();
+    expect(loadApiConfig(testnet({ DATABASE_URL: databaseUrl })).databaseUrl).toBe(databaseUrl);
+    expect(loadApiConfig(mainnet({ DATABASE_URL: 'postgres://thuli@localhost/thuli' })).databaseUrl).toBe('postgres://thuli@localhost/thuli');
+    const malformed = [
+      'mysql://thuli:hunter2-db-secret@db.internal.example/thuli',
+      'postgres:/thuli:hunter2-db-secret@db.internal.example/thuli',
+      'postgres://thuli:hunter2-db-secret@/thuli',
+      'postgres://thuli:hunter2-db-secret%zz@db.internal.example/thuli',
+      'postgres://thuli:hunter2-db-secret@db.internal.example:99999/thuli',
+      'thuli:hunter2-db-secret@db.internal.example',
+    ];
+    for (const value of malformed) {
+      const error = configError(testnet({ DATABASE_URL: value }));
+      expect(error.message, value).toContain('DATABASE_URL');
+      expect(error.message, value).not.toContain('hunter2');
+      expect(error.message, value).not.toContain('db.internal.example');
+    }
+  });
+
+  it('keeps DATABASE_URL out of anything that prints the config, while config.databaseUrl still reads it (C40)', () => {
+    const databaseUrl = 'postgres://thuli:hunter2-db-secret@db.internal.example:5432/thuli';
+    const config = loadApiConfig(testnet({ DATABASE_URL: databaseUrl }));
+    expect(config.databaseUrl).toBe(databaseUrl);
+    for (const printed of [JSON.stringify(config), inspect(config, { depth: 5 }), JSON.stringify({ ...config }), Object.keys(config).join()]) {
+      expect(printed).not.toContain('hunter2');
+      expect(printed).not.toContain('db.internal.example');
+      expect(printed).not.toContain('databaseUrl');
+    }
+  });
+
+  it('still refuses to start for a private key when a DATABASE_URL is set, and names neither value (C39, C40)', () => {
+    const error = configError(testnet({ DATABASE_URL: 'postgres://thuli:hunter2-db-secret@db.internal.example/thuli', WORKER_PRIVATE_KEY: WORKER_KEY }));
+    expect(error.message).toContain('WORKER_PRIVATE_KEY');
+    expect(error.message).not.toContain(WORKER_KEY.slice(2));
+    expect(error.message).not.toContain('hunter2');
   });
 
   it('refuses a facilitator that is not https and a port out of range', () => {

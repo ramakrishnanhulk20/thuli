@@ -53,6 +53,13 @@ export interface ApiConfig {
   trustedClientHeader: string | null;
   /** An https RPC on the payment's own chain, read only to check a settlement the facilitator left pending. */
   settlementRpcUrl: string;
+  /**
+   * The Postgres that keeps used payments and the limits for every copy of the server. Null keeps them in this
+   * process's memory, which is right only for one long-running server. It holds a password, so it is not enumerable:
+   * JSON.stringify, console.log and a spread copy of the config never carry it (C40). Read it from the object
+   * loadApiConfig returned, because a spread copy does not have it.
+   */
+  readonly databaseUrl: string | null;
 }
 
 export class ConfigError extends Error {
@@ -140,6 +147,25 @@ function publicOrigin(env: Env, isRequired: boolean): string | null {
   return url.origin;
 }
 
+// The scheme test is the one the store's own connector applies, and the parts it decodes must decode here too, so a URL
+// this accepts is one the store can read. The message never holds the value, which carries the password (C40).
+function databaseUrl(env: Env): string | null {
+  const value = read(env, 'DATABASE_URL');
+  if (value === undefined) return null;
+  const refusal = new ConfigError('DATABASE_URL must be a postgres:// or postgresql:// URL that names a host. Leave it empty to keep payments in memory.');
+  if (!/^postgres(ql)?:\/\//.test(value) || !URL.canParse(value)) throw refusal;
+  const url = new URL(value);
+  if (url.hostname === '') throw refusal;
+  try {
+    decodeURIComponent(url.username);
+    decodeURIComponent(url.password);
+    decodeURIComponent(url.pathname);
+  } catch {
+    throw refusal;
+  }
+  return value;
+}
+
 function port(env: Env): number {
   const value = read(env, 'PORT');
   if (value === undefined) return DEFAULT_PORT;
@@ -151,7 +177,7 @@ function port(env: Env): number {
  * Reads and checks the paid API's settings. X402_NETWORK has no default, so testnet payments are off unless chosen.
  * Base needs PAYTO_ADDRESS, the CDP keys, PUBLIC_ORIGIN and BASE_RPC_URL; Base Sepolia needs PAYTO_ADDRESS_TESTNET,
  * may name a FACILITATOR_URL and a PUBLIC_ORIGIN, and reads its receipts from the public Sepolia RPC.
- * TRUSTED_CLIENT_HEADER is optional on both.
+ * TRUSTED_CLIENT_HEADER and DATABASE_URL are optional on both.
  *
  * Refuses to start while any variable named like a private key is set, because a key held by an internet-facing server
  * is a key an attacker can reach (C39). This runs first, before any other setting is read.
@@ -179,7 +205,7 @@ export function loadApiConfig(env: Env): ApiConfig {
     facilitator = new HTTPFacilitatorClient({ url: facilitatorUrl(env) });
   }
 
-  return {
+  const settings: Omit<ApiConfig, 'databaseUrl'> = {
     network,
     networkId: chain.id,
     chainId: chain.chainId,
@@ -192,4 +218,5 @@ export function loadApiConfig(env: Env): ApiConfig {
     trustedClientHeader: trustedClientHeader(env),
     settlementRpcUrl: settlementRpcUrl(env, network),
   };
+  return Object.defineProperty(settings, 'databaseUrl', { value: databaseUrl(env), enumerable: false }) as ApiConfig;
 }

@@ -5,6 +5,9 @@ import { PRICE_UNITS, type NetworkId } from './config.ts';
 /** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
 export const MAX_CLAIMS = 100_000;
 
+/** The route's maxTimeoutSeconds, the library's own default, written out because the longest validity a claim accepts is built from it. */
+export const MAX_TIMEOUT_SECONDS = 300;
+
 /**
  * How far a buyer's clock may run ahead of ours. The x402 client signs validBefore as its own clock plus the route's
  * maxTimeoutSeconds, so a buyer whose clock is up to this fast still pays; anything further out was signed to outlive
@@ -20,7 +23,7 @@ export function hasExpired(validBefore: bigint, nowSeconds: bigint): boolean {
 type State = 'held' | 'unsure' | 'used';
 
 interface Claim {
-  owner: object | null;
+  owner: string | null;
   state: State;
   validBefore: bigint;
 }
@@ -55,10 +58,10 @@ export class PaymentClaims {
   }
 
   /**
-   * Takes the key for owner. Refuses an expired authorization, one valid for longer than the route allows, a key another
-   * request holds or used, and a full map.
+   * Takes the key for owner, one request's own random id. Refuses an expired authorization, one valid for longer than
+   * the route allows, a key another request holds or used, and a full map.
    */
-  claim(key: string, validBefore: bigint, owner: object, nowSeconds: bigint): ClaimResult {
+  claim(key: string, validBefore: bigint, owner: string, nowSeconds: bigint): ClaimResult {
     if (hasExpired(validBefore, nowSeconds)) return 'expired';
     if (validBefore > nowSeconds + this.#latestSeconds) return 'too-long';
     let entry = this.#claims.get(key);
@@ -79,7 +82,7 @@ export class PaymentClaims {
     return 'taken';
   }
 
-  markUsed(key: string, owner: object): void {
+  markUsed(key: string, owner: string): void {
     const entry = this.#take(key, owner);
     if (entry !== undefined) {
       entry.state = 'used';
@@ -88,7 +91,7 @@ export class PaymentClaims {
   }
 
   /** The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same header can take it. */
-  keepUnsure(key: string, owner: object): void {
+  keepUnsure(key: string, owner: string): void {
     const entry = this.#take(key, owner);
     if (entry !== undefined) {
       entry.state = 'unsure';
@@ -97,7 +100,7 @@ export class PaymentClaims {
   }
 
   /** Frees the key only for the request that holds it, and only while its outcome is a plain failure. */
-  release(key: string, owner: object): void {
+  release(key: string, owner: string): void {
     if (this.#take(key, owner) !== undefined) this.#claims.delete(key);
   }
 
@@ -105,7 +108,7 @@ export class PaymentClaims {
     return this.#claims.size;
   }
 
-  #take(key: string, owner: object): Claim | undefined {
+  #take(key: string, owner: string): Claim | undefined {
     const entry = this.#claims.get(key);
     return entry !== undefined && entry.state === 'held' && entry.owner === owner ? entry : undefined;
   }

@@ -12,8 +12,10 @@ export const CLIENT_MAX_FAILED_PER_HOUR = 5;
  */
 export const MAX_CLIENTS_TRACKED = 100_000;
 
-const MINUTE_MS = 60_000;
-const HOUR_MS = 3_600_000;
+/** The window CLIENT_MAX_PER_MINUTE counts over. */
+export const MINUTE_MS = 60_000;
+/** The window CLIENT_MAX_FAILED_PER_HOUR counts over, and how long an idle client is remembered. */
+export const HOUR_MS = 3_600_000;
 
 export type Limit = 'running' | 'minute' | 'failed' | 'clients';
 
