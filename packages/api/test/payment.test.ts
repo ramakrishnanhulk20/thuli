@@ -357,8 +357,8 @@ describe.each(BACKENDS)('POST /api/x402/screen with a payment, on $name', (backe
     const unplain = {
       'a control character': 'Fine wallet.\u001b[31m',
       'a markdown link': 'Fine wallet, see [the record](javascript:alert(1)).',
-      'a zero-width space': 'Fine wallet.​',
-      'a byte-order mark inside': 'Fine﻿ wallet.',
+      'a zero-width space': 'Fine wallet.\u200b',
+      'a byte-order mark inside': 'Fine\ufeff wallet.',
     };
     for (const [name, reason] of Object.entries(unplain)) {
       const { pay } = await setup({

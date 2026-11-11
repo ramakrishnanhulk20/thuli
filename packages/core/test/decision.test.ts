@@ -384,10 +384,10 @@ describe('validateDecision: a shared funder alone cannot hold a wallet', () => {
     ['a link', { reason: 'See https://example.org for why.' }, 'the reason contained a link, markup or control characters'],
     [
       'a hash split by a zero-width space',
-      { reason: `Funded in 0​x${'c3'.repeat(16)}​${'c3'.repeat(16)}.` },
+      { reason: `Funded in 0\u200bx${'c3'.repeat(16)}\u200b${'c3'.repeat(16)}.` },
       'the reason contained a link, markup or control characters',
     ],
-    ['a soft hyphen', { reason: 'An ordi­nary wallet.' }, 'the reason contained a link, markup or control characters'],
+    ['a soft hyphen', { reason: 'An ordi\u00adnary wallet.' }, 'the reason contained a link, markup or control characters'],
     ['a made-up hash', { citedTxs: [MADE_UP_TX] }, 'the reason cited a transaction Thuli did not fetch for this wallet'],
     ['a wrong share', { shareBps: 10000 }, 'the share did not match the action'],
     ['a wrong paid-hop count', { paidHops: 2 }, 'the model reported a different number of paid lookups than were made'],

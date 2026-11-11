@@ -78,7 +78,7 @@ describe('stripIdentifiers', () => {
   });
 
   it('cannot be split past by a zero-width character or full-width digits', () => {
-    expect(stripIdentifiers('See 0x​a9ac​1234 now.')).toBe('See [removed] now.');
+    expect(stripIdentifiers('See 0x\u200ba9ac\u200b1234 now.')).toBe('See [removed] now.');
     expect(stripIdentifiers('See ０ｘａ９ａｃ１２３４ now.')).toBe('See [removed] now.');
   });
 });
@@ -253,14 +253,14 @@ describe('parseVerdict', () => {
   });
 
   it('strips control and format characters from the reason and cuts it to 2000', () => {
-    expect(parseVerdict({ ...REAL_RESULT, reason: 'plain\u0000 te\u0007xt‮\n' })?.reason).toBe('plain text');
+    expect(parseVerdict({ ...REAL_RESULT, reason: 'plain\u0000 te\u0007xt\u202e\n' })?.reason).toBe('plain text');
     expect(parseVerdict({ ...REAL_RESULT, reason: 'x'.repeat(5000) })?.reason).toHaveLength(2000);
   });
 
   it.each([
     ['markup and a markdown link', '<img src=x onerror=alert(1)> [claim](https://evil.example)'],
     ['a bare link', 'Read more at https://evil.example today.'],
-    ['a link split by a format character', 'Read more at ht​tps://evil.example today.'],
+    ['a link split by a format character', 'Read more at ht\u200btps://evil.example today.'],
   ])('stores a reason with %s as null and keeps the rest of the verdict (C35)', (_name, reason) => {
     expect(parseVerdict({ ...REAL_RESULT, reason })).toEqual({ score: 66, decision: 'reject', confidence: 'low', route: 'review', reason: null });
   });

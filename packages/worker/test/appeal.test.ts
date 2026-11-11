@@ -162,7 +162,7 @@ describe('adviseOnAppeal', () => {
   });
 
   it('gives unclear on a reason validateDecision would refuse, and keeps none of its text', async () => {
-    const bad = ['x'.repeat(MAX_REASON_CHARS + 1), 'See https://evil.example', '<img src=x>', '[claim](evil)', 'bell\u0007', 'order‮'];
+    const bad = ['x'.repeat(MAX_REASON_CHARS + 1), 'See https://evil.example', '<img src=x>', '[claim](evil)', 'bell\u0007', 'order\u202e'];
     for (const reason of bad) {
       replyWith(adviceReply('reverse', reason));
       expect(await advise()).toEqual({ advice: 'unclear', reason: null, requestId: REQUEST_ID });

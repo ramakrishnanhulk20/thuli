@@ -329,7 +329,7 @@ describe.each(BACKENDS)('POST /api/check, on $name', (backend) => {
   });
 
   it('C13, C34: a reason with a markdown link or a zero-width character fails the one plain-text rule in core, as on the paid answer', async () => {
-    for (const reason of ['Fine wallet, see [the record](javascript:alert(1)).', 'Fine wallet.​', 'Fine⁠ wallet.']) {
+    for (const reason of ['Fine wallet, see [the record](javascript:alert(1)).', 'Fine wallet.\u200b', 'Fine\u2060 wallet.']) {
       const { check } = await checkApp({
         screen: async (wallet) => {
           const result = screenResult(wallet);

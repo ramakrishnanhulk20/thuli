@@ -10,7 +10,7 @@ describe('parseAddress', () => {
       CHECKSUMMED,
       CHECKSUMMED.toLowerCase(),
       `${CHECKSUMMED.toLowerCase()}   \r`,
-      `﻿${CHECKSUMMED}`,
+      `\ufeff${CHECKSUMMED}`,
     ];
     const parsed = new Set(spellings.map(parseAddress));
     expect([...parsed]).toEqual([CHECKSUMMED]);

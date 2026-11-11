@@ -18,7 +18,7 @@ const HEX_ADDRESS = /^0x([0-9a-fA-F]{40})$/;
 export function parseAddress(input: string): Address {
   if (typeof input !== 'string') throw new AddressError('address must be text');
   // Spreadsheet exports add a byte-order mark and Windows line endings; neither is part of the address.
-  const cleaned = input.replace(/^﻿/, '').trim();
+  const cleaned = input.replace(/^\ufeff/, '').trim();
   const match = HEX_ADDRESS.exec(cleaned);
   if (!match) throw new AddressError('not a 0x address of 40 hex characters');
   const body = match[1] as string;

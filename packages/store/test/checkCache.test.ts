@@ -35,7 +35,7 @@ describe('check cache', () => {
     await writeCheck(db, { address: LOWER, chain: 8453, rulebook: 2 }, BODY, NOW, 600);
     expect(await readCheck(db, { address: CHECKSUMMED, chain: 8453, rulebook: 2 }, NOW)).toEqual(BODY);
     expect(await readCheck(db, { address: UPPER, chain: 8453, rulebook: 2 }, NOW)).toEqual(BODY);
-    expect(await readCheck(db, { address: `﻿ ${LOWER}\r\n`, chain: 8453, rulebook: 2 }, NOW)).toEqual(BODY);
+    expect(await readCheck(db, { address: `\ufeff ${LOWER}\r\n`, chain: 8453, rulebook: 2 }, NOW)).toEqual(BODY);
     await writeCheck(db, { address: UPPER, chain: 8453, rulebook: 2 }, { decision: 'approve' }, NOW, 600);
     expect(await db.query('SELECT address FROM check_cache')).toEqual([{ address: CHECKSUMMED }]);
     expect(await readCheck(db, { address: LOWER, chain: 8453, rulebook: 2 }, NOW)).toEqual({ decision: 'approve' });

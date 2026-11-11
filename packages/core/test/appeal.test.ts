@@ -217,7 +217,7 @@ describe('checkAppeal', () => {
   });
 
   it('refuses links, markup and invisible format characters even when correctly signed', async () => {
-    const texts = ['see https://evil.example', 'WWW.evil.example', '<img src=x>', 'a > b', '[claim](evil)', 'order‮', 'iso⁦', 'zero\u200bwidth'];
+    const texts = ['see https://evil.example', 'WWW.evil.example', '<img src=x>', 'a > b', '[claim](evil)', 'order\u202e', 'iso\u2066', 'zero\u200bwidth'];
     for (const text of texts) {
       expect(await checkAppeal(await signed({ text }), options())).toEqual(refusedWith(LINK_CAUSE));
     }
