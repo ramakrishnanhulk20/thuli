@@ -13,6 +13,7 @@ import {
   HIGH_VOLUME_NONCE,
   isPassThrough,
   PASS_THROUGH_MAX_BLOCKS,
+  replayGroupLabels,
   SECONDS_PER_DAY,
   senderListShareBps,
   sharedDestinations,
@@ -873,5 +874,52 @@ describe('buildReplayFacts', () => {
       }
     }
     expect(checked).toBe(19 + 12 + 5 + 3 + 3);
+  });
+});
+
+describe('replayGroupLabels', () => {
+  const funder = synthetic('fa', 5);
+  const rooted = Array.from({ length: 3 }, (_, i) => synthetic('f6', i));
+  const sweepers = Array.from({ length: 2 }, (_, i) => synthetic('f7', i));
+  const loners = Array.from({ length: 2 }, (_, i) => synthetic('f8', i));
+  const fundings = rooted.map((w, i) => send(funder, w, ANCHOR_BLOCK + i, '0.1'));
+  const exchangeFunded = [...sweepers, ...loners].map((w, i) => send(BINANCE_14, w, OLD_BLOCK + 10 * i, '0.5'));
+  const sweeps = sweepers.map((w, i) => send(w, COLLECTOR, ANCHOR_BLOCK + 100 + i, '0.49'));
+  const states: [string, AccountState][] = [
+    [funder, eoa(5)],
+    [BINANCE_14, BINANCE_STATE],
+    [COLLECTOR, eoa(0)],
+    ...[...rooted, ...sweepers, ...loners].map((w): [string, AccountState] => [w, eoa(120)]),
+  ];
+
+  /** Every wallet's label beside its facts.group, after checking each label's member count is that group's size. */
+  function labelsAgainstFacts(input: ReplayInput): Map<string, string | undefined> {
+    const labels = replayGroupLabels(input);
+    const facts = buildReplayFacts(input);
+    const members = new Map<string, number>();
+    for (const label of labels.values()) members.set(label, (members.get(label) ?? 0) + 1);
+    for (const [wallet, f] of facts) {
+      const label = labels.get(wallet);
+      expect(label === undefined).toBe(f.group === null);
+      if (label !== undefined) expect(members.get(label)).toBe(f.group?.size);
+    }
+    return new Map(input.wallets.map((w) => [w, labels.get(w)]));
+  }
+
+  it('gives wallets linked by a root or a collector one label per group, and an unlinked wallet none', () => {
+    const wallets = [...rooted, ...sweepers, ...loners];
+    const labels = labelsAgainstFacts(replay(wallets, [...fundings, ...exchangeFunded, ...sweeps], states));
+    expect(new Set(rooted.map((w) => labels.get(w)))).toEqual(new Set([rooted[0]]));
+    expect(new Set(sweepers.map((w) => labels.get(w)))).toEqual(new Set([sweepers[0]]));
+    for (const w of loners) expect(labels.get(w)).toBeUndefined();
+  });
+
+  // The rooted group joins first and is the larger, so its root wins the union; the label still names the first wallet.
+  it('folds two groups bridged by one wallet into one label, named by the first wallet in input order', () => {
+    const bridge = send(rooted[0] as string, COLLECTOR, ANCHOR_BLOCK + 200, '0.09');
+    const wallets = [...sweepers, ...rooted, ...loners];
+    const labels = labelsAgainstFacts(replay(wallets, [...fundings, ...exchangeFunded, ...sweeps, bridge], states));
+    expect(new Set([...sweepers, ...rooted].map((w) => labels.get(w)))).toEqual(new Set([sweepers[0]]));
+    for (const w of loners) expect(labels.get(w)).toBeUndefined();
   });
 });

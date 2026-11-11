@@ -298,15 +298,20 @@ export function senderListShareBps(destination: string, page: TransferPage, clai
 
 /** Union-find over the claim wallets, so every wallet reachable through any link shares one component. */
 class Components {
+  private readonly wallets: string[] = [];
   private readonly index = new Map<string, number>();
   private readonly parent: number[] = [];
   private readonly size: number[] = [];
+  // Each root's earliest member in input order, so a group's label does not depend on the order links were joined in.
+  private readonly first: number[] = [];
 
   constructor(wallets: string[]) {
     for (const wallet of wallets) {
       this.index.set(wallet, this.parent.length);
+      this.first.push(this.parent.length);
       this.parent.push(this.parent.length);
       this.size.push(1);
+      this.wallets.push(wallet);
     }
   }
 
@@ -335,12 +340,21 @@ class Components {
       const [big, small] = (this.size[a] as number) >= (this.size[b] as number) ? [a, b] : [b, a];
       this.parent[small] = big;
       this.size[big] = (this.size[big] as number) + (this.size[small] as number);
+      this.first[big] = Math.min(this.first[big] as number, this.first[small] as number);
     }
   }
 
-  sizeOf(wallet: string): number {
+  /**
+   * The wallet's linked group: its size in claim wallets and a label naming it, the group's first wallet in input order.
+   * Null when nothing links the wallet to another claim wallet. facts.group and replayGroupLabels both read this.
+   */
+  groupOf(wallet: string): { label: string; size: number } | null {
     const at = this.index.get(wallet);
-    return at === undefined ? 0 : (this.size[this.find(at)] as number);
+    if (at === undefined) return null;
+    const root = this.find(at);
+    const size = this.size[root] as number;
+    if (size < 2) return null;
+    return { label: this.wallets[this.first[root] as number] as string, size };
   }
 }
 
@@ -482,44 +496,7 @@ function directExchangeFundings(
  */
 export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
   const { snapshotTime, settings, data, traces, states, destinationPages } = input;
-  const wallets = uniqueLower(input.wallets);
-  const claimWallets = new Set(wallets);
-  const kindOf = (address: string) => funderKind(states.get(address));
-  const linkable = (address: string) => kindOf(address) === 'wallet' || kindOf(address) === 'unknown';
-  // The one test for a destination, so groups, A3, A6, evidence and linkedByWallet can never disagree about an address.
-  const linksWallets = (dest: string) => {
-    const page = destinationPages.get(dest);
-    return linkable(dest) && page !== undefined && senderListShareBps(dest, page, claimWallets) >= settings.collectorMinListShareBps;
-  };
-
-  const byRoot = new Map<string, { wallet: string; fundingTime: number }[]>();
-  for (const wallet of wallets) {
-    const trace = traces.get(wallet);
-    if (trace?.status !== 'done') continue;
-    const root = lower(trace.root);
-    const members = byRoot.get(root) ?? [];
-    members.push({ wallet, fundingTime: trace.fundingTime });
-    byRoot.set(root, members);
-  }
-
-  const shared = sharedDestinations({ wallets, data });
-  const components = new Components(wallets);
-  const windowCounts = new Map<string, number>();
-  for (const [root, members] of byRoot) {
-    if (!linkable(root)) continue;
-    // A claim wallet that funded other claim wallets belongs in their group too.
-    components.join([...members.map((m) => m.wallet), ...(claimWallets.has(root) ? [root] : [])]);
-    for (const [wallet, fits] of sameFunderWindowCounts(members)) windowCounts.set(wallet, fits);
-  }
-  // A payment from a wallet whose inflows were not all read can look like a sweep, so every count at that destination
-  // is in doubt, for the wallets whose own inflows were read too: a fifth doubtful sweeper is what lifts four to A3.
-  // The wallets are still joined, because leaving one out could raise another wallet's outcome (C11).
-  const sweptOnUnreadInflows = new Set<string>();
-  for (const [dest, senders] of shared) {
-    if (!linksWallets(dest)) continue;
-    components.join(senders);
-    if ([...senders].some((sender) => !inflowsRead(data.get(sender)))) sweptOnUnreadInflows.add(dest);
-  }
+  const { wallets, kindOf, linkable, linksWallets, byRoot, shared, components, windowCounts, sweptOnUnreadInflows } = linkClaimWallets(input);
   const bursts = fundingBursts(directExchangeFundings(wallets, input, kindOf), settings);
 
   const result = new Map<string, Facts>();
@@ -560,12 +537,12 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
       else largestDeposit = Math.max(largestDeposit, senders);
     }
 
-    const size = components.sizeOf(wallet);
+    const linked = components.groupOf(wallet);
     const fundedAnotherClaimWallet = linkable(wallet) && (byRoot.get(wallet) ?? []).some((member) => member.wallet !== wallet);
     const group =
-      size >= 2
+      linked !== null
         ? {
-            size,
+            size: linked.size,
             sameFunderWithinWindow: windowCounts.get(wallet) ?? null,
             sweptToSharedCollector: swept,
             // Only a sweep is something this wallet did. A funding it received could have come from anyone (C15).
@@ -603,4 +580,75 @@ export function buildReplayFacts(input: ReplayInput): Map<string, Facts> {
     );
   }
   return result;
+}
+
+/**
+ * Each linked claim wallet's group label, keyed by lowercase wallet: the group's first wallet in input order. A wallet
+ * that facts.group leaves null is absent, and the wallets sharing a label are exactly the facts.group.size wallets of
+ * that group, because both come from the same linking. Pure, like buildReplayFacts.
+ */
+export function replayGroupLabels(input: ReplayInput): Map<string, string> {
+  const { wallets, components } = linkClaimWallets(input);
+  const labels = new Map<string, string>();
+  for (const wallet of wallets) {
+    const linked = components.groupOf(wallet);
+    if (linked !== null) labels.set(wallet, linked.label);
+  }
+  return labels;
+}
+
+interface Links {
+  wallets: string[];
+  kindOf: (address: string) => FunderKind;
+  linkable: (address: string) => boolean;
+  linksWallets: (dest: string) => boolean;
+  byRoot: Map<string, { wallet: string; fundingTime: number }[]>;
+  shared: Map<string, Set<string>>;
+  components: Components;
+  windowCounts: Map<string, number>;
+  sweptOnUnreadInflows: Set<string>;
+}
+
+/** The one place claim wallets are joined into groups, by the rules buildReplayFacts states. */
+function linkClaimWallets(input: ReplayInput): Links {
+  const { settings, data, traces, states, destinationPages } = input;
+  const wallets = uniqueLower(input.wallets);
+  const claimWallets = new Set(wallets);
+  const kindOf = (address: string) => funderKind(states.get(address));
+  const linkable = (address: string) => kindOf(address) === 'wallet' || kindOf(address) === 'unknown';
+  // The one test for a destination, so groups, A3, A6, evidence and linkedByWallet can never disagree about an address.
+  const linksWallets = (dest: string) => {
+    const page = destinationPages.get(dest);
+    return linkable(dest) && page !== undefined && senderListShareBps(dest, page, claimWallets) >= settings.collectorMinListShareBps;
+  };
+
+  const byRoot = new Map<string, { wallet: string; fundingTime: number }[]>();
+  for (const wallet of wallets) {
+    const trace = traces.get(wallet);
+    if (trace?.status !== 'done') continue;
+    const root = lower(trace.root);
+    const members = byRoot.get(root) ?? [];
+    members.push({ wallet, fundingTime: trace.fundingTime });
+    byRoot.set(root, members);
+  }
+
+  const shared = sharedDestinations({ wallets, data });
+  const components = new Components(wallets);
+  const windowCounts = new Map<string, number>();
+  for (const [root, members] of byRoot) {
+    if (!linkable(root)) continue;
+    // A claim wallet that funded other claim wallets belongs in their group too.
+    components.join([...members.map((m) => m.wallet), ...(claimWallets.has(root) ? [root] : [])]);
+    for (const [wallet, fits] of sameFunderWindowCounts(members)) windowCounts.set(wallet, fits);
+  }
+  // A payment from a wallet whose inflows were not all read can look like a sweep, so every count at that destination
+  // is in doubt, for the wallets whose own inflows were read too: a fifth doubtful sweeper is what lifts four to A3.
+  // The wallets are still joined, because leaving one out could raise another wallet's outcome (C11).
+  const sweptOnUnreadInflows = new Set<string>();
+  for (const [dest, senders] of shared) {
+    if (!linksWallets(dest)) continue;
+    components.join(senders);
+    if ([...senders].some((sender) => !inflowsRead(data.get(sender)))) sweptOnUnreadInflows.add(dest);
+  }
+  return { wallets, kindOf, linkable, linksWallets, byRoot, shared, components, windowCounts, sweptOnUnreadInflows };
 }
