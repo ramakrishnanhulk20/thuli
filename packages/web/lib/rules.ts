@@ -21,3 +21,14 @@ export function ruleMeaning(code: string): string {
 export function hopsText(hops: number): string {
   return hops === 1 ? '1 hop' : `${hops} hops`;
 }
+
+const LEADING_RULE_CODE = /^(?:A[1-9]|B[12]): */;
+
+/**
+ * A reason from the live routes without its leading rule code. The page already shows the rule beside the reason, so
+ * one code of the form A1 to A9, B1 or B2, its colon and the spaces after it are dropped, and the text is trimmed.
+ * Nothing else changes. This is the rule the replay export applies before it publishes a reason.
+ */
+export function displayReason(reason: string): string {
+  return reason.replace(LEADING_RULE_CODE, '').trim();
+}

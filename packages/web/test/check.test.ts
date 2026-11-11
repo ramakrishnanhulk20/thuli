@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { addressFromRoute, classify, isFreeCheck, isWalletInput, notCheckedText, relativeTime } from '../lib/check';
+import { displayReason } from '../lib/rules';
 
 const example = JSON.parse(
   fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'api', 'examples', 'free-check-response.json'), 'utf8'),
@@ -59,6 +60,16 @@ describe('isFreeCheck', () => {
     body.servRequestId = null;
     body.cached = true;
     expect(isFreeCheck(body)).toBe(true);
+  });
+});
+
+describe('the reason the result shows', () => {
+  it('is the example reason without its leading rule code, and the rule is still on the answer', () => {
+    const { decision } = example as { decision: { rule: string; reason: string } };
+    expect(decision.reason.startsWith(`${decision.rule}: `)).toBe(true);
+    expect(displayReason(decision.reason)).toBe(decision.reason.slice(decision.rule.length + 2));
+    expect(displayReason(decision.reason).startsWith('The wallet is')).toBe(true);
+    expect(decision.rule).toBe('A9');
   });
 });
 

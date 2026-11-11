@@ -5,7 +5,7 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { notCheckedText, OUTCOME_WORDS, relativeTime, type FreeCheck } from '@/lib/check';
 import { shortHash, txUrl } from '@/lib/explorer';
 import { loadWallet } from '@/lib/replay/client';
-import { ruleMeaning } from '@/lib/rules';
+import { displayReason, ruleMeaning } from '@/lib/rules';
 import styles from './check.module.css';
 
 function Rise({ index, className, children }: { index: number; className?: string; children: ReactNode }) {
@@ -50,7 +50,7 @@ export function CheckResult({ address, result }: { address: string; result: Free
           {meaning === decision.rule ? null : <p className={styles.ruleMeaning}>{meaning}</p>}
         </div>
         <p className={styles.reason} data-reason>
-          {decision.reason}
+          {displayReason(decision.reason)}
         </p>
         <p className={styles.citedLabel}>Cited transactions</p>
         {decision.citedTxs.length === 0 ? (

@@ -1,18 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import {
   apiAttacks,
   createChainClient,
   judgeRenderedReason,
-  rootMatches,
+  readActiveRoot,
+  rebuiltLeaf,
+  rootLineState,
+  rootLineText,
   runApiAttack,
   runVaultAttack,
-  shortHash,
   vaultCalls,
   type AttackResult,
+  type LiveRoot,
   type ProofFacts,
 } from '@/lib/attacks';
 import { Drop } from '../Drop';
@@ -54,9 +57,22 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
   const [markupRun, setMarkupRun] = useState(0);
   const markupRef = useRef<HTMLParagraphElement>(null);
   const client = useMemo(() => createChainClient(), []);
-  const matches = useMemo(() => rootMatches(facts), [facts]);
+  const [live, setLive] = useState<LiveRoot>({ status: 'reading' });
+  const rootLine = useMemo(() => rootLineState(rebuiltLeaf(facts), live, facts.root), [facts, live]);
+  // Only a root that is proven wrong switches the vault rows off. A vault that cannot be read leaves them to say so themselves.
+  const rowsOff = rootLine.kind === 'mismatch';
   const calls = useMemo(() => vaultCalls(facts), [facts]);
   const api = useMemo(() => apiAttacks(facts), [facts]);
+
+  useEffect(() => {
+    let current = true;
+    void readActiveRoot(client, facts.vault).then((read) => {
+      if (current) setLive(read);
+    });
+    return () => {
+      current = false;
+    };
+  }, [client, facts.vault]);
 
   const execute = useCallback(
     async (id: RowId): Promise<AttackResult> => {
@@ -98,7 +114,7 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
     setRunningAll(true);
     try {
       for (const [index, row] of ROWS.entries()) {
-        if (!matches && VAULT_IDS.includes(row.id)) continue;
+        if (rowsOff && VAULT_IDS.includes(row.id)) continue;
         if (index > 0) await sleep(GAP_MILLISECONDS);
         await run(row.id);
       }
@@ -134,14 +150,14 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
           {tally}
         </p>
       </div>
-      <p className={styles.rootLine} data-root-line>
-        {`LIST ROOT REBUILT IN YOUR BROWSER: ${matches ? 'MATCHES THE VAULT' : 'DOES NOT MATCH'} ${shortHash(facts.root)}`}
+      <p className={styles.rootLine} data-root-line data-root-state={rootLine.kind} aria-live="polite">
+        {rootLineText(rootLine)}
       </p>
-      {matches ? null : (
+      {rowsOff ? (
         <p className={styles.mismatch} role="alert">
           The vault record and this page disagree about the list root, so the vault rows are switched off.
         </p>
-      )}
+      ) : null}
 
       <ol className={styles.rows}>
         {ROWS.map((row, index) => (
@@ -151,7 +167,7 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
             number={index + 1}
             copy={row}
             state={states[row.id] ?? { kind: 'idle' }}
-            disabled={!matches && VAULT_IDS.includes(row.id)}
+            disabled={rowsOff && VAULT_IDS.includes(row.id)}
             markupRun={markupRun}
             onRun={() => void run(row.id)}
           />

@@ -16,10 +16,15 @@ import {
   leafFor,
   MARKUP_REASON,
   mistypedAddress,
+  readActiveRoot,
+  rebuiltLeaf,
+  rootLineState,
+  rootLineText,
   rootMatches,
   runApiAttack,
   settlementUrl,
   shortHash,
+  STATE_SIGNATURE,
   runVaultCall,
   shortenAddresses,
   vaultCalls,
@@ -73,6 +78,21 @@ describe('lib/vaultAbi.ts against the worker ABI', () => {
   it('parses into the ABI the page uses, one item per signature', () => {
     expect(VAULT_ABI).toHaveLength(VAULT_SIGNATURES.length);
   });
+
+  it('state() in lib/attacks.ts has the same twelve fields, names and types in order, as the worker ABI', () => {
+    const item = generated.find((entry) => entry.type === 'function' && entry.name === 'state') as
+      | { inputs: unknown[]; stateMutability: string; outputs: { type: string; components: { name: string; type: string }[] }[] }
+      | undefined;
+    expect(item, 'state is missing from the worker ABI').toBeDefined();
+    expect(item?.inputs).toEqual([]);
+    expect(item?.stateMutability).toBe('view');
+    expect(item?.outputs).toHaveLength(1);
+    expect(item?.outputs[0]?.type).toBe('tuple');
+    const fields = /returns \(\((.*)\) \w+\)$/.exec(STATE_SIGNATURE)?.[1]?.split(', ').map((entry) => entry.split(' ')) ?? [];
+    expect(fields).toHaveLength(12);
+    expect(fields.map(([type, name]) => ({ type, name }))).toEqual(item?.outputs[0]?.components.map(({ name, type }) => ({ type, name })));
+    expect(fields.map(([, name]) => name)).toContain('activeRoot');
+  });
 });
 
 describe('the list root', () => {
@@ -87,6 +107,63 @@ describe('the list root', () => {
     expect(rootMatches({ ...facts, paidAccount: facts.refusedAccount })).toBe(false);
     expect(rootMatches({ ...facts, vault: facts.token })).toBe(false);
     expect(rootMatches({ ...facts, chainId: 8453 })).toBe(false);
+  });
+});
+
+describe('the root line', () => {
+  const leaf = rebuiltLeaf(facts);
+  const other = `0x${'ab'.repeat(32)}`;
+
+  it('rebuilds the same leaf the record holds', () => {
+    expect(leaf.toLowerCase()).toBe(record.root.toLowerCase());
+  });
+
+  it('says it is reading until the vault answers', () => {
+    const line = rootLineState(leaf, { status: 'reading' }, record.root);
+    expect(line).toEqual({ kind: 'reading' });
+    expect(rootLineText(line)).toBe("READING THE VAULT'S ACTIVE ROOT");
+  });
+
+  it('says it matches when the rebuilt leaf is the live active root, with the first 10 and last 6 characters', () => {
+    const line = rootLineState(leaf, { status: 'read', root: leaf }, record.root);
+    expect(line).toEqual({ kind: 'match', root: leaf });
+    expect(rootLineText(line)).toBe(`LIST ROOT REBUILT IN YOUR BROWSER MATCHES THE VAULT'S ACTIVE ROOT ${leaf.slice(0, 10)}…${leaf.slice(-6)}`);
+    expect(rootLineState(leaf, { status: 'read', root: leaf.toUpperCase().replace('0X', '0x') }, record.root).kind).toBe('match');
+  });
+
+  it('says it could not read the vault, and keeps the rows on', () => {
+    const line = rootLineState(leaf, { status: 'failed' }, record.root);
+    expect(line).toEqual({ kind: 'unreadable' });
+    expect(rootLineText(line)).toBe('COULD NOT READ THE VAULT. THE ROWS BELOW MAY NOT RUN.');
+  });
+
+  it('is a mismatch when the live root differs, and shows the live root', () => {
+    const line = rootLineState(leaf, { status: 'read', root: other }, record.root);
+    expect(line).toEqual({ kind: 'mismatch', root: other });
+    expect(rootLineText(line)).toBe(`LIST ROOT REBUILT IN YOUR BROWSER: DOES NOT MATCH ${other.slice(0, 10)}…${other.slice(-6)}`);
+  });
+
+  it('is a mismatch when the record root differs, whatever the vault says, even before it is read', () => {
+    for (const live of [{ status: 'reading' }, { status: 'failed' }, { status: 'read', root: leaf }] as const) {
+      expect(rootLineState(leaf, live, other)).toEqual({ kind: 'mismatch', root: other });
+    }
+  });
+
+  it('reads activeRoot from state() on the vault and files a bad read as failed', async () => {
+    const calls: unknown[] = [];
+    const reader = (answer: () => unknown) => ({
+      readContract: async (parameters: never) => {
+        calls.push(parameters);
+        return answer();
+      },
+    });
+    const good = await readActiveRoot(reader(() => ({ activeRoot: leaf, pendingRoot: other })), facts.vault);
+    expect(good).toEqual({ status: 'read', root: leaf });
+    expect(calls[0]).toMatchObject({ address: facts.vault, functionName: 'state' });
+    expect(await readActiveRoot(reader(() => { throw new Error('offline'); }), facts.vault)).toEqual({ status: 'failed' });
+    expect(await readActiveRoot(reader(() => ({ activeRoot: '0x12' })), facts.vault)).toEqual({ status: 'failed' });
+    expect(await readActiveRoot(reader(() => null), facts.vault)).toEqual({ status: 'failed' });
+    expect(await readActiveRoot(reader(() => 7), facts.vault)).toEqual({ status: 'failed' });
   });
 });
 

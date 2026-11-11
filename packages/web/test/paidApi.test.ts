@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { checkPaidExample, formatUtc, loadPaidExample, PaidExampleError } from '../lib/paidExample';
+import { displayReason } from '../lib/rules';
 
 const folder = path.join(import.meta.dirname, '..', '..', 'api', 'examples');
 const read = (name: string) => JSON.parse(fs.readFileSync(path.join(folder, name), 'utf8')) as Record<string, any>;
@@ -37,6 +38,17 @@ describe('loadPaidExample', () => {
     expect(example.networkName).toBe('Base Sepolia');
     expect(example.testnet).toBe(true);
     expect(example.settlementUrl).toBe(`https://sepolia.basescan.org/tx/${answer().payment.transaction}`);
+  });
+});
+
+describe('the reason the receipt shows', () => {
+  it('is the example reason without its leading rule code, for the text and for the title', () => {
+    const example = loadPaidExample(folder);
+    expect(example.reason.startsWith(`${example.rule}: `)).toBe(true);
+    const shown = displayReason(example.reason);
+    expect(shown).toBe(example.reason.slice(example.rule.length + 2));
+    expect(shown.startsWith(example.rule)).toBe(false);
+    expect(shown).toBe(shown.trim());
   });
 });
 

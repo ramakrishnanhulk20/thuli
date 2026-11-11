@@ -3,6 +3,7 @@ import * as motion from 'motion/react-client';
 import { OUTCOME_WORDS } from '@/lib/check';
 import { loadPaidExample } from '@/lib/paidExample';
 import { loadSummary } from '@/lib/replay/load';
+import { displayReason } from '@/lib/rules';
 import { Drop } from '../Drop';
 import styles from './paidApi.module.css';
 
@@ -33,6 +34,7 @@ export function PaidApi() {
   const summary = loadSummary();
   const cents = (summary.run.spentCents / summary.wallets).toFixed(2);
   const paid = `${example.price} USDC on ${example.networkName}`;
+  const reason = displayReason(example.reason);
 
   const steps = [
     { title: 'Ask', line: 'POST /api/x402/screen with one wallet address.' },
@@ -117,8 +119,8 @@ export function PaidApi() {
             </div>
             <div className={styles.receiptRow}>
               <p className={styles.rowName}>REASON</p>
-              <p className={styles.reason} title={example.reason}>
-                {example.reason}
+              <p className={styles.reason} title={reason}>
+                {reason}
               </p>
             </div>
             <div className={styles.receiptRow}>

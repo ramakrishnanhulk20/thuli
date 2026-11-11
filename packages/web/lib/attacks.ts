@@ -1,4 +1,4 @@
-import { createPublicClient, encodeAbiParameters, http, isAddress, keccak256, type Address, type Hex } from 'viem';
+import { createPublicClient, encodeAbiParameters, http, isAddress, keccak256, parseAbi, type Address, type Hex } from 'viem';
 import { baseSepolia } from 'viem/chains';
 import { VAULT_ABI } from './vaultAbi';
 
@@ -47,9 +47,76 @@ export function leafFor(chainId: number, vault: string, account: string, amount:
   return keccak256(keccak256(encoded));
 }
 
-/** True when the list's single leaf, rebuilt here, is the root the vault holds. */
+/** The leaf of the one wallet on the vault's list, rebuilt here from the record's values. */
+export function rebuiltLeaf(facts: ProofFacts): Hex {
+  return leafFor(facts.chainId, facts.vault, facts.paidAccount, BigInt(facts.paidAmount));
+}
+
+/** True when the list's single leaf, rebuilt here, is the root the record holds. */
 export function rootMatches(facts: ProofFacts): boolean {
-  return leafFor(facts.chainId, facts.vault, facts.paidAccount, BigInt(facts.paidAmount)).toLowerCase() === facts.root.toLowerCase();
+  return rebuiltLeaf(facts).toLowerCase() === facts.root.toLowerCase();
+}
+
+/**
+ * The vault's state() view, written from the struct in ARCHITECTURE.md section 4.2. A test compares its fields, in order,
+ * with the generated ABI in packages/worker/src/vault/abi.ts.
+ */
+export const STATE_SIGNATURE =
+  'function state() view returns ((address token, address owner, address agent, uint256 perWalletCap, uint64 endTime, uint32 rootDelay, uint256 deposited, uint256 totalPaid, bytes32 activeRoot, bytes32 pendingRoot, uint64 pendingClaimableAt, bool paused) s)' as const;
+
+const STATE_ABI = parseAbi([STATE_SIGNATURE]);
+
+/** The vault's active root as the page knows it: not read yet, not readable, or read. */
+export type LiveRoot = { status: 'reading' } | { status: 'failed' } | { status: 'read'; root: string };
+
+/** All the state read needs from a chain client. */
+export interface StateReader {
+  readContract: (parameters: never) => Promise<unknown>;
+}
+
+const ROOT_HEX = /^0x[0-9a-fA-F]{64}$/;
+
+/** Reads activeRoot from the vault's state(). A call that fails, or an answer that is not a root, is a failed read. */
+export async function readActiveRoot(client: StateReader, vault: string): Promise<LiveRoot> {
+  try {
+    const state = await client.readContract({ address: vault as Address, abi: STATE_ABI, functionName: 'state' } as never);
+    const root = typeof state === 'object' && state !== null ? (state as { activeRoot?: unknown }).activeRoot : undefined;
+    if (typeof root !== 'string' || !ROOT_HEX.test(root)) return { status: 'failed' };
+    return { status: 'read', root };
+  } catch {
+    return { status: 'failed' };
+  }
+}
+
+export type RootLine =
+  | { kind: 'reading' }
+  | { kind: 'match'; root: string }
+  | { kind: 'unreadable' }
+  | { kind: 'mismatch'; root: string };
+
+/**
+ * What the root line says. The rebuilt leaf is checked against the root the record holds first, silently: a record that
+ * disagrees is a mismatch whatever the vault says. Then it is checked against the vault's live active root, once that
+ * has been read. Only a mismatch switches the vault rows off.
+ */
+export function rootLineState(leaf: string, live: LiveRoot, recordRoot: string): RootLine {
+  if (leaf.toLowerCase() !== recordRoot.toLowerCase()) return { kind: 'mismatch', root: recordRoot };
+  if (live.status === 'failed') return { kind: 'unreadable' };
+  if (live.status === 'reading') return { kind: 'reading' };
+  return leaf.toLowerCase() === live.root.toLowerCase() ? { kind: 'match', root: live.root } : { kind: 'mismatch', root: live.root };
+}
+
+export function rootLineText(line: RootLine): string {
+  switch (line.kind) {
+    case 'reading':
+      return "READING THE VAULT'S ACTIVE ROOT";
+    case 'match':
+      return `LIST ROOT REBUILT IN YOUR BROWSER MATCHES THE VAULT'S ACTIVE ROOT ${shortHash(line.root)}`;
+    case 'unreadable':
+      return 'COULD NOT READ THE VAULT. THE ROWS BELOW MAY NOT RUN.';
+    case 'mismatch':
+      return `LIST ROOT REBUILT IN YOUR BROWSER: DOES NOT MATCH ${shortHash(line.root)}`;
+  }
 }
 
 /**

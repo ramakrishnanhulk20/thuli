@@ -8,7 +8,7 @@ import { addressUrl, isReplayAddress, shortAddress, shortHash, txUrl } from '../
 import { familyClusters, shardName } from '../lib/replay/client';
 import { OUTCOME_STYLES, type ReplaySummary } from '../lib/replay/replayTypes';
 import type { WebPoints } from '../lib/replay/types';
-import { hopsText, ruleMeaning } from '../lib/rules';
+import { displayReason, hopsText, ruleMeaning } from '../lib/rules';
 
 const root = path.join(import.meta.dirname, '..', 'public', 'replay', 'robo');
 const read = <T>(name: string) => JSON.parse(fs.readFileSync(path.join(root, name), 'utf8')) as T;
@@ -101,6 +101,51 @@ describe('ruleMeaning', () => {
     expect(ruleMeaning('')).toBe('');
     expect(ruleMeaning('constructor')).toBe('constructor');
     expect(ruleMeaning('__proto__')).toBe('__proto__');
+  });
+});
+
+describe('displayReason', () => {
+  it('drops one leading rule code, its colon and the spaces after it', () => {
+    expect(displayReason('A8: The wallet is 12 days old.')).toBe('The wallet is 12 days old.');
+    expect(displayReason('A1:No space after the colon.')).toBe('No space after the colon.');
+    expect(displayReason('A9:    Several spaces.')).toBe('Several spaces.');
+    for (const code of ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'B1', 'B2']) {
+      expect(displayReason(`${code}: Reason text.`)).toBe('Reason text.');
+    }
+  });
+
+  it('changes nothing when there is no leading code', () => {
+    expect(displayReason('The wallet is 12 days old.')).toBe('The wallet is 12 days old.');
+    expect(displayReason('')).toBe('');
+  });
+
+  it('leaves a code in the middle of the text alone', () => {
+    expect(displayReason('Held under A3: a shared collector.')).toBe('Held under A3: a shared collector.');
+    expect(displayReason('See rule B1: shared funder.')).toBe('See rule B1: shared funder.');
+  });
+
+  it('drops B2: the same way', () => {
+    expect(displayReason('B2: The model raised a held wallet.')).toBe('The model raised a held wallet.');
+  });
+
+  it('turns a reason that is only a code into nothing, and trims the ends', () => {
+    expect(displayReason('A8:')).toBe('');
+    expect(displayReason('B1: ')).toBe('');
+    expect(displayReason('A8: text  ')).toBe('text');
+  });
+
+  it('drops only the first code, and only a code it knows', () => {
+    expect(displayReason('A8: A9: two codes')).toBe('A9: two codes');
+    expect(displayReason('A0: not a rule')).toBe('A0: not a rule');
+    expect(displayReason('B3: not a rule')).toBe('B3: not a rule');
+    expect(displayReason('a8: lowercase')).toBe('a8: lowercase');
+    expect(displayReason('A10: too long')).toBe('A10: too long');
+  });
+
+  it('does not touch a reason the replay export already cleaned', () => {
+    const members = read<{ members: { reason: string }[] }>('groups/0.json').members;
+    expect(members.length).toBeGreaterThan(0);
+    for (const member of members) expect(displayReason(member.reason)).toBe(member.reason);
   });
 });
 
