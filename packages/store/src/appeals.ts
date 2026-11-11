@@ -5,6 +5,7 @@ import {
   MAX_APPEAL_CHARS,
   OUTCOMES,
   parseAddress,
+  ReppoVerdict,
   shareFor,
   type Address,
   type Outcome,
@@ -24,6 +25,8 @@ export const APPEALS_DAY_MAX = 20;
 export const APPEALS_DAY_COUNTER = 'campaign-appeals';
 /** The longest note from the outside check that is kept, in characters, the same cap as a model's reason. */
 export const MAX_REPPO_NOTE_CHARS = 280;
+/** The longest decision word from the outside check that is kept, in characters. */
+export const MAX_REPPO_DECISION_CHARS = 64;
 /** The longest note the owner may keep with a settlement, in characters. */
 export const MAX_OWNER_NOTE_CHARS = 1_000;
 
@@ -39,6 +42,7 @@ const ROUTES: readonly string[] = ['ship', 'review', 'block'];
 export type AppealCheckStatus = 'queued' | 'checking' | 'checked' | 'unchecked';
 export type AppealOutcome = 'open' | 'reversed' | 'upheld';
 export type ReppoRoute = 'ship' | 'review' | 'block';
+export type ReppoConfidence = ReppoVerdict['confidence'];
 export type AddAppealResult = 'queued' | 'exists' | 'unknown' | 'undecided' | 'approved' | 'busy';
 export type ReleaseAppealResult = 'queued' | 'unchecked';
 
@@ -92,11 +96,22 @@ export interface TakenAppeal {
   record: Record<string, unknown> | null;
 }
 
+/**
+ * One finished outside check as the worker records it. score, decision and confidence are Reppo's own verdict values,
+ * each left out or null when Reppo gave none.
+ */
 export interface AppealCheck {
   evalId: string;
-  route: ReppoRoute;
+  /** null when Reppo answered and charged but named a route that is not one of the three. */
+  route: ReppoRoute | null;
   note: string | null;
   creditsCharged: number;
+  /** A whole number from 0 to 100, as ReppoVerdict has it. */
+  score?: number | null;
+  /** Plain text of 1 to 64 characters. */
+  decision?: string | null;
+  /** low, medium or high, as ReppoVerdict has it. */
+  confidence?: ReppoConfidence | null;
 }
 
 export interface AppealSettlement {
@@ -134,6 +149,9 @@ export interface OwnerAppeal {
   reppoRoute: ReppoRoute | null;
   reppoNote: string | null;
   creditsCharged: number | null;
+  reppoScore: number | null;
+  reppoDecision: string | null;
+  reppoConfidence: ReppoConfidence | null;
   checkedAt: Date | null;
   outcome: AppealOutcome;
   newAction: 'full' | 'partial' | null;
@@ -169,6 +187,9 @@ interface OwnerRow {
   reppo_route: string | null;
   reppo_note: string | null;
   credits_charged: number | null;
+  reppo_score: number | null;
+  reppo_decision: string | null;
+  reppo_confidence: string | null;
   checked_at: unknown;
   outcome: string;
   new_action: string | null;
@@ -212,6 +233,22 @@ function plainOrNull(value: unknown, label: string, most: number): string | null
     throw new StoreError(`${label} must be null or plain text of 1 to ${most} characters`);
   }
   return value;
+}
+
+// Score and confidence are held to core's ReppoVerdict, the schema the worker read them with, so the store and the
+// reader can never disagree on a range (C34, C41). Left out or null is no value.
+function scoreOf(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  const parsed = ReppoVerdict.shape.score.safeParse(value);
+  if (!parsed.success) throw new StoreError('score must be null or a whole number from 0 to 100');
+  return parsed.data;
+}
+
+function confidenceOf(value: unknown): ReppoConfidence | null {
+  if (value === undefined || value === null) return null;
+  const parsed = ReppoVerdict.shape.confidence.safeParse(value);
+  if (!parsed.success) throw new StoreError('confidence must be null, low, medium or high');
+  return parsed.data;
 }
 
 function evalIdOf(value: unknown): string {
@@ -430,29 +467,36 @@ export async function noteAppealEval(db: Db, key: AppealKey, evalId: string, now
 
 /**
  * Records the outside check's result on an appeal that is checking: Reppo's route, its note (already cut by the worker
- * and checked again here like any model text, C13, C34), the evaluation id and the credits it charged. Refused, changing
+ * and checked again here like any model text, C13, C34), the evaluation id, the credits it charged, and its score,
+ * decision and confidence, which only ownerAppeals returns (C40). A check Reppo charged for is marked checked even when
+ * its route is null, one Thuli does not know, so it is never handed out or paid for again (C23). Refused, changing
  * nothing, when a different evaluation id was noted for this appeal. The check is advice: nothing here touches the ask.
  * One statement.
  * @returns true when the appeal was checking and is now checked; false, changing nothing, otherwise.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when evalId is malformed, route is
- *   not ship, review or block, note is neither null nor plain text of 1 to 280 characters, creditsCharged is not a
- *   whole number from 0, or now is not a valid Date.
+ *   not null, ship, review or block, note is neither null nor plain text of 1 to 280 characters, creditsCharged is not
+ *   a whole number from 0, score is not a whole number from 0 to 100, decision is not plain text of 1 to 64
+ *   characters, confidence is not low, medium or high (each of the last three may be null or left out), or now is not
+ *   a valid Date, each before anything is written.
  */
 export async function recordAppealCheck(db: Db, key: AppealKey, check: AppealCheck, now: Date): Promise<boolean> {
   const nowAt = instant(now);
   const { campaignId, wallet } = keyOf(key);
   const evalId = evalIdOf(check.evalId);
-  if (!ROUTES.includes(check.route)) throw new StoreError('route must be ship, review or block');
+  if (check.route !== null && !ROUTES.includes(check.route)) throw new StoreError('route must be null, ship, review or block');
   const note = plainOrNull(check.note, 'note', MAX_REPPO_NOTE_CHARS);
   const credits = wholeNumber(check.creditsCharged, 'creditsCharged', 0, MAX_INTEGER);
+  const score = scoreOf(check.score);
+  const decision = plainOrNull(check.decision ?? null, 'decision', MAX_REPPO_DECISION_CHARS);
+  const confidence = confidenceOf(check.confidence);
   if (campaignId === null) return false;
   const rows = await db.query(
     `UPDATE appeals
         SET check_status = 'checked', lease_until = NULL, retry_at = NULL, reppo_eval_id = $3, reppo_route = $4, reppo_note = $5,
-            credits_charged = $6, checked_at = $7::timestamptz
+            credits_charged = $6, checked_at = $7::timestamptz, reppo_score = $8, reppo_decision = $9, reppo_confidence = $10
       WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking' AND (reppo_eval_id IS NULL OR reppo_eval_id = $3)
      RETURNING wallet`,
-    [campaignId, wallet, evalId, check.route, note, credits, nowAt],
+    [campaignId, wallet, evalId, check.route, note, credits, nowAt, score, decision, confidence],
   );
   return rows.length === 1;
 }
@@ -576,16 +620,16 @@ export async function getAppeal(db: Db, campaignId: string, wallet: string): Pro
 }
 
 /**
- * Every appeal of a campaign in full, oldest first, text and owner note included, for the operator's command that lists
- * and settles them. Never for a route or a log (C40), and the signature is not returned even here. At most one row per
+ * Every appeal of a campaign in full, oldest first, text, owner note and Reppo's score, decision and confidence
+ * included, for the operator's command that lists and settles them. Never for a route or a log (C40), and the signature is not returned even here. At most one row per
  * ask, so at most the campaign's ask cap.
  */
 export async function ownerAppeals(db: Db, campaignId: string): Promise<OwnerAppeal[]> {
   if (!isCampaignId(campaignId)) return [];
   const rows = await db.query<OwnerRow>(
     `SELECT campaign_id, wallet, text, text_hash, signed_at::text AS signed_at, appealed_action, appealed_rule, filed_at,
-            check_status, attempts, reppo_eval_id, reppo_route, reppo_note, credits_charged, checked_at, outcome, new_action,
-            owner_note, settled_at
+            check_status, attempts, reppo_eval_id, reppo_route, reppo_note, credits_charged, reppo_score, reppo_decision,
+            reppo_confidence, checked_at, outcome, new_action, owner_note, settled_at
        FROM appeals WHERE campaign_id = $1
       ORDER BY filed_at, wallet`,
     [campaignId],
@@ -605,6 +649,9 @@ export async function ownerAppeals(db: Db, campaignId: string): Promise<OwnerApp
     reppoRoute: row.reppo_route as ReppoRoute | null,
     reppoNote: row.reppo_note,
     creditsCharged: row.credits_charged,
+    reppoScore: row.reppo_score,
+    reppoDecision: row.reppo_decision,
+    reppoConfidence: row.reppo_confidence as ReppoConfidence | null,
     checkedAt: readTimeOrNull(row.checked_at),
     outcome: row.outcome as AppealOutcome,
     newAction: row.new_action as 'full' | 'partial' | null,

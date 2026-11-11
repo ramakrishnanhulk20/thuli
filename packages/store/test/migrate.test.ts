@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appealTextHash, parseAddress } from '@thuli/core';
-import { addAppeal, getAppeal } from '../src/appeals.ts';
+import { addAppeal, getAppeal, ownerAppeals, recordAppealCheck, takeAppeal } from '../src/appeals.ts';
 import { counts, getAsk, getCampaign, listVersions, markListResent, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
@@ -283,6 +283,68 @@ describe('migrate', () => {
     expect(await listVersions(db, 'old')).toEqual([expect.objectContaining({ status: 'sending', postTx: other, postNonce: null })]);
   });
 
+  it('a database made through 008, holding a checked and a waiting appeal, migrates on to 009 with every row readable', async () => {
+    const before = [
+      '002_campaigns.sql', '003_retries_and_vault_block.sql', '004_paid_results.sql', '005_list_sending.sql', '006_appeals.sql',
+      '007_screening_tries.sql', '008_post_nonce.sql',
+    ];
+    for (const name of before) {
+      await writeFile(path.join(directory, name), await readFile(fileURLToPath(new URL(`../migrations/${name}`, import.meta.url))));
+    }
+    expect((await migrate(db, directory)).applied).toHaveLength(8);
+    const at = '2026-11-11T12:00:00.000Z';
+    const checked = parseAddress('0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a');
+    const waiting = parseAddress('0x00000000000000000000000000000000000000b2');
+    const signature = `0x${'ab'.repeat(65)}`;
+    const text = 'My wallet is my own.';
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at)
+       VALUES ('old', 'Before the verdict', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{}', 'open',
+               $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz)`,
+      ['0x00000000000000000000000000000000000a11ce', at],
+    );
+    await db.query(
+      `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts, action, share_bps, rule, reason,
+                         cited_txs, not_checked, facts, decided_at)
+       SELECT 'old', w, 1800000000, $2, $3::timestamptz, 'decided', 1, 'hold', 0, 'A9', 'Held while the funder is checked.',
+              '[]', '[]', $4::jsonb, $3::timestamptz
+         FROM unnest(ARRAY[$1::text, $5::text]) AS w`,
+      [checked, signature, at, '{"ageDays":3,"txCount":1,"accountType":"eoa","funder":null,"burstWallets":null,"groupSize":null,"missing":[]}', waiting],
+    );
+    // Written the way the code before this migration wrote them: one checked with its route, one still queued.
+    await db.query(
+      `INSERT INTO appeals (campaign_id, wallet, text, text_hash, signed_at, signature, appealed_action, appealed_rule, filed_at,
+                            check_status, attempts, reppo_eval_id, reppo_route, reppo_note, credits_charged, checked_at, outcome)
+       VALUES ('old', $1, $3, $4, 1800000000, $5, 'hold', 'A9', $6::timestamptz, 'checked', 1, 'eval_1', 'block', 'A count alone.', 4,
+               $6::timestamptz, 'open'),
+              ('old', $2, $3, $4, 1800000000, $5, 'hold', 'A9', $6::timestamptz, 'queued', 0, NULL, NULL, NULL, NULL, NULL, 'open')`,
+      [checked, waiting, text, appealTextHash(text), signature, at],
+    );
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toHaveLength(8);
+    expect(upgraded.applied).toEqual(['009_reppo_verdict.sql']);
+    expect(await getAppeal(db, 'old', checked)).toMatchObject({ checkStatus: 'checked', reppoRoute: 'block', reppoNote: 'A count alone.', reppoEvalId: 'eval_1' });
+    expect(await getAppeal(db, 'old', waiting)).toMatchObject({ checkStatus: 'queued', reppoRoute: null });
+    expect((await ownerAppeals(db, 'old')).map((row) => [row.checkStatus, row.reppoRoute, row.reppoScore, row.reppoDecision, row.reppoConfidence])).toEqual([
+      ['queued', null, null, null, null],
+      ['checked', 'block', null, null, null],
+    ]);
+    // The waiting appeal, checked after the migration with a route Thuli does not know, is kept as checked.
+    expect(await takeAppeal(db, new Date(at), 300, 6)).toMatchObject({ wallet: waiting });
+    expect(await recordAppealCheck(db, { campaignId: 'old', wallet: waiting }, { evalId: 'eval_2', route: null, note: null, creditsCharged: 3, score: 12 }, new Date(at))).toBe(
+      true,
+    );
+    expect(await getAppeal(db, 'old', waiting)).toMatchObject({ checkStatus: 'checked', reppoRoute: null });
+    // Rows the new rules forbid are refused by the table itself: a verdict or a route on an appeal that is not checked.
+    await expect(db.query("UPDATE appeals SET check_status = 'unchecked', credits_charged = NULL WHERE wallet = $1", [waiting])).rejects.toThrow(StoreError);
+    await expect(db.query("UPDATE appeals SET reppo_route = 'ship', check_status = 'unchecked', credits_charged = NULL, reppo_score = NULL WHERE wallet = $1", [waiting])).rejects.toThrow(
+      StoreError,
+    );
+    await expect(db.query('UPDATE appeals SET reppo_score = 101 WHERE wallet = $1', [checked])).rejects.toThrow(StoreError);
+  });
+
   it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {
     await migrate(db);
     const rows = await db.query<{ table_name: string; column_name: string }>(
@@ -312,7 +374,7 @@ describe('migrate', () => {
       appeals: [
         'campaign_id', 'wallet', 'text', 'text_hash', 'signed_at', 'signature', 'appealed_action', 'appealed_rule', 'filed_at',
         'check_status', 'lease_until', 'attempts', 'retry_at', 'reppo_eval_id', 'reppo_route', 'reppo_note', 'credits_charged',
-        'checked_at', 'outcome', 'new_action', 'owner_note', 'settled_at',
+        'checked_at', 'outcome', 'new_action', 'owner_note', 'settled_at', 'reppo_score', 'reppo_decision', 'reppo_confidence',
       ],
       list_versions: [
         'campaign_id', 'version', 'root', 'published_list', 'declared_total', 'status', 'post_tx', 'claimable_at', 'created_at',

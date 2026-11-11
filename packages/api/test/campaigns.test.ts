@@ -729,6 +729,30 @@ describe('campaign routes', () => {
     expect(AskView.parse(JSON.parse((await send(`${asks()}/${walletOf(0)}`)).text)).ask.appeal?.reppoNote).toBeNull();
   });
 
+  it('C23, C34, C40: a checked appeal whose route Thuli does not know passes every public view with reppoRoute null', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'hold')).toEqual({ slot: null });
+    const filed = await signedAppeal(0);
+    expect(await addAppeal(db, { ...filed, campaignId: CAMPAIGN, textHash: appealTextHash(filed.text) }, NOW)).toBe('queued');
+    expect(await takeAppeal(db, NOW, 300, 6)).toMatchObject({ wallet: walletOf(0) });
+    const check = { evalId: 'eval_4', route: null, note: null, creditsCharged: 4, score: 41, decision: 'verdict-marker', confidence: 'low' as const };
+    expect(await recordAppealCheck(db, { campaignId: CAMPAIGN, wallet: walletOf(0) }, check, NOW)).toBe(true);
+    const send = campaignApp();
+    const shown = { checkStatus: 'checked', reppoRoute: null, reppoNote: null, reppoEvalId: 'eval_4', checkedAt: NOW.toISOString(), outcome: 'open' };
+    const replies = [
+      await send(`${asks()}/${walletOf(0)}`),
+      await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board`),
+      await send(appeals(), post(filed), '198.51.100.175'),
+      await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}`),
+    ];
+    expect(replies.map((reply) => reply.status)).toEqual([200, 200, 200, 200]);
+    expect(AskView.parse(JSON.parse(replies[0]?.text ?? '')).ask.appeal).toMatchObject(shown);
+    expect(BoardPage.parse(JSON.parse(replies[1]?.text ?? '')).asks[0]?.appeal).toMatchObject(shown);
+    expect(ExistsAppealBody.parse(JSON.parse(replies[2]?.text ?? '')).appeal).toMatchObject(shown);
+    expect(CampaignView.parse(JSON.parse(replies[3]?.text ?? '')).counts.appeals).toEqual({ filed: 1, checked: 1, block: 0, reversed: 0 });
+    for (const reply of replies) expect(reply.text).not.toMatch(/verdict-marker|"low"|Score|Confidence|Decision/);
+  });
+
   it('the appeals route answers queued, exists, approved, undecided, no ask, no campaign and each refusal, each in its shape', async () => {
     await createCampaign(db, terms());
     expect(await decided(0, 'hold')).toEqual({ slot: null });

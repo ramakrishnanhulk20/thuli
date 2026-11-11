@@ -319,6 +319,77 @@ for (const { name, open } of TARGETS) {
       expect(await counts(db, CAMPAIGN)).toMatchObject({ appeals: { filed: 1, checked: 1, block: 1, reversed: 0 } });
     });
 
+    it('C23: a paid check whose route Thuli does not know is still checked, shows reppoRoute null, and is never sent again', async () => {
+      await createCampaign(db, terms());
+      expect(await decided(1, 'hold', { record: RECORD })).toEqual({ slot: null });
+      expect(await addAppeal(db, appeal(1), NOW)).toBe('queued');
+      expect(await takeAppeal(db, plus(1), 300, 6)).toMatchObject({ wallet: wallet(1) });
+      expect(await recordAppealCheck(db, key(1), { evalId: 'eval_3', route: null, note: null, creditsCharged: 4 }, plus(2))).toBe(true);
+      const shown = {
+        filedAt: NOW,
+        checkStatus: 'checked',
+        reppoRoute: null,
+        reppoNote: null,
+        reppoEvalId: 'eval_3',
+        checkedAt: plus(2),
+        outcome: 'open',
+        newAction: null,
+        settledAt: null,
+      };
+      expect(await getAppeal(db, CAMPAIGN, wallet(1))).toEqual(shown);
+      expect((await getAsk(db, CAMPAIGN, wallet(1)))?.appeal).toEqual(shown);
+      expect((await board(db, CAMPAIGN, 10)).find((row) => row.wallet === wallet(1))?.appeal).toEqual(shown);
+      expect(await takeAppeal(db, plus(10_000), 300, 6)).toBeNull();
+      expect(await recordAppealCheck(db, key(1), { evalId: 'eval_3', route: 'ship', note: null, creditsCharged: 4 }, plus(3))).toBe(false);
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ checkStatus: 'checked', reppoRoute: null, creditsCharged: 4 });
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ appeals: { filed: 1, checked: 1, block: 0, reversed: 0 } });
+    });
+
+    it("C34, C40: Reppo's score, decision and confidence are kept as given for the owner and are in no public view", async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      for (const n of [1, 2]) expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(n) });
+      const verdict = { score: 37, decision: 'reject-marker', confidence: 'high' as const };
+      expect(await recordAppealCheck(db, key(1), { evalId: 'eval_1', route: 'block', note: null, creditsCharged: 4, ...verdict }, plus(20))).toBe(true);
+      expect(await recordAppealCheck(db, key(2), { evalId: 'eval_2', route: 'ship', note: null, creditsCharged: 4 }, plus(20))).toBe(true);
+      const owned = await ownerAppeals(db, CAMPAIGN);
+      expect(owned.map((row) => [row.wallet, row.reppoScore, row.reppoDecision, row.reppoConfidence])).toEqual([
+        [wallet(1), 37, 'reject-marker', 'high'],
+        [wallet(2), null, null, null],
+      ]);
+      const views = [await getAppeal(db, CAMPAIGN, wallet(1)), (await getAsk(db, CAMPAIGN, wallet(1)))?.appeal, (await board(db, CAMPAIGN, 10)).find((row) => row.wallet === wallet(1))?.appeal];
+      for (const view of views) expect(Object.keys(view ?? {}).sort()).toEqual(PUBLIC_APPEAL_KEYS);
+      const everything = JSON.stringify([...views, await getAsk(db, CAMPAIGN, wallet(1)), await board(db, CAMPAIGN, 10), await counts(db, CAMPAIGN)]);
+      for (const hidden of ['reject-marker', '"high"', 'Score', 'Confidence']) expect(everything).not.toContain(hidden);
+    });
+
+    it("C41: a score, decision or confidence outside ReppoVerdict's bounds is refused before anything is written", async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      for (const n of [1, 2]) expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(n) });
+      const base = { evalId: 'eval_1', route: 'review', note: null, creditsCharged: 4 };
+      const refused: Record<string, unknown>[] = [
+        ...[-1, 101, 1.5, Number.NaN, '50', true].map((score) => ({ score })),
+        ...['', 'x'.repeat(65), '<b>accept</b>', 'accept\u0007', 5].map((decision) => ({ decision })),
+        ...['certain', 'High', '', 0.9, 2].map((confidence) => ({ confidence })),
+      ];
+      for (const bad of refused) {
+        await expect(recordAppealCheck(db, key(1), { ...base, ...bad } as Parameters<typeof recordAppealCheck>[2], plus(20))).rejects.toThrow(StoreError);
+      }
+      expect((await getAppeal(db, CAMPAIGN, wallet(1)))?.checkStatus).toBe('checking');
+      expect((await ownerAppeals(db, CAMPAIGN))[0]).toMatchObject({ reppoEvalId: null, reppoScore: null, reppoDecision: null, reppoConfidence: null });
+      // The edges themselves are kept.
+      const edge = { score: 100, decision: 'x'.repeat(64), confidence: 'low' as const };
+      expect(await recordAppealCheck(db, key(1), { ...base, route: 'review', ...edge }, plus(21))).toBe(true);
+      expect(await recordAppealCheck(db, key(2), { ...base, evalId: 'eval_2', route: 'review', score: 0, decision: 'accept', confidence: 'medium' }, plus(21))).toBe(true);
+      expect((await ownerAppeals(db, CAMPAIGN)).map((row) => [row.reppoScore, row.reppoDecision, row.reppoConfidence])).toEqual([
+        [100, 'x'.repeat(64), 'low'],
+        [0, 'accept', 'medium'],
+      ]);
+    });
+
     it('C41: an appeal try that was not its fault is handed back, never below zero, and its wait still holds', async () => {
       await createCampaign(db, terms());
       expect(await decided(1, 'hold')).toEqual({ slot: null });
@@ -491,7 +562,7 @@ for (const { name, open } of TARGETS) {
 
 // The functions whose answers anyone may see. None may name a private appeal column or the ask's record (C40).
 describe('C40 public query scan', () => {
-  it('no public read selects text, text_hash, signature, owner_note or record', async () => {
+  it("no public read selects text, text_hash, signature, owner_note, record or Reppo's score, decision or confidence", async () => {
     const sources = {
       'appeals.ts': await readFile(new URL('../src/appeals.ts', import.meta.url), 'utf8'),
       'campaigns.ts': await readFile(new URL('../src/campaigns.ts', import.meta.url), 'utf8'),
@@ -502,7 +573,7 @@ describe('C40 public query scan', () => {
       ['campaigns.ts', 'board'],
       ['campaigns.ts', 'counts'],
     ];
-    const privateColumn = /(?<![:\w])(text|text_hash|signature|owner_note|record)(?![\w(])|\*/;
+    const privateColumn = /(?<![:\w])(text|text_hash|signature|owner_note|record|reppo_score|reppo_decision|reppo_confidence)(?![\w(])|\*/;
     for (const [file, name] of publicReads) {
       const source = sources[file];
       const start = source.indexOf(`export async function ${name}(`);
