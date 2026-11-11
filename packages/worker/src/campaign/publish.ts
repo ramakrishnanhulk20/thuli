@@ -24,8 +24,10 @@ import {
   NO_VAULT_BLOCK,
   vaultRecordFor,
   type ChainDeps,
+  type ChainMemory,
   type PostReceipt,
   type SentPost,
+  type VaultRoots,
 } from './vault.ts';
 
 export type PublishOutcome =
@@ -139,11 +141,66 @@ function unseenFor(deps: ChainDeps, campaignId: string, version: number, seen: b
   return true;
 }
 
+// Rule b's clock, one per sending version, kept beside the process's memory: started when a read first finds the nonce
+// used with no receipt and no root on the vault, stopped by any read that does not. A restart starts it again, which
+// only waits longer.
+const deadSince = new WeakMap<ChainMemory, Map<string, number>>();
+
+function deadClocks(deps: ChainDeps): Map<string, number> {
+  let clocks = deadSince.get(deps.memory);
+  if (clocks === undefined) {
+    clocks = new Map();
+    deadSince.set(deps.memory, clocks);
+  }
+  return clocks;
+}
+
+/** True once rule b's reading has held on every read for CANCEL_MARGIN_SECONDS; a sighting of the post starts it again. */
+function deadFor(deps: ChainDeps, campaignId: string, version: number, seen: boolean): boolean {
+  const clocks = deadClocks(deps);
+  const key = `${campaignId}:${version}`;
+  if (seen) {
+    clocks.delete(key);
+    return false;
+  }
+  const now = deps.now().getTime();
+  const since = clocks.get(key) ?? now;
+  clocks.set(key, since);
+  return now - since >= CANCEL_MARGIN_SECONDS * 1000;
+}
+
 /** Forgets what this process sent for a version that is no longer sending. */
 function forgetPost(deps: ChainDeps, campaignId: string, version: number): void {
   const mine = campaignMemory(deps.memory, campaignId);
   mine.posts.delete(version);
   mine.missingSince.delete(version);
+  deadClocks(deps).delete(`${campaignId}:${version}`);
+}
+
+/**
+ * Records a sending version posted because its root is on the vault, landed through its stored transaction or an earlier
+ * one at the same nonce: the vault's own claimable time for a pending root, the block's time for one it already pays,
+ * exactly as reconcile records a root it finds there, and the stored hash kept.
+ */
+async function recordFromVault(
+  deps: ChainDeps,
+  campaignId: string,
+  sending: ListVersion,
+  roots: VaultRoots,
+  outcome: { posted: number[] },
+  signal: AbortSignal | undefined,
+): Promise<true> {
+  const claimableAt = Number(sending.root === roots.pendingRoot ? roots.pendingClaimableAt : roots.timestamp);
+  checkpoint(signal, 'recording a post found on the vault');
+  if (!(await markListPosted(deps.db, campaignId, sending.version, { postTx: null, claimableAt }))) {
+    throw new RootError(`list version ${sending.version} could not be recorded as posted from the vault`);
+  }
+  forgetPost(deps, campaignId, sending.version);
+  outcome.posted.push(sending.version);
+  deps.log(
+    `reconcile ${campaignId}: nonce ${sending.postNonce} of list version ${sending.version} is used and its root is on the vault, so it is recorded as posted, claimable from unix ${claimableAt}`,
+  );
+  return true;
 }
 
 /** What this process signed for a sending version at its stored nonce, starting from the stored hash after a restart. */
@@ -243,8 +300,15 @@ async function resend(deps: ChainDeps, campaign: Campaign, sending: ListVersion,
  * a. a receipt for any transaction it was sent with, the stored one or an earlier one this process signed at the same
  *    nonce: mined and successful, posted with the claimable time that receipt's own RootPosted log holds, so the
  *    existing cancel rule applies to it after its margin and its root is never sent again; mined and reverted, built again;
- * b. no receipt, and the agent's nonce at the latest mined block is above the stored nonce: another transaction used
- *    that nonce, so none of this version's can ever land, and it is built again, for publish to sign anew;
+ * b. no receipt, and the agent's nonce at the latest mined block is above the stored nonce: the nonce is used. The nonce,
+ *    the receipt and the roots can be read from different nodes a few blocks apart, and after a restart only the last
+ *    hash of a resent version is known, so a used nonce alone proves nothing. The vault is read at once: when the
+ *    version's root is pending or paid there, it landed, through this hash or an earlier one, and it is recorded posted
+ *    (recordFromVault). Otherwise the reading "nonce used, no receipt, root not on the vault" must hold on every read for
+ *    CANCEL_MARGIN_SECONDS, any sighting starting the count again (deadFor), before it is built again for publish to
+ *    sign anew. Not covered: a resend, then a restart, then the earlier hash landing, then the owner cancelling that root
+ *    before the next run. The worker then sees no root and no receipt for the stored hash and, after the margin, builds
+ *    the list again. That needs all four inside one run's gap, so it is rare, and the owner's pause stops it;
  * c. no receipt, the nonce unused, and no node has shown any of them for RESEND_AFTER_SECONDS: signed again at the same
  *    nonce (resend). Never a new nonce and never another version while the stored nonce is unused.
  * The nonce is read before the receipts, so a post mined between the two reads shows as its receipt, not as a used
@@ -276,7 +340,20 @@ async function settleSending(
     if (!unseenFor(deps, id, version, seen, UNSENT_AFTER_SECONDS)) return false;
     return recordUnsent(deps, id, version, `no node knows the post ${stored} after ${UNSENT_AFTER_SECONDS} s`, outcome, signal);
   }
-  if (used) return recordUnsent(deps, id, version, `nonce ${nonce} of its post was used by another transaction`, outcome, signal);
+  if (used) {
+    const roots = await deps.chain.roots(vault);
+    if (sending.root === roots.pendingRoot || sending.root === roots.activeRoot) return recordFromVault(deps, id, sending, roots, outcome, signal);
+    if (!deadFor(deps, id, version, seen)) return false;
+    return recordUnsent(
+      deps,
+      id,
+      version,
+      `nonce ${nonce} of its post was used by another transaction, and for ${CANCEL_MARGIN_SECONDS} s no receipt and no root on the vault showed it landed`,
+      outcome,
+      signal,
+    );
+  }
+  deadClocks(deps).delete(`${id}:${version}`);
   if (!unseenFor(deps, id, version, seen, RESEND_AFTER_SECONDS)) return false;
   await resend(deps, campaign, sending, nonce, signal);
   return false;

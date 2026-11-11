@@ -124,6 +124,8 @@ class StandInVault implements CampaignVault {
   holdBroadcasts = 0;
   /** Every post signed, in order, with the nonce it was signed at. */
   readonly signings: { hash: `0x${string}`; root: MerkleHash; nonce: number }[] = [];
+  /** The node answering receipt reads is behind: every receipt read answers as if no post were known yet. */
+  receiptsLag = false;
   private gate: Promise<void> | null = null;
   private readonly signedPosts = new Map<string, { root: MerkleHash; declaredTotal: bigint; nonce: number }>();
   private readonly postReceipts = new Map<string, { ok: boolean; claimableAt: bigint }>();
@@ -368,6 +370,7 @@ class StandInVault implements CampaignVault {
 
   async postReceipt(_vault: Address, _root: MerkleHash, hash: `0x${string}`, _waitMs: number) {
     this.calls.push('postReceipt');
+    if (this.receiptsLag) return { state: 'unknown' as const };
     if (this.inPool.has(hash)) return { state: 'pending' as const };
     const receipt = this.postReceipts.get(hash);
     if (receipt === undefined) return { state: 'unknown' as const };
@@ -1427,6 +1430,8 @@ describe('a post the network lost, settled only on proof', () => {
   it('(b) builds a version again once another transaction used its nonce, and the next publish signs at a fresh nonce', async () => {
     const { vault, worker } = await lostPost();
     vault.takeNonce();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    later(CANCEL_MARGIN_SECONDS);
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
     expect(await statuses()).toEqual(['built']);
     expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
@@ -1490,7 +1495,74 @@ describe('a post the network lost, settled only on proof', () => {
     expect(lines.filter((line) => line.includes(`signed again ${MAX_RESENDS} times`))).toHaveLength(1);
     expect(await statuses()).toEqual(['sending']);
     vault.takeNonce();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    later(CANCEL_MARGIN_SECONDS);
     expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
+  });
+
+  it('unsends nothing while the nonce reads used but the receipt and roots reads lag behind a post just mined, and records it once from the next fresh read (C27, C32)', async () => {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    const beforePost = vault.view();
+    vault.stopAfterPost = 1;
+    await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('stopped between the post and its record');
+    vault.receiptsLag = true;
+    vault.staleView = beforePost;
+    for (let run = 0; run < 3; run += 1) {
+      expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [], unsent: [] });
+      expect(await publishCheck(worker, CAMPAIGN)).toEqual({ kind: 'skipped', reason: SENDING_LIST });
+      later(30);
+    }
+    expect(await statuses()).toEqual(['sending']);
+    vault.receiptsLag = false;
+    vault.staleView = null;
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ posted: [1], unsent: [] });
+    await publishCheck(worker, CAMPAIGN);
+    expect(vault.sent.filter((fn) => fn === 'postRoot')).toHaveLength(1);
+    expect(vault.posted).toHaveLength(1);
+  });
+
+  it('records a resent version posted from the vault when its earlier transaction lands after a restart, posting nothing again', async () => {
+    const { vault, worker } = await lostPost();
+    await reconcileCheck(worker, CAMPAIGN);
+    later(RESEND_AFTER_SECONDS);
+    vault.holdBroadcasts = 1;
+    await reconcileCheck(worker, CAMPAIGN);
+    const [first, resent] = vault.signings;
+    const restarted = deps(vault);
+    const beforeLanding = vault.view();
+    expect(vault.land(first?.hash as string)).toBe(true);
+    // The first run after the restart reads the vault from a node that has not seen the landing yet.
+    vault.staleView = beforeLanding;
+    expect(await reconcileCheck(restarted, CAMPAIGN)).toMatchObject({ posted: [], unsent: [] });
+    expect(await publishCheck(restarted, CAMPAIGN)).toEqual({ kind: 'skipped', reason: SENDING_LIST });
+    vault.staleView = null;
+    expect(await reconcileCheck(restarted, CAMPAIGN)).toMatchObject({ posted: [1], unsent: [] });
+    expect(await listVersions(db, CAMPAIGN)).toMatchObject([
+      { status: 'posted', postTx: resent?.hash, claimableAt: Number(CHAIN_START + ROOT_DELAY) },
+    ]);
+    for (let run = 0; run < 3; run += 1) {
+      await reconcileCheck(restarted, CAMPAIGN);
+      await publishCheck(restarted, CAMPAIGN);
+    }
+    expect(vault.signings).toHaveLength(2);
+    expect(vault.posted).toEqual([first?.root]);
+  });
+
+  it('builds a genuinely dead post again only after CANCEL_MARGIN_SECONDS, then signs it at a fresh nonce', async () => {
+    const { vault, worker } = await lostPost();
+    vault.takeNonce();
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    later(CANCEL_MARGIN_SECONDS - 1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(await statuses()).toEqual(['sending']);
+    later(1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
+    expect(await publishCheck(worker, CAMPAIGN)).toMatchObject({ kind: 'posted', version: 1 });
+    expect(vault.signings.map((signing) => signing.nonce)).toEqual([0, 1]);
   });
 });
 
