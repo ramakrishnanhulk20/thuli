@@ -44,7 +44,7 @@ export default function VersionsPage() {
               One rule, added after outside feedback.
             </h2>
             <p className={styles.body}>
-              {`Reppo's judges read ${routesTotal} of Thuli's decisions with every address, hash and amount removed. They blocked ${versions.routes.block}. In each one the only evidence for the hold was a funder shared with other wallets.`}
+              {`Reppo's judges read ${routesTotal} of Thuli's decisions with every address, hash and amount removed. They blocked ${versions.routes.block}. In each one the reason given for the hold was a funder shared with other wallets.`}
             </p>
             <p className={styles.body}>
               Rulebook v2 adds: a shared funder alone cannot hold a wallet. How many wallets a funder paid is a count, not a trail. A wallet with a link of its own, or a traced trail to a shared source, is still held.

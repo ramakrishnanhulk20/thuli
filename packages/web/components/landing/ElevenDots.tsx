@@ -82,7 +82,7 @@ export function ElevenDots({ afterActions, before, after }: ElevenDotsProps) {
           {after}
         </p>
       </div>
-      {stays ? <p className={styles.stillHeld}>Still held: that wallet has a link of its own.</p> : null}
+      {stays ? <p className={styles.stillHeld}>Still held: that wallet has a link of its own, which its reason left out.</p> : null}
     </div>
   );
 }

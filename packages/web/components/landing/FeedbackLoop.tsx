@@ -42,7 +42,7 @@ export function FeedbackLoop() {
         <div className={styles.feedback}>
           <motion.div className={`${styles.feedbackText} ${styles.reveal}`} {...reveal(2)}>
             <p className={styles.body}>
-              {`An outside judge, Reppo, read ${routesTotal} of Thuli's decisions without seeing a single address. It blocked ${verdicts.length} holds: the evidence was a shared funder and nothing else.`}
+              {`An outside judge, Reppo, read ${routesTotal} of Thuli's decisions without seeing a single address. It blocked ${verdicts.length} holds whose stated reason was a shared funder and nothing else.`}
             </p>
             <p className={styles.body}>So the rulebook changed by one rule: a shared funder alone cannot hold a wallet.</p>
             <p className={styles.body}>Scored again on the same model replies, before and after:</p>
