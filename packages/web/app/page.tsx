@@ -3,6 +3,7 @@ import { Hero } from '@/components/hero/Hero';
 import { CaseFile } from '@/components/landing/CaseFile';
 import { FeedbackLoop } from '@/components/landing/FeedbackLoop';
 import { Measured } from '@/components/landing/Measured';
+import { VaultProof } from '@/components/landing/VaultProof';
 import { SiteNav } from '@/components/site/SiteNav';
 
 export const metadata: Metadata = {
@@ -18,6 +19,7 @@ export default function HomePage() {
         <CaseFile />
         <Measured />
         <FeedbackLoop />
+        <VaultProof />
       </main>
       <SiteNav mode="bar" revealAfterHero />
     </>
