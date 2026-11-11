@@ -11,12 +11,12 @@ export interface SiteFiles {
 }
 
 export interface SiteApi {
-  /** Answers one request to /api/x402/* or /api/check*, handed to the API unchanged. Never rejects. */
+  /** Answers one request to /api/x402/*, /api/check* or /api/campaigns/*, handed to the API unchanged. Never rejects. */
   fetch(request: Request): Promise<Response>;
 }
 
 /**
  * The paid and free API for one server copy. Every request answers 503 {busy: true} when a setting is missing, malformed
- * or forbidden, or when production lacks DATABASE_URL or TRUSTED_CLIENT_HEADER.
+ * or forbidden, or when production lacks DATABASE_URL or TRUSTED_CLIENT_HEADER. The campaign routes share its database.
  */
 export declare function siteApi(env: Record<string, string | undefined>, files: SiteFiles): SiteApi;

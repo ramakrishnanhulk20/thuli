@@ -1,5 +1,14 @@
 import { z } from 'zod';
-import { DECISION_RULES, isCanonicalAddress, MAX_EVIDENCE_TXS, OutcomeSchema, TxHash, type Address } from '@thuli/core';
+import {
+  CAMPAIGN_ID,
+  DECISION_RULES,
+  isCanonicalAddress,
+  isPlainText,
+  MAX_EVIDENCE_TXS,
+  OutcomeSchema,
+  TxHash,
+  type Address,
+} from '@thuli/core';
 import { heldScreen, NOT_CHECKED, SINGLE_SCOPE, type SingleScreen } from '@thuli/worker/src/screen/single.ts';
 import { NETWORKS } from './config.ts';
 
@@ -99,6 +108,97 @@ export function freeBody(checked: Address, screen: SingleScreen): { body: FreeCh
   }
   return { body: FreeCheckResponse.parse({ ...fieldsFrom(heldScreen(checked, OUTPUT_CHECK_CAUSE)), cached: false }), accepted: false };
 }
+
+// The campaign routes' answers. Each passes its shape before it leaves (C34), and none has a field for a signature, a
+// lease or the caller's address (C40).
+
+/** Base units as decimal text, the way the store keeps them, so an amount never passes through a float. */
+const AmountText = z.string().regex(/^(0|[1-9][0-9]{0,77})$/);
+const HashText = z.string().regex(/^0x[0-9a-f]{64}$/);
+const Count = z.int().min(0);
+// The store's own plain-text rule, so what leaves is held to what was let in (C13, C33).
+const plainText = (most: number) => z.string().min(1).max(most).refine(isPlainText, 'must be plain text');
+
+/** The body POST /api/campaigns/:id/asks takes, by type and size only; checkAsk judges the values. */
+export const AskRequest = z.strictObject({
+  wallet: z.string().max(64),
+  signedAt: z.number(),
+  signature: z.string().max(200),
+});
+
+export const ErrorBody = z.strictObject({ error: z.string().min(1).max(200) });
+export const BusyBody = z.strictObject({ busy: z.literal(true) });
+export const QueuedBody = z.strictObject({ queued: z.literal(true) });
+export const ClosedBody = z.strictObject({ closed: z.literal(true) });
+
+const ListVersionJson = z.strictObject({
+  version: z.int().min(1),
+  root: HashText,
+  status: z.enum(['built', 'posted', 'active', 'superseded', 'cancelled']),
+  postTx: HashText.nullable(),
+  claimableAt: Count.nullable(),
+});
+
+export const CampaignView = z.strictObject({
+  name: plainText(80),
+  chain: z.int().min(1),
+  vault: CanonicalAddressText,
+  token: CanonicalAddressText,
+  rewardPerWallet: AmountText,
+  perWalletCap: AmountText,
+  maxSlots: z.int().min(1).max(100_000),
+  status: z.enum(['open', 'closed']),
+  opensAt: z.iso.datetime(),
+  closesAt: z.iso.datetime(),
+  counts: z.strictObject({ asked: Count, queued: Count, decided: Count, held: Count, slotsTaken: Count, slotsLeft: Count }),
+  lists: z.array(ListVersionJson),
+});
+export type CampaignView = z.infer<typeof CampaignView>;
+
+const FactsJson = z.strictObject({
+  ageDays: Count.nullable(),
+  txCount: Count.nullable(),
+  accountType: plainText(32),
+  funder: z
+    .strictObject({ address: CanonicalAddressText, kind: plainText(32), fanout: Count.nullable(), hops: Count })
+    .nullable(),
+  burstWallets: Count.nullable(),
+  groupSize: Count.nullable(),
+  missing: z.array(plainText(64)).max(16),
+});
+
+/** One ask as anyone may see it: the store's public view, with times as ISO 8601 text. */
+export const AskJson = z.strictObject({
+  campaignId: z.string().regex(CAMPAIGN_ID),
+  wallet: CanonicalAddressText,
+  askedAt: z.iso.datetime(),
+  status: z.enum(['queued', 'screening', 'decided', 'failed']),
+  action: OutcomeSchema.nullable(),
+  shareBps: z.int().min(0).max(10_000).nullable(),
+  rule: z.enum(DECISION_RULES).nullable(),
+  reason: plainText(400).nullable(),
+  citedTxs: z.array(TxHash).max(MAX_EVIDENCE_TXS).nullable(),
+  notChecked: z.array(plainText(64)).max(16).nullable(),
+  facts: FactsJson.nullable(),
+  servRequestId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).nullable(),
+  decidedAt: z.iso.datetime().nullable(),
+  slot: z.int().min(1).nullable(),
+});
+export type AskJson = z.infer<typeof AskJson>;
+
+/** What a wallet on the active list needs to claim. claimed and claimable are left out when the vault was not read. */
+export const TicketJson = z.strictObject({
+  cumulativeAmount: AmountText,
+  // A tree of 100,000 leaves is 17 levels deep, so 64 is far past any real proof.
+  proof: z.array(HashText).max(64),
+  root: HashText,
+  claimed: AmountText.optional(),
+  claimable: AmountText.optional(),
+});
+
+export const AskView = z.strictObject({ ask: AskJson, ticket: TicketJson.optional() });
+export const ExistsBody = z.strictObject({ exists: z.literal(true), ask: AskJson });
+export const BoardPage = z.strictObject({ asks: z.array(AskJson).max(50) });
 
 /**
  * A cached free check read back from the store, checked like an input before it goes out again (C34): it must pass

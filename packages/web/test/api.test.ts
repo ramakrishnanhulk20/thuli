@@ -157,4 +157,21 @@ describe('the API mounted in the site', { timeout: 30_000 }, () => {
     expect(logs.text()).not.toContain('hunter2');
     expect(logs.text()).not.toContain('serv-key-that-is-never-sent');
   });
+
+  it('serves the campaign routes from the same in-process database, an unknown campaign answering 404 no-store', async () => {
+    captureLogs();
+    await mount({ NODE_ENV: 'test' });
+    const campaigns = await import('../app/api/campaigns/[...path]/route');
+    expect(campaigns).toMatchObject({ runtime: 'nodejs', dynamic: 'force-dynamic', maxDuration: 300 });
+    const headers = { 'x-forwarded-for': '198.51.100.7', 'content-type': 'application/json' };
+    const replies = [
+      await campaigns.GET(new Request(`${SITE}/api/campaigns/demo`, { headers })),
+      await campaigns.POST(new Request(`${SITE}/api/campaigns/demo/asks`, { method: 'POST', headers, body: '{}' })),
+    ];
+    for (const reply of replies) {
+      expect(reply.status).toBe(404);
+      expect(await reply.text()).toBe('{"error":"no such campaign"}');
+      expect(reply.headers.get('cache-control')).toBe('no-store');
+    }
+  });
 });

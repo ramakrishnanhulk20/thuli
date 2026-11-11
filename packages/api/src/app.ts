@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { AddressError, CURRENT_RULEBOOK, parseAddress, type Address } from '@thuli/core';
 import type { CheckKey } from '@thuli/store';
 import { heldScreen, NOT_CHECKED, SCREEN_CAUSES, SINGLE_SCOPE, type SingleScreen } from '@thuli/worker/src/screen/single.ts';
+import { registerCampaignRoutes, type CampaignDeps } from './campaigns.ts';
 import { MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult } from './claims.ts';
 import { PRICE, PRICE_UNITS, type ApiConfig } from './config.ts';
 import type { Ticket } from './guard.ts';
@@ -54,6 +55,8 @@ export interface ApiDeps {
   readReceipt?: ReadReceipt;
   /** Where used payments and the limits live. Defaults to this process's memory, which is right only for one server. */
   stores?: Stores;
+  /** The campaign routes' database and chain readers. Left out, no /api/campaigns route exists. */
+  campaigns?: CampaignDeps;
 }
 
 interface AppEnv {
@@ -239,6 +242,9 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  * ceiling but the minute. It never buys data and never takes payment (C24). A store failure before the screening
  * answers 503 {busy: true} and starts nothing; once a screening has run its result goes out even if it cannot be cached.
  * GET /api/check/health returns the scope, the rulebook version and the price, "free".
+ *
+ * When deps.campaigns is given, the campaign routes under /api/campaigns are added too (see registerCampaignRoutes),
+ * reading the caller's address by the same rule as the routes above.
  *
  * Every answer from every route, whatever its status, carries cache-control: no-store.
  */
@@ -623,6 +629,10 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     readRequest,
     runCheck,
   );
+
+  if (deps.campaigns !== undefined) {
+    registerCampaignRoutes(app, { ...deps.campaigns, now: deps.campaigns.now ?? now }, (c) => clientOf(c, config.trustedClientHeader));
+  }
 
   return app;
 }

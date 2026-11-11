@@ -2,8 +2,9 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { connectPostgres, migrate, openMemoryDb, type Db } from '@thuli/store';
-import { EnvError } from '@thuli/worker/src/env.ts';
+import { EnvError, loadEnv } from '@thuli/worker/src/env.ts';
 import { createApp } from './app.ts';
+import { accountTypeReader, vaultReaders } from './campaigns.ts';
 import { ConfigError, loadApiConfig } from './config.ts';
 import { liveScreen } from './live.ts';
 import { failureCode, postgresStores } from './stores.ts';
@@ -17,7 +18,7 @@ export interface SiteFiles {
 }
 
 export interface SiteApi {
-  /** Answers one request to /api/x402/* or /api/check*, handed to the API unchanged. Never rejects. */
+  /** Answers one request to /api/x402/*, /api/check* or /api/campaigns/*, handed to the API unchanged. Never rejects. */
   fetch(request: Request): Promise<Response>;
 }
 
@@ -40,6 +41,14 @@ function causeOf(error: unknown): string {
 }
 
 const present = (value: string | undefined) => value !== undefined && value.trim() !== '';
+
+// Only Base campaigns need it, so it may be left out; a value that is set must still be an https URL.
+function baseRpcUrl(env: Record<string, string | undefined>): string | null {
+  const value = env.BASE_RPC_URL?.trim();
+  if (value === undefined || value === '') return null;
+  if (!URL.canParse(value) || new URL(value).protocol !== 'https:') throw new MountRefused('BASE_RPC_URL must be an https URL.');
+  return value;
+}
 
 // migrate() reads a folder, so the carried copies are written to a fresh one that is deleted once the schema is current.
 async function migrateFrom(db: Db, migrations: Readonly<Record<string, string>>): Promise<void> {
@@ -65,6 +74,8 @@ async function migrateFrom(db: Db, migrations: Readonly<Record<string, string>>)
  * - Production needs both DATABASE_URL and TRUSTED_CLIENT_HEADER (on Vercel, x-vercel-forwarded-for). Outside
  *   production the caller is read from x-forwarded-for, which Next's own server fills from the socket.
  * Production is env.NODE_ENV as the server runs, not as the site was built.
+ * - The campaign routes share that database. They read wallet types on ETH_RPC_URL, and vaults on Base Sepolia's
+ *   public RPC, or for a Base campaign on BASE_RPC_URL when it is set.
  *
  * A setting that is missing, malformed or forbidden, a private key in env included (C39), means no API at all: every
  * request answers 503 {busy: true} and the cause is logged once, by variable name, never with a value (C40). The site
@@ -75,6 +86,8 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
   const now = () => new Date();
   let config: ReturnType<typeof loadApiConfig>;
   let screen: ReturnType<typeof liveScreen>;
+  let isContract: ReturnType<typeof accountTypeReader>;
+  let vault: ReturnType<typeof vaultReaders>;
   try {
     const production = env.NODE_ENV === 'production';
     // The private key refusal inside loadApiConfig runs before anything else is read.
@@ -86,6 +99,8 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
       throw new MountRefused('DATABASE_URL is not set: a production server keeps no payments or limits in its own memory.');
     }
     screen = liveScreen(env, files.rulebook);
+    isContract = accountTypeReader(loadEnv(env).ETH_RPC_URL);
+    vault = vaultReaders(baseRpcUrl(env));
   } catch (error) {
     console.error(`api not mounted: ${causeOf(error)}`);
     return { fetch: async () => answer(503, { busy: true }) };
@@ -106,7 +121,7 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
       await db.close().catch(() => undefined);
       throw error;
     }
-    const app = createApp(config, { screen, stores: postgresStores(db, now), now });
+    const app = createApp(config, { screen, stores: postgresStores(db, now), now, campaigns: { db, isContract, vault, now } });
     return (request) => app.fetch(request);
   }
 
