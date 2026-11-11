@@ -32,12 +32,14 @@ export interface Settlement {
 
 /**
  * What redeemPayment found for a key. none: no settled payment within its day, so the header goes the way of any new
- * payment. refused: settled for another wallet, or another request is screening it. settled: the caller now screens it.
- * served: the stored result, as it was written.
+ * payment. refused: settled for another wallet, or a row missing what a settlement records. in-use: settled for this
+ * wallet, and another live request is screening it now. settled: the caller now screens it. served: the stored
+ * result, as it was written.
  */
 export type Redeemed =
   | { found: 'none' }
   | { found: 'refused' }
+  | { found: 'in-use' }
   | { found: 'settled'; transaction: string }
   | { found: 'served'; transaction: string; body: unknown };
 
@@ -128,9 +130,10 @@ function ownerTiming({ nowSeconds, ownedUntil }: OwnerTiming): [string, string] 
  * Looks for a payment of key that already went through, for a request that carries its header again (C25). Inside
  * PAID_RESULT_KEEP_SECONDS from the settlement, and only for the wallet the payment was for: a served claim answers
  * with its stored result, and a settled one no other live request owns is taken by owner until ownedUntil, to screen
- * it. Runs in one transaction under the key's advisory lock, so of two requests started together at most one gets
- * 'settled'. Writes nothing unless it answers 'settled'. A row in any other state, or settled more than a day ago, is
- * 'none'.
+ * it; while another does own it, the answer is 'in-use'. The wallet is checked first, so another wallet is 'refused'
+ * whoever owns the claim. Runs in one transaction under the key's advisory lock, so of two requests started together
+ * at most one gets 'settled'. Writes nothing unless it answers 'settled'. A row in any other state, or settled more
+ * than a day ago, is 'none'.
  * @param wallet compared in its canonical form, the only form markPaymentSettled stores.
  * @throws AddressError from @thuli/core when wallet is not an address. StoreError when ownedUntil is not after
  *   nowSeconds, the owner is empty or too long, or the database refuses.
@@ -160,7 +163,7 @@ export async function redeemPayment(db: Db, key: string, wallet: string, owner: 
     if (entry.wallet !== paidFor) return { found: 'refused' };
     if (entry.state === 'served') return { found: 'served', transaction: entry.tx, body: entry.result };
     if (entry.owner !== null && entry.owned_until !== null && BigInt(entry.owned_until) > timing.nowSeconds) {
-      return { found: 'refused' };
+      return { found: 'in-use' };
     }
     await tx.query(
       'UPDATE payment_claims SET owner = $2, owned_until = $3::bigint, updated_at = to_timestamp($4::bigint) WHERE key = $1',

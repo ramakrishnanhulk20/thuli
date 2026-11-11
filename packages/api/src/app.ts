@@ -25,7 +25,7 @@ import { MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult, type Redeemed 
 import { PRICE, PRICE_UNITS, REQUEST_DEADLINE_MS, SETTLE_TIMEOUT_MS, type ApiConfig } from './config.ts';
 import type { Ticket } from './guard.ts';
 import { canonicalClient, type Limit, type Pass } from './limits.ts';
-import { receiptPays, receiptReader, type ReadReceipt } from './receipt.ts';
+import { RECEIPT_TIMEOUT_MS, receiptPays, receiptReader, type ReadReceipt } from './receipt.ts';
 import {
   cachedBody,
   freeBody,
@@ -52,14 +52,12 @@ export const REPLY_MARGIN_MS = 10_000;
 export const SCREEN_LEAST_MS = 20_000;
 /** The wait a settled-retry answer asks for before the same header comes back. */
 export const SETTLED_RETRY_AFTER_SECONDS = 10;
-// receipt.ts reads a pending settlement's receipt with this timeout.
-const RECEIPT_READ_MS = 10_000;
 /**
  * Time a paid request needs left before it asks the facilitator to settle: two settle calls (the library asks once
  * more when the first is pending), the receipt read, and the least a screening may start with. With less, nothing is
  * settled, so settling can never run the request past its deadline.
  */
-export const SETTLE_ROOM_MS = 2 * SETTLE_TIMEOUT_MS + RECEIPT_READ_MS + SCREEN_LEAST_MS;
+export const SETTLE_ROOM_MS = 2 * SETTLE_TIMEOUT_MS + RECEIPT_TIMEOUT_MS + SCREEN_LEAST_MS;
 
 /** A wait cut off at its request's deadline. Logged by its name only, like a store failure. */
 class DeadlineReached extends Error {
@@ -127,8 +125,11 @@ interface PaidRequest {
   payment: Payment | null;
   /** True when the latest settle call threw rather than answering, so its outcome is unknown. */
   settleThrew: boolean;
-  /** Set when the reply must replace the payment middleware's: retry for an unknown outcome, busy for a full claim map. */
-  answer: 'retry' | 'busy' | null;
+  /**
+   * Set when the reply must replace the payment middleware's: retry for an unknown outcome, busy for a full claim map,
+   * settled for a payment that went through and that another request is screening now.
+   */
+  answer: 'retry' | 'busy' | 'settled' | null;
 }
 
 const TxHashText = z
@@ -273,7 +274,8 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  * the reply is stored on it before it is sent. For a day from the settlement, the same header with the same wallet
  * redeems the payment with no settle: a stored result comes back exactly as stored, marked by the thuli-stored-result
  * header, and a payment with no result yet is screened then. Only one request screens a payment at a time; the others
- * get the in-use refusal. Another wallet with that header is refused. A redeem passes the same client and service
+ * get the settled-retry answer, which hands out no payment terms and never counts as a failed payment. Another wallet
+ * with that header is refused. A redeem passes the same client and service
  * limits as any paid request and never counts as a failed payment (C24, C42). Non-goal: a redeem does not check the
  * signature again, so anyone who rebuilds the header from the settled transaction on chain can fetch the same wallet's
  * result; it buys no screening the payment did not, and the free check gives that wallet's screening to anyone anyway.
@@ -408,6 +410,11 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       return refuse('payment_not_recorded');
     }
     if (found.found === 'refused') return refuse('payment_already_used');
+    // The money moved and the buyer's screening is under way in another request: come back, never "used up" (C25).
+    if (found.found === 'in-use') {
+      request.answer = 'settled';
+      return refuse('payment_being_screened');
+    }
     if (found.found !== 'none') {
       const payment = Payment.safeParse({ network: config.networkId, payer: terms.payer, transaction: found.transaction });
       request.claim = taken;
@@ -636,15 +643,22 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
         await giveBack('giving back a settled payment', within(() => claims.leave(claim.key, request.owner)));
       }
       // Any paid attempt that took a place and bought nothing counts, an unknown outcome included, so failing is never
-      // free. A full claim map is this server's limit, not the client's, so it does not count.
-      c.get('pass').paymentFailed = request.payment === null && request.answer !== 'busy';
+      // free. A full claim map is this server's limit, not the client's, and a buyer waiting on its own settled payment
+      // has paid, so neither counts.
+      c.get('pass').paymentFailed = request.payment === null && request.answer !== 'busy' && request.answer !== 'settled';
     }
     if (request.payment === null && request.answer !== null) {
-      // Built fresh, so no PAYMENT-REQUIRED or PAYMENT-RESPONSE header from the middleware's own answer is carried over.
+      // Built fresh, so no PAYMENT-REQUIRED or PAYMENT-RESPONSE header from the middleware's own answer is carried over,
+      // and no client is handed fresh terms to pay a second time.
+      const body = request.answer === 'settled' ? SETTLED_RETRY : request.answer === 'retry' ? { retry: true } : { busy: true };
       c.res = undefined;
-      c.res = new Response(JSON.stringify(request.answer === 'retry' ? { retry: true } : { busy: true }), {
+      c.res = new Response(JSON.stringify(body), {
         status: 503,
-        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
+        headers: {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
+          ...(request.answer === 'settled' && { 'retry-after': String(SETTLED_RETRY_AFTER_SECONDS) }),
+        },
       });
     }
   });

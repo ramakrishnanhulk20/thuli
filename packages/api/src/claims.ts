@@ -44,13 +44,15 @@ interface Claim {
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
 /**
- * What redeem found for a key. none: no settled payment within its day, so the header goes the way of any new payment.
- * refused: settled for another wallet, or another request is screening it. settled: the caller now screens it. served:
- * the stored result, as it was written.
+ * What redeem found for a key, by redeemPayment's rules in @thuli/store. none: no settled payment within its day, so the
+ * header goes the way of any new payment. refused: settled for another wallet, or a row missing what a settlement
+ * records. in-use: settled for this wallet, and another live request is screening it now. settled: the caller now
+ * screens it. served: the stored result, as it was written.
  */
 export type Redeemed =
   | { found: 'none' }
   | { found: 'refused' }
+  | { found: 'in-use' }
   | { found: 'settled'; transaction: string }
   | { found: 'served'; transaction: string; body: unknown };
 
@@ -65,8 +67,8 @@ export type Redeemed =
  * facilitator, one copy at a time, and it is never served on a guess. If it settled, it becomes settled, with the wallet
  * and transaction it paid for, owned by that request while it screens; once the result is stored it is served. For
  * PAID_RESULT_KEEP_SECONDS from the settlement, a copy of the header asking for the same wallet redeems it: a settled
- * claim no live request owns is screened by that copy, and a served claim answers with its stored result. Every other
- * copy is refused.
+ * claim no live request owns is screened by that copy, a settled claim another live request is screening is in use,
+ * and a served claim answers with its stored result. Every other copy is refused.
  *
  * Memory only, in this process, at most MAX_CLAIMS entries. Only an authorization valid for at most maxTimeoutSeconds
  * plus CLOCK_ALLOWANCE_SECONDS is claimed, and its claim is remembered until its validBefore, or a day from its
@@ -115,7 +117,8 @@ export class PaymentClaims {
   /**
    * Looks for a payment of key that already went through, for a request carrying its header again. Inside a day from
    * the settlement and only for the wallet it paid for: a served claim answers with its stored result, and a settled one
-   * no live request owns is taken by owner until ownedUntil, to screen it.
+   * no live request owns is taken by owner until ownedUntil, to screen it; one a live request owns is in use. The wallet
+   * is checked first, so another wallet is refused whoever owns the claim.
    */
   redeem(key: string, wallet: Address, owner: string, nowSeconds: bigint, ownedUntil: bigint): Redeemed {
     const entry = this.#claims.get(key);
@@ -124,7 +127,7 @@ export class PaymentClaims {
     if (entry.settled.wallet !== parseAddress(wallet)) return { found: 'refused' };
     const { transaction } = entry.settled;
     if (entry.state === 'served' && entry.result !== null) return { found: 'served', transaction, body: JSON.parse(entry.result) as unknown };
-    if (entry.owner !== null && entry.ownedUntil !== null && entry.ownedUntil > nowSeconds) return { found: 'refused' };
+    if (entry.owner !== null && entry.ownedUntil !== null && entry.ownedUntil > nowSeconds) return { found: 'in-use' };
     entry.owner = owner;
     entry.ownedUntil = ownedUntil;
     return { found: 'settled', transaction };

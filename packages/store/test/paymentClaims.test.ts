@@ -109,7 +109,7 @@ for (const { name, open } of TARGETS) {
       const owners = Array.from({ length: 20 }, (_, index) => `redeem-${index}`);
       const results = await Promise.all(owners.map((owner) => redeemPayment(db, KEY, WALLET, owner, owned(NOW + 10n))));
       expect(results.filter((result) => result.found === 'settled')).toEqual([{ found: 'settled', transaction: TX }]);
-      expect(results.filter((result) => result.found === 'refused')).toHaveLength(19);
+      expect(results.filter((result) => result.found === 'in-use')).toHaveLength(19);
       const winner = owners[results.findIndex((result) => result.found === 'settled')] as string;
       expect((await row(KEY))?.owner).toBe(winner);
 
@@ -136,7 +136,9 @@ for (const { name, open } of TARGETS) {
     it('C25: an owner that leaves frees the key at once, an owner past its lease is taken over, and a late write from it changes nothing', async () => {
       expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
       await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
-      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST - 1n))).toEqual({ found: 'refused' });
+      // Its own wallet hears in-use while the owner lives; another wallet is refused all the same.
+      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST - 1n))).toEqual({ found: 'in-use' });
+      expect(await redeemPayment(db, KEY, OTHER_WALLET, 'other', owned(NOW + LATEST - 1n))).toEqual({ found: 'refused' });
       expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST))).toEqual({ found: 'settled', transaction: TX });
       await leaveSettledPayment(db, KEY, 'payer');
       await servePayment(db, KEY, 'payer', { late: true });

@@ -724,10 +724,14 @@ describe.each(BACKENDS)('redeeming a payment that went through, with the same he
     await vi.waitFor(() => expect(reached).toBe(true));
     expect(facilitator.settled).toHaveLength(1);
 
-    // While the cut request may still be alive, a copy screens nothing beside it.
-    const early = await fetchAs('198.51.100.40')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(early.status).toBe(402);
-    expect(decodePaymentResponseHeader(early.headers.get('payment-response') as string)).toMatchObject({ errorReason: 'payment_already_used' });
+    // While the cut request may still be alive, a copy screens nothing beside it, and is told to come back, since the
+    // money has moved. Waiting on a payment that went through is not a failed payment, so it never locks the buyer out.
+    for (let index = 0; index <= CLIENT_MAX_FAILED_PER_HOUR; index += 1) {
+      const early = await fetchAs('198.51.100.40')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(early.status, `copy ${index + 1}`).toBe(503);
+      expect(SettledRetryBody.safeParse(await early.json()).success).toBe(true);
+      expect(early.headers.get('retry-after')).toBe(String(SETTLED_RETRY_AFTER_SECONDS));
+    }
 
     clock = new Date(clock.getTime() + LEASE_SECONDS * 1000);
     const otherWallet = await fetchAs('198.51.100.41')(url(SCREEN_PATH), post({ wallet: OTHER_WALLET }, header));
@@ -784,7 +788,7 @@ describe.each(BACKENDS)('redeeming a payment that went through, with the same he
     expect(facilitator.settled).toHaveLength(1);
   });
 
-  it('gives two redeems of one settled payment at once a single screening: the other gets the in-use answer', async () => {
+  it('gives two redeems of one settled payment at once a single screening: the other is told to come back, never that the payment is used, and then gets the stored result', async () => {
     let clock = new Date();
     const now = () => clock;
     // The first request's settling used up its time, as a slow facilitator would, so it stores nothing.
@@ -811,7 +815,20 @@ describe.each(BACKENDS)('redeeming a payment that went through, with the same he
     await vi.waitFor(() => expect(screen).toHaveBeenCalledTimes(1));
     release();
     const replies = await Promise.all(both);
-    expect(replies.map((reply) => reply.status).sort()).toEqual([200, 402]);
+    expect(replies.map((reply) => reply.status).sort()).toEqual([200, 503]);
+    const screened = replies.find((reply) => reply.status === 200) as Response;
+    const waiting = replies.find((reply) => reply.status === 503) as Response;
+    const result = await screened.text();
+    expect(SettledRetryBody.safeParse(await waiting.json()).success).toBe(true);
+    expect(waiting.headers.get('retry-after')).toBe(String(SETTLED_RETRY_AFTER_SECONDS));
+    // No fresh terms, so no client is led to pay a second time.
+    expect(waiting.headers.get('payment-required')).toBeNull();
+    expect(waiting.headers.get('payment-response')).toBeNull();
+
+    const again = await fetchAs('198.51.100.51')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(again.status).toBe(200);
+    expect(again.headers.get(STORED_HEADER)).toBe('true');
+    expect(await again.text()).toBe(result);
     expect(screen).toHaveBeenCalledTimes(1);
     expect(facilitator.settled).toHaveLength(1);
   });
@@ -1221,13 +1238,15 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     const day = BigInt(PAID_RESULT_KEEP_SECONDS);
     expect(await claims.claim('paid', settledAt + 300n, 'payer', settledAt)).toBe('taken');
     await claims.markSettled('paid', 'payer', settlementFor(WALLET), settledAt);
-    // The settling request owns it while it screens, so no copy screens beside it.
-    expect(await claims.redeem('paid', WALLET, 'copy', settledAt + 1n)).toEqual({ found: 'refused' });
+    // The settling request owns it while it screens, so no copy screens beside it. Its own wallet hears in-use; another
+    // wallet is refused, owned or not, because it is not this payment's buyer.
+    expect(await claims.redeem('paid', WALLET, 'copy', settledAt + 1n)).toEqual({ found: 'in-use' });
+    expect(await claims.redeem('paid', OTHER_WALLET, 'other', settledAt + 1n)).toEqual({ found: 'refused' });
     await claims.leave('paid', 'payer');
 
     expect(await claims.redeem('paid', OTHER_WALLET, 'other', settledAt + 400n)).toEqual({ found: 'refused' });
     const both = await Promise.all(['first', 'second'].map((owner) => claims.redeem('paid', WALLET, owner, settledAt + 400n)));
-    expect(both.map((found) => found.found).sort()).toEqual(['refused', 'settled']);
+    expect(both.map((found) => found.found).sort()).toEqual(['in-use', 'settled']);
     const winner = both[0]?.found === 'settled' ? 'first' : 'second';
     // An owner past its lease is surely gone, so a later copy takes the screening over.
     expect(await claims.redeem('paid', WALLET, 'third', settledAt + 400n + BigInt(LEASE_SECONDS))).toEqual({
@@ -1519,8 +1538,8 @@ describe.each(BACKENDS)('a store that fails (C25, C40), on $name', (backend) => 
       expect((await refused.pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(402);
       expect(refused.screen).not.toHaveBeenCalled();
 
-      // The result cannot be stored and the claim cannot be given back: the buyer still gets it, and a copy is
-      // refused while the request's ownership lasts, never served a second screening beside it.
+      // The result cannot be stored and the claim cannot be given back: the buyer still gets it, and a copy is told to
+      // come back while the request's ownership lasts, never served a second screening beside it.
       const unstored = await brokenCopy(['claims.serve', 'claims.leave']);
       const fresh = await unstored.pay(url(SCREEN_PATH), post({ wallet: WALLET }));
       expect(fresh.status).toBe(200);
@@ -1529,7 +1548,8 @@ describe.each(BACKENDS)('a store that fails (C25, C40), on $name', (backend) => 
         url(SCREEN_PATH),
         post({ wallet: WALLET }, { 'PAYMENT-SIGNATURE': unstored.sentSignatures[0] as string }),
       );
-      expect(meanwhile.status).toBe(402);
+      expect(meanwhile.status).toBe(503);
+      expect(SettledRetryBody.safeParse(await meanwhile.json()).success).toBe(true);
       expect(unstored.screen).toHaveBeenCalledTimes(1);
       expect(unstored.facilitator.settled).toHaveLength(1);
 

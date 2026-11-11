@@ -1,7 +1,8 @@
 import { createPublicClient, http, parseAbi, parseEventLogs, type Hash, type Hex, type Log } from 'viem';
 import { parseAddress, type Address } from '@thuli/core';
 
-const RECEIPT_TIMEOUT_MS = 10_000;
+/** The longest one read of a pending settlement's receipt may take (C41). */
+export const RECEIPT_TIMEOUT_MS = 10_000;
 // One transferWithAuthorization receipt is about 2 KB. Anything near this cap is not the receipt we asked for (C41).
 const MAX_RECEIPT_BYTES = 256 * 1024;
 
