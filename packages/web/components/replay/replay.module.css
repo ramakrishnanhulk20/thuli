@@ -1,0 +1,927 @@
+/* Page frame: one column below 1024px, map beside panel from 1024px up. */
+.page {
+  --pad: clamp(20px, 3vw, 48px);
+
+  position: relative;
+  min-height: calc(100svh - 64px);
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.full {
+  --tone: var(--color-full);
+}
+
+.partial {
+  --tone: var(--color-partial);
+}
+
+.hold {
+  --tone: var(--color-hold);
+}
+
+.exclude {
+  --tone: var(--color-exclude);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Panel head */
+.head {
+  padding: 32px var(--pad) 0;
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.labelMark {
+  color: var(--color-accent);
+}
+
+.title {
+  margin-top: 14px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(2rem, 3.2vw, 2.75rem);
+  line-height: 1.05;
+  color: var(--color-ink);
+}
+
+.lede {
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.bar {
+  display: flex;
+  gap: 2px;
+  height: 16px;
+  margin-top: 28px;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.segment {
+  flex-basis: 0;
+  min-width: 0;
+  background: var(--tone);
+  transform-origin: left center;
+  animation: grow 900ms var(--ease-out-expo) both;
+}
+
+.legend {
+  margin-top: 14px;
+}
+
+.legendRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 30px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  color: var(--color-ink-2);
+}
+
+.swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  background: var(--tone);
+}
+
+.legendName {
+  flex: 1;
+  min-width: 0;
+}
+
+.legendCount {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--color-ink);
+}
+
+.note {
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* Search, the same look as the check field on the home page. */
+.search {
+  position: relative;
+  margin-top: 28px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  height: 52px;
+  padding: 0 84px 0 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  transition: border-color 160ms ease;
+}
+
+.input::placeholder {
+  color: var(--color-ink-3);
+}
+
+.input:hover {
+  border-color: var(--color-ink-3);
+}
+
+.input:focus {
+  border-color: var(--color-accent);
+}
+
+.submit {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.error {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-exclude);
+}
+
+/* Quiet buttons and back links: text only, with the underline drawn on hover. */
+.quiet {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0;
+  font-family: var(--font-body);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: color 180ms ease;
+}
+
+.quiet:hover {
+  color: var(--color-ink);
+}
+
+.quietLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.quietLabel::after,
+.submitLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.quiet:hover .quietLabel::after,
+.submit:hover .submitLabel::after {
+  transform: scaleX(1);
+}
+
+.submitLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.randomRow {
+  margin-top: 10px;
+}
+
+/* Panel body */
+.body {
+  padding: 0 var(--pad) 72px;
+  scroll-margin-top: 88px;
+}
+
+.bodyIn {
+  animation: rise 300ms var(--ease-out-expo) both;
+}
+
+.heading {
+  margin-top: 48px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: 24px;
+  line-height: 1.15;
+  color: var(--color-ink);
+}
+
+.headingFamily {
+  margin-top: 20px;
+  font-size: 28px;
+}
+
+.sub {
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.chip {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-ink-2);
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+
+.chip:hover {
+  background: var(--color-night-2);
+}
+
+.chip[aria-pressed='true'] {
+  border-color: var(--color-ink);
+  color: var(--color-ink);
+}
+
+.rows {
+  margin-top: 16px;
+  border-top: 1px solid var(--color-line);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 48px;
+  padding: 0;
+  border-bottom: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--color-ink);
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+
+.row:hover {
+  background: var(--color-night-2);
+}
+
+.rowNumber {
+  flex: none;
+  width: 48px;
+  padding-left: 4px;
+  color: var(--color-ink-3);
+}
+
+.rowSize {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-ink);
+}
+
+.rowHeld {
+  flex: none;
+  color: var(--color-ink-3);
+}
+
+.rowHeldOn {
+  color: var(--color-hold);
+}
+
+.rowRobo {
+  flex: none;
+  padding-right: 4px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--color-ink-2);
+}
+
+.showAll {
+  margin-top: 20px;
+}
+
+/* Family view */
+.back {
+  margin-top: 48px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  gap: 8px;
+}
+
+.backArrow {
+  flex: none;
+}
+
+.stats {
+  margin-top: 14px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--color-ink-2);
+}
+
+.stat {
+  display: block;
+}
+
+.familyNote {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.members {
+  margin-top: 24px;
+  border-top: 1px solid var(--color-line);
+}
+
+.member {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 44px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--color-ink);
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+
+.member:hover {
+  background: var(--color-night-2);
+}
+
+.memberAddress {
+  flex: none;
+}
+
+.memberOutcome {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-ink-2);
+}
+
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+.memberRule {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-ink-3);
+}
+
+.memberRobo {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Loading and failure */
+.skeletons {
+  margin-top: 24px;
+}
+
+.skeleton {
+  height: 44px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  animation: pulse 1.2s ease-in-out infinite alternate;
+}
+
+.failure {
+  margin-top: 24px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.failure .quiet {
+  display: flex;
+  margin-top: 8px;
+}
+
+/* Wallet view */
+.addressRow {
+  margin-top: 20px;
+}
+
+.address {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  color: var(--color-ink);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-top: 6px;
+}
+
+.banner {
+  margin-top: 20px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: 40px;
+  line-height: 1.05;
+  color: var(--tone);
+}
+
+.bannerMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 20px;
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-ink-3);
+}
+
+.blockLabel {
+  margin: 32px 0 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.ruleLine {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.ruleChip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-ink);
+}
+
+.ruleMeaning {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-2);
+}
+
+.reason {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 17px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  color: var(--color-ink);
+}
+
+.citedLabel {
+  margin: 20px 0 6px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--color-ink-3);
+}
+
+.txList {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.tx {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-ink);
+}
+
+.txText {
+  position: relative;
+  display: inline-block;
+}
+
+.txText::after,
+.factLink::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -3px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.tx:hover .txText::after,
+.factLink:hover::after {
+  transform: scaleX(1);
+}
+
+.none {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-ink-3);
+}
+
+.facts {
+  border-top: 1px solid var(--color-line);
+}
+
+.fact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  min-height: 36px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.factName {
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--color-ink-3);
+}
+
+.factValue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  color: var(--color-ink);
+}
+
+.factLink {
+  position: relative;
+  display: inline-block;
+  color: var(--color-ink);
+}
+
+.factButton {
+  min-height: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--color-ink);
+}
+
+.decided {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.decided p + p {
+  margin-top: 6px;
+}
+
+.servRun {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-3);
+}
+
+.closing {
+  margin-top: 32px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-line);
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* The map. Below 1024px the caption sits above the canvas and the legend below it, so no text lands on the dots. */
+.mapWrap {
+  margin-top: 32px;
+}
+
+.map {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  max-height: 70svh;
+  overflow: hidden;
+}
+
+.canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mapCount {
+  margin-bottom: 10px;
+  padding: 0 var(--pad);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.mapBottom {
+  margin-top: 12px;
+  padding: 0 var(--pad);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.mapLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+}
+
+.mapLegendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mapSwatch {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--tone);
+}
+
+.tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  pointer-events: none;
+  padding: 10px 12px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-night-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--color-ink-2);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.tooltipFirst {
+  display: block;
+  color: var(--color-ink);
+}
+
+.tooltipLine {
+  display: block;
+}
+
+/* Two columns from 1024px: the map sticks under the nav, the panel scrolls with the page. */
+@media (min-width: 1024px) {
+  .page {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 480px;
+    grid-template-rows: auto 1fr;
+  }
+
+  .head {
+    grid-column: 2;
+    grid-row: 1;
+    padding: 40px 32px 0;
+    border-left: 1px solid var(--color-line);
+  }
+
+  .body {
+    grid-column: 2;
+    grid-row: 2;
+    padding: 0 32px 96px;
+    border-left: 1px solid var(--color-line);
+  }
+
+  .mapWrap {
+    grid-column: 1;
+    grid-row: 1 / span 2;
+    position: sticky;
+    top: 64px;
+    align-self: start;
+    height: calc(100svh - 64px);
+    margin-top: 0;
+  }
+
+  .map {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    aspect-ratio: auto;
+    max-height: none;
+  }
+
+  .mapCount {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    right: 16px;
+    z-index: 2;
+    margin: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+
+  .mapBottom {
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    bottom: 16px;
+    z-index: 2;
+    margin: 0;
+    padding: 0;
+    pointer-events: none;
+  }
+
+  .mapLegend {
+    gap: 4px 16px;
+  }
+}
+
+/* Tap targets of at least 44px below 768px. */
+@media (max-width: 767px) {
+  .quiet {
+    min-height: 44px;
+  }
+
+  .factButton {
+    min-height: 44px;
+  }
+
+  .chip {
+    height: 44px;
+  }
+
+  .tx {
+    min-height: 44px;
+  }
+
+  .submit {
+    top: 4px;
+    right: 4px;
+    height: 44px;
+  }
+
+  .fact {
+    min-height: 44px;
+  }
+
+  .banner {
+    font-size: 34px;
+  }
+}
+
+@keyframes grow {
+  from {
+    transform: scaleX(0);
+  }
+
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+  from {
+    background: var(--color-night-2);
+  }
+
+  to {
+    background: var(--color-line);
+  }
+}
+
+/* Reduced motion: the bar is full at once, the panel changes in place, the loading blocks sit still. */
+@media (prefers-reduced-motion: reduce) {
+  .segment,
+  .bodyIn,
+  .skeleton {
+    animation: none;
+  }
+
+  .skeleton {
+    background: var(--color-night-2);
+  }
+}
