@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
+import { PAID_RESULT_KEEP_SECONDS } from '@thuli/store';
 import { PRICE_UNITS, type NetworkId } from './config.ts';
 
 /** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
@@ -20,33 +21,62 @@ export function hasExpired(validBefore: bigint, nowSeconds: bigint): boolean {
   return validBefore <= nowSeconds;
 }
 
-type State = 'held' | 'unsure' | 'used';
+type State = 'held' | 'unsure' | 'settled' | 'served';
+
+/** What a payment that went through bought: the wallet it was for and the settlement transaction. */
+export interface Settlement {
+  wallet: Address;
+  transaction: `0x${string}`;
+}
 
 interface Claim {
   owner: string | null;
   state: State;
   validBefore: bigint;
+  /** Set once the money moved, with the second it settled. */
+  settled: (Settlement & { at: bigint }) | null;
+  /** While a request owns a settled claim, the second by which that request has surely ended. */
+  ownedUntil: bigint | null;
+  /** A served claim's result as JSON text, kept as the shared store keeps it. */
+  result: string | null;
 }
 
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
 /**
- * One payment authorization buys one screening (threat model C25). A claim is taken before the facilitator is asked to
- * settle, so a second copy of the same authorization, in parallel or later, is refused without reaching it.
+ * What redeem found for a key. none: no settled payment within its day, so the header goes the way of any new payment.
+ * refused: settled for another wallet, or another request is screening it. settled: the caller now screens it. served:
+ * the stored result, as it was written.
+ */
+export type Redeemed =
+  | { found: 'none' }
+  | { found: 'refused' }
+  | { found: 'settled'; transaction: string }
+  | { found: 'served'; transaction: string; body: unknown };
+
+/**
+ * One payment authorization buys one screening, and that screening can be fetched again (threat model C25). A claim is
+ * taken before the facilitator is asked to settle, so a second copy of the same authorization, in parallel or later, is
+ * refused without reaching it.
  *
  * A claim is held by the one request settling it. If that settlement failed outright, it is released, so an honest
- * retry can try again. If it settled, it stays used. If its outcome is unknown (the facilitator threw, timed out, or left
- * it pending without proof), it stays as unsure: owned by no request, it lets the same authorization come back and try
- * again through the facilitator, one copy at a time, and it is never served on a guess.
+ * retry can try again. If its outcome is unknown (the facilitator threw, timed out, or left it pending without proof),
+ * it stays as unsure: owned by no request, it lets the same authorization come back and try again through the
+ * facilitator, one copy at a time, and it is never served on a guess. If it settled, it becomes settled, with the wallet
+ * and transaction it paid for, owned by that request while it screens; once the result is stored it is served. For
+ * PAID_RESULT_KEEP_SECONDS from the settlement, a copy of the header asking for the same wallet redeems it: a settled
+ * claim no live request owns is screened by that copy, and a served claim answers with its stored result. Every other
+ * copy is refused.
  *
  * Memory only, in this process, at most MAX_CLAIMS entries. Only an authorization valid for at most maxTimeoutSeconds
- * plus CLOCK_ALLOWANCE_SECONDS is claimed, and its claim is remembered until its validBefore, after which the expiry
- * check refuses every copy. So no copy of an accepted authorization is ever let through by forgetting, and a claim lives
- * about 330 seconds at most. A full map refuses new payments as busy; it never forgets a claim still in its window.
+ * plus CLOCK_ALLOWANCE_SECONDS is claimed, and its claim is remembered until its validBefore, or a day from its
+ * settlement if it settled, after which the expiry check refuses every copy. So no copy of an accepted authorization is
+ * ever let through by forgetting. Settled claims come only from paid screenings, which the day ceiling bounds. A full
+ * map refuses new payments as busy; it never forgets a claim still in its window.
  *
- * A restart forgets every claim. A copy sent after a restart but inside its window reaches the facilitator again, and a
- * facilitator that still holds the payment as pending can answer it from the old transaction. This class does not close
- * that gap.
+ * A restart forgets every claim, results included. A copy sent after a restart but inside its window reaches the
+ * facilitator again, and a facilitator that still holds the payment as pending can answer it from the old transaction.
+ * This class does not close that gap.
  */
 export class PaymentClaims {
   readonly #claims = new Map<string, Claim>();
@@ -59,7 +89,7 @@ export class PaymentClaims {
 
   /**
    * Takes the key for owner, one request's own random id. Refuses an expired authorization, one valid for longer than
-   * the route allows, a key another request holds or used, and a full map.
+   * the route allows, a key another request holds, settled or used, and a full map.
    */
   claim(key: string, validBefore: bigint, owner: string, nowSeconds: bigint): ClaimResult {
     if (hasExpired(validBefore, nowSeconds)) return 'expired';
@@ -78,15 +108,57 @@ export class PaymentClaims {
     }
     if (this.#claims.size >= MAX_CLAIMS) this.#forgetDue(nowSeconds);
     if (this.#claims.size >= MAX_CLAIMS) return 'full';
-    this.#claims.set(key, { owner, state: 'held', validBefore });
+    this.#claims.set(key, { owner, state: 'held', validBefore, settled: null, ownedUntil: null, result: null });
     return 'taken';
   }
 
-  markUsed(key: string, owner: string): void {
+  /**
+   * Looks for a payment of key that already went through, for a request carrying its header again. Inside a day from
+   * the settlement and only for the wallet it paid for: a served claim answers with its stored result, and a settled one
+   * no live request owns is taken by owner until ownedUntil, to screen it.
+   */
+  redeem(key: string, wallet: Address, owner: string, nowSeconds: bigint, ownedUntil: bigint): Redeemed {
+    const entry = this.#claims.get(key);
+    if (entry === undefined || entry.settled === null) return { found: 'none' };
+    if (entry.settled.at + BigInt(PAID_RESULT_KEEP_SECONDS) <= nowSeconds) return { found: 'none' };
+    if (entry.settled.wallet !== parseAddress(wallet)) return { found: 'refused' };
+    const { transaction } = entry.settled;
+    if (entry.state === 'served' && entry.result !== null) return { found: 'served', transaction, body: JSON.parse(entry.result) as unknown };
+    if (entry.owner !== null && entry.ownedUntil !== null && entry.ownedUntil > nowSeconds) return { found: 'refused' };
+    entry.owner = owner;
+    entry.ownedUntil = ownedUntil;
+    return { found: 'settled', transaction };
+  }
+
+  /** The settlement went through: the claim is settled for settlement, owned by owner until ownedUntil while it screens. */
+  markSettled(key: string, owner: string, settlement: Settlement, nowSeconds: bigint, ownedUntil: bigint): void {
     const entry = this.#take(key, owner);
     if (entry !== undefined) {
-      entry.state = 'used';
+      entry.state = 'settled';
+      entry.settled = { wallet: parseAddress(settlement.wallet), transaction: settlement.transaction, at: nowSeconds };
+      entry.ownedUntil = ownedUntil;
+    }
+  }
+
+  /** Stores the result a settled claim bought and frees it. Does nothing unless owner owns the settled key. */
+  serve(key: string, owner: string, body: unknown): void {
+    const entry = this.#owned(key, owner);
+    const json = body === null ? undefined : JSON.stringify(body);
+    if (json === undefined) throw new TypeError('the paid result must be a JSON value other than null');
+    if (entry !== undefined) {
+      entry.state = 'served';
+      entry.result = json;
       entry.owner = null;
+      entry.ownedUntil = null;
+    }
+  }
+
+  /** The screening ended with no result: the claim stays settled, owned by no request, for the next copy of its header. */
+  leave(key: string, owner: string): void {
+    const entry = this.#owned(key, owner);
+    if (entry !== undefined) {
+      entry.owner = null;
+      entry.ownedUntil = null;
     }
   }
 
@@ -113,10 +185,17 @@ export class PaymentClaims {
     return entry !== undefined && entry.state === 'held' && entry.owner === owner ? entry : undefined;
   }
 
+  #owned(key: string, owner: string): Claim | undefined {
+    const entry = this.#claims.get(key);
+    return entry !== undefined && entry.state === 'settled' && entry.owner === owner ? entry : undefined;
+  }
+
   // A held claim belongs to a request in flight and is never forgotten under it. Any other is forgotten only once its
-  // authorization has expired, by the same comparison that refuses the authorization itself.
+  // authorization has expired, by the same comparison that refuses the authorization itself, and a settled or served
+  // one not before a day from its settlement, so its buyer can always come back for the result inside that day.
   #due(entry: Claim, nowSeconds: bigint): boolean {
-    return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds);
+    const kept = entry.settled !== null && entry.settled.at + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
+    return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds) && !kept;
   }
 
   // Runs only when the map is full, so its cost is paid once per wave of new claims, not on every request.

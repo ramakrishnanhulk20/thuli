@@ -12,20 +12,59 @@ import { createMiddleware } from 'hono/factory';
 import { z } from 'zod';
 import { AddressError, CURRENT_RULEBOOK, parseAddress, type Address } from '@thuli/core';
 import type { CheckKey } from '@thuli/store';
-import { heldScreen, NOT_CHECKED, SCREEN_CAUSES, SINGLE_SCOPE, type SingleScreen } from '@thuli/worker/src/screen/single.ts';
+import {
+  heldScreen,
+  NOT_CHECKED,
+  SCREEN_CAUSES,
+  SCREEN_TIME_LIMIT_MS,
+  SINGLE_SCOPE,
+  type SingleScreen,
+} from '@thuli/worker/src/screen/single.ts';
 import { registerCampaignRoutes, type CampaignDeps } from './campaigns.ts';
-import { MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult } from './claims.ts';
-import { PRICE, PRICE_UNITS, type ApiConfig } from './config.ts';
+import { MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult, type Redeemed } from './claims.ts';
+import { PRICE, PRICE_UNITS, REQUEST_DEADLINE_MS, SETTLE_TIMEOUT_MS, type ApiConfig } from './config.ts';
 import type { Ticket } from './guard.ts';
 import { canonicalClient, type Limit, type Pass } from './limits.ts';
 import { receiptPays, receiptReader, type ReadReceipt } from './receipt.ts';
-import { cachedBody, freeBody, paidBody, PaidScreenResponse, Payment, ScreenRequest, type FreeCheckResponse } from './schema.ts';
+import {
+  cachedBody,
+  freeBody,
+  paidBody,
+  PaidScreenResponse,
+  Payment,
+  ScreenRequest,
+  SETTLED_RETRY,
+  storedPaidBody,
+  type FreeCheckResponse,
+} from './schema.ts';
 import { failureCode, memoryStores, type CheckPlace, type CheckRefusal, type Stores } from './stores.ts';
 
 export const SCREEN_PATH = '/api/x402/screen';
 export const HEALTH_PATH = '/api/x402/health';
 export const CHECK_PATH = '/api/check';
 export const CHECK_HEALTH_PATH = '/api/check/health';
+/** Set to true on a paid answer served from the result its payment already bought, with no screening and no settlement. */
+export const STORED_HEADER = 'thuli-stored-result';
+
+/** Kept back from the screening's share of a paid request's time, to store its result and give the places back. */
+export const REPLY_MARGIN_MS = 10_000;
+/** With less than this left after settling, no screening starts and the buyer is asked to send the same header again. */
+export const SCREEN_LEAST_MS = 20_000;
+/** The wait a settled-retry answer asks for before the same header comes back. */
+export const SETTLED_RETRY_AFTER_SECONDS = 10;
+// receipt.ts reads a pending settlement's receipt with this timeout.
+const RECEIPT_READ_MS = 10_000;
+/**
+ * Time a paid request needs left before it asks the facilitator to settle: two settle calls (the library asks once
+ * more when the first is pending), the receipt read, and the least a screening may start with. With less, nothing is
+ * settled, so settling can never run the request past its deadline.
+ */
+export const SETTLE_ROOM_MS = 2 * SETTLE_TIMEOUT_MS + RECEIPT_READ_MS + SCREEN_LEAST_MS;
+
+/** A wait cut off at its request's deadline. Logged by its name only, like a store failure. */
+class DeadlineReached extends Error {
+  override name = 'DeadlineReached';
+}
 
 /** The single-wallet screening reads Ethereum mainnet only, so every cached check is for chain 1. */
 const CHECK_CHAIN = 1;
@@ -60,8 +99,8 @@ export interface ApiDeps {
 }
 
 interface AppEnv {
-  /** pass is set on the paid route, client on the free check. */
-  Variables: { wallet: Address; pass: Pass; client: string };
+  /** pass and deadlineAt are set on the paid route, client on the free check. */
+  Variables: { wallet: Address; pass: Pass; client: string; deadlineAt: number };
 }
 
 /** What one paid request carries through the payment middleware to the handler, in its own async context. */
@@ -69,10 +108,22 @@ interface PaidRequest {
   ticket: Ticket;
   /** A fresh random id, this request's name as the owner of its claim. */
   owner: string;
+  /** The wallet the request body names, the one a payment is for. */
+  wallet: Address;
+  /** The moment, in ms on the app's clock, by which this request has answered and stopped waiting on anything. */
+  deadlineAt: number;
   /** The claim this request took, or may have taken when the store failed while it was being written. */
   claim: { key: string; payer: Address; nonce: `0x${string}` } | null;
-  /** True once the claim was marked used or unsure. From then on it is never released, even if that write failed. */
+  /** True once the claim was settled, kept unsure or redeemed. From then on it is never released, even if that write failed. */
   kept: boolean;
+  /** True once this request may own a settled claim, so it gives the claim back if it ends with no result stored. */
+  owns: boolean;
+  /** True once the result this request screened is stored on its claim. */
+  served: boolean;
+  /** True when the claim settled on an earlier request and this one carries its header again. */
+  redeemed: boolean;
+  /** A served claim's stored result, answered as it is, with no screening and no settlement. */
+  stored: unknown;
   payment: Payment | null;
   /** True when the latest settle call threw rather than answering, so its outcome is unknown. */
   settleThrew: boolean;
@@ -218,13 +269,28 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  * only when its on-chain receipt proves this payment; any other unclear outcome answers 503 {retry: true} and keeps the
  * claim for a retry of the same header. The reply is the fixed PaidScreenResponse and nothing else (C34).
  *
+ * Exactly once paid, as many times fetched (C25). A settled claim keeps the wallet and transaction it paid for, and
+ * the reply is stored on it before it is sent. For a day from the settlement, the same header with the same wallet
+ * redeems the payment with no settle: a stored result comes back exactly as stored, marked by the thuli-stored-result
+ * header, and a payment with no result yet is screened then. Only one request screens a payment at a time; the others
+ * get the in-use refusal. Another wallet with that header is refused. A redeem passes the same client and service
+ * limits as any paid request and never counts as a failed payment (C24, C42). Non-goal: a redeem does not check the
+ * signature again, so anyone who rebuilds the header from the settled transaction on chain can fetch the same wallet's
+ * result; it buys no screening the payment did not, and the free check gives that wallet's screening to anyone anyway.
+ *
+ * Every paid request answers by REQUEST_DEADLINE_MS from its first line (C41). It is not settled unless SETTLE_ROOM_MS
+ * is left, and after settling the screening gets the time left less REPLY_MARGIN_MS, at most its own 120 s. With under
+ * SCREEN_LEAST_MS left, or when the screening runs out of time, the answer is 503 with the settled-retry body and a
+ * Retry-After; the claim stays settled and no hold written for lack of time is ever stored.
+ *
  * The claims and limits live in deps.stores, this process's memory unless given. When a store call fails (the database
  * is down or slow), the rule has two sides:
  * - Before a settlement is confirmed, the failure refuses: 503 {busy: true} before a claim is attempted, 503 {retry:
  *   true} once one was, and the facilitator is never asked to settle on a claim the store could not record.
  * - After a settlement is confirmed, the buyer gets the result whatever the store does (C25). A failure to mark the
- *   claim used or to count the screening is logged, and the claim simply stays held until its validBefore, so no copy
- *   is served twice.
+ *   claim settled, to count the screening or to store the result is logged. A claim not marked settled stays held until
+ *   the sweep, so no copy is ever served, and that payment cannot be redeemed; a result not stored is screened again on
+ *   the next redeem.
  * A failure while giving places back after the reply is decided keeps that reply; a shared place frees itself when its
  * lease ends. No reply and no log line carries a store's message. Non-goal: when a settlement's outcome is unknown and
  * keeping the claim as unsure fails too, the claim stays held by a request that is gone, so the same header cannot
@@ -255,6 +321,50 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   const paidRequests = new AsyncLocalStorage<PaidRequest>();
   const readReceipt = deps.readReceipt ?? receiptReader(config.settlementRpcUrl, config.chainId);
 
+  /**
+   * work, or a DeadlineReached rejection once deadlineAt has passed, so a paid request never waits past its deadline
+   * (C41). A store call cut off this way may still finish; every such call is one a lease or a retry already covers.
+   */
+  function byDeadline<T>(deadlineAt: number, work: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new DeadlineReached('the request reached its deadline')), Math.max(0, deadlineAt - now().getTime()));
+      Promise.resolve()
+        .then(work)
+        .then(resolve, reject)
+        .finally(() => clearTimeout(timer));
+    });
+  }
+
+  /**
+   * The screening of wallet, or null when it has not finished within ms. One that throws becomes the code-written hold.
+   * The screening is started before the timer, so one that finishes at the very moment the share runs out still counts.
+   */
+  async function screenWithin(wallet: Address, ms: number): Promise<SingleScreen | null> {
+    if (ms <= 0) return null;
+    let screening: Promise<SingleScreen>;
+    try {
+      screening = deps.screen(wallet);
+    } catch (error) {
+      screening = Promise.reject(error);
+    }
+    const finished = screening.catch(() => heldScreen(wallet, SCREEN_CAUSES.failed));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), ms);
+    });
+    try {
+      return await Promise.race([finished, late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Fixed words and a fixed shape: the payment settled, and the same header gets the screening it bought (C25).
+  const settledRetry = (c: Context<AppEnv>) => {
+    c.header('retry-after', String(SETTLED_RETRY_AFTER_SECONDS));
+    return c.json(SETTLED_RETRY, 503);
+  };
+
   // The settle-failure hook is handed the same kind of error whether the facilitator answered "failed" or the call
   // threw, so the throw is noted here, per call, where the two can still be told apart.
   const facilitator: FacilitatorClient = {
@@ -281,6 +391,48 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     const terms = readPaymentTerms(paymentPayload.payload, requirements, config);
     if (!terms.ok) return refuse(terms.reason);
     const nowSeconds = BigInt(Math.floor(now().getTime() / 1000));
+    const taken = { key: terms.key, payer: terms.payer, nonce: terms.nonce };
+
+    // A header whose payment already went through is never settled again: it gets its stored result, or the screening
+    // it paid for, and only for the wallet it paid for (C24, C25).
+    let found: Redeemed;
+    try {
+      found = await claims.redeem(terms.key, request.wallet, request.owner, nowSeconds);
+    } catch (error) {
+      // The claim may have been taken before the failure, so it is given back when the request ends.
+      storeFailed('looking up a settled payment', error);
+      request.claim = taken;
+      request.kept = true;
+      request.owns = true;
+      request.answer = 'retry';
+      return refuse('payment_not_recorded');
+    }
+    if (found.found === 'refused') return refuse('payment_already_used');
+    if (found.found !== 'none') {
+      const payment = Payment.safeParse({ network: config.networkId, payer: terms.payer, transaction: found.transaction });
+      request.claim = taken;
+      request.kept = true;
+      request.redeemed = true;
+      request.owns = found.found === 'settled';
+      if (!payment.success) {
+        // Only a damaged row can get here, and nothing is served on it.
+        request.answer = 'retry';
+        return refuse('payment_not_recorded');
+      }
+      request.payment = payment.data;
+      if (found.found === 'served') request.stored = found.body;
+      return {
+        skip: true as const,
+        result: { success: true, transaction: payment.data.transaction, network: config.networkId, payer: terms.payer },
+      };
+    }
+
+    // Too little time left to settle and still screen: nothing is claimed or settled, so nothing is spent (C41).
+    if (request.deadlineAt - now().getTime() < SETTLE_ROOM_MS) {
+      request.answer = 'busy';
+      return refuse('payment_out_of_time');
+    }
+
     let claimed: ClaimResult;
     try {
       claimed = await claims.claim(terms.key, terms.validBefore, request.owner, nowSeconds);
@@ -288,7 +440,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       // The claim may have been written before the failure, so it is released when the request ends, and nothing is
       // settled on it. Caught here because the library would log the message and answer with its own reason.
       storeFailed('claiming a payment', error);
-      request.claim = { key: terms.key, payer: terms.payer, nonce: terms.nonce };
+      request.claim = taken;
       request.answer = 'retry';
       return refuse('payment_not_recorded');
     }
@@ -301,7 +453,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       request.answer = 'busy';
       return refuse('payment_claims_full');
     }
-    request.claim = { key: terms.key, payer: terms.payer, nonce: terms.nonce };
+    request.claim = taken;
   });
 
   /** True only when the receipt of hash shows this authorization paying exactly the price to payTo. Never throws. */
@@ -314,13 +466,19 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     }
   }
 
-  /** Marks the claim used. Never throws: once money has moved the buyer is served, and a failed write leaves it held. */
-  async function markSettled(request: PaidRequest, key: string): Promise<void> {
+  /**
+   * Marks the claim settled for this request's wallet and payment, owned by this request while it screens. Never throws:
+   * once money has moved the buyer is served, and a failed write leaves the claim held, so no copy is ever served.
+   */
+  async function markSettled(request: PaidRequest, key: string, payment: Payment): Promise<void> {
     request.kept = true;
+    request.owns = true;
+    request.payment = payment;
+    const nowSeconds = BigInt(Math.floor(now().getTime() / 1000));
     try {
-      await claims.markUsed(key, request.owner);
+      await claims.markSettled(key, request.owner, { wallet: request.wallet, transaction: payment.transaction as `0x${string}` }, nowSeconds);
     } catch (error) {
-      storeFailed('marking a payment used', error);
+      storeFailed('marking a payment settled', error);
     }
   }
 
@@ -353,9 +511,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
         await keepForRetry();
         return;
       }
-      const payment = Payment.parse({ network: config.networkId, payer: claim.payer, transaction: hash.data });
-      await markSettled(request, claim.key);
-      request.payment = payment;
+      await markSettled(request, claim.key, Payment.parse({ network: config.networkId, payer: claim.payer, transaction: hash.data }));
       return {
         recovered: true as const,
         result: { success: true, transaction: hash.data, network: config.networkId, payer: claim.payer },
@@ -366,12 +522,15 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     }
   });
 
-  // Throwing AfterSettleAbortError turns the settle into a failure, so no screening runs. The claim stays used either
-  // way, because money may have moved. Any other throw would be read as success, so the store write cannot throw here.
+  // Throwing AfterSettleAbortError turns the settle into a failure, so no screening runs. The claim is kept either way,
+  // because money may have moved: settled with its receipt, or held for good when the receipt cannot be read, so no copy
+  // is ever served on it. Any other throw would be read as success, so the store write cannot throw here.
   resourceServer.onAfterSettle(async ({ result, phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) throw new AfterSettleAbortError('settlement_not_claimed');
-    await markSettled(request, request.claim.key);
+    // A redeem's result is the earlier settlement's own, and its claim is already settled.
+    if (request.redeemed) return;
+    request.kept = true;
     const receipt = SettleReceipt.safeParse({
       network: result.network,
       payer: result.payer ?? request.claim.payer,
@@ -380,11 +539,13 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     if (!receipt.success || receipt.data.network !== config.networkId || receipt.data.payer !== request.claim.payer) {
       throw new AfterSettleAbortError('settlement_receipt_invalid');
     }
-    request.payment = Payment.parse({ ...receipt.data, network: config.networkId });
+    await markSettled(request, request.claim.key, Payment.parse({ ...receipt.data, network: config.networkId }));
   });
 
-  // First on the route, so every request counts, even one that fails later on its body.
+  // First on the route, so every request counts, even one that fails later on its body, and its deadline runs from here.
   const limitClient = createMiddleware<AppEnv>(async (c, next) => {
+    const deadlineAt = now().getTime() + REQUEST_DEADLINE_MS;
+    c.set('deadlineAt', deadlineAt);
     const client = clientOf(c, config.trustedClientHeader);
     if (client === null) {
       console.warn('api refused: the client address could not be read');
@@ -407,7 +568,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     try {
       await next();
     } finally {
-      await giveBack('ending a client request', () => limits.leave(admitted));
+      await giveBack('ending a client request', () => byDeadline(deadlineAt, () => limits.leave(admitted)));
     }
   });
 
@@ -446,13 +607,34 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     if (full) return c.json({ busy: true }, 503);
     // An unpaid request only gets the 402 terms back, which runs nothing, so it needs no place.
     if (ticket === null) return next();
-    const request: PaidRequest = { ticket, owner: randomUUID(), claim: null, kept: false, payment: null, settleThrew: false, answer: null };
+    const deadlineAt = c.get('deadlineAt');
+    const request: PaidRequest = {
+      ticket,
+      owner: randomUUID(),
+      wallet: c.get('wallet'),
+      deadlineAt,
+      claim: null,
+      kept: false,
+      owns: false,
+      served: false,
+      redeemed: false,
+      stored: null,
+      payment: null,
+      settleThrew: false,
+      answer: null,
+    };
     try {
       await paidRequests.run(request, next);
     } finally {
-      await giveBack('giving back a place', () => guard.leave(request.ticket));
+      const within = (call: () => Promise<void>) => () => byDeadline(deadlineAt, call);
+      await giveBack('giving back a place', within(() => guard.leave(request.ticket)));
       const claim = request.claim;
-      if (claim !== null && !request.kept) await giveBack('releasing a payment', () => claims.release(claim.key, request.owner));
+      if (claim !== null && !request.kept) await giveBack('releasing a payment', within(() => claims.release(claim.key, request.owner)));
+      // A settled payment this request did not store a result for goes back at once, so its header can come again now
+      // rather than once the ownership runs out.
+      if (claim !== null && request.owns && !request.served) {
+        await giveBack('giving back a settled payment', within(() => claims.leave(claim.key, request.owner)));
+      }
       // Any paid attempt that took a place and bought nothing counts, an unknown outcome included, so failing is never
       // free. A full claim map is this server's limit, not the client's, so it does not count.
       c.get('pass').paymentFailed = request.payment === null && request.answer !== 'busy';
@@ -602,21 +784,35 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     async (c) => {
       const request = paidRequests.getStore();
       // The upfront flow only reaches here after a settle this app recorded. Anything else is a broken invariant.
-      if (request?.payment == null) return c.json({ error: 'the payment could not be confirmed' }, 500);
+      if (request?.payment == null || request.claim === null) return c.json({ error: 'the payment could not be confirmed' }, 500);
+      const wallet = c.get('wallet');
+      const { key } = request.claim;
+      if (request.redeemed && request.stored !== null) {
+        c.header(STORED_HEADER, 'true');
+        return c.json(storedPaidBody(wallet, request.stored, request.payment));
+      }
+      // Too little time is left to screen: the buyer sends the same header again and nothing is lost (C25, C41).
+      if (request.deadlineAt - now().getTime() < SCREEN_LEAST_MS) return settledRetry(c);
       // The payment has settled, so a failure to count the screening must not cost the buyer the result (C25).
       try {
-        await guard.start(request.ticket);
+        await byDeadline(request.deadlineAt, () => guard.start(request.ticket));
       } catch (error) {
         storeFailed('counting a screening', error);
       }
-      const wallet = c.get('wallet');
-      let screen: SingleScreen;
+      const share = Math.min(SCREEN_TIME_LIMIT_MS, request.deadlineAt - REPLY_MARGIN_MS - now().getTime());
+      const screen = await screenWithin(wallet, share);
+      // Out of time, whether the share ran out or the screening's own limit did: the claim stays settled and is never
+      // served with a hold the clock wrote, so the same header gets a real screening (C25).
+      if (screen === null || screen.decision.cause === SCREEN_CAUSES.timeUp) return settledRetry(c);
+      const body = paidBody(wallet, screen, request.payment);
+      // Stored before it is sent, so a reply lost on the way can be fetched again with the same header.
       try {
-        screen = await deps.screen(wallet);
-      } catch {
-        screen = heldScreen(wallet, SCREEN_CAUSES.failed);
+        await byDeadline(request.deadlineAt, () => claims.serve(key, request.owner, body));
+        request.served = true;
+      } catch (error) {
+        storeFailed('storing a paid result', error);
       }
-      return c.json(paidBody(wallet, screen, request.payment));
+      return c.json(body);
     },
   );
 

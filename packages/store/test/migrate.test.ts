@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getAsk, getCampaign, listVersions, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
+import { claimPayment, redeemPayment } from '../src/paymentClaims.ts';
 
 const INIT = fileURLToPath(new URL('../migrations/001_init.sql', import.meta.url));
 const CAMPAIGNS = fileURLToPath(new URL('../migrations/002_campaigns.sql', import.meta.url));
@@ -156,6 +157,41 @@ describe('migrate', () => {
     expect((await listVersions(db, 'old'))[2]).toMatchObject({ status: 'sending', postTx: hash, claimableAt: null });
   });
 
+  it('a database made through 003, holding a held, an unsure and a used claim, migrates through 004 with each claim keeping its meaning', async () => {
+    await writeFile(path.join(directory, '002_campaigns.sql'), await readFile(CAMPAIGNS));
+    await writeFile(path.join(directory, '003_retries_and_vault_block.sql'), await readFile(RETRIES));
+    await migrate(db, directory);
+    for (const [key, state, owner] of [
+      ['held', 'held', 'request-1'],
+      ['unsure', 'unsure', null],
+      ['used', 'used', null],
+    ] as const) {
+      await db.query(
+        `INSERT INTO payment_claims (key, state, owner, valid_before, updated_at)
+         VALUES ($1, $2, $3, 1800000300, to_timestamp(1800000000))`,
+        [key, state, owner],
+      );
+    }
+
+    const upgraded = await migrate(db);
+    expect(upgraded.applied).toContain('004_paid_results.sql');
+    const timing = { nowSeconds: 1_800_000_010n, latestSeconds: 330n };
+    const owned = { nowSeconds: 1_800_000_010n, ownedUntil: 1_800_000_340n };
+    const wallet = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
+    expect(await claimPayment(db, 'held', 1_800_000_300n, 'copy', timing)).toBe('in-use');
+    expect(await claimPayment(db, 'used', 1_800_000_300n, 'copy', timing)).toBe('in-use');
+    expect(await redeemPayment(db, 'used', wallet, 'copy', owned)).toEqual({ found: 'none' });
+    expect(await claimPayment(db, 'unsure', 1_800_000_300n, 'retry', timing)).toBe('taken');
+    // A row the new rules forbid is refused by the table itself: settled with no wallet, served with no result.
+    await expect(db.query("UPDATE payment_claims SET state = 'settled', owner = NULL WHERE key = 'used'")).rejects.toThrow(StoreError);
+    await expect(
+      db.query(
+        "UPDATE payment_claims SET state = 'served', owner = NULL, wallet = $1, tx = $2, settled_at = 1800000000 WHERE key = 'used'",
+        [wallet, `0x${'5e'.repeat(32)}`],
+      ),
+    ).rejects.toThrow(StoreError);
+  });
+
   it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {
     await migrate(db);
     const rows = await db.query<{ table_name: string; column_name: string }>(
@@ -165,7 +201,7 @@ describe('migrate', () => {
     for (const row of rows) (tables[row.table_name] ??= []).push(row.column_name);
     expect(tables).toEqual({
       schema_migrations: ['name', 'sha256', 'applied_at'],
-      payment_claims: ['key', 'state', 'owner', 'valid_before', 'updated_at'],
+      payment_claims: ['key', 'state', 'owner', 'valid_before', 'updated_at', 'wallet', 'tx', 'settled_at', 'owned_until', 'result'],
       leases: ['id', 'pool', 'expires_at'],
       rate_events: ['id', 'bucket', 'client', 'at'],
       day_counts: ['day', 'name', 'count'],

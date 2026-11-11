@@ -1,16 +1,47 @@
-// Not covered here: whether the CDP keys are accepted by CDP (no request leaves the machine), and the facilitator's
-// own /supported answer, which the payment middleware checks at start (payment.test.ts uses a stub).
+// Not covered here: whether the CDP keys are accepted by CDP (no request leaves the machine: fetch is a stand-in), and
+// the facilitator's own /supported answer, which the payment middleware checks at start (payment.test.ts uses a stub).
+import { generateKeyPairSync } from 'node:crypto';
 import { inspect } from 'node:util';
-import { HTTPFacilitatorClient } from '@x402/core/server';
+import { FacilitatorTimeoutError } from '@x402/core/server';
+import type { PaymentPayload, PaymentRequirements } from '@x402/core/types';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PayerKeyError, takePayerAccount } from '../scripts/payer-key.ts';
-import { BASE_SEPOLIA_RPC, ConfigError, DEFAULT_PORT, loadApiConfig } from '../src/config.ts';
+import {
+  BASE_SEPOLIA_RPC,
+  ConfigError,
+  DEFAULT_PORT,
+  loadApiConfig,
+  SETTLE_TIMEOUT_MS,
+  VERIFY_TIMEOUT_MS,
+  type ApiConfig,
+} from '../src/config.ts';
 
 const PAY_TO = '0x1111111111111111111111111111111111111111';
 const WORKER_KEY = generatePrivateKey();
 const PAYER_KEY = generatePrivateKey();
 const CDP_SECRET = 'cdp-secret-that-must-never-print';
+// A key made for this run only, in the form CDP signs with, so the CDP client gets as far as its HTTP call.
+const SIGNING_SECRET = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+const PAYLOAD = { x402Version: 2, accepted: {}, payload: {} } as unknown as PaymentPayload;
+const REQUIREMENTS = {} as PaymentRequirements;
+
+/** Stands in for fetch: records each URL asked for, and answers with body, or never when body is null. */
+function fetchStandIn(body: unknown) {
+  const urls: string[] = [];
+  vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+    urls.push(input instanceof Request ? input.url : String(input));
+    if (body === null) return new Promise<never>(() => undefined);
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  return urls;
+}
+
+async function verifyUrl(config: ApiConfig): Promise<string | undefined> {
+  const urls = fetchStandIn({ isValid: true, payer: PAY_TO });
+  await config.facilitator.verify(PAYLOAD, REQUIREMENTS);
+  return urls[0];
+}
 
 const testnet = (extra: Record<string, string | undefined> = {}) => ({
   X402_NETWORK: 'base-sepolia',
@@ -39,7 +70,12 @@ function configError(env: Record<string, string | undefined>): ConfigError {
 }
 
 describe('loadApiConfig', () => {
-  it('reads Base Sepolia with the public facilitator and the default port', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('reads Base Sepolia with the public facilitator and the default port', async () => {
     const config = loadApiConfig(testnet());
     expect(config).toMatchObject({
       network: 'base-sepolia',
@@ -49,16 +85,44 @@ describe('loadApiConfig', () => {
       payTo: PAY_TO,
       port: DEFAULT_PORT,
     });
-    expect(config.facilitator).toBeInstanceOf(HTTPFacilitatorClient);
-    expect((config.facilitator as HTTPFacilitatorClient).url).toBe('https://x402.org/facilitator');
+    expect(await verifyUrl(config)).toBe('https://x402.org/facilitator/verify');
   });
 
-  it('reads Base mainnet with the CDP facilitator', () => {
+  it('reads Base mainnet with the CDP facilitator', async () => {
     const config = loadApiConfig(mainnet({ PORT: '9000' }));
     expect(config).toMatchObject({ network: 'base', networkId: 'eip155:8453', chainId: 8453, port: 9000 });
     expect(config.usdc).toBe('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913');
-    expect((config.facilitator as HTTPFacilitatorClient).url).toBe('https://api.cdp.coinbase.com/platform/v2/x402');
     expect(JSON.stringify(config)).not.toContain(CDP_SECRET);
+    expect(inspect(config, { depth: 8 })).not.toContain(CDP_SECRET);
+    expect(await verifyUrl(loadApiConfig(mainnet({ CDP_API_KEY_SECRET: SIGNING_SECRET })))).toBe(
+      'https://api.cdp.coinbase.com/platform/v2/x402/verify',
+    );
+  });
+
+  it('bounds every facilitator call on both networks: a hanging verify ends at 15 s and a hanging settle at 30 s, with nothing settled (C41)', async () => {
+    expect([VERIFY_TIMEOUT_MS, SETTLE_TIMEOUT_MS]).toEqual([15_000, 30_000]);
+    for (const env of [testnet(), mainnet({ CDP_API_KEY_SECRET: SIGNING_SECRET })]) {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const urls = fetchStandIn(null);
+      const config = loadApiConfig(env);
+      for (const [call, limit] of [
+        [() => config.facilitator.verify(PAYLOAD, REQUIREMENTS), VERIFY_TIMEOUT_MS],
+        [() => config.facilitator.settle(PAYLOAD, REQUIREMENTS), SETTLE_TIMEOUT_MS],
+      ] as const) {
+        let outcome: unknown = 'waiting';
+        void call().then(
+          () => (outcome = 'answered'),
+          (error: unknown) => (outcome = error),
+        );
+        await vi.advanceTimersByTimeAsync(limit - 1);
+        expect(outcome, env.X402_NETWORK).toBe('waiting');
+        await vi.advanceTimersByTimeAsync(1);
+        expect(outcome, env.X402_NETWORK).toBeInstanceOf(FacilitatorTimeoutError);
+        if (limit === VERIFY_TIMEOUT_MS) expect(urls.some((url) => url.endsWith('/settle')), env.X402_NETWORK).toBe(false);
+      }
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   it('has no default network, so testnet is off unless chosen', () => {

@@ -11,9 +11,11 @@ import {
   activeList,
   addAsk,
   addListVersion,
+  ASKS_PER_SLOT,
   board,
   counts,
   createCampaign,
+  MIN_ASKS_PER_CAMPAIGN,
   decideAsk,
   funderLinks,
   getAsk,
@@ -40,6 +42,7 @@ import {
   type CampaignInput,
 } from '../src/campaigns.ts';
 import { connectPostgres, openMemoryDb, StoreError, type Db } from '../src/db.ts';
+import { dayCount } from '../src/limits.ts';
 import { migrate } from '../src/migrate.ts';
 
 const REAL_URL = process.env.STORE_TEST_URL;
@@ -148,7 +151,7 @@ for (const { name, open } of TARGETS) {
       await migrate(db);
     });
     beforeEach(async () => {
-      await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns');
+      await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns, day_counts');
     });
     afterAll(async () => {
       await db.close();
@@ -201,12 +204,10 @@ for (const { name, open } of TARGETS) {
       }
       expect((await getAsk(db, CAMPAIGN, wallet(6)))?.slot).toBeNull();
       expect((await getAsk(db, CAMPAIGN, wallet(7)))?.slot).toBeNull();
-      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 7, queued: 0, decided: 7, held: 1, slotsTaken: 3, slotsLeft: 0 });
+      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 7, queued: 0, decided: 7, held: 1, slotsTaken: 3, slotsLeft: 0, asksLeft: 43 });
 
-      // A full campaign gives a later approval no slot, and nothing moves a slot once given.
-      expect(await ask(8)).toBe('queued');
-      await screenAll(1);
-      expect(await decideAsk(db, decision(wallet(8), 'full'), plus(2))).toEqual({ slot: null });
+      // A full campaign takes no new ask at all (C24), and nothing moves a slot once given.
+      expect(await ask(8)).toBe('full');
       expect(await decideAsk(db, decision(holders[0]?.wallet as string, 'hold'), plus(3))).toBeNull();
       expect(await releaseAsk(db, CAMPAIGN, holders[0]?.wallet as string, plus(3), 3)).toBeNull();
       expect((await slotHolders(db, CAMPAIGN)).map((holder) => holder.wallet)).toEqual(holders.map((holder) => holder.wallet));
@@ -576,6 +577,65 @@ for (const { name, open } of TARGETS) {
       expect(await db.query('SELECT id FROM campaigns')).toEqual([]);
     });
 
+    it('C24: addAsk answers full once the asks reach the cap or the slots are taken, and exists still beats full', async () => {
+      expect(MIN_ASKS_PER_CAMPAIGN).toBe(50);
+      expect(ASKS_PER_SLOT).toBe(10);
+      await createCampaign(db, terms({ maxSlots: 2 }));
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 0, slotsLeft: 2, asksLeft: 50 });
+      for (let n = 1; n <= 50; n += 1) expect(await ask(n)).toBe('queued');
+      expect(await counts(db, CAMPAIGN)).toMatchObject({ asked: 50, slotsLeft: 2, asksLeft: 0 });
+      expect(await ask(51)).toBe('full');
+      expect(await ask(1)).toBe('exists');
+      const [stored] = await db.query<{ asks: number }>('SELECT count(*)::int AS asks FROM asks');
+      expect(stored?.asks).toBe(50);
+
+      // Ten asks a slot past fifty: a campaign of 8 slots takes 80.
+      await createCampaign(db, terms({ id: 'big', maxSlots: 8 }));
+      expect(await counts(db, 'big')).toMatchObject({ asksLeft: 80 });
+
+      // Slots taken: no new ask is queued even though the cap has room.
+      await createCampaign(db, terms({ id: 'one', maxSlots: 1 }));
+      // Asked before the others, so it is the ask the worker takes next.
+      expect(await ask(1, plus(-10), 'one')).toBe('queued');
+      await screenAll(1);
+      expect(await decideAsk(db, decision(wallet(1), 'full', { campaignId: 'one' }), NOW)).toEqual({ slot: 1 });
+      expect(await counts(db, 'one')).toMatchObject({ slotsLeft: 0, asksLeft: 49 });
+      expect(await ask(2, NOW, 'one')).toBe('full');
+      expect(await ask(1, NOW, 'one')).toBe('exists');
+    });
+
+    it('C24: the day ceiling counts only an ask that is queued, in the same transaction, and refuses past it', async () => {
+      await createCampaign(db, terms({ maxSlots: 1 }));
+      await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
+      const day = { name: 'campaign-asks', max: 2 };
+      const add = (n: number, campaignId = CAMPAIGN) =>
+        addAsk(db, { campaignId, wallet: wallet(n), signedAt: 1_800_000_000, signature: SIGNATURE }, NOW, day);
+      expect(await add(1)).toBe('queued');
+      expect(await add(1)).toBe('exists');
+      expect(await add(9, 'shut')).toBe('closed');
+      expect(await add(9, 'missing')).toBe('unknown');
+      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(1);
+      await screenAll(1);
+      expect(await decideAsk(db, decision(wallet(1), 'full'), NOW)).toEqual({ slot: 1 });
+      expect(await add(2)).toBe('full');
+      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(1);
+      await createCampaign(db, terms({ id: 'other' }));
+      expect(await add(3, 'other')).toBe('queued');
+      expect(await add(4, 'other')).toBe('busy');
+      expect(await add(3, 'other')).toBe('exists');
+      expect(await dayCount(db, 'campaign-asks', NOW)).toBe(2);
+      const [stored] = await db.query<{ asks: number }>("SELECT count(*)::int AS asks FROM asks WHERE campaign_id = 'other'");
+      expect(stored?.asks).toBe(1);
+      // A new UTC day starts again from zero, and leaving the ceiling out keeps today's behaviour.
+      expect(await addAsk(db, { campaignId: 'other', wallet: wallet(4), signedAt: 1, signature: SIGNATURE }, new Date('2026-11-12T00:00:00.000Z'), day)).toBe(
+        'queued',
+      );
+      expect(await addAsk(db, { campaignId: 'other', wallet: wallet(5), signedAt: 1, signature: SIGNATURE }, NOW)).toBe('queued');
+      await expect(addAsk(db, { campaignId: 'other', wallet: wallet(6), signedAt: 1, signature: SIGNATURE }, NOW, { name: '', max: 2 })).rejects.toThrow(
+        StoreError,
+      );
+    });
+
     it("addAsk answers closed outside opens_at to closes_at and on a closed campaign, and unknown for an unknown id", async () => {
       await createCampaign(db, terms({ opensAt: NOW, closesAt: plus(60) }));
       await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
@@ -842,7 +902,7 @@ for (const { name, open } of TARGETS) {
       expect(await board(db, 'missing', 10)).toEqual([]);
       await expect(board(db, CAMPAIGN, 101)).rejects.toThrow(StoreError);
       await expect(board(db, CAMPAIGN, 0)).rejects.toThrow(StoreError);
-      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 4, queued: 1, decided: 3, held: 2, slotsTaken: 1, slotsLeft: 19 });
+      expect(await counts(db, CAMPAIGN)).toEqual({ asked: 4, queued: 1, decided: 3, held: 2, slotsTaken: 1, slotsLeft: 19, asksLeft: 196 });
       expect(await counts(db, 'missing')).toBeNull();
     });
 

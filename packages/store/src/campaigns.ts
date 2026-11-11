@@ -11,6 +11,7 @@ import {
   type Outcome,
 } from '@thuli/core';
 import { instant, shifted, StoreError, wholeNumber, type Db, type Queryable } from './db.ts';
+import { bumpDay } from './limits.ts';
 
 // Advisory lock namespace 1005 is one campaign, beside the ones db.ts lists. Every check-then-write on a campaign's
 // asks, slots and list versions holds it, so two server copies or two workers never decide on the same stale count.
@@ -31,6 +32,10 @@ export const MAX_ASK_REASON_CHARS = 400;
 export const MAX_RETRY_SECONDS = 86_400;
 /** The most campaigns openCampaigns returns, so one worker pass reads a bounded list (C41). */
 export const MAX_OPEN_CAMPAIGNS = 100;
+/** The fewest asks any campaign takes in all, so a campaign of a few slots still has room once some are held. */
+export const MIN_ASKS_PER_CAMPAIGN = 50;
+/** Asks a campaign takes per slot, past MIN_ASKS_PER_CAMPAIGN. See askCap. */
+export const ASKS_PER_SLOT = 10;
 
 const MAX_NAME_CHARS = 80;
 const MAX_NOT_CHECKED = 16;
@@ -69,7 +74,7 @@ export type ListStatus = 'built' | 'sending' | 'posted' | 'active' | 'superseded
 export type RelayStatus = 'pending' | 'sent' | 'confirmed' | 'failed';
 export type DecisionRule = (typeof DECISION_RULES)[number];
 
-export type AddAskResult = 'queued' | 'exists' | 'closed' | 'unknown';
+export type AddAskResult = 'queued' | 'exists' | 'closed' | 'unknown' | 'full' | 'busy';
 export type CreateCampaignResult = 'created' | 'unchanged';
 export type ReleaseAskResult = 'queued' | 'failed';
 
@@ -186,7 +191,8 @@ export interface AskDecision {
 
 /**
  * asked counts every ask; queued those not yet decided, screening included; decided those with a decision, failed
- * ones included; held those whose action is hold, failed ones included.
+ * ones included; held those whose action is hold, failed ones included; asksLeft how many more asks the campaign takes
+ * before it answers full, never below 0.
  */
 export interface CampaignCounts {
   asked: number;
@@ -195,6 +201,7 @@ export interface CampaignCounts {
   held: number;
   slotsTaken: number;
   slotsLeft: number;
+  asksLeft: number;
 }
 
 export interface SlotHolder {
@@ -678,20 +685,48 @@ export async function openCampaigns(db: Db, now: Date): Promise<Campaign[]> {
   return rows.map(readCampaign);
 }
 
+// bumpDay runs one query on the Db it is given, so the transaction's own connection can stand in for one: the day's
+// count is then written, or rolled back, together with the ask it counts.
+function inTransaction(tx: Queryable): Db {
+  return {
+    query: tx.query,
+    transaction: () => Promise.reject(new StoreError('a transaction cannot be opened inside this one')),
+    close: async () => undefined,
+  };
+}
+
+/** The most asks a campaign of maxSlots slots takes in all. */
+export function askCap(maxSlots: number): number {
+  return Math.max(MIN_ASKS_PER_CAMPAIGN, ASKS_PER_SLOT * maxSlots);
+}
+
 /**
  * Queues one wallet's signed ask to join a campaign. The signature must already have been checked; this stores it as
  * the wallet's proof. The wallet goes through parseAddress, so every spelling of it is one ask (C1, C42). Runs in one
  * transaction under the campaign's lock, and the insert itself can never write a second ask for a wallet.
- * @returns 'unknown' when no campaign has the id; 'exists' when the wallet already asked, whatever the time, and the
- *   first ask is left exactly as it was; 'closed' when the campaign's status is closed or now is before opensAt or at
- *   or after closesAt; otherwise 'queued'.
+ *
+ * A campaign takes no ask it cannot seat, because each queued ask costs a screening (C24): none once every slot is
+ * taken, and none past askCap(max_slots) asks in all. That cap is above the slots on purpose: most honest campaigns
+ * hold some wallets, and a held wallet takes no slot, so a cap equal to the slots would shut honest wallets out once a
+ * few farms were held.
+ *
+ * With day given, the ask also counts toward that shared day ceiling, through the store's bumpDay, inside this same
+ * transaction and only once the ask is certain to be queued. So the count is taken after the fact and atomically: it
+ * is written with the ask or not at all, and an ask answered exists, closed or full never uses one.
+ * @param day the day counter's name (1 to 40 characters) and its ceiling for one UTC day, counted across campaigns.
+ * @returns in this order: 'unknown' when no campaign has the id; 'exists' when the wallet already asked, whatever the
+ *   time or the campaign's state, and the first ask is left exactly as it was; 'closed' when the campaign's status is
+ *   closed or now is before opensAt or at or after closesAt; 'full' when its slots are all taken or its asks have
+ *   reached the cap; 'busy' when day is given and today's count is at its ceiling; otherwise 'queued'.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when signedAt is not whole
- *   seconds from 0, the signature is not 0x and 130 hex characters, or now is not a valid Date.
+ *   seconds from 0, the signature is not 0x and 130 hex characters, now is not a valid Date, or day has an empty or
+ *   over-long name or a ceiling that is not a whole number from 0, each before anything is written.
  */
 export async function addAsk(
   db: Db,
   ask: { campaignId: string; wallet: string; signedAt: number; signature: string },
   now: Date,
+  day?: { name: string; max: number },
 ): Promise<AddAskResult> {
   const nowAt = instant(now);
   const wallet = parseAddress(ask.wallet);
@@ -699,12 +734,18 @@ export async function addAsk(
   if (typeof ask.signature !== 'string' || !SIGNATURE.test(ask.signature)) {
     throw new StoreError('a signature is 0x and 130 hex characters');
   }
+  if (day !== undefined) {
+    if (typeof day.name !== 'string' || day.name.length === 0 || day.name.length > 40) {
+      throw new StoreError('the day counter name must be 1 to 40 characters');
+    }
+    wholeNumber(day.max, 'the day ceiling', 0, MAX_INTEGER);
+  }
   if (!isCampaignId(ask.campaignId)) return 'unknown';
   const campaignId = ask.campaignId;
   return db.transaction(async (tx) => {
     await lockCampaign(tx, campaignId);
-    const [campaign] = await tx.query<{ open: boolean }>(
-      `SELECT status = 'open' AND opens_at <= $2::timestamptz AND $2::timestamptz < closes_at AS open
+    const [campaign] = await tx.query<{ open: boolean; max_slots: number }>(
+      `SELECT status = 'open' AND opens_at <= $2::timestamptz AND $2::timestamptz < closes_at AS open, max_slots
          FROM campaigns WHERE id = $1`,
       [campaignId, nowAt],
     );
@@ -712,6 +753,13 @@ export async function addAsk(
     const [earlier] = await tx.query('SELECT 1 AS found FROM asks WHERE campaign_id = $1 AND wallet = $2', [campaignId, wallet]);
     if (earlier !== undefined) return 'exists';
     if (campaign.open !== true) return 'closed';
+    const [held] = await tx.query<{ asked: number; taken: number }>(
+      'SELECT count(*)::int AS asked, count(slot)::int AS taken FROM asks WHERE campaign_id = $1',
+      [campaignId],
+    );
+    const asked = held?.asked ?? 0;
+    if ((held?.taken ?? 0) >= campaign.max_slots || asked >= askCap(campaign.max_slots)) return 'full';
+    if (day !== undefined && !(await bumpDay(inTransaction(tx), day.name, day.max, now))) return 'busy';
     const added = await tx.query(
       `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
        VALUES ($1, $2, $3::bigint, $4, $5::timestamptz, 'queued', 0)
@@ -719,7 +767,10 @@ export async function addAsk(
        RETURNING wallet`,
       [campaignId, wallet, String(signedAt), ask.signature, nowAt],
     );
-    return added.length === 1 ? 'queued' : 'exists';
+    // Under the campaign's lock the wallet was just found absent, so this cannot happen; if it does, the day's count
+    // is rolled back with everything else rather than spent on an ask that was not added.
+    if (added.length !== 1) throw new StoreError('the ask appeared while it was being added');
+    return 'queued';
   });
 }
 
@@ -994,7 +1045,8 @@ export async function board(db: Db, campaignId: string, limit: number, beforeDec
 }
 
 /**
- * How a campaign's asks stand, as CampaignCounts defines each number. slotsLeft is max_slots less the slots taken.
+ * How a campaign's asks stand, as CampaignCounts defines each number. slotsLeft is max_slots less the slots taken, and
+ * asksLeft is askCap(max_slots) less the asks so far.
  * @returns the counts, or null when no campaign has the id.
  */
 export async function counts(db: Db, campaignId: string): Promise<CampaignCounts | null> {
@@ -1026,6 +1078,7 @@ export async function counts(db: Db, campaignId: string): Promise<CampaignCounts
     held: row.held,
     slotsTaken: row.slots_taken,
     slotsLeft: Math.max(0, row.max_slots - row.slots_taken),
+    asksLeft: Math.max(0, askCap(row.max_slots) - row.asked),
   };
 }
 

@@ -9,10 +9,15 @@ import { migrate } from '../src/migrate.ts';
 import {
   claimPayment,
   keepPaymentUnsure,
-  markPaymentUsed,
+  leaveSettledPayment,
+  markPaymentSettled,
   MAX_PAYMENT_CLAIMS,
+  PAID_RESULT_KEEP_SECONDS,
+  redeemPayment,
   releasePayment,
+  servePayment,
   type ClaimTiming,
+  type OwnerTiming,
 } from '../src/paymentClaims.ts';
 
 const REAL_URL = process.env.STORE_TEST_URL;
@@ -31,6 +36,16 @@ const KEY = 'eip155:8453|0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913|0x1111111111
 function at(nowSeconds: bigint): ClaimTiming {
   return { nowSeconds, latestSeconds: LATEST };
 }
+
+function owned(nowSeconds: bigint): OwnerTiming {
+  return { nowSeconds, ownedUntil: nowSeconds + LATEST };
+}
+
+const WALLET = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
+const OTHER_WALLET = '0x5555555555555555555555555555555555555555';
+const TX = `0x${'5e'.repeat(32)}`;
+const SETTLEMENT = { wallet: WALLET, transaction: TX };
+const DAY = BigInt(PAID_RESULT_KEEP_SECONDS);
 
 for (const { name, open } of TARGETS) {
   describe.skipIf(open === undefined)(`payment claims on ${name}`, () => {
@@ -63,14 +78,81 @@ for (const { name, open } of TARGETS) {
       expect(await row(KEY)).toEqual({ state: 'held', owner: winner, valid_before: (NOW + 300n).toString() });
     });
 
-    it('C25: a used key stays in-use until its validBefore passes, then a fresh claim replaces it', async () => {
-      expect(await claimPayment(db, KEY, NOW + 300n, 'first', at(NOW))).toBe('taken');
-      await markPaymentUsed(db, KEY, 'first');
-      expect(await row(KEY)).toEqual({ state: 'used', owner: null, valid_before: (NOW + 300n).toString() });
+    it('C25: a used key, as the code before migration 004 wrote it, stays in-use until its validBefore passes, then a fresh claim replaces it, and it is never redeemed', async () => {
+      await db.query(
+        `INSERT INTO payment_claims (key, state, owner, valid_before, updated_at)
+         VALUES ($1, 'used', NULL, $2::bigint, to_timestamp($3::bigint))`,
+        [KEY, (NOW + 300n).toString(), NOW.toString()],
+      );
+      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + 1n))).toEqual({ found: 'none' });
       expect(await claimPayment(db, KEY, NOW + 300n, 'copy', at(NOW + 299n))).toBe('in-use');
       expect(await claimPayment(db, KEY, NOW + 300n, 'copy', at(NOW + 300n))).toBe('expired');
       expect(await claimPayment(db, KEY, NOW + 400n, 'later', at(NOW + 300n))).toBe('taken');
       expect(await row(KEY)).toEqual({ state: 'held', owner: 'later', valid_before: (NOW + 400n).toString() });
+    });
+
+    it('C25: a settled key keeps its wallet, transaction and second, stays in-use long past its validBefore, and is replaced only a day after it settled', async () => {
+      expect(await claimPayment(db, KEY, NOW + 300n, 'first', at(NOW))).toBe('taken');
+      await markPaymentSettled(db, KEY, 'first', { wallet: WALLET.toLowerCase(), transaction: TX }, owned(NOW));
+      const [settled] = await db.query('SELECT state, owner, wallet, tx, settled_at::text AS settled_at, owned_until::text AS owned_until FROM payment_claims');
+      expect(settled).toEqual({ state: 'settled', owner: 'first', wallet: WALLET, tx: TX, settled_at: NOW.toString(), owned_until: (NOW + LATEST).toString() });
+      expect(await claimPayment(db, KEY, NOW + 600n, 'copy', at(NOW + 301n))).toBe('in-use');
+      expect(await claimPayment(db, KEY, NOW + DAY + 300n, 'copy', at(NOW + DAY - 1n))).toBe('in-use');
+      expect(await claimPayment(db, KEY, NOW + DAY + 300n, 'later', at(NOW + DAY))).toBe('taken');
+      expect((await row(KEY))?.state).toBe('held');
+    });
+
+    it('C25: 20 redeems of one settled key at once give exactly one settled, and a served key answers every one with its stored body', async () => {
+      expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
+      await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
+      await leaveSettledPayment(db, KEY, 'payer');
+      const owners = Array.from({ length: 20 }, (_, index) => `redeem-${index}`);
+      const results = await Promise.all(owners.map((owner) => redeemPayment(db, KEY, WALLET, owner, owned(NOW + 10n))));
+      expect(results.filter((result) => result.found === 'settled')).toEqual([{ found: 'settled', transaction: TX }]);
+      expect(results.filter((result) => result.found === 'refused')).toHaveLength(19);
+      const winner = owners[results.findIndex((result) => result.found === 'settled')] as string;
+      expect((await row(KEY))?.owner).toBe(winner);
+
+      // Only the owner stores the result, and from then on every redeem, at once or later, gets exactly that body.
+      await servePayment(db, KEY, 'stranger', { wrong: true });
+      await servePayment(db, KEY, winner, { decision: 'kept', list: [1, 2] });
+      const fetched = await Promise.all(owners.map((owner) => redeemPayment(db, KEY, WALLET, owner, owned(NOW + 20n))));
+      for (const result of fetched) expect(result).toEqual({ found: 'served', transaction: TX, body: { decision: 'kept', list: [1, 2] } });
+      expect(await row(KEY)).toEqual({ state: 'served', owner: null, valid_before: (NOW + 300n).toString() });
+    });
+
+    it('C24: a settled key redeems only for its own wallet, in any spelling of it, and never past its day', async () => {
+      expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
+      await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
+      await leaveSettledPayment(db, KEY, 'payer');
+      expect(await redeemPayment(db, KEY, OTHER_WALLET, 'other', owned(NOW + 1n))).toEqual({ found: 'refused' });
+      expect(await redeemPayment(db, KEY, WALLET, 'late', owned(NOW + DAY))).toEqual({ found: 'none' });
+      expect(await redeemPayment(db, KEY, WALLET.toLowerCase(), 'same', owned(NOW + DAY - 1n))).toEqual({ found: 'settled', transaction: TX });
+      expect(await redeemPayment(db, 'no-such-key', WALLET, 'same', owned(NOW))).toEqual({ found: 'none' });
+      await expect(redeemPayment(db, KEY, 'not-an-address', 'same', owned(NOW))).rejects.toThrow();
+      await expect(redeemPayment(db, KEY, WALLET, 'same', { nowSeconds: NOW, ownedUntil: NOW })).rejects.toThrow(StoreError);
+    });
+
+    it('C25: an owner that leaves frees the key at once, an owner past its lease is taken over, and a late write from it changes nothing', async () => {
+      expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
+      await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
+      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST - 1n))).toEqual({ found: 'refused' });
+      expect(await redeemPayment(db, KEY, WALLET, 'copy', owned(NOW + LATEST))).toEqual({ found: 'settled', transaction: TX });
+      await leaveSettledPayment(db, KEY, 'payer');
+      await servePayment(db, KEY, 'payer', { late: true });
+      expect((await row(KEY))?.owner).toBe('copy');
+      await leaveSettledPayment(db, KEY, 'copy');
+      expect(await row(KEY)).toEqual({ state: 'settled', owner: null, valid_before: (NOW + 300n).toString() });
+      expect(await redeemPayment(db, KEY, WALLET, 'next', owned(NOW + LATEST + 1n))).toEqual({ found: 'settled', transaction: TX });
+    });
+
+    it('refuses a settled result that is null, a transaction that is not lowercase hex, and a result over 16 KB', async () => {
+      expect(await claimPayment(db, KEY, NOW + 300n, 'payer', at(NOW))).toBe('taken');
+      await expect(markPaymentSettled(db, KEY, 'payer', { wallet: WALLET, transaction: TX.toUpperCase() }, owned(NOW))).rejects.toThrow(StoreError);
+      await markPaymentSettled(db, KEY, 'payer', SETTLEMENT, owned(NOW));
+      await expect(servePayment(db, KEY, 'payer', null)).rejects.toThrow(StoreError);
+      await expect(servePayment(db, KEY, 'payer', { text: 'x'.repeat(17_000) })).rejects.toThrow(StoreError);
+      expect((await row(KEY))?.state).toBe('settled');
     });
 
     it('C25: a held key is never replaced, even past its validBefore', async () => {
@@ -85,7 +167,7 @@ for (const { name, open } of TARGETS) {
       expect(await row(KEY)).toEqual({ state: 'unsure', owner: null, valid_before: (NOW + 300n).toString() });
       expect(await claimPayment(db, KEY, NOW + 100n, 'retry', at(NOW + 10n))).toBe('taken');
       expect(await row(KEY)).toEqual({ state: 'held', owner: 'retry', valid_before: (NOW + 300n).toString() });
-      await markPaymentUsed(db, KEY, 'first');
+      await markPaymentSettled(db, KEY, 'first', SETTLEMENT, owned(NOW + 10n));
       await keepPaymentUnsure(db, KEY, 'first');
       await releasePayment(db, KEY, 'first');
       expect(await row(KEY)).toEqual({ state: 'held', owner: 'retry', valid_before: (NOW + 300n).toString() });
@@ -98,9 +180,9 @@ for (const { name, open } of TARGETS) {
       await releasePayment(db, KEY, 'holder');
       expect(await row(KEY)).toBeUndefined();
       expect(await claimPayment(db, KEY, NOW + 300n, 'next', at(NOW))).toBe('taken');
-      await markPaymentUsed(db, KEY, 'next');
+      await markPaymentSettled(db, KEY, 'next', SETTLEMENT, owned(NOW));
       await releasePayment(db, KEY, 'next');
-      expect((await row(KEY))?.state).toBe('used');
+      expect((await row(KEY))?.state).toBe('settled');
     });
 
     it("C25: 'expired' and 'too-long' are answered before anything is written", async () => {

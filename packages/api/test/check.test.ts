@@ -328,6 +328,20 @@ describe.each(BACKENDS)('POST /api/check, on $name', (backend) => {
     expect(screen).toHaveBeenCalledTimes(2);
   });
 
+  it('C13, C34: a reason with a markdown link or a zero-width character fails the one plain-text rule in core, as on the paid answer', async () => {
+    for (const reason of ['Fine wallet, see [the record](javascript:alert(1)).', 'Fine wallet.​', 'Fine⁠ wallet.']) {
+      const { check } = await checkApp({
+        screen: async (wallet) => {
+          const result = screenResult(wallet);
+          return { ...result, decision: { ...result.decision, reason } };
+        },
+      });
+      const body = await freeReply(await check(WALLET));
+      expect(body.decision, reason).toMatchObject({ action: 'hold', rule: 'A1', reason: `Held for review: ${OUTPUT_CHECK_CAUSE}.` });
+      expect(body.servRequestId, reason).toBeNull();
+    }
+  });
+
   it('C34: a cached body is checked like an input, so one with an extra key or the wrong wallet is never served', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const now = () => new Date();

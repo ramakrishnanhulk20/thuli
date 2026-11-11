@@ -27,8 +27,17 @@ import {
 import { buildClaimList } from '@thuli/worker/src/vault/claimList.ts';
 import { buildRoot, publishList } from '@thuli/worker/src/vault/root.ts';
 import { createApp } from '../src/app.ts';
-import { ASK_CLIENT_MAX_PER_MINUTE, CAMPAIGNS_PATH, type CampaignDeps, type VaultReader } from '../src/campaigns.ts';
-import { AskView, BoardPage, BusyBody, CampaignView, ClosedBody, ErrorBody, ExistsBody, QueuedBody } from '../src/schema.ts';
+import {
+  ASK_CLIENT_MAX_PER_MINUTE,
+  CAMPAIGN_ASKS_DAY_COUNTER,
+  CAMPAIGN_ASKS_DAY_MAX,
+  CAMPAIGN_CHAIN_READS_PER_MINUTE,
+  CAMPAIGN_READS_PER_MINUTE,
+  CAMPAIGNS_PATH,
+  type CampaignDeps,
+  type VaultReader,
+} from '../src/campaigns.ts';
+import { AskView, BoardPage, BusyBody, CampaignView, ClosedBody, ErrorBody, ExistsBody, FullBody, QueuedBody } from '../src/schema.ts';
 import { captureLogs, expectNoDatabaseUrl, noChain, post, screenResult, socketFrom, storeDown, testnetConfig, url } from './support.ts';
 
 /** The campaign routes never take a payment, so this facilitator only answers what the app asks at start. */
@@ -53,6 +62,8 @@ const CHAIN = 84532;
 const VAULT = parseAddress('0x00000000000000000000000000000000000a11ce');
 const HASH = `0x${'1f'.repeat(32)}`;
 const NO_CAMPAIGN = '{"error":"no such campaign"}';
+// Well formed, so it passes the body's shape, and signed by nobody, so checkAsk refuses it before any chain read.
+const UNSIGNED = { wallet: '0x00000000000000000000000000000000000000c1', signedAt: Math.floor(Date.parse('2026-11-11T12:00:00.000Z') / 1000), signature: `0x${'ab'.repeat(65)}` };
 const KEYS: PrivateKeyAccount[] = Array.from({ length: 12 }, () => privateKeyToAccount(generatePrivateKey()));
 const walletOf = (index: number): Address => (KEYS[index] as PrivateKeyAccount).address;
 
@@ -80,7 +91,10 @@ function terms(overrides: Partial<CampaignInput> = {}): CampaignInput {
 }
 
 async function signedAsk(index: number, options: { campaignId?: string; signedAt?: number; wallet?: string } = {}) {
-  const account = KEYS[index] as PrivateKeyAccount;
+  return signedBy(KEYS[index] as PrivateKeyAccount, options);
+}
+
+async function signedBy(account: PrivateKeyAccount, options: { campaignId?: string; signedAt?: number; wallet?: string } = {}) {
   const signedAt = options.signedAt ?? NOW_SECONDS;
   const message = askMessage({ campaignId: options.campaignId ?? CAMPAIGN, wallet: account.address, signedAt });
   return { wallet: options.wallet ?? account.address, signedAt, signature: await account.signMessage({ message }) };
@@ -90,6 +104,7 @@ interface Reply {
   status: number;
   text: string;
   type: string | null;
+  retryAfter: string | null;
 }
 
 /** The campaign chain's reader unless a test gives its own: no address has code, and the vault is not read. */
@@ -109,7 +124,7 @@ describe('campaign routes', () => {
     await migrate(db);
   }, 60_000);
   beforeEach(async () => {
-    await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns, rate_events');
+    await db.query('TRUNCATE claim_relays, list_versions, asks, campaigns, rate_events, day_counts');
   });
   afterAll(async () => {
     await db.close();
@@ -120,7 +135,7 @@ describe('campaign routes', () => {
     const app = createApp(config, {
       screen: async (wallet) => screenResult(wallet),
       readReceipt: noChain,
-      now: () => NOW,
+      now: options.now ?? (() => NOW),
       campaigns: {
         db: options.db ?? db,
         isContract: options.isContract ?? (async () => false),
@@ -132,7 +147,7 @@ describe('campaign routes', () => {
       expect(reply.headers.get('cache-control'), path).toBe('no-store');
       const text = await reply.text();
       seen.push(text);
-      return { status: reply.status, text, type: reply.headers.get('content-type') };
+      return { status: reply.status, text, type: reply.headers.get('content-type'), retryAfter: reply.headers.get('retry-after') };
     };
   }
 
@@ -147,17 +162,22 @@ describe('campaign routes', () => {
     return row?.n ?? -1;
   }
 
-  async function decided(index: number, action: 'full' | 'partial' | 'hold', reason = 'No shared funder links this wallet.') {
+  async function decided(
+    index: number,
+    action: 'full' | 'partial' | 'hold',
+    reason = 'No shared funder links this wallet.',
+    campaignId = CAMPAIGN,
+  ) {
     await db.query(
       `INSERT INTO asks (campaign_id, wallet, signed_at, signature, asked_at, status, attempts)
        VALUES ($1, $2, $3::bigint, $4, $5::timestamptz, 'queued', 0)`,
-      [CAMPAIGN, walletOf(index), String(NOW_SECONDS), (await signedAsk(index)).signature, NOW.toISOString()],
+      [campaignId, walletOf(index), String(NOW_SECONDS), (await signedAsk(index)).signature, NOW.toISOString()],
     );
     expect(await takeAsk(db, NOW, 60, 3)).not.toBeNull();
     return decideAsk(
       db,
       {
-        campaignId: CAMPAIGN,
+        campaignId,
         wallet: walletOf(index),
         action,
         shareBps: { full: 10_000, partial: 5_000, hold: 0 }[action],
@@ -173,16 +193,16 @@ describe('campaign routes', () => {
   }
 
   /** Posts a list of these wallets as the campaign's next version, made active unless told otherwise. */
-  async function publish(wallets: { index: number; action: 'full' | 'partial' }[], active = true) {
+  async function publish(wallets: { index: number; action: 'full' | 'partial' }[], active = true, campaignId = CAMPAIGN, vault = VAULT) {
     const { entries, declaredTotal } = buildClaimList(
       wallets.map(({ index, action }) => ({ account: walletOf(index), action, shareBps: action === 'full' ? 10_000 : 5_000 })),
       { rewardPerWallet: 1_000_000n, perWalletCap: 1_000_000n, partialShareBps: 5000 },
     );
     const text = publishList(entries);
-    const { root } = buildRoot(entries, VAULT, CHAIN);
-    const version = await addListVersion(db, { campaignId: CAMPAIGN, root, publishedList: text, declaredTotal: declaredTotal.toString() }, NOW);
-    expect(await markListPosted(db, CAMPAIGN, version, { postTx: HASH, claimableAt: NOW_SECONDS })).toBe(true);
-    if (active) expect(await markListActive(db, CAMPAIGN, version)).toBe(true);
+    const { root } = buildRoot(entries, vault, CHAIN);
+    const version = await addListVersion(db, { campaignId, root, publishedList: text, declaredTotal: declaredTotal.toString() }, NOW);
+    expect(await markListPosted(db, campaignId, version, { postTx: HASH, claimableAt: NOW_SECONDS })).toBe(true);
+    if (active) expect(await markListActive(db, campaignId, version)).toBe(true);
     return { version, root, text };
   }
 
@@ -296,14 +316,195 @@ describe('campaign routes', () => {
     expect((await send(asks(), post(await signedAsk(5), as('198.51.100.2')))).status).toBe(202);
     expect(await rows('asks')).toBe(6);
 
-    // The minute counts every request, a refused one too, before anything reads the chain.
+    // The minute counts every well-formed request, a refused one too, before anything reads the chain.
     const statuses: number[] = [];
     for (let index = 0; index <= ASK_CLIENT_MAX_PER_MINUTE; index += 1) {
-      statuses.push((await send(asks(), post({ wallet: 'x' }, as('198.51.100.3')))).status);
+      statuses.push((await send(asks(), post(UNSIGNED, as('198.51.100.3')))).status);
     }
     expect(statuses).toEqual([...Array(ASK_CLIENT_MAX_PER_MINUTE).fill(400), 429]);
     const noCaller = await send(asks(), post(await signedAsk(6)));
     expect([noCaller.status, JSON.parse(noCaller.text)]).toEqual([400, { error: 'the client address could not be read' }]);
+  });
+
+  it('C24: a campaign with no slot left queues no ask, whatever the number of callers and keys, and answers 409 full', async () => {
+    await createCampaign(db, terms({ maxSlots: 1 }));
+    expect(await decided(0, 'full')).toEqual({ slot: 1 });
+    const send = campaignApp();
+    const fresh = Array.from({ length: 60 }, () => privateKeyToAccount(generatePrivateKey()));
+    const statuses: string[] = [];
+    for (const [index, account] of fresh.entries()) {
+      const reply = await send(asks(), post(await signedBy(account)), `198.51.100.${10 + (index % 12)}`);
+      statuses.push(`${reply.status} ${reply.text}`);
+    }
+    expect(new Set(statuses)).toEqual(new Set(['409 {"full":true}']));
+    expect(statuses).toHaveLength(60);
+    expect(await rows('asks')).toBe(1);
+    // The wallet that already asked can still read its decision: exists beats full.
+    const again = await send(asks(), post(await signedAsk(0)), '198.51.100.99');
+    expect(again.status).toBe(200);
+    expect(ExistsBody.parse(JSON.parse(again.text)).ask).toMatchObject({ status: 'decided', slot: 1 });
+  });
+
+  it('C42: 500 reads of one ask from one caller give 120 answers in the minute, and the vault is read once', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'full')).toEqual({ slot: 1 });
+    await publish([{ index: 0, action: 'full' }]);
+    let reads = 0;
+    const reader: VaultReader = {
+      ...NO_CODE,
+      claimed: async () => {
+        reads += 1;
+        return 0n;
+      },
+      claimable: async (_vault, _account, amount) => {
+        reads += 1;
+        return amount;
+      },
+    };
+    const send = campaignApp({ vault: () => reader });
+    const counted = new Map<number, number>();
+    for (let index = 0; index < 500; index += 1) {
+      const reply = await send(`${asks()}/${walletOf(0)}`, {}, '198.51.100.5');
+      counted.set(reply.status, (counted.get(reply.status) ?? 0) + 1);
+      if (reply.status === 429) expect(reply.text).toBe('{"busy":true}');
+    }
+    expect(reads).toBeLessThanOrEqual(2);
+    expect(Object.fromEntries(counted)).toEqual({ 200: CAMPAIGN_READS_PER_MINUTE, 429: 500 - CAMPAIGN_READS_PER_MINUTE });
+  });
+
+  it('C24: 300 asks a UTC day across campaigns, then 429 with Retry-After to midnight; exists, closed and full asks use none', async () => {
+    await createCampaign(db, terms());
+    await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
+    await createCampaign(db, terms({ id: 'one', maxSlots: 1 }));
+    expect(await decided(10, 'full', undefined, 'one')).toEqual({ slot: 1 });
+    const today = async (day = '2026-11-11') => {
+      const [row] = await db.query<{ count: number }>('SELECT count FROM day_counts WHERE name = $1 AND day = $2::date', [
+        CAMPAIGN_ASKS_DAY_COUNTER,
+        day,
+      ]);
+      return row?.count ?? 0;
+    };
+    const send = campaignApp();
+    expect((await send(asks(), post(await signedAsk(0)), '198.51.100.40')).status).toBe(202);
+    expect(await today()).toBe(1);
+    // Stands in for the asks other campaigns already took today.
+    await db.query('UPDATE day_counts SET count = $1 WHERE name = $2', [CAMPAIGN_ASKS_DAY_MAX - 1, CAMPAIGN_ASKS_DAY_COUNTER]);
+    const answers = [
+      await send(asks(), post(await signedAsk(0)), '198.51.100.41'),
+      await send(asks('shut'), post(await signedAsk(1, { campaignId: 'shut' })), '198.51.100.42'),
+      await send(asks('one'), post(await signedAsk(2, { campaignId: 'one' })), '198.51.100.43'),
+      await send(asks(), post(UNSIGNED), '198.51.100.44'),
+    ];
+    expect(answers.map((reply) => reply.status)).toEqual([200, 409, 409, 400]);
+    expect(answers.slice(1, 3).map((reply) => reply.text)).toEqual(['{"closed":true}', '{"full":true}']);
+    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX - 1);
+    expect((await send(asks(), post(await signedAsk(3)), '198.51.100.45')).status).toBe(202);
+    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX);
+    const refusedToday = await send(asks(), post(await signedAsk(4)), '198.51.100.46');
+    expect([refusedToday.status, refusedToday.text, refusedToday.retryAfter]).toEqual([429, '{"busy":true}', '43200']);
+    expect(await today()).toBe(CAMPAIGN_ASKS_DAY_MAX);
+    expect((await db.query('SELECT wallet FROM asks WHERE wallet = $1', [walletOf(4)])).length).toBe(0);
+
+    // Half a second before midnight Retry-After is the one second left, and the next UTC day starts from zero.
+    const lateAt = new Date('2026-11-11T23:59:59.500Z');
+    const late = await campaignApp({ now: () => lateAt })(
+      asks(),
+      post(await signedAsk(4, { signedAt: Math.floor(lateAt.getTime() / 1000) })),
+      '198.51.100.47',
+    );
+    expect([late.status, late.retryAfter]).toEqual([429, '1']);
+    const nextAt = new Date('2026-11-12T00:00:01.000Z');
+    const next = await campaignApp({ now: () => nextAt })(
+      asks(),
+      post(await signedAsk(4, { signedAt: Math.floor(nextAt.getTime() / 1000) })),
+      '198.51.100.48',
+    );
+    expect(next.status).toBe(202);
+    expect(await today('2026-11-12')).toBe(1);
+  });
+
+  it('C42: past 600 chain reads a minute a ticket goes out without claimed and claimable, and amounts are kept 15 seconds', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'full')).toEqual({ slot: 1 });
+    await publish([{ index: 0, action: 'full' }]);
+    let reads = 0;
+    const reader: VaultReader = {
+      ...NO_CODE,
+      claimed: async () => {
+        reads += 1;
+        return 0n;
+      },
+      claimable: async (_vault, _account, amount) => {
+        reads += 1;
+        return amount;
+      },
+    };
+    let clock = NOW;
+    const send = campaignApp({ vault: () => reader, now: () => clock });
+    const ticket = async () => AskView.parse(JSON.parse((await send(`${asks()}/${walletOf(0)}`)).text)).ticket;
+    // Stands in for the tickets every caller read in the last minute, two chain reads each.
+    await db.query(
+      `INSERT INTO rate_events (bucket, client, at)
+       SELECT 'campaign-chain-reads', 'all', $1::timestamptz FROM generate_series(1, $2::int)`,
+      [NOW.toISOString(), CAMPAIGN_CHAIN_READS_PER_MINUTE / 2],
+    );
+    expect(Object.keys((await ticket()) ?? {}).sort()).toEqual(['cumulativeAmount', 'proof', 'root']);
+    expect(reads).toBe(0);
+    clock = new Date(NOW.getTime() + 61_000);
+    expect(await ticket()).toMatchObject({ claimed: '0', claimable: '1000000' });
+    expect(reads).toBe(2);
+    clock = new Date(NOW.getTime() + 61_000 + 14_999);
+    expect(await ticket()).toMatchObject({ claimed: '0', claimable: '1000000' });
+    expect(reads).toBe(2);
+    clock = new Date(NOW.getTime() + 61_000 + 15_000);
+    expect(await ticket()).toMatchObject({ claimed: '0', claimable: '1000000' });
+    expect(reads).toBe(4);
+  });
+
+  it('C1: the caches never serve one wallet, vault or version what was read for another', async () => {
+    const otherVault = parseAddress('0x00000000000000000000000000000000000b0b0b');
+    await createCampaign(db, terms());
+    await createCampaign(db, terms({ id: 'twin', vault: otherVault }));
+    expect(await decided(0, 'full')).toEqual({ slot: 1 });
+    expect(await decided(1, 'partial')).toEqual({ slot: 2 });
+    expect(await decided(0, 'full', undefined, 'twin')).toEqual({ slot: 1 });
+    const first = await publish([
+      { index: 0, action: 'full' },
+      { index: 1, action: 'partial' },
+    ]);
+    const twin = await publish([{ index: 0, action: 'full' }], true, 'twin', otherVault);
+    const lastByte = (account: string) => BigInt(`0x${account.slice(-2)}`);
+    const reader: VaultReader = {
+      ...NO_CODE,
+      claimed: async (vault, account) => (vault === otherVault ? 7n : 0n) + lastByte(account),
+      claimable: async (vault, _account, amount) => amount - (vault === otherVault ? 1n : 0n),
+    };
+    const send = campaignApp({ vault: () => reader });
+    const ticketOf = async (path: string) => AskView.parse(JSON.parse((await send(path)).text)).ticket;
+    const proves = (root: string, vault: string, wallet: string, amount: bigint, proof: string[] | undefined) =>
+      StandardMerkleTree.verify(root, LEAF_TYPES, leafValues(CHAIN, vault, wallet, amount), proof ?? []);
+
+    const mine = await ticketOf(`${asks()}/${walletOf(0)}`);
+    const theirs = await ticketOf(`${asks()}/${walletOf(1).toLowerCase()}`);
+    expect(mine).toMatchObject({ cumulativeAmount: '1000000', root: first.root, claimed: String(lastByte(walletOf(0))), claimable: '1000000' });
+    expect(theirs).toMatchObject({ cumulativeAmount: '500000', root: first.root, claimed: String(lastByte(walletOf(1))), claimable: '500000' });
+    expect(proves(first.root, VAULT, walletOf(0), 1_000_000n, mine?.proof)).toBe(true);
+    expect(proves(first.root, VAULT, walletOf(1), 500_000n, theirs?.proof)).toBe(true);
+    expect(proves(first.root, VAULT, walletOf(1), 500_000n, mine?.proof)).toBe(false);
+
+    const elsewhere = await ticketOf(`${asks('twin')}/${walletOf(0)}`);
+    expect(elsewhere).toMatchObject({ root: twin.root, claimed: String(7n + lastByte(walletOf(0))), claimable: '999999' });
+    expect(proves(twin.root, otherVault, walletOf(0), 1_000_000n, elsewhere?.proof)).toBe(true);
+    expect(await ticketOf(`${asks()}/${walletOf(0)}`)).toEqual(mine);
+
+    // A newer active version is a new key: its own amount, root and vault read, well inside the 15 seconds.
+    const second = await publish([
+      { index: 0, action: 'partial' },
+      { index: 1, action: 'full' },
+    ]);
+    const moved = await ticketOf(`${asks()}/${walletOf(0)}`);
+    expect(moved).toMatchObject({ cumulativeAmount: '500000', root: second.root, claimable: '500000' });
+    expect(proves(second.root, VAULT, walletOf(0), 500_000n, moved?.proof)).toBe(true);
   });
 
   it('C32: the ticket proves against the active root, a version not yet active gives none, and a list is served byte for byte', async () => {
@@ -489,6 +690,8 @@ describe('campaign routes', () => {
   it('C34, C40: every answer parses as its strict shape with no extra key, and no answer holds a stored signature', async () => {
     await createCampaign(db, terms());
     await createCampaign(db, terms({ id: 'shut', status: 'closed' }));
+    await createCampaign(db, terms({ id: 'one', maxSlots: 1 }));
+    expect(await decided(11, 'full', undefined, 'one')).toEqual({ slot: 1 });
     expect(await decided(0, 'full')).toEqual({ slot: 1 });
     await publish([{ index: 0, action: 'full' }]);
     const send = campaignApp({ vault: () => ({ ...NO_CODE, claimed: async () => 0n, claimable: async () => 1_000_000n }) });
@@ -504,6 +707,7 @@ describe('campaign routes', () => {
       [ErrorBody, await send(asks(), post({ ...(await signedAsk(2)), extra: true }), '192.0.2.24')],
       [ErrorBody, await send(asks(), post({ wallet: walletOf(2), signedAt: NOW_SECONDS, signature: 'x'.repeat(2_000) }), '192.0.2.25')],
       [ClosedBody, await send(asks('shut'), post(await signedAsk(3, { campaignId: 'shut' })), '192.0.2.26')],
+      [FullBody, await send(asks('one'), post(await signedAsk(5, { campaignId: 'one' })), '192.0.2.28')],
       [AskView, await send(`${asks()}/${walletOf(0)}`)],
       [AskView, await send(`${asks()}/${walletOf(1)}`)],
       [ErrorBody, await send(`${asks()}/${walletOf(9)}`)],
@@ -512,18 +716,18 @@ describe('campaign routes', () => {
       [BusyBody, await campaignApp({ db: { query: async () => Promise.reject(storeDown()), transaction: async () => Promise.reject(storeDown()), close: async () => undefined } })(`${CAMPAIGNS_PATH}/${CAMPAIGN}`)],
     ];
     for (let index = 0; index <= ASK_CLIENT_MAX_PER_MINUTE; index += 1) {
-      const reply = await send(asks(), post({ wallet: 'x' }), '192.0.2.27');
+      const reply = await send(asks(), post(UNSIGNED), '192.0.2.27');
       if (index === ASK_CLIENT_MAX_PER_MINUTE) checked.push([BusyBody, reply]);
     }
     logs.restore();
     expect(checked.map(([, reply]) => reply.status)).toEqual([
-      200, 404, 200, 400, 202, 200, 400, 400, 413, 409, 200, 200, 404, 400, 404, 503, 429,
+      200, 404, 200, 400, 202, 200, 400, 400, 413, 409, 409, 200, 200, 404, 400, 404, 503, 429,
     ]);
     for (const [shape, reply] of checked) {
       expect(reply.type).toContain('application/json');
       expect(shape.safeParse(JSON.parse(reply.text)).success, reply.text).toBe(true);
     }
-    const ticketed = AskView.parse(JSON.parse((checked[10] as [z.ZodType, Reply])[1].text));
+    const ticketed = AskView.parse(JSON.parse((checked[11] as [z.ZodType, Reply])[1].text));
     expect(ticketed.ticket).toMatchObject({ claimed: '0', claimable: '1000000' });
 
     const signatures = (await db.query<{ signature: string }>('SELECT signature FROM asks')).map((row) => row.signature);

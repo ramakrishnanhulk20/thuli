@@ -7,7 +7,14 @@ import { writeCheck } from '../src/checkCache.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { bumpDay, recordEvent, recordIfUnder, takeLease } from '../src/limits.ts';
 import { migrate } from '../src/migrate.ts';
-import { claimPayment, keepPaymentUnsure, markPaymentUsed } from '../src/paymentClaims.ts';
+import {
+  claimPayment,
+  keepPaymentUnsure,
+  markPaymentSettled,
+  PAID_RESULT_KEEP_SECONDS,
+  redeemPayment,
+  servePayment,
+} from '../src/paymentClaims.ts';
 import { sweep } from '../src/sweep.ts';
 
 const NOW_SECONDS = 1_800_000_000n;
@@ -22,6 +29,12 @@ function plus(seconds: number): Date {
 function at(nowSeconds: bigint): { nowSeconds: bigint; latestSeconds: bigint } {
   return { nowSeconds, latestSeconds: 330n };
 }
+
+function owned(nowSeconds: bigint): { nowSeconds: bigint; ownedUntil: bigint } {
+  return { nowSeconds, ownedUntil: nowSeconds + 330n };
+}
+
+const SETTLEMENT = { wallet: ADDRESS, transaction: `0x${'5e'.repeat(32)}` };
 
 describe('sweep', () => {
   let db: Db;
@@ -67,12 +80,38 @@ describe('sweep', () => {
     expect((await db.query('SELECT key FROM payment_claims')).map((row) => row.key)).toEqual(['live']);
   });
 
+  it('C25, C41: keeps a settled or served claim for a day from its settlement, long past its validBefore, and deletes it after', async () => {
+    const day = BigInt(PAID_RESULT_KEEP_SECONDS);
+    const settledAt = NOW_SECONDS - day;
+    for (const key of ['settled', 'served']) {
+      expect(await claimPayment(db, key, settledAt + 300n, 'payer', at(settledAt))).toBe('taken');
+      await markPaymentSettled(db, key, 'payer', SETTLEMENT, owned(settledAt));
+    }
+    await servePayment(db, 'served', 'payer', { result: 1 });
+    // A day to the second after settling, the claims are past redeeming but not yet more than a day old.
+    expect(await redeemPayment(db, 'served', ADDRESS, 'fetch', owned(NOW_SECONDS))).toEqual({ found: 'none' });
+    expect(await sweep(db, NOW)).toEqual({ claims: 0, leases: 0, events: 0, checks: 0 });
+    expect(await sweep(db, plus(0.5))).toEqual({ claims: 2, leases: 0, events: 0, checks: 0 });
+    expect(await db.query('SELECT key FROM payment_claims')).toEqual([]);
+
+    // One second younger, the claim is still redeemable, and so the sweep keeps it.
+    expect(await claimPayment(db, 'young', settledAt + 301n, 'payer', at(settledAt + 1n))).toBe('taken');
+    await markPaymentSettled(db, 'young', 'payer', SETTLEMENT, owned(settledAt + 1n));
+    await servePayment(db, 'young', 'payer', { result: 2 });
+    expect(await sweep(db, plus(0.5))).toEqual({ claims: 0, leases: 0, events: 0, checks: 0 });
+    expect(await redeemPayment(db, 'young', ADDRESS, 'fetch', owned(NOW_SECONDS))).toEqual({
+      found: 'served',
+      transaction: SETTLEMENT.transaction,
+      body: { result: 2 },
+    });
+  });
+
   it('C41: a sweep far in the future empties every table outside input can grow', async () => {
     expect(await claimPayment(db, 'held', NOW_SECONDS + 300n, 'a', at(NOW_SECONDS))).toBe('taken');
     expect(await claimPayment(db, 'unsure', NOW_SECONDS + 300n, 'b', at(NOW_SECONDS))).toBe('taken');
     await keepPaymentUnsure(db, 'unsure', 'b');
-    expect(await claimPayment(db, 'used', NOW_SECONDS + 300n, 'c', at(NOW_SECONDS))).toBe('taken');
-    await markPaymentUsed(db, 'used', 'c');
+    expect(await claimPayment(db, 'settled', NOW_SECONDS + 300n, 'c', at(NOW_SECONDS))).toBe('taken');
+    await markPaymentSettled(db, 'settled', 'c', SETTLEMENT, owned(NOW_SECONDS));
     expect(await takeLease(db, 'pool', 5, 86_400, NOW)).not.toBeNull();
     expect(await recordIfUnder(db, 'bucket', 'client', 5, 60, NOW)).toBe(true);
     await recordEvent(db, 'failed', 'client', NOW);

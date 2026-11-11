@@ -7,19 +7,22 @@ import {
   dayCount,
   dropLease,
   keepPaymentUnsure,
+  leaveSettledPayment,
   liveLeases,
-  markPaymentUsed,
+  markPaymentSettled,
   readCheck,
   recordEvent,
   recordIfUnder,
+  redeemPayment,
   releasePayment,
+  servePayment,
   sweep,
   takeLease,
   writeCheck,
   type CheckKey,
   type Db,
 } from '@thuli/store';
-import { CLOCK_ALLOWANCE_SECONDS, MAX_TIMEOUT_SECONDS, PaymentClaims, type ClaimResult } from './claims.ts';
+import { CLOCK_ALLOWANCE_SECONDS, MAX_TIMEOUT_SECONDS, PaymentClaims, type ClaimResult, type Redeemed, type Settlement } from './claims.ts';
 import { MAX_PER_DAY, MAX_RUNNING, ScreenGuard, type Ticket } from './guard.ts';
 import {
   CLIENT_MAX_FAILED_PER_HOUR,
@@ -44,16 +47,26 @@ export const CHECK_MAX_PER_DAY = 300;
 /** Cached free checks this process remembers at once (C41). The shared cache is bounded by sweep instead. */
 export const MAX_CHECKS_CACHED = 10_000;
 
-/** Which payment authorizations are being settled or were used (C25), by PaymentClaims' rules. Any call may reject when the store fails. */
+/**
+ * Which payment authorizations are being settled, went through or bought a result (C25), by PaymentClaims' rules. A
+ * request that takes a settled claim owns it for LEASE_SECONDS, so one that dies frees it by itself. Any call may reject
+ * when the store fails.
+ */
 export interface ClaimStore {
   /** Takes key for owner, one request's random id. The answers are PaymentClaims.claim's. */
   claim(key: string, validBefore: bigint, owner: string, nowSeconds: bigint): Promise<ClaimResult>;
-  /** The settlement went through, so every copy is refused until validBefore. Does nothing unless owner holds key. */
-  markUsed(key: string, owner: string): Promise<void>;
+  /** A payment of key that already went through, redeemed for wallet by owner. The answers are PaymentClaims.redeem's. */
+  redeem(key: string, wallet: Address, owner: string, nowSeconds: bigint): Promise<Redeemed>;
+  /** The settlement went through: settled at nowSeconds for settlement, owned by owner. Does nothing unless owner holds key. */
+  markSettled(key: string, owner: string, settlement: Settlement, nowSeconds: bigint): Promise<void>;
   /** The outcome is unknown: one retry of the same authorization at a time may take it. Does nothing unless owner holds key. */
   keepUnsure(key: string, owner: string): Promise<void>;
   /** The settlement failed outright, so an honest retry may try again. Does nothing unless owner holds key. */
   release(key: string, owner: string): Promise<void>;
+  /** Stores the result the payment bought, for every later redeem. Does nothing unless owner owns the settled key. */
+  serve(key: string, owner: string, body: unknown): Promise<void>;
+  /** The screening ended with no result: the next copy of the header may screen it. Does nothing unless owner owns it. */
+  leave(key: string, owner: string): Promise<void>;
 }
 
 /** The ceilings on paid screenings across the whole service (C24, C42), by ScreenGuard's rules. Any call may reject when the store fails. */
@@ -120,9 +133,13 @@ export interface Stores {
 export function claimStoreOver(claims: PaymentClaims): ClaimStore {
   return {
     claim: async (key, validBefore, owner, nowSeconds) => claims.claim(key, validBefore, owner, nowSeconds),
-    markUsed: async (key, owner) => claims.markUsed(key, owner),
+    redeem: async (key, wallet, owner, nowSeconds) => claims.redeem(key, wallet, owner, nowSeconds, nowSeconds + BigInt(LEASE_SECONDS)),
+    markSettled: async (key, owner, settlement, nowSeconds) =>
+      claims.markSettled(key, owner, settlement, nowSeconds, nowSeconds + BigInt(LEASE_SECONDS)),
     keepUnsure: async (key, owner) => claims.keepUnsure(key, owner),
     release: async (key, owner) => claims.release(key, owner),
+    serve: async (key, owner, body) => claims.serve(key, owner, body),
+    leave: async (key, owner) => claims.leave(key, owner),
   };
 }
 
@@ -161,10 +178,12 @@ export function memoryStores(now: () => Date): Stores {
 }
 
 /**
- * How long the shared store holds a place whose copy never gives it back, so a copy that dies mid-request frees its
- * places by themselves. It must outlast the slowest live request, or that request loses its place while it still runs:
- * a 90 s settle, a 90 s retry of a pending settle, a 10 s receipt read and a 120 s screening make 310 s, and 20 s more
- * is margin.
+ * How long a place, or a settled payment a request is screening, is held for a copy that never gives it back, so a copy
+ * that dies mid-request frees them by themselves. It must outlast the request that took it, or that request loses its
+ * place while it still runs and a ceiling can be passed by one. A paid request ends by REQUEST_DEADLINE_MS, 240 s after
+ * its first line, and takes every place after that line, so 330 s leaves at least 90 s of margin: for two copies whose
+ * clocks disagree, and for a store call already sent when the deadline came. A free check, a 120 s screening and its
+ * store calls, ends well inside it too.
  */
 export const LEASE_SECONDS = 330;
 /** The day's count at which the shared guard refuses new paid requests: MAX_RUNNING short of MAX_PER_DAY. */
@@ -180,11 +199,15 @@ const HOUR_SECONDS = HOUR_MS / 1000;
 function postgresClaims(db: Db): ClaimStore {
   // The same bound PaymentClaims builds from the route's timeout.
   const latestSeconds = BigInt(MAX_TIMEOUT_SECONDS) + CLOCK_ALLOWANCE_SECONDS;
+  const owned = (nowSeconds: bigint) => ({ nowSeconds, ownedUntil: nowSeconds + BigInt(LEASE_SECONDS) });
   return {
     claim: (key, validBefore, owner, nowSeconds) => claimPayment(db, key, validBefore, owner, { nowSeconds, latestSeconds }),
-    markUsed: (key, owner) => markPaymentUsed(db, key, owner),
+    redeem: (key, wallet, owner, nowSeconds) => redeemPayment(db, key, wallet, owner, owned(nowSeconds)),
+    markSettled: (key, owner, settlement, nowSeconds) => markPaymentSettled(db, key, owner, settlement, owned(nowSeconds)),
     keepUnsure: (key, owner) => keepPaymentUnsure(db, key, owner),
     release: (key, owner) => releasePayment(db, key, owner),
+    serve: (key, owner, body) => servePayment(db, key, owner, body),
+    leave: (key, owner) => leaveSettledPayment(db, key, owner),
   };
 }
 

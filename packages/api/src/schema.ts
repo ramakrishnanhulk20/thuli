@@ -24,8 +24,6 @@ const CanonicalAddressText = z
 
 // Model reasons pass the decision checks at 280 characters; code-written ones are shorter. Anything past this is wrong.
 const MAX_REASON_OUT = 400;
-// Control characters other than tab and newline, and the bidirectional overrides that make text display out of order.
-const NOT_PLAIN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
 
 export const Payment = z.strictObject({
   network: z.enum(NETWORK_IDS),
@@ -44,11 +42,8 @@ const SCREEN_FIELDS = {
     action: OutcomeSchema,
     shareBps: z.int().min(0).max(10_000),
     rule: z.enum(DECISION_RULES),
-    reason: z
-      .string()
-      .min(1)
-      .max(MAX_REASON_OUT)
-      .refine((text) => !NOT_PLAIN.test(text), 'reason must be plain text'),
+    // Core's one plain-text rule, the one the model's reason passed and every other answer's text passes (C13, C34).
+    reason: z.string().min(1).max(MAX_REASON_OUT).refine(isPlainText, 'reason must be plain text'),
     citedTxs: z.array(TxHash).max(MAX_EVIDENCE_TXS),
   }),
   servRequestId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).nullable(),
@@ -64,6 +59,23 @@ export const FreeCheckResponse = z.strictObject({ ...SCREEN_FIELDS, cached: z.bo
 export type FreeCheckResponse = z.infer<typeof FreeCheckResponse>;
 
 export const OUTPUT_CHECK_CAUSE = 'the result did not pass the output check';
+
+export const SETTLED_RETRY_MESSAGE = 'The payment has settled. Send the same payment header again to get the screening it bought.';
+
+/**
+ * The 503 a paid request answers when its payment settled but too little time was left to screen. The same header
+ * then redeems the payment: it is never charged again (C25).
+ */
+export const SettledRetryBody = z.strictObject({
+  settled: z.literal(true),
+  retry: z.literal(true),
+  message: z.literal(SETTLED_RETRY_MESSAGE),
+});
+export const SETTLED_RETRY: z.infer<typeof SettledRetryBody> = SettledRetryBody.parse({
+  settled: true,
+  retry: true,
+  message: SETTLED_RETRY_MESSAGE,
+});
 
 function fieldsFrom(screen: SingleScreen) {
   const { action, shareBps, rule, reason, citedTxs } = screen.decision;
@@ -94,6 +106,22 @@ export function paidBody(paidFor: Address, screen: SingleScreen, payment: Paymen
     if (parsed.success) return parsed.data;
   }
   return PaidScreenResponse.parse(bodyFrom(heldScreen(paidFor, OUTPUT_CHECK_CAUSE), payment));
+}
+
+/**
+ * A paid result read back from the claim store, checked like an input before it goes out again (C34): it must pass
+ * PaidScreenResponse, name the wallet paid for and carry exactly this payment. Anything else is replaced by the
+ * code-written hold, as paidBody replaces a screening that fails the check, because the payment still bought a decision.
+ */
+export function storedPaidBody(paidFor: Address, stored: unknown, payment: Payment): PaidScreenResponse {
+  const parsed = PaidScreenResponse.safeParse(stored);
+  const same =
+    parsed.success &&
+    parsed.data.wallet === paidFor &&
+    parsed.data.payment.network === payment.network &&
+    parsed.data.payment.payer === payment.payer &&
+    parsed.data.payment.transaction === payment.transaction;
+  return same ? parsed.data : PaidScreenResponse.parse(bodyFrom(heldScreen(paidFor, OUTPUT_CHECK_CAUSE), payment));
 }
 
 /**
@@ -131,6 +159,8 @@ export const ErrorBody = z.strictObject({ error: z.string().min(1).max(200) });
 export const BusyBody = z.strictObject({ busy: z.literal(true) });
 export const QueuedBody = z.strictObject({ queued: z.literal(true) });
 export const ClosedBody = z.strictObject({ closed: z.literal(true) });
+/** The campaign cannot seat another wallet: every slot is taken, or its asks have reached their cap. */
+export const FullBody = z.strictObject({ full: z.literal(true) });
 
 const ListVersionJson = z.strictObject({
   version: z.int().min(1),
@@ -151,7 +181,15 @@ export const CampaignView = z.strictObject({
   status: z.enum(['open', 'closed']),
   opensAt: z.iso.datetime(),
   closesAt: z.iso.datetime(),
-  counts: z.strictObject({ asked: Count, queued: Count, decided: Count, held: Count, slotsTaken: Count, slotsLeft: Count }),
+  counts: z.strictObject({
+    asked: Count,
+    queued: Count,
+    decided: Count,
+    held: Count,
+    slotsTaken: Count,
+    slotsLeft: Count,
+    asksLeft: Count,
+  }),
   lists: z.array(ListVersionJson),
 });
 export type CampaignView = z.infer<typeof CampaignView>;

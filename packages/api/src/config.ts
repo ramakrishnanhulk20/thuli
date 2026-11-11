@@ -1,7 +1,44 @@
 import { createCdpFacilitatorClient } from '@coinbase/cdp-sdk/x402';
-import { HTTPFacilitatorClient, type FacilitatorClient } from '@x402/core/server';
+import { FacilitatorTimeoutError, HTTPFacilitatorClient, type FacilitatorClient } from '@x402/core/server';
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
+
+/**
+ * The longest a paid request may run, counted from its first line (C41). The site's host ends a request at 300 s
+ * whatever it is doing, so this leaves a minute before that.
+ */
+export const REQUEST_DEADLINE_MS = 240_000;
+/** The longest one facilitator verify call may take before it counts as failed (C41). */
+export const VERIFY_TIMEOUT_MS = 15_000;
+/**
+ * The longest one facilitator settle call, or the one supported-kinds call a copy makes at start, may take (C41). A
+ * pending settle is asked once more, so settling waits at most twice this.
+ */
+export const SETTLE_TIMEOUT_MS = 30_000;
+
+function bounded<T>(operation: string, ms: number, call: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new FacilitatorTimeoutError(operation, ms)), ms);
+    Promise.resolve()
+      .then(call)
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
+
+/**
+ * client with every call bounded: a call that has not answered in time rejects with FacilitatorTimeoutError, which the
+ * paid route treats as an outcome it does not know. Set per call here because the library's client takes one timeout
+ * for every call and the CDP client takes none. A call cut off here may still finish at the facilitator; the route's
+ * claim, kept unsure, is what makes that safe.
+ */
+export function timedFacilitator(client: FacilitatorClient): FacilitatorClient {
+  return {
+    getSupported: () => bounded('supported', SETTLE_TIMEOUT_MS, () => client.getSupported()),
+    verify: (payload, requirements) => bounded('verify', VERIFY_TIMEOUT_MS, () => client.verify(payload, requirements)),
+    settle: (payload, requirements) => bounded('settle', SETTLE_TIMEOUT_MS, () => client.settle(payload, requirements)),
+  };
+}
 
 /** Set on 6 Nov. A constant in code, so neither the environment nor a request can change what a screening costs. */
 export const PRICE = '$0.05';
@@ -43,7 +80,10 @@ export interface ApiConfig {
    * Host header never shapes them. Null only on Base Sepolia, where the request's own origin is used instead.
    */
   publicOrigin: string | null;
-  /** The CDP facilitator on Base, the configured URL on Base Sepolia. Holds the CDP credentials inside, never as fields. */
+  /**
+   * The CDP facilitator on Base, the configured URL on Base Sepolia, with every call bounded by timedFacilitator. Holds
+   * the CDP credentials inside, never as fields.
+   */
   facilitator: FacilitatorClient;
   port: number;
   /**
@@ -208,8 +248,10 @@ export function loadApiConfig(env: Env): ApiConfig {
       apiKeySecret: required(env, 'CDP_API_KEY_SECRET'),
     });
   } else {
-    facilitator = new HTTPFacilitatorClient({ url: facilitatorUrl(env) });
+    // Its own timeout cuts the HTTP request too, so a call bounded below does not keep a connection open for long.
+    facilitator = new HTTPFacilitatorClient({ url: facilitatorUrl(env), timeoutMs: SETTLE_TIMEOUT_MS });
   }
+  facilitator = timedFacilitator(facilitator);
 
   const settings: Omit<ApiConfig, 'databaseUrl'> = {
     network,

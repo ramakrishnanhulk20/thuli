@@ -1,27 +1,30 @@
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
 import { serve } from '@hono/node-server';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
-import { decodePaymentResponseHeader } from '@x402/core/http';
+import { decodePaymentResponseHeader, decodePaymentSignatureHeader } from '@x402/core/http';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { wrapFetchWithPayment } from '@x402/fetch';
 import { createPublicClient, erc20Abi, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { AddressError, parseAddress, type Address } from '@thuli/core';
 import { EnvError } from '@thuli/worker/src/env.ts';
-import { createApp, SCREEN_PATH } from '../src/app.ts';
-import { ConfigError, loadApiConfig, PRICE_UNITS, type ApiConfig } from '../src/config.ts';
+import { createApp, SCREEN_PATH, STORED_HEADER } from '../src/app.ts';
+import { ConfigError, loadApiConfig, PRICE_UNITS, REQUEST_DEADLINE_MS, type ApiConfig } from '../src/config.ts';
 import { liveScreen } from '../src/live.ts';
-import { PaidScreenResponse } from '../src/schema.ts';
+import { PaidScreenResponse, SettledRetryBody } from '../src/schema.ts';
 import { PayerKeyError, takePayerAccount } from './payer-key.ts';
 
 const ROBO_FARM_WALLET = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
 const USAGE = 'Usage: npm run prove:paid -- [--wallet <address>] [--url <http origin of a running site>] [--save <file for the 200 body>]';
-const REPLAYS = 10;
+const FETCHES = 10;
+// A settled payment whose screening ran out of time is asked for again with the same header, at most this often.
+const REDEEM_TRIES = 2;
 const RPC_TIMEOUT_MS = 15_000;
-// The screening's own limit is 2 minutes; settlement and the reply fit in the rest (C41).
-const REQUEST_TIMEOUT_MS = 180_000;
+// The route answers by its own deadline, so a reply that has not come 10 s after it is not coming (C41).
+const REQUEST_TIMEOUT_MS = REQUEST_DEADLINE_MS + 10_000;
 const BALANCE_WAIT_MS = 15_000;
 
 class UsageError extends Error {
@@ -120,11 +123,21 @@ async function listen(config: ApiConfig): Promise<{ origin: string; close(): voi
   });
 }
 
+/** The same signed payment with a fresh nonce: a header that never settled, whose signature no longer matches. */
+function unsettledCopy(header: string, client: x402Client): Record<string, string> {
+  const payload = decodePaymentSignatureHeader(header);
+  const inner = payload.payload as { authorization: { nonce: string } };
+  inner.authorization.nonce = `0x${randomBytes(32).toString('hex')}`;
+  return new x402HTTPClient(client).encodePaymentSignatureHeader(payload);
+}
+
+const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function waitForChange(read: () => Promise<bigint>, before: bigint): Promise<bigint> {
   const deadline = Date.now() + BALANCE_WAIT_MS;
   let now = await read();
   while (now === before && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await wait(1_000);
     now = await read();
   }
   return now;
@@ -163,9 +176,30 @@ async function main(): Promise<number> {
     const target = `${server.origin}${SCREEN_PATH}`;
     const body = JSON.stringify({ wallet });
 
-    const response = await pay(target, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
-    const outcome = await new x402HTTPClient(client).processResponse(response);
+    const send = (headers: Record<string, string>) =>
+      fetch(target, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body,
+        redirect: 'error',
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    const settledTx = (reply: Response) => {
+      const header = reply.headers.get('payment-response');
+      return header === null ? null : decodePaymentResponseHeader(header).transaction;
+    };
+
+    let response = await pay(target, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
     console.log(`wallet screened:  ${wallet}`);
+    // A settled payment whose screening ran out of time is asked for again with the same header, which never pays twice.
+    for (let tries = 0; response.status === 503 && sentSignature !== null && tries < REDEEM_TRIES; tries += 1) {
+      if (!SettledRetryBody.safeParse(await response.clone().json().catch(() => null)).success) break;
+      console.log(`settled, no result yet: sending the same header again (try ${tries + 1})`);
+      await wait(Math.min(30, Number(response.headers.get('retry-after') ?? '10')) * 1000);
+      response = await send({ 'PAYMENT-SIGNATURE': sentSignature });
+    }
+    const firstText = await response.clone().text();
+    const outcome = await new x402HTTPClient(client).processResponse(response);
     if (outcome.status !== 200 || outcome.paymentStatus !== 'settled') {
       console.error(`The paid call did not return a result: status ${outcome.status}, payment ${outcome.paymentStatus}.`);
       // The reason is a fixed code. The message beside it can quote a contract call or an RPC URL, so it is not printed.
@@ -185,29 +219,38 @@ async function main(): Promise<number> {
     console.log(`explorer:         ${config.explorer}/tx/${payment.transaction}`);
 
     if (sentSignature === null) {
-      console.error('The payment header that was sent could not be read back, so the replay was not tried.');
+      console.error('The payment header that was sent could not be read back, so the fetches were not tried.');
       return 1;
     }
-    const replayHeader: string = sentSignature;
-    const replays = await Promise.all(
-      Array.from({ length: REPLAYS }, () =>
-        fetch(target, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'PAYMENT-SIGNATURE': replayHeader },
-          body,
-          redirect: 'error',
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        }),
-      ),
-    );
-    const statuses = replays.map((reply) => reply.status);
-    const replayed = statuses.filter((status) => status === 200).length;
-    console.log(`replays:          ${REPLAYS} copies of the same payment header, ${replayed} returned 200 (must be 0); statuses ${statuses.join(' ')}`);
+    const paidHeader: string = sentSignature;
+    // One at a time, as a buyer coming back would, so the per-client limit of one request in flight is not what answers.
+    let identical = 0;
+    for (let index = 0; index < FETCHES; index += 1) {
+      const again = await send({ 'PAYMENT-SIGNATURE': paidHeader });
+      const text = await again.text();
+      const same = again.status === 200 && again.headers.get(STORED_HEADER) === 'true' && text === firstText && settledTx(again) === payment.transaction;
+      if (same) identical += 1;
+      else console.error(`fetch ${index + 1}: status ${again.status}, not the stored result`);
+    }
+    console.log(`same payment:     ${FETCHES} more fetches with the same header, ${identical} returned the identical result from storage with the same settlement (must be ${FETCHES})`);
 
-    const after = await waitForChange(readBalance, before);
+    const unsettled = await send(unsettledCopy(paidHeader, client));
+    const unsettledText = await unsettled.text();
+    const refused = unsettled.status !== 200 && !unsettledText.includes('decision');
+    const reason = (() => {
+      const header = unsettled.headers.get('payment-response');
+      return header === null ? 'none given' : (decodePaymentResponseHeader(header).errorReason ?? 'none given');
+    })();
+    console.log(`unsettled header: a fresh header that never settled got status ${unsettled.status}, reason ${reason}, ${refused ? 'no result' : 'A RESULT'} (must be no result)`);
+
+    const changed = await waitForChange(readBalance, before);
+    // Read once more after everything else, so a second charge from the fetches or the fresh header would show here.
+    await wait(5_000);
+    const after = await readBalance();
     const spent = before - after;
-    console.log(`payer USDC after: ${usdc(after)} (spent ${usdc(spent)}, price ${usdc(BigInt(PRICE_UNITS))})`);
-    return replayed === 0 && spent === BigInt(PRICE_UNITS) && payment.payer === payer ? 0 : 1;
+    console.log(`payer USDC after: ${usdc(after)} (spent ${usdc(spent)} in all, price ${usdc(BigInt(PRICE_UNITS))}, charged once)`);
+    const once = changed === after && spent === BigInt(PRICE_UNITS);
+    return identical === FETCHES && refused && once && payment.payer === payer ? 0 : 1;
   } finally {
     server.close();
   }
