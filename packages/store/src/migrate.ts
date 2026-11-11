@@ -4,7 +4,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StoreError, withSession, type Db } from './db.ts';
 
-const MIGRATIONS = fileURLToPath(new URL('../migrations/', import.meta.url));
+// Worked out when migrate runs, from this file's own path. A bundler reads a URL literal built on import.meta.url as an
+// asset to pack, and a folder is not one, which broke the site's build.
+function ownMigrations(): string {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
+}
 
 interface MigrationFile {
   name: string;
@@ -36,7 +40,7 @@ async function readMigrations(directory: string): Promise<MigrationFile[]> {
  */
 export async function migrate(
   db: Db,
-  directory: string = MIGRATIONS,
+  directory: string = ownMigrations(),
 ): Promise<{ applied: string[]; alreadyApplied: string[] }> {
   const files = await readMigrations(directory);
   return withSession(db, async (session) => {
