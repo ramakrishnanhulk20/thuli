@@ -7,12 +7,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { getAsk, getCampaign, listVersions, takeAsk, takeRelay } from '../src/campaigns.ts';
+import { getAsk, getCampaign, listVersions, markListSending, takeAsk, takeRelay } from '../src/campaigns.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
 import { migrate } from '../src/migrate.ts';
 
 const INIT = fileURLToPath(new URL('../migrations/001_init.sql', import.meta.url));
 const CAMPAIGNS = fileURLToPath(new URL('../migrations/002_campaigns.sql', import.meta.url));
+const RETRIES = fileURLToPath(new URL('../migrations/003_retries_and_vault_block.sql', import.meta.url));
 
 describe('migrate', () => {
   let db: Db;
@@ -106,13 +107,53 @@ describe('migrate', () => {
 
     const upgraded = await migrate(db);
     expect(upgraded.alreadyApplied).toEqual(['001_init.sql', '002_campaigns.sql']);
-    expect(upgraded.applied).toEqual(['003_retries_and_vault_block.sql']);
+    expect(upgraded.applied).toContain('003_retries_and_vault_block.sql');
     expect(await getCampaign(db, 'old')).toMatchObject({ id: 'old', settings: { groupMinSize: 3 }, vaultBlock: null, status: 'open' });
     expect(await getAsk(db, 'old', wallet)).toMatchObject({ status: 'queued', wallet });
     expect((await listVersions(db, 'old')).map((list) => [list.version, list.status, list.postTx])).toEqual([[1, 'active', `0x${'bb'.repeat(32)}`]]);
     const now = new Date('2026-11-11T12:01:00.000Z');
     expect(await takeAsk(db, now, 60, 3)).toMatchObject({ campaignId: 'old', wallet, attempts: 1 });
     expect(await takeRelay(db, now, 60)).toMatchObject({ campaignId: 'old', wallet, version: 1, attempts: 5, status: 'sent' });
+  });
+
+  it('a database made through 003, holding a built, a posted and an active list, migrates on with every list readable', async () => {
+    await writeFile(path.join(directory, '002_campaigns.sql'), await readFile(CAMPAIGNS));
+    await writeFile(path.join(directory, '003_retries_and_vault_block.sql'), await readFile(RETRIES));
+    expect((await migrate(db, directory)).applied).toEqual(['001_init.sql', '002_campaigns.sql', '003_retries_and_vault_block.sql']);
+    const vault = '0x00000000000000000000000000000000000a11ce';
+    const at = '2026-11-11T12:00:00.000Z';
+    const hash = `0x${'bb'.repeat(32)}`;
+    await db.query(
+      `INSERT INTO campaigns (id, name, chain, vault, token, owner, agent, reward_per_wallet, per_wallet_cap, partial_share_bps,
+                              max_slots, rulebook, settings, status, opens_at, closes_at, created_at, vault_block)
+       VALUES ('old', 'Before sending', 84532, $1, $1, $1, $1, '1000000', '1000000', 5000, 20, 2, '{}', 'open',
+               $2::timestamptz, '2026-12-11T12:00:00.000Z'::timestamptz, $2::timestamptz, 34210987)`,
+      [vault, at],
+    );
+    // Written the way the code before this migration wrote them: active with its hash, posted as found on the vault
+    // with no hash, and built.
+    for (const [version, status, postTx, claimableAt] of [
+      [1, 'active', hash, '1800000000'],
+      [2, 'posted', null, '1800003600'],
+      [3, 'built', null, null],
+    ] as const) {
+      await db.query(
+        `INSERT INTO list_versions (campaign_id, version, root, published_list, declared_total, status, post_tx, claimable_at, created_at)
+         VALUES ('old', $1, $2, '[]', '0', $3, $4, $5::bigint, $6::timestamptz)`,
+        [version, `0x${String(version).repeat(64)}`, status, postTx, claimableAt, at],
+      );
+    }
+
+    const upgraded = await migrate(db);
+    expect(upgraded.alreadyApplied).toEqual(['001_init.sql', '002_campaigns.sql', '003_retries_and_vault_block.sql']);
+    expect(upgraded.applied).toContain('005_list_sending.sql');
+    expect((await listVersions(db, 'old')).map((list) => [list.version, list.status, list.postTx, list.claimableAt])).toEqual([
+      [1, 'active', hash, 1_800_000_000],
+      [2, 'posted', null, 1_800_003_600],
+      [3, 'built', null, null],
+    ]);
+    expect(await markListSending(db, 'old', 3, { postTx: hash }, new Date(at))).toBe(true);
+    expect((await listVersions(db, 'old'))[2]).toMatchObject({ status: 'sending', postTx: hash, claimableAt: null });
   });
 
   it('C40: every table holds exactly the columns listed here, so no secret has a column to live in', async () => {

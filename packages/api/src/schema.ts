@@ -135,7 +135,7 @@ export const ClosedBody = z.strictObject({ closed: z.literal(true) });
 const ListVersionJson = z.strictObject({
   version: z.int().min(1),
   root: HashText,
-  status: z.enum(['built', 'posted', 'active', 'superseded', 'cancelled']),
+  status: z.enum(['built', 'sending', 'posted', 'active', 'superseded', 'cancelled']),
   postTx: HashText.nullable(),
   claimableAt: Count.nullable(),
 });

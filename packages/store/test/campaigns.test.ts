@@ -24,6 +24,9 @@ import {
   markListActive,
   markListCancelled,
   markListPosted,
+  markListSending,
+  markListUnsent,
+  requeueFailedAsk,
   markRelay,
   MAX_RELAY_ATTEMPTS,
   openCampaigns,
@@ -310,6 +313,47 @@ for (const { name, open } of TARGETS) {
       expect(await takeAsk(db, plus(41 + 86_400), 60, 3)).toMatchObject({ wallet: wallet(1), attempts: 3 });
       expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(90_000), 3, 30)).toBe('failed');
       expect(await getAsk(db, CAMPAIGN, wallet(1))).toMatchObject({ status: 'failed', action: 'hold', rule: 'A1', slot: null });
+    });
+
+    it('C11: requeueFailedAsk screens a failed ask again from the start, and never touches a decided, waiting or slotted ask', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3]) expect(await ask(n, plus(n))).toBe('queued');
+      expect(await takeAsk(db, plus(10), 60, 3)).toMatchObject({ wallet: wallet(1) });
+      expect(await releaseAsk(db, CAMPAIGN, wallet(1), plus(10), 1)).toBe('failed');
+      expect(await takeAsk(db, plus(11), 60, 3)).toMatchObject({ wallet: wallet(2) });
+      expect(await decideAsk(db, decision(wallet(2), 'hold'), plus(11))).toEqual({ slot: null });
+      expect(await takeAsk(db, plus(12), 60, 3)).toMatchObject({ wallet: wallet(3) });
+      expect(await decideAsk(db, decision(wallet(3), 'full'), plus(12))).toEqual({ slot: 1 });
+      expect(await ask(5, plus(13))).toBe('queued');
+      expect(await takeAsk(db, plus(14), 60, 3)).toMatchObject({ wallet: wallet(5) });
+      expect(await ask(4, plus(15))).toBe('queued');
+
+      const untouched = await Promise.all([2, 3, 4, 5].map((n) => row(n)));
+      for (const n of [2, 3, 4, 5]) expect(await requeueFailedAsk(db, CAMPAIGN, wallet(n), plus(100))).toBe(false);
+      expect(await Promise.all([2, 3, 4, 5].map((n) => row(n)))).toEqual(untouched);
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(9), plus(100))).toBe(false);
+      expect(await requeueFailedAsk(db, 'missing', wallet(1), plus(100))).toBe(false);
+      await expect(requeueFailedAsk(db, CAMPAIGN, wallet(1), new Date(Number.NaN))).rejects.toThrow(StoreError);
+
+      const signed = await row(1);
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1).toLowerCase(), plus(100))).toBe(true);
+      expect(await getAsk(db, CAMPAIGN, wallet(1))).toMatchObject({
+        status: 'queued',
+        action: null,
+        shareBps: null,
+        rule: null,
+        reason: null,
+        citedTxs: null,
+        notChecked: null,
+        facts: null,
+        servRequestId: null,
+        decidedAt: null,
+        slot: null,
+      });
+      expect(await row(1)).toMatchObject({ attempts: 0, lease_until: null, signed_at: signed?.signed_at, signature: signed?.signature });
+      expect(await requeueFailedAsk(db, CAMPAIGN, wallet(1), plus(101))).toBe(false);
+      // It waits its turn by when it first asked, so it is the next ask handed out.
+      expect(await takeAsk(db, plus(102), 60, 3)).toMatchObject({ wallet: wallet(1), attempts: 1 });
     });
 
     it('releaseAsk queues again below the limit and at the limit ends failed with the A1 hold', async () => {
@@ -621,6 +665,52 @@ for (const { name, open } of TARGETS) {
       expect(await activeList(db, CAMPAIGN)).toMatchObject({ version: 1, postTx: null });
       // The time it becomes claimable is always known from the vault, so a posted version can never lack it.
       await expect(db.query("UPDATE list_versions SET claimable_at = NULL WHERE campaign_id = 'demo'")).rejects.toThrow(StoreError);
+    });
+
+    it('C32: a list sent to the vault keeps its hash from built to sending to posted, and an unsent one returns to built with none', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3, 4]) {
+        expect(await addListVersion(db, { campaignId: CAMPAIGN, root: root(n), publishedList: '[]', declaredTotal: '0' }, plus(n))).toBe(n);
+      }
+      const other = `0x${'2e'.repeat(32)}`;
+      const version = async (n: number) => (await listVersions(db, CAMPAIGN))[n - 1];
+      await expect(markListSending(db, CAMPAIGN, 1, { postTx: 'not a hash' }, NOW)).rejects.toThrow(StoreError);
+      expect(await version(1)).toMatchObject({ status: 'built', postTx: null });
+
+      // The hash is on record before any wait, and a stored null keeps it when the mined root is recorded.
+      expect(await markListSending(db, CAMPAIGN, 1, { postTx: HASH }, NOW)).toBe(true);
+      expect(await version(1)).toMatchObject({ status: 'sending', postTx: HASH, claimableAt: null });
+      expect(await latestList(db, CAMPAIGN)).toMatchObject({ version: 4, status: 'built' });
+      expect(await markListSending(db, CAMPAIGN, 1, { postTx: other }, NOW)).toBe(false);
+      expect(await markListCancelled(db, CAMPAIGN, 1)).toBe(false);
+      expect(await version(1)).toMatchObject({ status: 'sending', postTx: HASH });
+      expect(await markListPosted(db, CAMPAIGN, 1, { postTx: null, claimableAt: 1_800_000_000 })).toBe(true);
+      expect(await version(1)).toMatchObject({ status: 'posted', postTx: HASH, claimableAt: 1_800_000_000 });
+
+      // A replacement hash given with the post replaces the one sent.
+      expect(await markListSending(db, CAMPAIGN, 2, { postTx: HASH }, NOW)).toBe(true);
+      expect(await markListPosted(db, CAMPAIGN, 2, { postTx: other, claimableAt: 1_800_003_600 })).toBe(true);
+      expect(await version(2)).toMatchObject({ status: 'posted', postTx: other });
+
+      // A transaction the chain reverted or never saw: back to built with no hash, and free to be sent again.
+      expect(await markListUnsent(db, CAMPAIGN, 3)).toBe(false);
+      expect(await markListSending(db, CAMPAIGN, 3, { postTx: HASH }, NOW)).toBe(true);
+      expect(await markListUnsent(db, CAMPAIGN, 3)).toBe(true);
+      expect(await version(3)).toMatchObject({ status: 'built', postTx: null, claimableAt: null });
+      expect(await markListUnsent(db, CAMPAIGN, 3)).toBe(false);
+      expect(await markListSending(db, CAMPAIGN, 3, { postTx: other }, NOW)).toBe(true);
+
+      expect(await markListActive(db, CAMPAIGN, 2)).toBe(true);
+      expect(await markListCancelled(db, CAMPAIGN, 4)).toBe(true);
+      const before = await listVersions(db, CAMPAIGN);
+      for (const n of [1, 2, 4]) expect(await markListSending(db, CAMPAIGN, n, { postTx: other }, NOW)).toBe(false);
+      for (const n of [1, 2, 4]) expect(await markListUnsent(db, CAMPAIGN, n)).toBe(false);
+      expect(await markListPosted(db, CAMPAIGN, 2, { postTx: null, claimableAt: 1 })).toBe(false);
+      expect(await listVersions(db, CAMPAIGN)).toEqual(before);
+      expect(before.map((list) => list.status)).toEqual(['posted', 'active', 'sending', 'cancelled']);
+      // The table itself refuses a sending row without its hash, or with a claimable time.
+      await expect(db.query("UPDATE list_versions SET post_tx = NULL WHERE campaign_id = 'demo' AND version = 3")).rejects.toThrow(StoreError);
+      await expect(db.query("UPDATE list_versions SET claimable_at = 1 WHERE campaign_id = 'demo' AND version = 3")).rejects.toThrow(StoreError);
     });
 
     it('markListCancelled cancels a built or posted version, and leaves an active one exactly as it was', async () => {

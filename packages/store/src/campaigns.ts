@@ -65,7 +65,7 @@ const MAX_MISSING_FACT_CHARS = 64;
 
 export type CampaignStatus = 'open' | 'closed';
 export type AskStatus = 'queued' | 'screening' | 'decided' | 'failed';
-export type ListStatus = 'built' | 'posted' | 'active' | 'superseded' | 'cancelled';
+export type ListStatus = 'built' | 'sending' | 'posted' | 'active' | 'superseded' | 'cancelled';
 export type RelayStatus = 'pending' | 'sent' | 'confirmed' | 'failed';
 export type DecisionRule = (typeof DECISION_RULES)[number];
 
@@ -912,6 +912,35 @@ export async function releaseAsk(
 }
 
 /**
+ * Puts an ask that failed, because every try at screening it ran out during an outage, back in the queue to be
+ * screened again from the start: status queued, no attempts, no retry time, and the A1 hold cleared. It keeps its
+ * signature and its place by when it asked. For an operator's command once the outage is over. A decided ask is never
+ * re-screened this way, a decided hold included: only a failed ask, which never took a slot, moves, so no command can
+ * approve a wallet (C11). One row, in one statement under the campaign's lock (C41). now is checked like every caller's
+ * time; the ask keeps no requeue time of its own.
+ * @returns true when the ask was failed and is now queued; false, changing nothing, for any other ask or none.
+ * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when now is not a valid Date.
+ */
+export async function requeueFailedAsk(db: Db, campaignId: string, wallet: string, now: Date): Promise<boolean> {
+  instant(now);
+  const canonical = parseAddress(wallet);
+  if (!isCampaignId(campaignId)) return false;
+  return db.transaction(async (tx) => {
+    await lockCampaign(tx, campaignId);
+    const rows = await tx.query(
+      `UPDATE asks
+          SET status = 'queued', attempts = 0, retry_at = NULL, lease_until = NULL, action = NULL, share_bps = NULL,
+              rule = NULL, reason = NULL, cited_txs = NULL, not_checked = NULL, facts = NULL, serv_request_id = NULL,
+              decided_at = NULL
+        WHERE campaign_id = $1 AND wallet = $2 AND status = 'failed' AND slot IS NULL
+       RETURNING wallet`,
+      [campaignId, canonical],
+    );
+    return rows.length === 1;
+  });
+}
+
+/**
  * The public view of one ask, never its signature or lease (C40). The wallet goes through parseAddress, so any
  * spelling finds the one ask (C1).
  * @returns the ask, or null when there is none.
@@ -1086,10 +1115,58 @@ export async function addListVersion(
 }
 
 /**
- * A built version's root went on chain in postTx and can be claimed from claimableAt, in Unix seconds. postTx is null
- * for a root the worker finds pending on the vault after a restart without having seen the transaction that posted it;
- * claimableAt is always given, because the vault holds it.
- * @returns true when the version was built and is now posted; false, changing nothing, for any other version.
+ * The worker has broadcast the transaction that posts a built version's root, and records its hash before it waits for
+ * the transaction to be mined. A stop or a timeout during that wait then leaves a record that the root may already be
+ * on the vault, so the list is settled by markListPosted or markListUnsent and never posted a second time (C27, C32).
+ * now is checked like every caller's time; the version keeps no send time of its own. One statement.
+ * @returns true when the version was built and is now sending; false, changing nothing, for any other version.
+ * @throws StoreError when version is not a whole number from 1, postTx is not 0x and 64 lowercase hex, or now is not a
+ *   valid Date.
+ */
+export async function markListSending(
+  db: Db,
+  campaignId: string,
+  version: number,
+  sent: { postTx: string },
+  now: Date,
+): Promise<boolean> {
+  wholeNumber(version, 'version', 1, MAX_INTEGER);
+  const postTx = txHashOf(sent.postTx, 'postTx');
+  instant(now);
+  if (!isCampaignId(campaignId)) return false;
+  const rows = await db.query(
+    `UPDATE list_versions SET status = 'sending', post_tx = $3
+      WHERE campaign_id = $1 AND version = $2 AND status = 'built'
+     RETURNING version`,
+    [campaignId, version, postTx],
+  );
+  return rows.length === 1;
+}
+
+/**
+ * A sending version's transaction was reverted, or the network does not know it after the worker's wait, so its root
+ * never reached the vault: the version is built again, with no hash, and may be sent anew. One statement.
+ * @returns true when the version was sending and is now built; false, changing nothing, for any other version.
+ * @throws StoreError when version is not a whole number from 1.
+ */
+export async function markListUnsent(db: Db, campaignId: string, version: number): Promise<boolean> {
+  wholeNumber(version, 'version', 1, MAX_INTEGER);
+  if (!isCampaignId(campaignId)) return false;
+  const rows = await db.query(
+    `UPDATE list_versions SET status = 'built', post_tx = NULL
+      WHERE campaign_id = $1 AND version = $2 AND status = 'sending'
+     RETURNING version`,
+    [campaignId, version],
+  );
+  return rows.length === 1;
+}
+
+/**
+ * A version's root is on the vault and can be claimed from claimableAt, in Unix seconds, which is always given because
+ * the vault holds it. The normal path is from sending: postTx replaces the stored hash, and null keeps it. From built,
+ * it is a root the worker found pending on the vault after a restart with no record of sending it, and postTx is the
+ * hash if the worker learned it, or null.
+ * @returns true when the version was sending or built and is now posted; false, changing nothing, for any other version.
  * @throws StoreError when version is not a whole number from 1, postTx is neither null nor 0x and 64 lowercase hex,
  *   or claimableAt is not whole seconds from 0.
  */
@@ -1104,8 +1181,8 @@ export async function markListPosted(
   const claimableAt = wholeNumber(posted.claimableAt, 'claimableAt', 0, Number.MAX_SAFE_INTEGER);
   if (!isCampaignId(campaignId)) return false;
   const rows = await db.query(
-    `UPDATE list_versions SET status = 'posted', post_tx = $3, claimable_at = $4::bigint
-      WHERE campaign_id = $1 AND version = $2 AND status = 'built'
+    `UPDATE list_versions SET status = 'posted', post_tx = COALESCE($3::text, post_tx), claimable_at = $4::bigint
+      WHERE campaign_id = $1 AND version = $2 AND status IN ('built', 'sending')
      RETURNING version`,
     [campaignId, version, postTx, String(claimableAt)],
   );
@@ -1138,7 +1215,8 @@ export async function markListActive(db: Db, campaignId: string, version: number
 /**
  * A version that never became active is cancelled: one built but never posted, or posted and then cancelled on chain
  * by the owner's cancelRoot inside its delay. An active or superseded version has already been claimable, so it cannot
- * be cancelled, and neither can one already cancelled.
+ * be cancelled, and neither can one already cancelled. A sending version cannot be either: whether its root reached the
+ * vault is not yet known, so it is first settled by markListPosted or markListUnsent.
  * @returns true when the version was built or posted and is now cancelled; false, changing nothing, otherwise.
  * @throws StoreError when version is not a whole number from 1.
  */

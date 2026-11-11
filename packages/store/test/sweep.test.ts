@@ -1,6 +1,7 @@
 // Not covered here: who runs sweep and how often (that is the next order's wiring), and a sweep racing a claim on a
 // real Postgres. day_counts is outside sweep by design: it gains one row per counter name per UTC day, and the names
 // are chosen by Thuli's code, never by a caller. schema_migrations is the schema's own record and must stay.
+import fs from 'node:fs';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { writeCheck } from '../src/checkCache.ts';
 import { openMemoryDb, StoreError, type Db } from '../src/db.ts';
@@ -81,7 +82,8 @@ describe('sweep', () => {
     expect(await sweep(db, new Date('2100-01-01T00:00:00.000Z'))).toEqual({ claims: 3, leases: 1, events: 2, checks: 1 });
     for (const table of SWEPT) expect({ table, rows: await rows(table) }).toEqual({ table, rows: 0 });
     expect(await rows('day_counts')).toBe(1);
-    expect(await rows('schema_migrations')).toBe(3);
+    const migrationFiles = fs.readdirSync(new URL('../migrations/', import.meta.url)).filter((name) => name.endsWith('.sql'));
+    expect(await rows('schema_migrations')).toBe(migrationFiles.length);
   });
 
   it('C41: the length checks refuse an over-long key, pool, bucket, client and counter name', async () => {
