@@ -1,6 +1,6 @@
 ---
 title: Threat model
-description: The 47 rules Thuli is built against, what shows each one, and the known gaps.
+description: The 47 rules Thuli is built against, what shows each one, the known gaps, and the campaign worker's non-goals.
 ---
 
 An independent review pass wrote this threat model on 27 October 2026, before any code, working only from a plain description of the system. It held rules C1 to C44. Three more, C45 to C47, were added on 6 November, after the replays and the outside feedback showed what was missing. It is the definition of done, not a status report: the build counts as finished only when every rule below is upheld and shown by its test. Each rule has a code (C1 to C47), a statement and a "Shown by" line that names the test or attack that demonstrates it. A change that touches a rule must carry its test.
@@ -37,7 +37,7 @@ Shown by: owner B calls each owner route with owner A's id, gets not-found every
 
 ### C5. Unpublished means unreachable
 
-Before publish, no public route, page, cache, sitemap, link-preview tag or error message reveals a campaign's claim list, rules, decisions, held wallets or appeals, or whether an address is on the list. Not built yet: there are no campaign routes and no publishing.
+Before publish, no public route, page, cache, sitemap, link-preview tag or error message reveals a campaign's claim list, rules, decisions, held wallets or appeals, or whether an address is on the list. Built only the other way round so far: the campaign routes serve one campaign that is public from the start, so its decisions, held wallets and list versions can be read as soon as they exist. Private campaigns, where nothing shows before publish, are not built yet.
 
 Shown by: public responses for an unpublished campaign and for a random id match, apart from request ids.
 
@@ -119,13 +119,13 @@ Shown by: an appeal whose model answer is "reverse" changes nothing until the ow
 
 ### C18. Every decision is traceable, and a published list is frozen
 
-Each decision records its rule version, facts snapshot, model request ids and data receipts. Publish is refused while any wallet is queued or any decision was made under an older rule version. After publish, changes come only through C17, each creating a new public list version shown beside the old one. Not built yet: nothing publishes a list and no worker takes jobs. The store has tables for list versions and for a queue of asks, and no route or worker reads or writes them.
+Each decision records its rule version, facts snapshot, model request ids and data receipts. Publish is refused while any wallet is queued or any decision was made under an older rule version. After publish, changes come only through C17, each creating a new public list version shown beside the old one. Built differently for a campaign: the worker posts a list as soon as the slot holders change, without waiting for queued asks to finish, and every change is a new list version shown beside the old ones. The refusal to publish while a wallet is queued belongs to an owner-run publish step, which is not built yet.
 
 Shown by: editing the rules mid-run, then trying to publish; publish is refused.
 
 ### C19. Campaigns do not leak into each other
 
-A decision in campaign A depends only on A's own list, rules and settings, the chain, and purchased data about the chain. Cached provider data is shared only as facts about an address, never as list membership. Not built yet: no route stores a campaign. The store has campaign tables, and no route or worker reads or writes them.
+A decision in campaign A depends only on A's own list, rules and settings, the chain, and purchased data about the chain. Cached provider data is shared only as facts about an address, never as list membership. Built for campaign asks: the worker links an ask only to the same campaign's other asks and screens it under that campaign's own settings. Private campaigns are not built yet.
 
 Shown by: adding a wallet to private campaign B changes no output of A or of the public check.
 
@@ -265,7 +265,7 @@ Shown by: an `eth_call` to a fork contract that reverts with `OffchainLookup` po
 
 ### C39. No internet-facing handler holds a key that moves money
 
-x402 income goes to a payTo address whose key is on no server. The Reppo-paying key and the vault agent key live only on the worker, and publish queues a job for the worker to sign. If the worker is compromised, the most lost is the open Kite session budgets plus the hot wallet's float, both stated numbers.
+x402 income goes to a payTo address whose key is on no server. The Reppo-paying key and the vault agent key live only on the worker, and no web handler signs: the campaign worker reads the approved wallets from the database and posts the list itself. If the worker is compromised, the most lost is the open Kite session budgets plus the hot wallet's float, both stated numbers.
 
 Shown by: the web app's deployed environment holds no private key and no Kite token.
 
@@ -323,7 +323,7 @@ Shown by: stand-in replies of hold, exclude and full on a burst wallet all end p
 
 ### C44. The demo pays at most 20 USDC, 1 USDC each, only to wallets that proved control
 
-A slot is taken only by a wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at 1 USDC and the vault holds only the demo deposit. The vault side is tested on a fork. The signed ask message and its check are built and tested, and the store has a slot column for approved asks. No route takes an ask and no worker decides one, so nothing hands out a slot yet.
+A slot is taken only by a wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at 1 USDC and the vault holds only the demo deposit. The vault side is tested on a fork. A signed ask is checked and queued by the campaign route, the worker screens it, and an approved wallet takes the next free slot only while slots are left. A held or excluded wallet never takes one. The 20 USDC and 1 USDC figures are the demo's terms: the code sets no campaign's slots or reward itself, and each campaign's come from its database row and its vault.
 
 Shown by: 30 signed asks from farm wallets on a fork; no more than 20 USDC leaves the vault and no address gets more than 1 USDC.
 
@@ -334,3 +334,16 @@ From the backend review on 10 November.
 - Farms funded through a batch-send contract (Disperse, a router) are not grouped, because an internal transfer names the contract and contracts never link. Candidate fix: attribute an internal transfer to the signer of its parent transaction.
 - A sweep into a contract wallet (a Safe, a forwarder) never links, so one contract collector avoids A3. Candidate fix: apply C46's sender-share test to contract destinations instead of exempting them by kind.
 - Framing through a counterparty: wallets on the same list could sweep into an address a victim once swept to and turn the victim's own payment into an A3 exclude. Candidate fix: links other wallets authored count only inside a time window.
+
+## Non-goals of the campaign worker
+
+The worker screens each ask as it arrives and runs as one script on one machine. These are the limits that follow from that. They were checked against the code on 11 November 2026.
+
+- A campaign that pays as asks arrive sees a family only as it grows. Until the family reaches the campaign's group size (`groupMinSize`, 5 unless the campaign changes it), each of its wallets looks alone and can be approved, and an ask once decided is not screened again. Screening a whole claim list at once, as the replay does, has no such gap.
+- A campaign ask is linked through the wallet's direct first funder only. Funding passed through in-between wallets is not traced for it, where the replay follows a funding back through up to 6 single-use pass-through wallets.
+- A first funder with 10,000 or more transactions sent (read when the ask is screened), or with contract code, is treated as an exchange or service and links nobody. Wallets funded straight from such an address are not linked by funding.
+- Campaign facts come from free public data: the wallet's own Ethereum history and the campaign's own asks. A shared deposit address, a sweep to a shared collector, a funding burst, a claim paid to another address and funding through pass-through wallets are not measured for campaign asks. Every decision lists them as not checked.
+- The worker is meant to run as one process. Two for a few seconds are safe for money, because every amount is cumulative and the vault answers `NothingToClaim` to a second claim, so a claim sent twice pays once. They can post one list twice, which restarts that list's waiting time.
+- A claim the worker cannot submit after 10 tries is left for the wallet. It is still owed, and can claim with its own ticket from the campaign route, paying its own gas.
+- The worker records an owner's cancel only when the vault is read at least 120 seconds after the post, because a lagging RPC node would otherwise look like a cancel. A cancelled list is not posted again until the slot holders change. An owner who wants no further lists pauses the vault, which also stops every claim for as long as the pause lasts.
+- C18's refusal to publish while a wallet is queued belongs to an owner-run publish step, which is not built. The worker posts a list as soon as the slot holders change, without waiting for queued asks.

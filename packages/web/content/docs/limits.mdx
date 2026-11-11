@@ -35,15 +35,26 @@ It can also be wrong the other way:
 - Farmers reading the rulebook. It is public so the process is fair and appealable. Farmers reading it is a stated non-goal.
 - Payment edge cases. Without a database, a restart can let a copy inside its window be answered from a facilitator's pending cache. A facilitator that fails after broadcasting leaves a payment unserved until the buyer retries. If the server copy screening a wallet stops part way, that wallet answers `202` for up to 330 seconds, until its place frees itself.
 
+## What the campaign worker does not do
+
+The campaign worker is the script that screens each ask, posts the approved wallets' list to the vault and submits their claims. It runs from this repository against Base Sepolia with test money. Its limits:
+
+- It judges each ask as it arrives, so it sees a group of linked wallets only as the group grows. Until a group reaches the campaign's group size (5 unless the campaign sets another), each wallet in it looks alone and can be approved, and a wallet that has been decided is not looked at again. Screening a whole claim list at once, as the replay does, has no such gap.
+- It links wallets through the first wallet that funded each one, and only that one. If the money passed through in-between wallets first, the worker does not follow it back. The replay follows up to 6 such wallets.
+- A first funder that has sent 10,000 or more transactions, or is a contract, is treated as an exchange or a service and links nobody. Wallets funded straight from such an address are not linked by their funding.
+- It uses only free public data: the wallet's own Ethereum history and the campaign's own asks. It does not measure a shared deposit address, a sweep to one shared collector, a funding burst, a claim paid to another address or funding through in-between wallets. Every decision says these were not checked.
+- It is meant to run as one copy. Two copies for a few seconds cannot pay anyone twice, because the vault pays a wallet only what it has not yet received. They can post the same list twice, which restarts that list's waiting time.
+- If the worker cannot submit a wallet's claim after 10 tries, spread over about an hour, it stops trying. The wallet is still owed. It can claim for itself with the claim ticket the campaign route gives it, and pays its own gas.
+- If the project cancels a waiting list, the worker records that only after 2 minutes, and does not post that list again until a new wallet takes a slot. A project that wants no further lists pauses the vault, which also stops every claim until it unpauses.
+
 ## What Thuli has not built
 
-- Owner sign-in, campaigns, publishing and an owner dashboard. There are no owner routes and no campaign routes. The store has tables and queries for campaigns, asks, list versions and claim submissions, and the signed message a wallet would sign to ask to join a campaign exists in code. No route and no worker reads or writes those tables or runs that check.
-- A database that holds campaigns, decisions, wallets or appeals. The paid and free routes keep payment claims, rate limits and cached checks in Postgres when a database is configured, and in memory when it is not. No route saves a campaign, a decision, a wallet or an appeal. Appeals and run state are local files. No database is hosted for Thuli yet.
-- A job queue that runs. Nothing queues or takes a job: the paid route screens inside the request, and the replays run as scripts.
+- Owner sign-in and an owner dashboard. There are no owner routes: no route creates a campaign or changes one. A campaign is registered from the command line with `npm run campaign:create`. The public campaign routes take a signed ask, show the board and serve a claim ticket, and the worker screens the asks and posts the lists (see above).
+- A database for appeals, and a hosted database. Postgres holds payment claims, rate limits, cached checks and the campaign tables (campaigns, asks with their decisions, list versions and claim submissions) when a database is configured. Without one, the paid and free routes keep payment claims, rate limits and checks in memory. Appeals and run state are local files. No database is hosted for Thuli yet.
+- A general job queue. Only campaign asks and claim submissions are queued, each in its own table, and the worker takes them one at a time. The paid route screens inside the request, and the replays run as scripts.
 - Paid data through Kite Passport, Nansen or Allium, and Dolphin summaries. No code calls them.
-- A deployed worker host.
+- A deployed worker host. The worker that screens asks, posts lists and submits claims runs as `npm run worker` on one machine.
 - Base mainnet contracts. The paid route has been proven only on Base Sepolia with test USDC.
-- A service that turns decisions into a posted list. The code that builds claim lists and claim tickets has tests, but only the vault proof script posts a root, from a hand-written list. Nothing serves a claimant its proof.
 - Appeals in public. The checks, record, local file store and advice exist; the public route, owner sign-in and rate limit do not. Contract wallets cannot appeal, and neither can a wallet whose type could not be read. A reversal does not change the claim list or the vault root.
 - An external audit.
 

@@ -1,0 +1,230 @@
+---
+title: Architecture
+description: Three diagrams of Thuli as the code runs it today, with the planned parts drawn apart and marked as planned.
+---
+
+Each diagram below was drawn from the code. Solid lines are built. Dashed lines, and anything labelled planned, are not built yet.
+
+## System overview
+
+Who comes in, what the web app, the API, the worker and the vault each do, and the outside services they call. Every dashed line leads into the planned box, and nothing in that box is built yet.
+
+```mermaid
+flowchart TB
+  subgraph People["Who comes in"]
+    VIS["Visitor or judge"]
+    AGT["Paying agent"]
+    WAL["Wallet"]
+  end
+
+  subgraph Web["Web app on Next.js, holds no private key"]
+    PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
+    FILES["Static replay files"]
+    ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
+  end
+
+  API["API package: free check, paid screen, campaign routes"]
+  FAC["x402 facilitator"]
+  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays")]
+
+  subgraph Worker["Worker, run as scripts"]
+    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims"]
+    SCRIPTS["Replay, scoring and export scripts"]
+  end
+
+  subgraph Screening["Screening code"]
+    FACTS["Facts from public Ethereum reads"]
+    LIMITS["Start and ceiling set in code"]
+    ASK["Ask SERV with the rules graph or the rulebook"]
+    CHECKS["Output checks in code"]
+  end
+
+  ETH["Ethereum RPC and Blockscout"]
+  SERV["SERV Reasoning"]
+  REPPO["Reppo evaluation API"]
+
+  subgraph Base["Base Sepolia"]
+    FACTORY["ThuliVaultFactory"]
+    VAULT["ThuliVault, one per campaign"]
+  end
+
+  subgraph Planned["Planned, not built"]
+    P1["Planned: paid data through Kite Passport, Nansen and Allium"]
+    P2["Planned: Dolphin summaries"]
+    P3["Planned: owner sign-in and campaign upload"]
+    P4["Planned: public appeal routes"]
+    P5["Planned: hosted worker and database"]
+    P6["Planned: Base mainnet"]
+  end
+
+  VIS --> PAGES
+  AGT -->|"pays 0.05 USDC over x402"| ROUTES
+  WAL -->|"signed ask, ticket"| ROUTES
+  PAGES -->|"reads"| FILES
+  PAGES -->|"free check"| ROUTES
+  ROUTES -->|"all but /api/search"| API
+  API -->|"settles payments"| FAC
+  API --> DB
+  API -->|"screens one wallet"| FACTS
+  API -->|"claimed, claimable"| VAULT
+  DB <-->|"asks, decisions, lists, relays"| LOOP
+  DB ~~~ SCRIPTS
+  LOOP -->|"screens each ask"| FACTS
+  LOOP -->|"VaultCreated log"| FACTORY
+  LOOP -->|"postRoot, claim"| VAULT
+  FACTORY -->|"creates"| VAULT
+  VAULT -->|"pays"| WAL
+  SCRIPTS -->|"replays a claim list"| FACTS
+  SCRIPTS -->|"writes"| FILES
+  SCRIPTS -->|"feedback"| REPPO
+  FACTS -->|"public reads"| ETH
+  FACTS --> LIMITS
+  LIMITS --> ASK
+  ASK <--> SERV
+  ASK --> CHECKS
+
+  FACTS -.-> P1
+  FACTS -.-> P2
+  API -.-> P3
+  API -.-> P4
+  LOOP -.-> P5
+  VAULT -.-> P6
+
+  classDef planned stroke-dasharray: 5 5
+  class P1,P2,P3,P4,P5,P6 planned
+```
+
+The free check and the paid route run the same screening inside the request. The paid route is described in [Check a wallet and the paid API](/docs/paid-api).
+
+## One wallet through an open campaign
+
+A wallet signs an ask. The worker screens it, gives an approved wallet a slot, and posts the list's root to the campaign's vault. Once the vault's delay is over, the worker submits each claim, so the wallet is paid without paying gas. Every step here is in the code today.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W as Wallet
+  participant API as Campaign routes
+  participant DB as Postgres store
+  participant K as Worker
+  participant ETH as Ethereum RPC and Blockscout
+  participant SV as SERV Reasoning
+  participant V as Vault on Base Sepolia
+
+  W->>W: Sign the ask text as a personal message
+  W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
+  API->>API: checkAsk: a valid address, signed in the last 600 seconds
+  API->>ETH: Read the wallet's code, a contract cannot ask yet
+  API->>API: The signature must match the rebuilt ask text
+  API->>DB: Store the ask as queued, the first ask per wallet stands
+  API-->>W: 202 queued
+  K->>DB: Take the oldest queued ask, leased for 300 seconds
+  K->>ETH: Read the wallet's facts at the latest finalized block
+  K->>DB: Read the first funders of the campaign's other asks
+  K->>K: Link asks that share a funder, set start and ceiling in code
+  K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
+  SV-->>K: Action, rule, reason, cited transactions
+  K->>K: Output checks, never above the ceiling
+  K->>DB: Store the decision, an approved wallet takes the next free slot
+  K->>DB: Build the list from the slot holders, store it as a new list version
+  K->>K: Read the stored text back and rebuild the root from it
+  K->>V: Check the vault against the factory log, then postRoot
+  K->>DB: Mark the version posted with its transaction
+  V->>V: The root waits out its delay, and the owner can cancel it
+  K->>V: Read state, and claimable for every listed wallet
+  K->>DB: Mark the version active, queue a relay for each wallet still owed
+  K->>DB: Take the oldest waiting relay
+  K->>V: Simulate, then send claim(account, cumulativeAmount, proof) from the agent key
+  V-->>W: Pay the capped leaf amount minus what this wallet already received
+  K->>DB: Mark the relay confirmed
+  W->>API: GET /api/campaigns/:id/asks/:wallet
+  API-->>W: The decision, and a claim ticket once the list is active
+```
+
+Whoever submits a claim, the vault pays only the wallet named in the list. More on who can do what in [The reward vault](/docs/vault).
+
+## How the code is split
+
+The packages and their main modules. An arrow points from a module to one it imports, and only the main imports are drawn. The one dashed line is not an import: core's leaf and the vault hash a claim the same way, so a list built in TypeScript proves on chain.
+
+```mermaid
+flowchart TB
+  subgraph web["packages/web"]
+    PAGES["pages and components"]
+    THULIAPI["lib/server/thuliApi"]
+    RFILES["public/replay files"]
+  end
+
+  subgraph api["packages/api"]
+    SITE["site, server, live"]
+    APP["app, schema, receipt"]
+    ACAMP["campaigns"]
+    AREST["stores, claims, limits, guard, config"]
+  end
+
+  subgraph worker["packages/worker"]
+    CAMPW["campaign: loop, screen, facts, publish, relay, vault"]
+    SINGLE["screen/single"]
+    REPLAY["replay: decide, runner, scoring, export"]
+    REPPO["reppo: client, feedback"]
+    SERVC["serv/client"]
+    READ["facts/basic and chain readers"]
+    VAULTW["vault: root, claimList, proof, chain, abi"]
+  end
+
+  subgraph store["packages/store"]
+    SCAMP["campaigns"]
+    SROWS["paymentClaims, limits, checkCache, sweep"]
+    SDB["db, migrate"]
+  end
+
+  subgraph core["packages/core"]
+    SIGN["ask, appeal"]
+    DEC["start, ceiling, decision, graph"]
+    FACTS["facts, factsEngine, settings"]
+    LEAF["leaf"]
+    MONEY["money"]
+    ADDR["address, chains"]
+  end
+
+  subgraph contracts["packages/contracts"]
+    VF["ThuliVaultFactory"]
+    VA["ThuliVault"]
+    OZ["OpenZeppelin: Ownable2Step, Pausable, ReentrancyGuard, SafeERC20, MerkleProof, Math, SafeCast"]
+  end
+
+  PAGES --> RFILES
+  THULIAPI --> SITE
+  SITE --> APP
+  SITE --> SINGLE
+  APP --> ACAMP
+  APP --> AREST
+  AREST --> SROWS
+  ACAMP --> SCAMP
+  ACAMP --> SIGN
+  ACAMP --> VAULTW
+  CAMPW --> SINGLE
+  CAMPW --> REPLAY
+  CAMPW --> VAULTW
+  CAMPW --> SCAMP
+  SINGLE --> READ
+  SINGLE --> REPLAY
+  REPLAY --> SERVC
+  REPLAY --> READ
+  REPLAY --> DEC
+  REPPO --> REPLAY
+  READ --> FACTS
+  SERVC --> DEC
+  VAULTW --> LEAF
+  VAULTW --> MONEY
+  SCAMP --> SDB
+  SROWS --> SDB
+  SCAMP --> DEC
+  SIGN --> DEC
+  DEC --> FACTS
+  FACTS --> ADDR
+  LEAF --> ADDR
+  VF --> VA
+  VA --> OZ
+  LEAF -.-|"same encoding"| VA
+```

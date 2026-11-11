@@ -118,6 +118,8 @@ const NOT_CHECKED_TEXT = new Map<string, string>([
   ['sharedDepositAddress', 'Shared exchange deposit address'],
   ['fundingBurst', 'Same-day funding burst'],
   ['claimPaidToOtherAddress', 'Claim paid to another address'],
+  ['sweptToSharedCollector', 'Sweeps to a shared collector wallet'],
+  ['passThroughFunding', 'Funding passed through in-between wallets'],
 ]);
 
 /** The plain line for something the check did not measure. A name the table does not know is shown as it is. */

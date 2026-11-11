@@ -11,6 +11,14 @@ No. Thuli reads on-chain behaviour and finds wallets that move together, such as
 
 A hold means a person reviews the wallet. It is not paid and not excluded, its reason names the facts and cites the transactions, and it gets no entry in the claim list. A held wallet can appeal with a signed message, one open appeal per wallet per campaign, but the public appeal route is not built yet.
 
+## Why was my new wallet held?
+
+Because Thuli found nothing to read. It reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder, and a fact that cannot be read means hold, under rule A1, so a person can look. A wallet that has some history but is young or quiet is not held for that. By default one that is under 30 days old or has sent fewer than 5 transactions gets a partial reward, under rule A8. A wallet used mostly on other chains looks new, because only Ethereum mainnet is read. The board shows the rule and the reason for every decision. More on [Live campaign](/docs/campaigns).
+
+## What if two of my wallets share a funder?
+
+Wallets that both asked and were first funded by the same ordinary wallet are linked. Linked wallets are held only above a line. By default a linked group of 5 or more asking wallets is held under rule A4, and a funder that first funded 10 or more asking wallets is held under rule A5. Two of your wallets are below both lines, so being linked alone does not hold them, and each is still judged on its own age and activity. The group counts every asking wallet connected through shared funders, so other people's wallets that share your funder count too. A funder that is an exchange, a bridge or a contract links nobody, because those pay strangers all day. A project can change the lines for its campaign.
+
 ## Can a project override a decision?
 
 Yes. The project owns its campaign and has the last word. A model's advice on an appeal never changes a decision; only the owner can settle it, from a signed-in session. Owner sign-in is not built yet, and a reversal does not yet change the claim list or the vault root.
@@ -26,6 +34,14 @@ Doubt means hold. A paid request always gets a decision: if SERV gives no answer
 ## Who holds the reward money?
 
 The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. The only vault so far is a proof vault on Base Sepolia with test USDC.
+
+## Can Thuli take the money in a vault?
+
+No. The key Thuli's worker uses can do one thing in a vault: post a list. It cannot withdraw, cancel a list, pause, extend the end, replace itself or the owner, or rescue a token. Those belong to the owner, the project that funds the vault. A claim pays only the wallet named in the list, whoever sends it, so the worker cannot redirect one. No wallet can receive more than the per-wallet cap fixed when the vault was made, and the total paid never passes the deposit. What a stolen or misused key can do is post a list that names the wrong wallets. That list waits out the vault's delay and the owner can cancel it. If nobody does, the vault pays it, at most the cap per wallet and never more than the deposit. The full list of who can do what is on [the vault page](/docs/vault).
+
+## Why does the payout take an hour or more?
+
+The vault waits a set time before it pays any new list, so the project that funds it has time to cancel a list that looks wrong. That wait is fixed when the vault is made. The contract's minimum is 1 hour and its maximum is 30 days, and Thuli cannot shorten it. A wallet approved while another list is already waiting goes on the next list, which is posted after the first list's delay ends, so the wait can be up to two delays. After the delay the worker submits one claim at a time, so a long list is paid over several minutes. The steps are on [Live campaign](/docs/campaigns).
 
 ## What does it cost?
 
@@ -45,7 +61,7 @@ It is public, and you can read it on [the rulebook page](/docs/rulebook). It is 
 
 ## What is not built yet?
 
-As of 11 November 2026: owner sign-in, campaigns, publishing, a job queue that runs, paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The store has tables for campaigns and the code has the signed message a wallet would sign to join one, but no route or worker uses them. The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
+As of 11 November 2026: owner sign-in, a general job queue (only campaign asks and claim submissions are queued), paid data lookups, a deployed worker host, public appeals and Base mainnet contracts. The campaign routes, the screening worker that posts each list to the vault and submits claims, and the campaign page are built, and the worker runs as a script on one machine. They are described on [Live campaign](/docs/campaigns). The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
 
 ## Is it audited?
 

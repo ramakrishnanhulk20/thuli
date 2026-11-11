@@ -12,6 +12,23 @@ You need nothing installed for these four.
 3. Read [the versions page](/versions). It shows the rulebook before and after the one change outside feedback led to, scored on the same stored answers.
 4. Attack the system at [/break](/break). It has ten rows, each a real attack: five against the proof vault on Base Sepolia, four against this site's own routes, and one against how a reason is shown. A vault attack is a simulated call, so it sends nothing and needs no wallet. Press "Run all 10 attacks", or run one row, and read the answer. The four rows against the site meet the same per-caller limits as any visitor, and a row that meets one shows 429 and counts as refused. Once the proof vault's campaign has ended, the vault refuses every claim for that reason, and the page says so beside the answer.
 
+## Try the campaign
+
+The [campaign page](/campaign) shows the campaign the site is set up with. If the site has none open, the page says "No campaign is open right now." When one is open you need a wallet you control and nothing else. Asking costs no gas, and the reward is test USDC on Base Sepolia, which has no value. What happens behind each step is on [Live campaign](/docs/campaigns).
+
+1. Open the campaign page and connect a wallet. Pick one you do not mind showing in public. The board lists a wallet's address, its decision and the reason.
+2. Press Sign and ask. The page first shows the four-line message your wallet will sign. Signing costs nothing and moves nothing.
+3. Watch the page. It shows that your wallet is being screened, then your decision with its rule, its reason, the transactions the reason cites and the things the screening did not measure. The same decision appears on the board for everyone to read.
+4. If you are approved you hold a slot. Your reward goes on the next list Thuli posts to the vault, and the page shows that list and the time it starts paying. The vault waits its delay, at least 1 hour, before it pays any list. After that the worker submits your claim and the page shows the reward as paid.
+
+What to expect:
+
+- A brand-new wallet with no history is held. Thuli reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder to read, and a fact that cannot be read means hold, under rule A1. The board shows the rule and the reason for the hold.
+- A wallet with some history that is young or quiet gets a partial reward, not a hold. By default that is under 30 days old or fewer than 5 transactions sent, under rule A8.
+- A wallet used only on other chains looks new, because only Ethereum mainnet is read.
+
+With the repository, `npm run rehearse:campaign` runs the whole path on a local copy of Base Sepolia. Six signed asks are screened through the real decision path with live SERV, the approved wallets take the campaign's three slots, the list goes to a vault made by the real factory, the copy's clock moves past the delay, and the worker submits each claim. It needs Foundry's `anvil`, and the Base Sepolia, SERV and Ethereum settings from `.env`. It loads no key from `.env`: the owner, the agent and the six asking wallets are fresh keys made for the run, and every transaction stays inside the local copy.
+
 ## With the repository
 
 You need Node 26 or newer.

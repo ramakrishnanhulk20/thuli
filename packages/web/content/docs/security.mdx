@@ -42,7 +42,7 @@ The API refuses to start if any setting named like a private key is present, and
 
 ### Reading or changing another project's campaign
 
-The rules say owners act only on their own campaigns, unpublished data stays unreachable, and a sign-in works once (C4, C5, C6). Campaigns, owner routes and sign-in are not built yet, so this goal has no running code to defend today. Two checks are built, and no route takes either yet. The appeal check ties a signature to the exact text, campaign, wallet and time (C8). The check on a signed ask to join a campaign ties a signature to the campaign, wallet and time. Both refuse a contract wallet and a wallet whose type could not be read (C9).
+The rules say owners act only on their own campaigns, unpublished data stays unreachable, and a sign-in works once (C4, C5, C6). Owner routes and sign-in are not built yet, and the one kind of campaign that runs today is public from its first ask, so this goal has no private data to defend today. Two checks are built. The campaign ask route uses the ask check; no route takes the appeal check yet. The appeal check ties a signature to the exact text, campaign, wallet and time (C8). The check on a signed ask to join a campaign ties a signature to the campaign, wallet and time. Both refuse a contract wallet and a wallet whose type could not be read (C9).
 
 ### Turning Thuli's pages against users, or framing a wallet
 

@@ -8,6 +8,7 @@ import styles from './site.module.css';
 
 export const NAV_LINKS = [
   { href: '/replay', label: 'Replay' },
+  { href: '/campaign', label: 'Campaign' },
   { href: '/check', label: 'Check a wallet' },
   { href: '/versions', label: 'Versions' },
   { href: '/break', label: 'Break it', footerLabel: 'Try to break it' },

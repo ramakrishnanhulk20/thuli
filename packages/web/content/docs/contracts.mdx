@@ -1,6 +1,6 @@
 ---
 title: Contracts and addresses
-description: The deployed factory and proof vault on Base Sepolia, the five proof transactions, and how to check them.
+description: The deployed factory and proof vault on Base Sepolia, the five proof transactions, how to check them, and the two commands that make a vault and register a campaign.
 ---
 
 Everything here is on Base Sepolia, Base's public test network, chain id `84532`. The vault pays test USDC, which has no value. Base mainnet is not deployed yet: there is no mainnet record, and the deploy script refuses every chain except Base Sepolia.
@@ -73,3 +73,77 @@ It reads Base Sepolia through the address in `BASE_SEPOLIA_RPC_URL` when that is
 - a fresh simulated claim for the refused wallet, with the paid wallet's proof, reverts with `InvalidProof`
 
 `record` needs the saved run file from the setup step. That file is private and not in the repository, so only the machine that ran the proof can repeat `record`, and it is not for strangers. Anyone else can run `verify` above, or check the same facts from the tables on the explorer.
+
+## Make a vault and register a campaign
+
+A project that runs a campaign uses two commands, one after the other. Both do nothing until told to: run on their own, they read the chain, print what they would do, and stop. Both work on Base Sepolia only, and each refuses a connection that reports any other chain. What a campaign does once it is registered is on [Live campaign](/docs/campaigns).
+
+### Make and fund the vault
+
+```bash
+npm run vault:create -- --agent ADDRESS --cap USDC --deposit USDC [--days N] [--delay-hours N] [--send]
+```
+
+It makes one vault through the factory above and puts the reward money in. Without `--send` it simulates the vault's creation, prints the plan and signs nothing. With `--send` the owner's test key sends exactly three transactions: `createVault`, an `approve` of exactly the deposit, and the `deposit`. Each is simulated first and each receipt is awaited.
+
+| Flag | Needed | What it sets |
+| --- | --- | --- |
+| `--agent ADDRESS` | yes | The key that will post lists, which is the worker's key. It must not be the owner. |
+| `--cap USDC` | yes | The most one wallet can ever receive, such as `1`. Above zero. |
+| `--deposit USDC` | yes | How much reward money goes in, such as `2.5`. Above zero. |
+| `--days N` | no, 120 | How long the vault runs, a whole number of days from 1 to 365. |
+| `--delay-hours N` | no, 1 | The wait before a posted list pays, a whole number of hours from 1 to 720 (30 days). |
+| `--send` | no | Sign and send. Left out, nothing is sent. |
+
+The owner's key goes in `PAYER_PRIVATE_KEY`, in `.env` or `.env.payer` at the repository root. Even the dry run needs it, because it simulates the call from the owner's address, but it signs nothing. The command reads `BASE_SEPOLIA_RPC_URL`, and uses the public `https://sepolia.base.org` when that is not set.
+
+It refuses, and sends nothing, when:
+
+- a flag is missing or outside the limits in the table;
+- the connection reports a chain other than Base Sepolia (84532);
+- there is no contract at the factory address in the deployment record;
+- the reward token is not Base Sepolia USDC with six decimals;
+- the agent is the owner, because the owner's cancel is the check on the agent;
+- the owner holds less USDC than `--deposit`;
+- `--days` is too short for the vault to run for at least the delay plus the one-hour minimum claim window;
+- with `--send`, the owner has no Base Sepolia ETH for gas.
+
+When it finishes it prints the vault's address and creation transaction, and the exact `campaign:create` command to run next. If the vault is created but the funding step fails, it says which vault was made and that it is not funded, so a second run does not make another.
+
+### Register the campaign
+
+```bash
+npm run campaign:create -- --id ID --name NAME --vault-tx HASH --reward USDC --slots N [--partial-share-bps N] [--opens ISO] [--closes ISO] [--settings JSON] [--write]
+```
+
+It registers a campaign for a vault that `vault:create` made, and no vault term is typed in by hand. It reads the creation transaction named by `--vault-tx` and the vault's own `state()` from Base Sepolia, checks that the two agree, and prints the campaign. It signs nothing and reads no private key. Without `--write` it stores nothing. With `--write` it stores the campaign in the database named by `DATABASE_URL`, a `postgres://` or `postgresql://` address. If the tables are missing it says to run `npm run db:migrate` first.
+
+| Flag | Needed | What it sets |
+| --- | --- | --- |
+| `--id ID` | yes | The campaign's id: 1 to 128 letters, digits, dots, dashes or underscores. It goes into the text a wallet signs. |
+| `--name NAME` | yes | Plain text, 1 to 80 characters. |
+| `--vault-tx HASH` | yes | The vault's creation transaction. |
+| `--reward USDC` | yes | The full reward for one wallet. Above zero, and not above the vault's per-wallet cap. |
+| `--slots N` | yes | How many wallets can be paid, from 1 to 100,000. |
+| `--partial-share-bps N` | no, 5000 | The partial reward as a share of the full one, in basis points, from 1 to 9,999. |
+| `--opens ISO`, `--closes ISO` | no | Times with a zone, such as `2026-11-12T09:00:00Z`. It opens now by default and closes at the latest allowed moment. |
+| `--settings JSON` | no | A JSON object that changes the screening numbers for this campaign, such as `minWalletAgeDays` (30 by default), `minTxCount` (5), `groupMinSize` (5) and `funderFanoutMin` (10). `allowPartial` set to false turns partial rewards into holds. |
+| `--write` | no | Store the campaign. Left out, nothing is written. |
+
+It refuses, and writes nothing, when:
+
+- a flag is missing or outside the limits in the table;
+- the transaction did not succeed, was not sent to the factory in the deployment record, or does not hold exactly one `VaultCreated` log from that factory;
+- the log holds terms the contract could never have allowed;
+- the vault's `state()` disagrees with its creation log on the token, owner, agent, cap or delay;
+- the vault's token is not Base Sepolia USDC;
+- `--reward` is above the vault's per-wallet cap;
+- the vault has already ended;
+- `--closes` is later than the vault's end minus its delay minus the one-hour minimum claim window, which is the latest moment a list posted then could still pay;
+- `--opens` is not before the close;
+- `--settings` is not a JSON object of known settings with valid values, or it names a partial share that differs from `--partial-share-bps`;
+- the same `--id` is already stored with different terms. Running the command again with exactly the same terms changes nothing.
+
+It warns, and does not refuse, when the reward times the slots is more than the vault still holds, because the vault refuses a list above its deposit. Deposit more before that many wallets are paid.
+
+The worker then serves the campaign. `npm run worker` handles every open campaign in the database with the key the vault names as its agent, so a new campaign needs no change there.

@@ -42,8 +42,8 @@ function routeExists(route: string): boolean {
 }
 
 describe('the sidebar order', () => {
-  it('lists fifteen pages and four group separators', () => {
-    expect(listed).toHaveLength(15);
+  it('lists seventeen pages and four group separators', () => {
+    expect(listed).toHaveLength(17);
     expect(meta.pages.filter((entry) => /^---.*---$/.test(entry))).toHaveLength(4);
   });
 

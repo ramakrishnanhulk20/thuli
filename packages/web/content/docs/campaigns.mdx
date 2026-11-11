@@ -1,0 +1,212 @@
+---
+title: Live campaign
+description: How an open reward campaign works, what happens to your wallet when you ask, why the money arrives later, and how to check each step yourself.
+---
+
+## What it is
+
+A live campaign is one reward campaign that anyone can enter. Any wallet may ask for a reward. The campaign has a fixed number of slots, from 1 to 100,000, and every slot is worth the same reward. Thuli screens each wallet that asks, puts the decision and its reason on a public board, and gives each approved wallet the next free slot. A vault contract holds the money and pays only the wallets on the list that Thuli's worker posts to it.
+
+Today a campaign runs on Base Sepolia, Base's public test network, and pays test USDC that has no value. The [campaign page](/campaign) shows the slots taken, the wallets that asked, every decision as it is made, and the lists posted to the vault.
+
+The project that runs a campaign sets the reward per wallet, the number of slots, and when asks open and close. A wallet approved for a partial reward gets half of the full reward unless the project sets another share. The default is 5,000 of 10,000 basis points, where a basis point is one hundredth of a percent. A campaign stops taking asks at least one vault delay plus one hour before the vault ends, so a list posted at the last moment can still be paid.
+
+## What happens when you ask
+
+Eight steps run from your signature to your payment. The same path is drawn as a sequence on [Architecture](/docs/architecture).
+
+### 1. You sign one message
+
+Connect a wallet you control and press Sign and ask. Your wallet shows this text for you to sign. The words in angle brackets stand for the real values:
+
+```text
+Thuli ask v1
+Campaign: <campaign id>
+Wallet: <your wallet address>
+Signed at: <unix seconds>
+```
+
+The campaign id is the name the campaign is known by. The address is yours, written with its usual mix of capital letters. The last line is the moment you signed, counted in seconds since 1 January 1970. Each of the four lines ends with a line break.
+
+Signing costs nothing and moves nothing. It is a plain text message, not a transaction, so there is no gas to pay and no money leaves your wallet. The first line marks the text as an ask, so Thuli can never read your signature as a sign-in or an appeal. The campaign id and your address sit inside the text, so a signature made for one campaign does not work in another.
+
+A signature stays valid for 10 minutes (600 seconds). One dated more than 60 seconds ahead of Thuli's clock is refused. A wallet that holds contract code on Ethereum or on the campaign's own chain, such as a multisig, cannot ask yet. An ordinary wallet that has delegated to a contract's code (EIP-7702) still counts as a wallet and can ask.
+
+Each wallet asks once. If you ask again, you get your first ask back unchanged. Each visitor, counted by network address, may send 20 requests a minute and 5 signed asks an hour.
+
+### 2. Your ask is queued
+
+Thuli checks the signature and answers within the same request, with the status 202 and `{"queued": true}`. Nothing is screened while you wait. The ask joins a queue, and the worker takes the oldest waiting ask first.
+
+### 3. The worker screens your wallet
+
+The worker reads three things from public chain data:
+
+- Your wallet's own history on Ethereum mainnet, up to the latest finalized block, a block the network will not undo. That gives its age in whole days since its first activity, how many transactions it has sent, and whether it is an ordinary wallet.
+- Your first funder, the address that first sent you value, and what kind of sender it is: a contract, a busy exchange or service wallet (one that has sent 10,000 transactions or more), or an ordinary wallet.
+- The other wallets that asked in this campaign, to see which of them share a funder with you.
+
+The history is read on Ethereum mainnet even though the reward is test money on Base Sepolia.
+
+The rulebook's fixed checks, A1 to A9, then run in code and set the most generous result your wallet could get, a ceiling. SERV, the reasoning service Thuli uses, writes the reason. The model may move the code's starting result only with rule B1 or B2, and never above the ceiling. One screening stops after 120 seconds or 12 calls to SERV, whichever comes first. The full rules are on [the rulebook](/docs/rulebook).
+
+### 4. The decision goes on the public board
+
+The decision, the rule behind it and the reason are posted on the board for everyone to read. A board row also holds the transactions the reason cites, the facts the decision rested on (wallet age, transactions sent, first funder and its kind, how many asking wallets that funder paid, and the size of the linked group), and the list of things the screening did not measure. It never holds your signature or your network address.
+
+### 5. An approved wallet takes the next free slot
+
+A wallet approved in full or for a partial reward takes the next free slot. Slots go in the order wallets are decided, not the order they asked. A held or excluded wallet never takes a slot. When every slot is taken, a wallet can still ask and be decided, but nothing is reserved for it.
+
+### 6. The list is posted to the vault
+
+The worker builds a list of every wallet that holds a slot. A full wallet's entry is the campaign's reward. A partial wallet's entry is the partial share of it, rounded down. The list is saved as a text file first, and the worker posts the list's root from that saved text. A root is one short fingerprint of the whole list, explained on [the vault page](/docs/vault). Because the root comes from the saved file, anyone who downloads the file can rebuild it.
+
+Before it posts, the worker checks that the vault was made by Thuli's factory with the terms it has on record, that its own key is the vault's agent, that the vault is not paused, and that the vault holds enough to pay every list that could still be owed. It posts nothing while another list is still waiting on the vault. A wallet approved during that wait goes on the next list, which the worker posts after the first list's delay ends, so the wait can be up to two delays.
+
+Every amount in a list is a running total across all lists, so a wallet that appears on two lists is paid once. The vault pays only the difference from what it has already paid that wallet.
+
+### 7. The vault waits out its delay
+
+The vault does not pay a new list at once. It waits a delay that is fixed when the vault is made. The contract allows no less than 1 hour and no more than 30 days. A vault made with the project's `vault:create` command waits 1 hour unless told otherwise.
+
+The wait exists for the owner, the project that funds the vault. During it the owner can cancel the waiting list, or replace the worker's key, which also drops the waiting list. If Thuli's key were stolen and used to post a list that pays the wrong wallets, the delay is the owner's time to notice and cancel. Thuli cannot shorten it.
+
+If the owner cancels a list, the worker records it as cancelled and does not post it again. A new list goes up once a different set of wallets holds slots.
+
+### 8. The worker submits your claim
+
+When the delay is over, the vault pays that list. The worker marks the list active, then submits one claim for each listed wallet the vault still owes, from its own key. The gas comes from the worker's key, not from your wallet. It runs each claim as a dry run first, and a wallet that has already been paid gets no claim. The vault pays only the wallet named in the list, whoever sends the claim.
+
+The worker sends one claim, pauses for about 5 seconds, then sends the next. A long list is therefore paid wallet by wallet over several minutes after the delay ends.
+
+### The timings in one place
+
+| What | Value |
+| --- | --- |
+| A signature is valid | 10 minutes (600 seconds), and not more than 60 seconds ahead of Thuli's clock |
+| Asks from one visitor | 20 requests a minute, 5 signed asks an hour |
+| One screening | Stops after 120 seconds or 12 calls to SERV |
+| Tries for one screening | 10, with waits of 10, 30, 90 and 270 seconds, then 600 seconds, about 57 minutes in all |
+| The vault's wait | From 1 hour to 30 days, fixed when the vault is made |
+| Tries for one claim | 10, with the same waits |
+| Pause between worker runs | About 5 seconds |
+
+## What each outcome means
+
+The reasons below use the same wording as the rest of the site. The default numbers are the rulebook's: a wallet is new or little used when it is under 30 days old or has sent fewer than 5 transactions, a linked group counts from 5 wallets, and a shared funder counts from 10 asking wallets. A project can change them for its campaign. The campaign routes do not publish those settings today, so if a project changed them you can read the facts and the decision, but not the changed line.
+
+### Approved in full
+
+You get a slot and the campaign's full reward. This comes from rule A9: "Nothing in the record points to a farm." Rule B2 can also lead here: "The model raised a held wallet because its shared links look like ordinary infrastructure."
+
+### Approved for a partial reward
+
+You get a slot and the partial share of the reward, half by default. This comes from rule A8: "A new or little-used wallet, or one funded in a same-day burst from an exchange. It gets a partial reward." A campaign cannot see funding bursts, so here it means a wallet under the age or transaction minimum. Rule B2, quoted above, can lead here too.
+
+### Held for review
+
+No slot is taken and no reward is reserved. A hold means a person reviews the wallet. It is not a verdict that you are a farmer. Appeals are not open yet. A hold can come from these rules:
+
+- A1: "A fact about this wallet could not be read, so it waits for a person."
+- A4: "The wallet belongs to a linked group of claim wallets."
+- A5: "One ordinary wallet funded this wallet and many other claim wallets."
+- B1: "The model held the wallet because a traced funding trail leads to a shared source."
+
+A screening that could not finish is also a hold under A1, described below under "If something goes wrong".
+
+### Excluded
+
+Rule A3: "This wallet's own transfers link it to a group of claim wallets that sweep to one collector." Seeing a sweep needs every asking wallet's outgoing transfers, which a campaign screening does not collect. So a campaign does not exclude a wallet today. The strongest call it makes is a hold.
+
+### Approved, but every slot was taken
+
+The decision is an approval, under A8 or A9, but the campaign had no free slot left when the wallet was decided. The board row shows no slot. The wallet is not on any list and nothing is reserved for it.
+
+### Rules a campaign does not reach
+
+Three more rules in the rulebook, A2, A6 and A7, do not come up in practice here. Contract wallets are refused when they ask, and a campaign does not measure shared deposit addresses or where a claim is paid. All the rules are on [the rulebook](/docs/rulebook).
+
+## What a campaign screening checks and what it does not
+
+### What it measures
+
+- Wallet age in whole days, from the earliest successful transfer that moved value into the wallet or that the wallet sent itself. Failed transfers, and transfers of zero value sent to the wallet by others, do not count, so a stranger cannot make a wallet look older.
+- How many transactions the wallet has sent.
+- Whether the wallet is an ordinary wallet or a contract.
+- The first funder, and what kind of sender it is.
+- How many asking wallets that first funder paid.
+- The linked group: how many asking wallets are connected through shared funders.
+
+Two asking wallets are linked when the same ordinary wallet first funded both. The link follows a chain, so if one asking wallet was first funded by another asking wallet, they are in the same group. An exchange, a bridge or a contract as the first funder links nobody, because those pay strangers all day.
+
+### What it does not measure
+
+Every decision carries this list, and the campaign page shows it under "Not checked". The code name of each item is in brackets.
+
+- Shared exchange deposit address (`sharedDepositAddress`). Spotting it needs the outgoing transfers of every asking wallet, and a campaign screening does not collect them.
+- Sweeps to a shared collector wallet (`sweptToSharedCollector`). It needs the same outgoing transfers.
+- Claim paid to another address (`claimPaidToOtherAddress`). When a wallet asks, no reward has been paid yet, so there is no claim that could have been redirected.
+- Same-day funding burst (`fundingBurst`). It needs the amounts and times of funding for every asking wallet, and a link between two asks carries no funding time.
+- Funding passed through in-between wallets (`passThroughFunding`). The first funder is the wallet's direct one. Funding that reached it through pass-through wallets, which the replay follows back to its source, is linked here by the last hop only.
+
+As on the other pages, a farm that funds each wallet from its own exchange withdrawal, waits, and never sweeps will pass. The full list of limits is on [Limits](/docs/limits).
+
+## Check it yourself
+
+Each route below is a read you can open in a browser. `:id` is the campaign's id. It is the second line of the message you sign, after "Campaign:", and it sits in the address of each list link on the campaign page.
+
+| Route | What it returns |
+| --- | --- |
+| `GET /api/campaigns/:id` | The campaign: `name`, `chain` (84532 for Base Sepolia), `vault`, `token`, `rewardPerWallet` and `perWalletCap` (in the token's smallest unit, so 1 USDC is `1000000`), `maxSlots`, `status` (`open` or `closed`), `opensAt`, `closesAt`, the `counts` (`asked`, `queued`, `decided`, `held`, `slotsTaken`, `slotsLeft`), and `lists`, one entry per list with its `version`, `root`, `status`, `claimableAt` and `postTx`. |
+| `GET /api/campaigns/:id/board` | The 50 newest decided asks, newest decision first. Each holds the decision, rule, reason, cited transactions, the facts, the not-checked list and the slot. Add `?before=` and an ISO time such as `2026-11-11T12:00:00.000Z` to read older ones. Use the last row's `decidedAt` and no ask is skipped. |
+| `GET /api/campaigns/:id/asks/:wallet` | One wallet's ask. Once the wallet is on a paying list, the answer also holds its claim ticket: `cumulativeAmount`, `proof`, `root`, and `claimed` and `claimable` when the vault can be read. |
+| `GET /api/campaigns/:id/lists/:version` | One posted list as a JSON array of `account` and `cumulativeAmount`, exactly as stored. |
+
+A list's `status` is `built`, `posted`, `active`, `superseded` or `cancelled`. Posted means it is waiting out the vault's delay, and active means the vault is paying it now. An unknown campaign id answers 404 with `{"error": "no such campaign"}`, and a database that cannot be reached answers 503 with `{"busy": true}`. Amounts are whole token units written as text, times are ISO 8601, and no answer holds a signature or a network address.
+
+### Rebuild a list's root
+
+Anyone can rebuild a list's root and compare it with the vault, so nobody has to take the worker's word for what it posted. The leaf formula is on [the vault page](/docs/vault). The steps:
+
+1. Download the list from `GET /api/campaigns/:id/lists/:version`.
+2. Make one leaf for each entry from the chain id (`84532`), the vault address, the account and the amount, as the vault page shows.
+3. Build the tree with OpenZeppelin's `StandardMerkleTree`, from the `@openzeppelin/merkle-tree` package, over the types `uint256`, `address`, `address` and `uint256`. It sorts the leaves itself, so the order in the file does not matter. Thuli's own version is `buildRoot` in `packages/worker/src/vault/root.ts`.
+4. Compare your root with the `root` of that list in `GET /api/campaigns/:id`, and with the vault. Its `state()` returns `activeRoot`, the list paying now, and `pendingRoot`, the list waiting out its delay.
+
+## If something goes wrong
+
+### The screening could not finish
+
+If your wallet's history cannot be read, SERV gives no answer, or the screening runs out of its 120 seconds, the worker puts your ask back in the queue and tries again later. While it does, your ask shows as waiting. It gets 10 tries in all. The worker waits 10, 30, 90 and 270 seconds after the first four, then 600 seconds each time, so an outage of up to about 57 minutes is waited out before any wallet is held on it.
+
+If all ten tries fail, the ask ends as failed. The board shows it as a hold under rule A1 with the reason "Held for review: the screening could not finish." It has no facts attached and takes no slot. Doubt means hold.
+
+### Your ask was refused
+
+The answer names the cause in fixed words. There are seven:
+
+- the wallet is not a valid address
+- the signing time is not a whole number of seconds
+- the signature is too old
+- the signature is dated in the future
+- contract wallets cannot ask yet
+- the wallet type could not be checked
+- the signature does not match this ask
+
+If the signature is too old, sign again. A closed campaign answers `{"closed": true}`, and too many asks from one visitor answers `{"busy": true}`.
+
+### The claim was not submitted for you
+
+The worker tries each claim up to 10 times, with the same growing waits, which covers about an hour of trouble on the chain or the connection. If every try fails, it stops trying for that list. Your reward stays in the vault and is still yours. You can claim it yourself:
+
+1. Open `GET /api/campaigns/:id/asks/:wallet`. Once your wallet is on a paying list, the answer holds a `ticket` with `cumulativeAmount`, `proof` and `root`.
+2. Call `claim` on the campaign's vault with those values:
+
+```text
+claim(address account, uint256 cumulativeAmount, bytes32[] calldata proof)
+```
+
+`account` is your wallet. `cumulativeAmount` and `proof` come from the ticket. Anyone can send this call and the sender pays the gas, but the vault pays only `account`. To see what a claim would pay first, read `claimable(address account, uint256 cumulativeAmount)` on the vault. The ticket's `claimed` and `claimable` fields show the same numbers.
+
+A call that reverts with `NothingToClaim` means the vault has already paid you everything the list owes. `CampaignEnded` means the vault's end time has passed.

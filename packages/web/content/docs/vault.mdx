@@ -3,7 +3,7 @@ title: The reward vault
 description: How one campaign's reward money is held on Base and who can do what.
 ---
 
-Each campaign gets its own vault contract from a factory. The project running it is the owner: it funds the vault, can cancel a waiting list, can pause, and takes back what is left after the end. Thuli's worker key is the agent, and all it can do is post a list. Anyone can submit a claim, and the money goes only to the wallet named in the list.
+Each campaign gets its own vault contract from a factory. The project running it is the owner: it funds the vault, can cancel a waiting list, can pause, and takes back what is left after the end. Thuli's worker key is the agent, and the only thing the vault lets the agent do is post a list. The worker builds each list from the wallets that hold a slot, saves its text, and posts the root from that saved text, so the file anyone can download rebuilds to the root on chain. After the vault's delay, the worker submits each listed wallet's claim from the same key and pays the gas. That is allowed because anyone can submit a claim, and the money goes only to the wallet named in the list. If the owner cancels a waiting list, the worker marks it cancelled and posts nothing new until a different set of wallets holds slots. How this runs for a live campaign is on [Live campaign](/docs/campaigns).
 
 ## How the money is protected
 
