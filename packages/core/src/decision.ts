@@ -11,6 +11,12 @@ import { FIXED_RULES, type Start } from './start.ts';
 
 export const DECISION_RULES = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9', 'B1', 'B2'] as const;
 
+/** The rulebook versions the output checks know. Version 2 added C47: a shared funder alone cannot hold a wallet. */
+export const RULEBOOK_VERSIONS = [1, 2] as const;
+export type RulebookVersion = 1 | 2;
+/** The version every live screening runs. Only the version scorecard asks for another, on replies already stored. */
+export const CURRENT_RULEBOOK: RulebookVersion = 2;
+
 export const RawDecision = z.strictObject({
   action: OutcomeSchema,
   shareBps: z.int(),
@@ -32,6 +38,8 @@ export interface DecisionContext {
   toolTxs: string[];
   /** Paid lookups the worker actually made in this run; when given, the model's own count must match it. */
   paidHopsMade?: number;
+  /** Whose checks run. Left out, it is CURRENT_RULEBOOK, and no live path sets it (C47). */
+  rulebook?: RulebookVersion;
 }
 
 export const MAX_REASON_CHARS = 280;
@@ -41,6 +49,9 @@ export const BURST_KEPT_CAUSE = 'a funding burst keeps this wallet at partial';
 
 /** The cause on a hold or exclude the code replaced because a shared funder was all there was. The scorecard counts these on their own. */
 export const FUNDER_KEPT_CAUSE = 'a shared funder alone cannot hold this wallet';
+
+/** Rulebook 1's cause on a hold or exclude the code replaced when an exchange funder was all there was. */
+export const EXCHANGE_KEPT_CAUSE = 'an exchange funder alone cannot hold this wallet';
 
 const NOT_FETCHED_CAUSE = 'the reason cited a transaction Thuli did not fetch for this wallet';
 
@@ -54,7 +65,7 @@ export const FORBIDDEN_IN_REASON: readonly string[] = ['http', 'www.', '<', '>',
 export const NON_PLAIN_CHARACTERS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\p{Cf}]/u;
 
 /** The only share that matches each action, in basis points. */
-export function shareFor(action: Outcome, settings: Settings): number {
+export function shareFor(action: Outcome, settings: Pick<Settings, 'partialShareBps'>): number {
   if (action === 'full') return 10000;
   if (action === 'partial') return settings.partialShareBps;
   return 0;
@@ -148,6 +159,29 @@ function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDec
   };
 }
 
+// Rulebook 1, as f523125 left it. A wallet with links of its own has evidence beyond the shared exchange, so the hold stands.
+function onlyExchangeEvidence(facts: Facts): boolean {
+  return facts.firstFunder?.kind === 'exchange' && facts.group?.linkedByWallet !== true && facts.sharedDepositAddress === null;
+}
+
+/** Rulebook 1's start for a hold or exclude on a wallet whose only evidence is a shared exchange, worded as it was then. */
+function keepExchangeStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDecision; accepted: false; cause: string } {
+  const action = ctx.start.outcome;
+  return {
+    decision: {
+      action,
+      shareBps: shareFor(action, ctx.settings),
+      rule: ctx.start.rule,
+      reason: "The first funder is an exchange, and sharing an exchange is weak evidence on its own, so the code's start stands.",
+      citedTxs: [],
+      paidHops: ctx.paidHopsMade ?? 0,
+      clampedFrom: replied,
+    },
+    accepted: false,
+    cause: EXCHANGE_KEPT_CAUSE,
+  };
+}
+
 /**
  * Checks a model's decision like untrusted input, then applies the code ceiling.
  *
@@ -158,17 +192,22 @@ function keepStart(ctx: DecisionContext, replied: Outcome): { decision: FinalDec
  * reason itself: every hex run of 16 or more characters in it must be a full transaction hash Thuli fetched for this
  * wallet, so an address or a shortened or made-up hash in the text holds the wallet. After the output checks, a
  * hold or exclude on a wallet with no traced trail, no link of its own and no shared deposit is replaced by a start the
- * ceiling allows (C12). An exclude without the A3 self-linked group evidence becomes a hold (C15). The rule must fit the
- * code's start: a fixed rule must repeat it exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise
- * an A4 to A6 hold.
+ * ceiling allows (C12, C47). Rulebook 1, which only the version scorecard asks for, replaces it only when that wallet's
+ * first funder is an exchange, as the checks did before C47; every other check is the same in both versions. An exclude
+ * without the A3 self-linked group evidence becomes a hold (C15). The rule must fit the code's start: a fixed rule must
+ * repeat it exactly, B1 may only hold a wallet heading to a reward, and B2 may only raise an A4 to A6 hold.
  * Otherwise the final action is the less generous of the model's action and the ceiling; when that lowers it, clampedFrom
  * records the model's action and the share is recomputed (C12). The cause texts are fixed strings, so no model text is
  * ever copied into a fallback reason.
+ *
+ * @throws RangeError when ctx.rulebook is not one of RULEBOOK_VERSIONS, before the reply is read.
  */
 export function validateDecision(
   raw: unknown,
   ctx: DecisionContext,
 ): { decision: FinalDecision; accepted: boolean; cause?: string } {
+  const rulebook = ctx.rulebook ?? CURRENT_RULEBOOK;
+  if (!(RULEBOOK_VERSIONS as readonly number[]).includes(rulebook)) throw new RangeError('the rulebook must be 1 or 2');
   const parsed = parseRawDecision(raw);
   if (!parsed.ok) return holdForReview(parsed.cause);
   const reply = parsed.decision;
@@ -207,14 +246,12 @@ export function validateDecision(
   if (ctx.paidHopsMade !== undefined && reply.paidHops !== ctx.paidHopsMade) {
     return holdForReview('the model reported a different number of paid lookups than were made');
   }
-  if (
+  const holdsAReward =
     (ctx.start.outcome === 'full' || ctx.start.outcome === 'partial') &&
     leastGenerous(ctx.start.outcome, ctx.ceiling) === ctx.start.outcome &&
-    onlyFunderEvidence(ctx.facts, ctx.paidHopsMade) &&
-    (reply.action === 'hold' || reply.action === 'exclude')
-  ) {
-    return keepStart(ctx, reply.action);
-  }
+    (reply.action === 'hold' || reply.action === 'exclude');
+  if (holdsAReward && rulebook === 2 && onlyFunderEvidence(ctx.facts, ctx.paidHopsMade)) return keepStart(ctx, reply.action);
+  if (holdsAReward && rulebook === 1 && onlyExchangeEvidence(ctx.facts)) return keepExchangeStart(ctx, reply.action);
   if (reply.action === 'partial' && !ctx.settings.allowPartial) {
     return holdForReview('the model chose partial but this campaign has partial rewards switched off');
   }

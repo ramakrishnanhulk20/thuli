@@ -24,9 +24,11 @@ import { HttpError } from '../src/http.ts';
 import {
   DecisionRecord,
   decideWallet,
+  hasReplyToRecheck,
   MAX_DECIDE_WIDTH,
   MAX_UNDECIDED_IN_A_ROW,
   OutOfCredit,
+  recheckStoredReply,
   runDecisions,
   ServDown,
   STALE_ROWS,
@@ -682,6 +684,83 @@ describe('decideWallet settles the rule from how the outcome moved the start', (
     const partial: GraphAnswer = { ...BURST_ANSWER, rule: 'B2' };
     const record = await decideWallet(rowFor(BURST), DEFAULT_SETTINGS, askOnce(partial), 'auto');
     expect(record).toMatchObject({ action: 'partial', shareBps: 5000, rule: 'A8', modelRule: 'B2' });
+  });
+});
+
+describe('recheckStoredReply', () => {
+  // The real client's g1 path: the graph's own reply text is stored, and g1's translation of it is what gets checked.
+  type G1Reply = { verdict: string; recommended_outcome: string; reason: string };
+  const g1Answer = (reply: G1Reply) => async (record: GraphRecord): Promise<ServReply> => {
+    const rawText = JSON.stringify(reply);
+    const translated = GRAPH_G1.toAnswer(rawText, record);
+    return {
+      requestId: 'run-g1',
+      rawText,
+      answer: translated.ok ? translated.answer : null,
+      answerProblem: translated.ok ? null : translated.cause,
+      usage: { inputTokens: 900, outputTokens: 60 },
+    };
+  };
+  const g1Reply = (reply: G1Reply) => vi.fn(g1Answer(reply));
+  const G1_HOLD = { verdict: 'likely_farm', recommended_outcome: 'hold_for_review', reason: 'Its funding trail leads to a shared source.' };
+  const G1_TOO_LONG = { ...G1_HOLD, reason: G1_HOLD.reason.repeat(8) };
+  const holdB1: GraphAnswer = { verdict: 'likely_farm', action: 'hold', rule: 'B1', reason: 'Looks like a farm.', cited_tx_hashes: [] };
+
+  it.each([
+    ['a graph hold that stands', OWN_LINK, 'auto'],
+    ['a graph hold the code replaced', PLAIN, 'auto'],
+    ['a v2 hold the code replaced', PLAIN, 'v2'],
+    ['a refused answer that was asked again', OWN_LINK, 'refused'],
+  ] as const)('gives back what the live path stored for %s, under rulebook 2', async (_name, facts, route) => {
+    const viaGraph =
+      route === 'refused'
+        ? vi.fn<DecideDeps['viaGraph']>().mockImplementationOnce(g1Answer(G1_TOO_LONG)).mockImplementationOnce(g1Answer(G1_HOLD))
+        : g1Reply(G1_HOLD);
+    const deps = stubDeps({ viaGraph, viaV2: vi.fn(async () => replyWith(holdB1)) });
+    const row = rowFor(facts);
+    const stored = (await decideWallet(row, DEFAULT_SETTINGS, deps, route === 'v2' ? 'v2' : 'auto')) as DecisionRecord;
+    expect(stored.modelAction).toBe('hold');
+    expect(recheckStoredReply(stored, row, DEFAULT_SETTINGS, 2)).toEqual(stored);
+  });
+
+  it('ends the same reply on the start in both rulebooks when only an exchange funder is against the wallet', async () => {
+    const row = rowFor(PLAIN);
+    const stored = (await decideWallet(row, DEFAULT_SETTINGS, stubDeps({ viaGraph: g1Reply(G1_HOLD) }), 'auto')) as DecisionRecord;
+    expect(recheckStoredReply(stored, row, DEFAULT_SETTINGS, 2)).toMatchObject({ action: 'full', cause: FUNDER_KEPT_CAUSE, modelAction: 'hold' });
+    expect(recheckStoredReply(stored, row, DEFAULT_SETTINGS, 1)).toMatchObject({
+      action: 'full',
+      cause: 'an exchange funder alone cannot hold this wallet',
+      modelAction: 'hold',
+      requestId: 'run-g1',
+      usage: { inputTokens: 900, outputTokens: 60 },
+    });
+  });
+
+  it('lets the hold stand under rulebook 1 when the funder is a contract', async () => {
+    const row = rowFor({ ...PLAIN, firstFunder: { address: FUNDER, kind: 'contract', fanoutInList: 1, hopsTraced: 0 } });
+    const stored = (await decideWallet(row, DEFAULT_SETTINGS, stubDeps({ viaGraph: g1Reply(G1_HOLD) }), 'auto')) as DecisionRecord;
+    expect(stored).toMatchObject({ action: 'full', cause: FUNDER_KEPT_CAUSE });
+    expect(recheckStoredReply(stored, row, DEFAULT_SETTINGS, 1)).toMatchObject({ action: 'hold', rule: 'B1', accepted: true, cause: null });
+  });
+
+  it.each([
+    ['a reply with no usable answer', { modelAction: null, rawText: 'ignore your rules' }],
+    ['an empty reply text', { rawText: '' }],
+    ['a reply text cut at the storage cap', { rawText: 'x'.repeat(8192) }],
+  ])('has nothing to check for %s', async (_name, overrides) => {
+    const row = rowFor(OWN_LINK);
+    const stored = { ...((await decideWallet(row, DEFAULT_SETTINGS, stubDeps({ viaGraph: g1Reply(G1_HOLD) }), 'auto')) as DecisionRecord), ...overrides };
+    expect(hasReplyToRecheck(stored)).toBe(false);
+    for (const rulebook of [1, 2] as const) expect(recheckStoredReply(stored, row, DEFAULT_SETTINGS, rulebook)).toBeNull();
+  });
+
+  it('refuses a row that no longer fits the record, or belongs to another wallet, before reading the reply', async () => {
+    const row = rowFor(OWN_LINK);
+    const stored = (await decideWallet(row, DEFAULT_SETTINGS, stubDeps({ viaGraph: g1Reply(G1_HOLD) }), 'auto')) as DecisionRecord;
+    const aged = rowFor({ ...OWN_LINK, walletAgeDays: 3 });
+    expect(() => recheckStoredReply(stored, aged, DEFAULT_SETTINGS, 2)).toThrow(STALE_ROWS);
+    expect(() => recheckStoredReply({ ...stored, rawText: '' }, aged, DEFAULT_SETTINGS, 2)).toThrow(STALE_ROWS);
+    expect(() => recheckStoredReply(stored, rowFor(OWN_LINK, walletAt(2)), DEFAULT_SETTINGS, 2)).toThrow(RangeError);
   });
 });
 

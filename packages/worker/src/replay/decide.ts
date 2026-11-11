@@ -6,6 +6,7 @@ import {
   DECISION_RULES,
   decisionFromGraphAnswer,
   FUNDER_KEPT_CAUSE,
+  GRAPH_G1,
   GraphVersionError,
   holdForReview,
   OutcomeSchema,
@@ -17,6 +18,7 @@ import {
   type DecisionContext,
   type GraphRecord,
   type ReplayRow,
+  type RulebookVersion,
   type Settings,
 } from '@thuli/core';
 import type { JsonlCache } from '../chain/jsonlCache.ts';
@@ -173,6 +175,29 @@ function addUsage(first: ServReply['usage'], second: ServReply['usage']): ServRe
   return { inputTokens: first.inputTokens + second.inputTokens, outputTokens: first.outputTokens + second.outputTokens };
 }
 
+/** How a reply was asked for. A recheck of a stored reply keeps all of this as it was stored. */
+type Asked = Pick<
+  DecisionRecord,
+  'wallet' | 'mode' | 'fallback' | 'start' | 'ceiling' | 'requestId' | 'rawText' | 'usage' | 'secondAsk' | 'firstCause'
+>;
+
+function toRecord(asked: Asked, { answer, result }: Pick<Checked, 'answer' | 'result'>): DecisionRecord {
+  return DecisionRecord.parse({
+    ...asked,
+    verdict: answer.ok ? answer.verdict : null,
+    modelAction: answer.ok ? answer.decision.action : null,
+    modelRule: answer.ok ? answer.decision.rule : null,
+    action: result.decision.action,
+    shareBps: result.decision.shareBps,
+    rule: result.decision.rule,
+    reason: result.decision.reason,
+    citedTxs: result.decision.citedTxs,
+    clampedFrom: result.decision.clampedFrom ?? null,
+    accepted: result.accepted,
+    cause: result.cause ?? null,
+  });
+}
+
 /**
  * Sends one wallet through SERV and checks the answer with the code's rules. A burst wallet goes to v2 because graph g1
  * has no field for a burst; a graph call that fails after its retries also goes to v2, marked as a fallback.
@@ -214,29 +239,69 @@ export async function decideWallet(
   const { answer, result, served: kept } = secondServed === null ? first : checkAnswer(secondServed, context, record);
   const { reply } = kept;
 
-  return DecisionRecord.parse({
-    wallet: row.wallet,
-    mode: kept.mode,
-    fallback: kept.fallback,
-    start,
-    ceiling,
-    requestId: reply.requestId,
-    rawText: reply.rawText.slice(0, MAX_STORED_TEXT_CHARS),
-    usage: addUsage(served.reply.usage, secondServed?.reply.usage ?? null),
-    verdict: answer.ok ? answer.verdict : null,
-    modelAction: answer.ok ? answer.decision.action : null,
-    modelRule: answer.ok ? answer.decision.rule : null,
-    action: result.decision.action,
-    shareBps: result.decision.shareBps,
-    rule: result.decision.rule,
-    reason: result.decision.reason,
-    citedTxs: result.decision.citedTxs,
-    clampedFrom: result.decision.clampedFrom ?? null,
-    accepted: result.accepted,
-    cause: result.cause ?? null,
-    secondAsk: askAgain,
-    firstCause: askAgain ? (first.result.cause ?? null) : null,
-  });
+  return toRecord(
+    {
+      wallet: row.wallet,
+      mode: kept.mode,
+      fallback: kept.fallback,
+      start,
+      ceiling,
+      requestId: reply.requestId,
+      rawText: reply.rawText.slice(0, MAX_STORED_TEXT_CHARS),
+      usage: addUsage(served.reply.usage, secondServed?.reply.usage ?? null),
+      secondAsk: askAgain,
+      firstCause: askAgain ? (first.result.cause ?? null) : null,
+    },
+    { answer, result },
+  );
+}
+
+/**
+ * True when a stored record holds a model reply that can be checked again: the reply gave a usable answer when it was
+ * asked, and its text is neither empty (no route served the wallet) nor at the storage cut, where it may be cut short.
+ */
+export function hasReplyToRecheck(record: DecisionRecord): boolean {
+  return record.modelAction !== null && record.rawText !== '' && record.rawText.length < MAX_STORED_TEXT_CHARS;
+}
+
+/**
+ * Checks a stored record's own model reply again, on today's row and under the given rulebook, with no call. The reply
+ * takes the parse and checks a live answer takes on the record's route: graph g1's translation for v3, the only graph
+ * Thuli has one for, and the reply text itself for v2. How it was asked for (route, fallback, request id, usage and the
+ * second-ask marks) stays as stored. The result is bound by the same checks and ceiling as a live answer (C12, C13).
+ *
+ * Returns null when there is no reply to check (hasReplyToRecheck), and the caller keeps that record, which holds (C11).
+ *
+ * @throws RangeError when the row is another wallet's.
+ * @throws Error STALE_ROWS when the record's start or ceiling no longer match the row's facts, whatever the record holds.
+ */
+export function recheckStoredReply(
+  record: DecisionRecord,
+  row: ReplayRow,
+  settings: Settings,
+  rulebook: RulebookVersion,
+): DecisionRecord | null {
+  if (row.wallet !== record.wallet) throw new RangeError('the row is for a different wallet from the record');
+  const start = computeStart(row.facts, settings);
+  const { ceiling } = computeCeiling(row.facts, settings);
+  if (start.outcome !== record.start.outcome || start.rule !== record.start.rule || ceiling !== record.ceiling) {
+    throw new Error(STALE_ROWS);
+  }
+  if (!hasReplyToRecheck(record)) return null;
+
+  const graphRecord = toGraphRecord(row.facts, start);
+  const translated = record.mode === 'v3' ? GRAPH_G1.toAnswer(record.rawText, graphRecord) : null;
+  const reply: ServReply = {
+    requestId: record.requestId,
+    rawText: record.rawText,
+    answer: translated === null ? record.rawText : translated.ok ? translated.answer : null,
+    answerProblem: translated === null || translated.ok ? null : translated.cause,
+    usage: record.usage,
+  };
+  const context: DecisionContext = { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0, rulebook };
+  const checked = checkAnswer({ reply, mode: record.mode, fallback: record.fallback }, context, graphRecord);
+  const { wallet, mode, fallback, requestId, rawText, usage, secondAsk, firstCause } = record;
+  return toRecord({ wallet, mode, fallback, start, ceiling, requestId, rawText, usage, secondAsk, firstCause }, checked);
 }
 
 function timeLeft(ms: number): string {

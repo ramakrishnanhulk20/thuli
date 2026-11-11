@@ -1,12 +1,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import { AppealRecord, DEFAULT_SETTINGS, Facts, OutcomeSchema, Start, type ReplayRow } from '@thuli/core';
+import { AppealRecord, DEFAULT_SETTINGS, Facts, OutcomeSchema, Start } from '@thuli/core';
 import { AnswerKeyError, loadFarmKey } from '../src/replay/answerKeys.ts';
 import { KEYS_DIR, refuseNetwork, REPO_ROOT, UsageError, writeAtomically } from '../src/replay/cliSupport.ts';
 import { DecisionRecord, STALE_ROWS } from '../src/replay/decide.ts';
 import { STALE_DECISION } from '../src/replay/decisionScore.ts';
-import { asRulebookV2, compareVersions, versionsToMarkdown, type VersionRecords } from '../src/replay/versions.ts';
+import {
+  compareVersions,
+  JUDGED_SOURCES,
+  judgedActions,
+  judgedKey,
+  versionColumns,
+  versionsToMarkdown,
+  type VersionRecords,
+} from '../src/replay/versions.ts';
 import { FeedbackEntry } from '../src/reppo/feedback.ts';
 
 // The largest replay file is about 40 MB; a file far past this is not our replay output (C41).
@@ -21,6 +29,13 @@ const RowLine = z.strictObject({
   start: Start,
   ceiling: OutcomeSchema,
   facts: Facts,
+});
+
+const JudgedLine = z.strictObject({
+  key: z.string().regex(/^0x[0-9a-f]{40}$/),
+  source: z.enum(JUDGED_SOURCES),
+  record: DecisionRecord,
+  row: RowLine,
 });
 
 // Read by hand, not through JsonlCache: its constructor can repair a file in place, and stored runs are read only. A bad
@@ -49,14 +64,6 @@ function readKeyed<T>(file: string, schema: z.ZodType<T>): T[] {
   return [...new Map(lines.map((line) => [line.key, line.value])).values()];
 }
 
-function replayed(records: DecisionRecord[], rows: Map<string, ReplayRow>): DecisionRecord[] {
-  return records.map((record) => {
-    const row = rows.get(record.wallet);
-    if (row === undefined) throw new UsageError('a stored decision has no replay row, rerun the replay');
-    return asRulebookV2(record, row, DEFAULT_SETTINGS);
-  });
-}
-
 function saveDecisions(file: string, records: DecisionRecord[]): void {
   writeAtomically(file, records.map((record) => `${JSON.stringify({ key: record.wallet, value: record })}\n`).join(''));
 }
@@ -69,25 +76,35 @@ function main(): void {
   const roboByWallet = new Map(roboRows.map((row) => [row.wallet, row]));
   const hopByWallet = new Map(hopRows.map((row) => [row.wallet, row]));
 
-  const v1: VersionRecords = {
+  const sampleFile = path.join(HOP_DIR, 'decisions-sample.jsonl');
+  const eliminatedFile = path.join(HOP_DIR, 'decisions-eliminated.jsonl');
+  const stored: VersionRecords = {
     robo: readKeyed(path.join(ROBO_DIR, 'decisions.jsonl'), DecisionRecord),
-    hopSample: readKeyed(path.join(HOP_DIR, 'decisions-sample.jsonl'), DecisionRecord),
-    hopEliminated: readKeyed(path.join(HOP_DIR, 'decisions-eliminated.jsonl'), DecisionRecord),
+    hopSample: readKeyed(sampleFile, DecisionRecord),
+    hopEliminated: readKeyed(eliminatedFile, DecisionRecord),
   };
-  const v2: VersionRecords = {
-    robo: replayed(v1.robo, roboByWallet),
-    hopSample: replayed(v1.hopSample, hopByWallet),
-    hopEliminated: replayed(v1.hopEliminated, hopByWallet),
-  };
+  const { v1, v2, noReply } = versionColumns(stored, { robo: roboByWallet, hop: hopByWallet }, DEFAULT_SETTINGS);
+
+  const entries = readKeyed(path.join(FEEDBACK_DIR, 'reppo.jsonl'), FeedbackEntry);
+  const judged = readStored(path.join(FEEDBACK_DIR, 'judged.jsonl'), JudgedLine);
+  // A judged reply missing from the file would quietly drop out of the feedback number, so every entry must have one.
+  const judgedKeys = new Set(judged.map((line) => judgedKey(line.source === 'robo' ? 'robo' : 'hop', line.key)));
+  if (entries.some((entry) => !judgedKeys.has(judgedKey(entry.set, entry.wallet)))) {
+    throw new UsageError('data/feedback/judged.jsonl has no line for a wallet Reppo judged');
+  }
 
   const comparison = compareVersions(v1, v2, {
     roboRows,
     key: loadFarmKey(path.join(KEYS_DIR, 'robo-farm-claim-wallets-reconstructed.csv')),
-    entries: readKeyed(path.join(FEEDBACK_DIR, 'reppo.jsonl'), FeedbackEntry),
+    entries,
     appeals: readKeyed(path.join(FEEDBACK_DIR, 'appeals.jsonl'), AppealRecord),
     listed: [...roboByWallet.keys(), ...hopByWallet.keys()],
+    judged: { v1: judgedActions(judged, DEFAULT_SETTINGS, 1), v2: judgedActions(judged, DEFAULT_SETTINGS, 2) },
+    noReply,
   });
-  const report = versionsToMarkdown(comparison, { runDate: new Date().toISOString().slice(0, 10) });
+  // decide:hop rewrites both sample files when it finishes, so the later of the two is the day the answers were asked.
+  const hopAskedOn = new Date(Math.max(fs.statSync(sampleFile).mtimeMs, fs.statSync(eliminatedFile).mtimeMs)).toISOString().slice(0, 10);
+  const report = versionsToMarkdown(comparison, { runDate: new Date().toISOString().slice(0, 10), hopAskedOn });
 
   saveDecisions(path.join(ROBO_DIR, 'decisions-v2.jsonl'), v2.robo);
   saveDecisions(path.join(HOP_DIR, 'decisions-sample-v2.jsonl'), v2.hopSample);

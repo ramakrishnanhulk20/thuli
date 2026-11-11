@@ -1,21 +1,18 @@
 import {
-  computeCeiling,
-  computeStart,
   count,
   leastGenerous,
   percent,
   ratio,
-  shareFor,
-  validateDecision,
   type AppealRecord,
   type FarmKeyEntry,
   type Outcome,
   type ReplayRow,
   type ReppoVerdict,
+  type RulebookVersion,
   type Settings,
 } from '@thuli/core';
 import type { FeedbackEntry } from '../reppo/feedback.ts';
-import { STALE_ROWS, type DecisionRecord } from './decide.ts';
+import { hasReplyToRecheck, recheckStoredReply, STALE_ROWS, type DecisionRecord } from './decide.ts';
 import { scoreDecisions } from './decisionScore.ts';
 import { wilson } from './hopScore.ts';
 
@@ -39,14 +36,29 @@ export interface VersionFeedback {
   entries: FeedbackEntry[];
   /** Claimant appeals, latest state only (see splitAppeals). Only status 'reversed' is marked. */
   appeals: AppealRecord[];
-  /** This version's decisions on Hop's eliminated sample. Some blocked entries came from it, and it is no part of the false-hold rate. */
+  /** This version's decisions on Hop's eliminated sample. An appeal may name one, and it is no part of the false-hold rate. */
   hopEliminated: DecisionRecord[];
+  /** This version's action on each reply Reppo judged, keyed by judgedKey. Blocked entries are marked from this alone. */
+  judged: Map<string, Outcome>;
 }
 
 export interface VersionRecords {
   robo: DecisionRecord[];
   hopSample: DecisionRecord[];
   hopEliminated: DecisionRecord[];
+}
+
+/** How many records in each set had no model reply to check again, so both columns keep them as stored. */
+export type NoReplyCounts = Record<keyof VersionRecords, number>;
+
+export const JUDGED_SOURCES = ['hop-sample', 'hop-eliminated', 'robo'] as const;
+
+/** One line of data/feedback/judged.jsonl: the exact record Reppo judged and the row it was decided on. */
+export interface JudgedReply {
+  key: string;
+  source: (typeof JUDGED_SOURCES)[number];
+  record: DecisionRecord;
+  row: ReplayRow;
 }
 
 /** One Reppo verdict in the feedback set. No wallet, because this goes into a report and the wallet would link it to a verdict. */
@@ -56,7 +68,9 @@ export interface VerdictLine {
   score: number | null;
   route: ReppoVerdict['route'] | null;
   confidence: ReppoVerdict['confidence'] | null;
-  /** Null when v2 has no decision for this wallet. */
+  /** Null when there is no judged reply for this wallet. */
+  v1Action: Outcome | null;
+  /** Null when there is no judged reply for this wallet. */
   v2Action: Outcome | null;
 }
 
@@ -77,6 +91,7 @@ export interface VersionComparison {
   routes: { ship: number; review: number; block: number; unread: number };
   appeals: AppealLine[];
   testWalletAppeals: number;
+  noReply: NoReplyCounts;
 }
 
 // Both sides of every address comparison go through this one function (C.2 standard 2).
@@ -101,44 +116,69 @@ function blockedEntries(entries: FeedbackEntry[]): FeedbackEntry[] {
 }
 
 /**
- * Replays one stored answer through today's real validateDecision, so a rulebook version can be scored without calling a
- * model. Pure: no network, no clock. The result stays bound by the same checks and ceiling as a live run (C12, C13).
+ * One stored record under one rulebook version: its own stored model reply checked again on today's row with that
+ * version's checks (recheckStoredReply), so both versions are scored on the same reply and no model is called. Pure: no
+ * network, no clock. The result stays bound by the same checks and ceiling as a live run (C12, C13).
  *
- * A record with no usable answer comes back unchanged, and so does any record the checks did not accept. Those hold the
- * code's own fallback reason instead of the model's, so replaying that text would pass the checks the real reply failed:
- * on the stored ROBO run, 7 refused wallets would rise from a hold to a partial reward (C11).
+ * A record with no model reply to check (no usable answer, or reply text empty or cut at the storage cap) comes back
+ * unchanged under both versions, so it stays held (C11).
  *
  * @throws Error STALE_ROWS when the record's start or ceiling no longer match the row's facts.
+ * @throws RangeError when the row is another wallet's.
  */
-export function asRulebookV2(record: DecisionRecord, row: ReplayRow, settings: Settings): DecisionRecord {
-  if (record.modelAction === null || !record.accepted) return record;
-  const start = computeStart(row.facts, settings);
-  const { ceiling } = computeCeiling(row.facts, settings);
-  if (start.outcome !== record.start.outcome || start.rule !== record.start.rule || ceiling !== record.ceiling) {
-    throw new Error(STALE_ROWS);
-  }
-  const { decision, accepted, cause } = validateDecision(
-    {
-      action: record.modelAction,
-      shareBps: shareFor(record.modelAction, settings),
-      rule: record.rule,
-      reason: record.reason,
-      citedTxs: record.citedTxs,
-      paidHops: 0,
-    },
-    { facts: row.facts, settings, ceiling, start, toolTxs: [], paidHopsMade: 0 },
-  );
+export function asRulebook(record: DecisionRecord, row: ReplayRow, settings: Settings, rulebook: RulebookVersion): DecisionRecord {
+  return recheckStoredReply(record, row, settings, rulebook) ?? record;
+}
+
+/**
+ * Both columns of the scorecard for every stored set, and how many records in each had no reply to check again.
+ *
+ * @throws Error STALE_ROWS when a record has no row, or its start or ceiling no longer match its row's facts.
+ */
+export function versionColumns(
+  stored: VersionRecords,
+  rows: { robo: Map<string, ReplayRow>; hop: Map<string, ReplayRow> },
+  settings: Settings,
+): { v1: VersionRecords; v2: VersionRecords; noReply: NoReplyCounts } {
+  const column = (rulebook: RulebookVersion, records: DecisionRecord[], byWallet: Map<string, ReplayRow>) =>
+    records.map((record) => {
+      const row = byWallet.get(record.wallet);
+      if (row === undefined) throw new Error(STALE_ROWS);
+      return asRulebook(record, row, settings, rulebook);
+    });
+  const columnOf = (rulebook: RulebookVersion): VersionRecords => ({
+    robo: column(rulebook, stored.robo, rows.robo),
+    hopSample: column(rulebook, stored.hopSample, rows.hop),
+    hopEliminated: column(rulebook, stored.hopEliminated, rows.hop),
+  });
+  const unchecked = (records: DecisionRecord[]) => records.filter((record) => !hasReplyToRecheck(record)).length;
   return {
-    ...record,
-    action: decision.action,
-    shareBps: decision.shareBps,
-    rule: decision.rule,
-    reason: decision.reason,
-    citedTxs: decision.citedTxs,
-    clampedFrom: decision.clampedFrom ?? null,
-    accepted,
-    cause: cause ?? null,
+    v1: columnOf(1),
+    v2: columnOf(2),
+    noReply: { robo: unchecked(stored.robo), hopSample: unchecked(stored.hopSample), hopEliminated: unchecked(stored.hopEliminated) },
   };
+}
+
+/** The key a Reppo entry and a judged reply share: the entry's set and the wallet. */
+export function judgedKey(set: FeedbackEntry['set'], wallet: string): string {
+  return `${set}:${lower(wallet)}`;
+}
+
+/**
+ * One version's action on every reply Reppo judged, each checked on the row it was decided on, never on a fresh answer.
+ *
+ * @throws RangeError when a line's key is not its record's wallet, or two lines name the same wallet in one set.
+ * @throws Error STALE_ROWS when a judged record no longer fits its own row.
+ */
+export function judgedActions(judged: JudgedReply[], settings: Settings, rulebook: RulebookVersion): Map<string, Outcome> {
+  const actions = new Map<string, Outcome>();
+  for (const line of judged) {
+    if (lower(line.key) !== lower(line.record.wallet)) throw new RangeError('a judged line names a different wallet from its record');
+    const key = judgedKey(line.source === 'robo' ? 'robo' : 'hop', line.key);
+    if (actions.has(key)) throw new RangeError('two judged lines name the same wallet in one set');
+    actions.set(key, asRulebook(line.record, line.row, settings, rulebook).action);
+  }
+  return actions;
 }
 
 /**
@@ -165,9 +205,10 @@ export function heldShare(records: DecisionRecord[]): HeldShare {
  *
  * catchRate counts Bitquery key wallets in the rows, and an undecided key wallet is not held. falseHold is every Hop record
  * passed, with its 95% Wilson interval, so pass only the probably-real sample. A blocked entry is right when the version's
- * action for that wallet in that entry's set differs from the blocked action. A reversed appeal is right when the version's
- * action is at least as generous as the owner's new action, and a wallet in both sets must meet it in both. A wallet with
- * no decision is never right, so a gap cannot raise the feedback number.
+ * action on the reply Reppo judged (feedback.judged) differs from the blocked action, so a later answer for the same
+ * wallet never marks it. A reversed appeal is right when the version's action is at least as generous as the owner's new
+ * action, and a wallet in both sets must meet it in both. A wallet with no decision is never right, so a gap cannot raise
+ * the feedback number.
  *
  * @throws RangeError when two ROBO rows or records name the same wallet.
  * @throws Error STALE_DECISION when a ROBO record's start or ceiling differs from its row's.
@@ -190,7 +231,7 @@ export function scoreVersion(
   const actions = { robo: actionsByWallet(roboRecords), hop: actionsByWallet([...hopRecords, ...feedback.hopEliminated]) };
   const blocked = blockedEntries(feedback.entries);
   const blocksAvoided = blocked.filter((entry) => {
-    const action = actions[entry.set].get(lower(entry.wallet));
+    const action = feedback.judged.get(judgedKey(entry.set, entry.wallet));
     return action !== undefined && action !== entry.action;
   }).length;
 
@@ -216,28 +257,38 @@ export function scoreVersion(
  * @param data.entries Every stored Reppo entry.
  * @param data.appeals Every appeal, latest state only.
  * @param data.listed Every wallet on the replay lists, which is how a test wallet's appeal is kept out of the feedback number.
+ * @param data.judged Each version's actions on the replies Reppo judged (judgedActions).
+ * @param data.noReply How many stored records per set had no reply to check again (versionColumns).
  */
 export function compareVersions(
   v1: VersionRecords,
   v2: VersionRecords,
-  data: { roboRows: ReplayRow[]; key: Map<string, FarmKeyEntry>; entries: FeedbackEntry[]; appeals: AppealRecord[]; listed: Iterable<string> },
+  data: {
+    roboRows: ReplayRow[];
+    key: Map<string, FarmKeyEntry>;
+    entries: FeedbackEntry[];
+    appeals: AppealRecord[];
+    listed: Iterable<string>;
+    judged: { v1: Map<string, Outcome>; v2: Map<string, Outcome> };
+    noReply: NoReplyCounts;
+  },
 ): VersionComparison {
   const { claimant, testWallet } = splitAppeals(data.appeals, data.listed);
-  const score = (name: string, records: VersionRecords) =>
+  const score = (name: string, records: VersionRecords, judged: Map<string, Outcome>) =>
     scoreVersion(name, records.robo, data.roboRows, data.key, records.hopSample, {
       entries: data.entries,
       appeals: claimant,
       hopEliminated: records.hopEliminated,
+      judged,
     });
 
-  const v2Actions = { robo: actionsByWallet(v2.robo), hop: actionsByWallet([...v2.hopSample, ...v2.hopEliminated]) };
   const isTestWallet = new Set(testWallet);
   const routes = { ship: 0, review: 0, block: 0, unread: 0 };
   for (const entry of data.entries) routes[entry.verdict?.route ?? 'unread'] += 1;
 
   return {
-    v1: score('v1', v1),
-    v2: score('v2', v2),
+    v1: score('v1', v1, data.judged.v1),
+    v2: score('v2', v2, data.judged.v2),
     eliminatedHeld: { v1: heldShare(v1.hopEliminated), v2: heldShare(v2.hopEliminated) },
     verdicts: blockedEntries(data.entries).map((entry) => ({
       group: entry.group,
@@ -245,7 +296,8 @@ export function compareVersions(
       score: entry.verdict?.score ?? null,
       route: entry.verdict?.route ?? null,
       confidence: entry.verdict?.confidence ?? null,
-      v2Action: v2Actions[entry.set].get(lower(entry.wallet)) ?? null,
+      v1Action: data.judged.v1.get(judgedKey(entry.set, entry.wallet)) ?? null,
+      v2Action: data.judged.v2.get(judgedKey(entry.set, entry.wallet)) ?? null,
     })),
     routes,
     appeals: data.appeals.map((appeal) => ({
@@ -256,6 +308,7 @@ export function compareVersions(
       testWallet: isTestWallet.has(appeal),
     })),
     testWalletAppeals: testWallet.length,
+    noReply: { ...data.noReply },
   };
 }
 
@@ -280,7 +333,7 @@ function feedbackLine(score: VersionScore): string {
 
 function verdictLine(line: VerdictLine): string {
   const heard = `score ${line.score ?? 'unread'}, route ${line.route ?? 'unread'}, confidence ${line.confidence ?? 'unread'}`;
-  return `- ${line.group}: stored ${line.storedAction}, ${heard}, v2 now ${line.v2Action ?? 'undecided'}`;
+  return `- ${line.group}: stored ${line.storedAction}, ${heard}, v1 now ${line.v1Action ?? 'undecided'}, v2 now ${line.v2Action ?? 'undecided'}`;
 }
 
 function appealLine(line: AppealLine): string {
@@ -291,14 +344,18 @@ function appealLine(line: AppealLine): string {
 /**
  * The comparison as short plain-English markdown. It opens by saying no model ran and closes with what it does not cover.
  * It prints counts, groups and fixed words only, never a wallet, because a wallet here would link it to a verdict (C35).
+ *
+ * @param meta.hopAskedOn The day the Hop sample answers were last written, as YYYY-MM-DD.
  */
-export function versionsToMarkdown(comparison: VersionComparison, meta: { runDate: string }): string {
-  const { v1, v2, eliminatedHeld, verdicts, routes, appeals, testWalletAppeals } = comparison;
+export function versionsToMarkdown(comparison: VersionComparison, meta: { runDate: string; hopAskedOn: string }): string {
+  const { v1, v2, eliminatedHeld, verdicts, routes, appeals, testWalletAppeals, noReply } = comparison;
   return [
     '# Rulebook v1 and v2, side by side',
     '',
-    'Both columns come from stored runs. No model was called and nothing was sent.',
-    "v1 is the decisions as stored. v2 is the same stored answers put through today's checks.",
+    'Both columns come from the same stored model replies. No model was called and nothing was sent.',
+    "v1 applies the checks without the rule rulebook v2 added (a shared funder alone cannot hold a wallet). v2 applies today's checks.",
+    'The feedback line is scored on the replies Reppo judged.',
+    `Records with no model reply to check again, kept as stored in both columns: ROBO ${count(noReply.robo)}, Hop sample ${count(noReply.hopSample)}, Hop eliminated ${count(noReply.hopEliminated)}.`,
     '',
     `Run date: ${meta.runDate}`,
     '',
@@ -327,11 +384,12 @@ export function versionsToMarkdown(comparison: VersionComparison, meta: { runDat
     '',
     '## Not covered',
     '',
-    '- v2 replays the answers v1 got. No model read the new rulebook, so a fresh run could answer differently.',
-    "- Reppo judged v1's decisions in the old wording. No verdict here is on a v2 decision or on the new wording.",
-    '- Right on a blocked entry means v2 no longer makes the decision Reppo blocked, not that Reppo would pass what v2 does instead.',
+    '- Each wallet has one stored reply and both columns check that one reply, so neither shows how a model would answer under a different rulebook text.',
+    '- Reppo judged decisions made before the shared-funder rule. No verdict here is on a v2 decision.',
+    '- Right on a blocked entry means that version no longer makes the decision Reppo blocked, not that Reppo would pass what it does instead.',
     "- Hop's probably-real wallets are not proved real, and the rate comes from a sample.",
-    '- A wallet the checks refused or the code replaced in the stored run keeps that outcome, because its own reply is not replayed.',
+    '- A record with no model reply to check again keeps its stored hold in both columns.',
+    `- The Hop answers were asked again on ${meta.hopAskedOn} for wallets whose facts changed after the 10 Nov fixes, and the eliminated sample was drawn again from that day's rows.`,
     '',
   ].join('\n');
 }

@@ -284,7 +284,12 @@ describe('feedbackItem', () => {
     start,
     ceiling,
     requestId: 'run-1',
-    rawText: '{}',
+    // A graph g1 reply holding the wallet on its funder count alone, which rulebook 2 replaces with the start.
+    rawText: JSON.stringify({
+      verdict: 'likely_farm',
+      recommended_outcome: 'hold_for_review',
+      reason: 'The contract first funder also funded 62 claim wallets.',
+    }),
     usage: null,
     verdict: 'likely_farm',
     modelAction: 'hold',

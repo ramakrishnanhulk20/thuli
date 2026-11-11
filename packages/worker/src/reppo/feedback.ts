@@ -12,7 +12,7 @@ import {
 } from '@thuli/core';
 import type { JsonlCache } from '../chain/jsonlCache.ts';
 import type { DecisionRecord } from '../replay/decide.ts';
-import { asRulebookV2 } from '../replay/versions.ts';
+import { asRulebook } from '../replay/versions.ts';
 import type { ReppoEval } from './client.ts';
 
 export const FeedbackEntry = z.strictObject({
@@ -75,10 +75,12 @@ export interface FeedbackCounts {
 const feedbackKey = (item: FeedbackItem, rulebook: string) => `${rulebook}:${item.set}:${item.wallet}`;
 
 /**
- * Builds one item from a wallet's stored decision. With useV2 the decision goes through asRulebookV2 first, so a re-check
- * sends what v2 actually decided, not what v1 stored.
+ * Builds one item from a wallet's stored decision. With useV2 the stored model reply is checked again under rulebook 2
+ * (asRulebook), the same recheck the version scorecard runs, so a re-check sends what v2 actually decided, not what v1
+ * stored. A record with no reply to check is sent as stored, which holds (C11).
  *
  * @throws Error STALE_ROWS when useV2 is on and the stored decision no longer matches the row's facts.
+ * @throws RangeError when useV2 is on and the row is another wallet's.
  * @throws ZodError when the row's facts do not make a GraphRecord.
  */
 export function feedbackItem(
@@ -87,7 +89,7 @@ export function feedbackItem(
   stored: DecisionRecord,
   opts: { useV2: boolean; settings: Settings },
 ): FeedbackItem {
-  const decision = opts.useV2 ? asRulebookV2(stored, row, opts.settings) : stored;
+  const decision = opts.useV2 ? asRulebook(stored, row, opts.settings, 2) : stored;
   return {
     ...listed,
     record: toGraphRecord(row.facts, row.start),

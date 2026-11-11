@@ -2,10 +2,22 @@
 // reason's sentences are true.
 import { describe, expect, it } from 'vitest';
 import { parseAddress } from '../src/address.ts';
-import { BURST_KEPT_CAUSE, FUNDER_KEPT_CAUSE, validateDecision, type DecisionContext } from '../src/decision.ts';
+import {
+  BURST_KEPT_CAUSE,
+  CURRENT_RULEBOOK,
+  EXCHANGE_KEPT_CAUSE,
+  FUNDER_KEPT_CAUSE,
+  RULEBOOK_VERSIONS,
+  shareFor,
+  validateDecision,
+  type DecisionContext,
+  type RulebookVersion,
+} from '../src/decision.ts';
 import type { Facts } from '../src/facts.ts';
 import { decisionFromGraphAnswer } from '../src/graph.ts';
+import { OUTCOMES, type Outcome } from '../src/outcome.ts';
 import { DEFAULT_SETTINGS } from '../src/settings.ts';
+import type { Start } from '../src/start.ts';
 
 const OWN_TX = `0x${'a1'.repeat(32)}`;
 const OTHER_WALLET_TX = `0x${'b2'.repeat(32)}`;
@@ -496,5 +508,103 @@ describe('validateDecision: the rule must fit the code start', () => {
     expect(result.cause).toBeUndefined();
     expect(result.decision.action).toBe('hold');
     expect(result.decision.rule).toBe('B1');
+  });
+});
+
+describe('validateDecision: rulebook versions differ only on C47', () => {
+  type FunderKind = 'exchange' | 'contract' | 'wallet';
+  const funder = (kind: FunderKind) => ({ address: parseAddress(`0x${'f1'.repeat(20)}`), kind, fanoutInList: 3, hopsTraced: 0 });
+  const OLD = { walletAgeDays: 400, txCountAtSnapshot: 120 };
+  const fundedBy = (kind: FunderKind) => facts({ ...OLD, firstFunder: funder(kind) });
+  const OWN_LINKS = { size: 2, sameFunderWithinWindow: null, sweptToSharedCollector: false, authoredEvidence: false, linkedByWallet: true };
+  const A9 = (wallet: Facts, rulebook?: RulebookVersion) =>
+    ctx({ facts: wallet, ceiling: 'full', start: { outcome: 'full', rule: 'A9' }, ...(rulebook === undefined ? {} : { rulebook }) });
+  const HOLD_B1 = { action: 'hold', shareBps: 0, rule: 'B1', reason: 'Its funding trail leads to a shared source.', citedTxs: [] };
+  const EXCLUDE = { action: 'exclude', shareBps: 0, rule: 'A3', reason: 'Looks like one operator.', citedTxs: [] };
+
+  it('runs rulebook 2 when no version is given', () => {
+    expect(CURRENT_RULEBOOK).toBe(2);
+    for (const kind of ['exchange', 'contract', 'wallet'] as const) {
+      expect(validateDecision(reply(HOLD_B1), A9(fundedBy(kind)))).toEqual(validateDecision(reply(HOLD_B1), A9(fundedBy(kind), 2)));
+    }
+  });
+
+  it.each(['contract', 'wallet'] as const)('lets a clean hold on a %s funder alone stand under rulebook 1', (kind) => {
+    const result = validateDecision(reply(HOLD_B1), A9(fundedBy(kind), 1));
+    expect(result.accepted).toBe(true);
+    expect(result.cause).toBeUndefined();
+    expect(result.decision).toMatchObject({ action: 'hold', shareBps: 0, rule: 'B1', reason: HOLD_B1.reason });
+  });
+
+  it.each([
+    ['a hold', HOLD_B1, 'hold'],
+    ['an exclude', EXCLUDE, 'exclude'],
+  ] as const)('still ends %s on an exchange funder alone at the start under rulebook 1, in its own words', (_name, answer, replied) => {
+    expect(validateDecision(reply(answer), A9(fundedBy('exchange'), 1))).toEqual({
+      decision: {
+        action: 'full',
+        shareBps: 10000,
+        rule: 'A9',
+        reason: "The first funder is an exchange, and sharing an exchange is weak evidence on its own, so the code's start stands.",
+        citedTxs: [],
+        paidHops: 0,
+        clampedFrom: replied,
+      },
+      accepted: false,
+      cause: EXCHANGE_KEPT_CAUSE,
+    });
+  });
+
+  it.each(RULEBOOK_VERSIONS)('lets a hold stand under rulebook %s when the wallet made links of its own', (rulebook) => {
+    const result = validateDecision(reply(HOLD_B1), A9(facts({ ...OLD, firstFunder: funder('exchange'), group: OWN_LINKS }), rulebook));
+    expect(result).toMatchObject({ accepted: true, decision: { action: 'hold', rule: 'B1' } });
+  });
+
+  const STARTS: Start[] = [
+    { outcome: 'full', rule: 'A9' },
+    { outcome: 'partial', rule: 'A8' },
+    { outcome: 'hold', rule: 'A4' },
+  ];
+  const WALLETS = [fundedBy('exchange'), fundedBy('contract'), facts({ ...OLD, firstFunder: funder('exchange'), group: OWN_LINKS })];
+  // The rule a model would have to name for each move, so the stand-in tries every raise the checks could allow.
+  const ruleFor = (action: Outcome, start: Start) =>
+    action === start.outcome ? start.rule : action === 'hold' && start.rule !== 'A4' ? 'B1' : start.rule === 'A4' ? 'B2' : start.rule;
+
+  it.each(RULEBOOK_VERSIONS)('never pays above the ceiling under rulebook %s, whatever the model answers (C12)', (rulebook) => {
+    for (const wallet of WALLETS) {
+      for (const start of STARTS) {
+        for (const ceiling of OUTCOMES) {
+          for (const action of OUTCOMES) {
+            const answer = reply({ action, shareBps: shareFor(action, DEFAULT_SETTINGS), rule: ruleFor(action, start), citedTxs: [] });
+            const { decision } = validateDecision(answer, ctx({ facts: wallet, start, ceiling, rulebook }));
+            const label = JSON.stringify({ start, ceiling, action });
+            expect(decision.shareBps, label).toBe(shareFor(decision.action, DEFAULT_SETTINGS));
+            expect(decision.shareBps, label).toBeLessThanOrEqual(shareFor(ceiling, DEFAULT_SETTINGS));
+          }
+        }
+      }
+    }
+  });
+
+  it.each(RULEBOOK_VERSIONS)('holds a reply that fails the output checks on A1 under rulebook %s (C11, C13)', (rulebook) => {
+    for (const wallet of [fundedBy('exchange'), fundedBy('contract')]) {
+      const context = { ...A9(wallet, rulebook), paidHopsMade: 0 };
+      expectRejected(validateDecision('not json', context));
+      for (const overrides of [
+        { reason: 'x'.repeat(281) },
+        { reason: 'See https://example.org for why.' },
+        { citedTxs: [MADE_UP_TX] },
+        { shareBps: 10000 },
+        { paidHops: 2 },
+        { action: 'maybe' },
+      ]) {
+        expectRejected(validateDecision(reply({ ...HOLD_B1, ...overrides }), context));
+      }
+    }
+  });
+
+  it('refuses a rulebook it does not know, before reading the reply', () => {
+    const unknown = { ...A9(fundedBy('exchange')), rulebook: 3 as unknown as RulebookVersion };
+    expect(() => validateDecision(reply(HOLD_B1), unknown)).toThrow(RangeError);
   });
 });
