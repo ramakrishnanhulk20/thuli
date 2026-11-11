@@ -1,34 +1,56 @@
 // Proves on Base Sepolia that the vault pays an approved wallet and refuses a held one. Two phases, because every
-// root waits at least an hour on chain before it pays:
+// root waits at least an hour on chain before it pays, then a read-only third that publishes the result:
 //
 //   npm run prove:vault -- setup   the owner (PAYER key) creates a vault, 1 USDC cap, and deposits 2 USDC; the agent
 //                                  (WORKER key) posts a root holding claimant A at 1 USDC; claimant B is held off it
 //   npm run prove:vault -- claim   after the delay the agent submits A's claim, B's attempt fails with InvalidProof
+//   npm run prove:vault -- record  reads the saved run back from Base Sepolia, loading no key and sending nothing, and
+//                                  only when every receipt, event and view agrees writes the public record
+//                                  packages/contracts/deployments/base-sepolia-proof.json for the site and the README
 //
-// Rehearse on a local fork with --rpc-url http://127.0.0.1:PORT --deployment FILE --state FILE (rehearse.mjs does).
-// Both phases refuse any chain but 84532. Claimant keys are never stored: both are derived from a seed kept only in
-// the state file, which is fine for test USDC on a testnet and nowhere else.
+// Rehearse setup and claim on a local fork with --rpc-url http://127.0.0.1:PORT --deployment FILE --state FILE
+// (rehearse.mjs does). Every phase refuses any chain but 84532. Claimant keys are never stored: both are derived from a
+// seed kept only in the state file, which is fine for test USDC on a testnet and nowhere else.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { BaseError, erc20Abi, formatUnits, parseEventLogs, type Address, type Chain, type PublicClient, type Transport } from 'viem';
+import {
+  BaseError,
+  erc20Abi,
+  formatUnits,
+  parseEventLogs,
+  TransactionReceiptNotFoundError,
+  type Address,
+  type Chain,
+  type PublicClient,
+  type TransactionReceipt,
+  type Transport,
+} from 'viem';
 import type { z } from 'zod';
 import { parseAddress, proofFor } from '@thuli/core';
 import { FACTORY_ABI, VAULT_ABI } from '../src/vault/abi.ts';
 import { addressLink, BASE_SEPOLIA, ChainCallError, confirm, connectBaseSepolia, revertName, txLink, vaultPort, type Sent, type Wallet } from '../src/vault/chain.ts';
-import { claimants, Deployment, loadProofEnv, newSeed, PROOF_TERMS, ProofSetupError, ProofState } from '../src/vault/proof.ts';
+import {
+  buildProofRecord,
+  claimants,
+  Deployment,
+  loadProofEnv,
+  loadRpcEnv,
+  newSeed,
+  PROOF_TERMS,
+  ProofFailed,
+  ProofSetupError,
+  ProofState,
+} from '../src/vault/proof.ts';
 import { buildRoot, postRoot, readPublishedList, RootError, type CampaignRecord } from '../src/vault/root.ts';
 
 const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const DEFAULT_DEPLOYMENT = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia.json');
 const DEFAULT_STATE = path.join(REPO_ROOT, 'data', 'vault-proof', 'state.json');
+const PROOF_RECORD = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia-proof.json');
 const MAX_FILE_BYTES = 64 * 1024;
-const USAGE = 'Usage: npm run prove:vault -- setup|claim [--rpc-url http://127.0.0.1:PORT] [--deployment FILE] [--state FILE]';
-
-class ProofFailed extends Error {
-  override name = 'ProofFailed';
-}
+const USAGE = 'Usage: npm run prove:vault -- setup|claim|record [--rpc-url http://127.0.0.1:PORT] [--deployment FILE] [--state FILE]';
 
 type Client = PublicClient<Transport, Chain>;
 type Logged = Sent & { label: string };
@@ -257,21 +279,84 @@ async function claim(client: Client, owner: Wallet, agent: Wallet, stateFile: st
   fs.writeFileSync(stateFile, `${JSON.stringify(ProofState.parse(saved), null, 2)}\n`);
 }
 
+// Takes only a public client: this phase has no wallet, so it cannot send a transaction.
+async function record(client: Client, deploymentFile: string, stateFile: string) {
+  const state = readJson(ProofState, stateFile, 'proof state');
+  const deployment = readJson(Deployment, deploymentFile, 'deployment record');
+  await requireCode(client, state.vault, 'vault');
+
+  const receipts: TransactionReceipt[] = [];
+  for (const tx of state.transactions) {
+    try {
+      receipts.push(await client.getTransactionReceipt({ hash: tx.hash as `0x${string}` }));
+    } catch (error) {
+      // buildProofRecord names the transaction whose receipt is missing.
+      if (!(error instanceof TransactionReceiptNotFoundError)) throw error;
+    }
+  }
+
+  const { a, b } = claimants(state.seed as `0x${string}`);
+  const entries = readPublishedList(state.published);
+  const [entry] = entries;
+  if (entries.length !== 1 || entry === undefined || parseAddress(entry.account) !== a) {
+    throw new ProofFailed('the saved list does not hold claimant A from the saved seed');
+  }
+  const proofA = proofFor(buildRoot(entries, state.vault, BASE_SEPOLIA.id).tree, a);
+  // The views and the static call share one block, so the record describes the vault at one moment.
+  const blockNumber = await client.getBlockNumber();
+  const vaultState = await client.readContract({ address: state.vault, abi: VAULT_ABI, functionName: 'state', blockNumber });
+  const claimedByPaid = await client.readContract({ address: state.vault, abi: VAULT_ABI, functionName: 'claimed', args: [a], blockNumber });
+  let refusedSimulation = 'success';
+  try {
+    // From the agent's address, not its key: an eth_call needs no signature, and as the agent the proof is all that differs.
+    await client.simulateContract({
+      address: state.vault,
+      abi: VAULT_ABI,
+      functionName: 'claim',
+      args: [b, entry.cumulativeAmount, proofA],
+      account: state.agent,
+      blockNumber,
+    });
+  } catch (error) {
+    refusedSimulation = revertName(error) ?? 'an unrecognised revert';
+  }
+
+  const proof = buildProofRecord({ state, deployment, chain: { receipts, vaultState, claimedByPaid, refusedSimulation }, now: new Date() });
+  console.log(`Checked against Base Sepolia at block ${blockNumber}. Every line agrees with the chain.`);
+  console.log(`Vault      ${proof.vault}  ${addressLink(proof.vault)}`);
+  console.log(`Claimant A ${proof.paid.account} paid ${usdc(BigInt(proof.paid.amount))}; the vault reports ${usdc(BigInt(proof.totalPaid))} paid in all`);
+  console.log(`Claimant B ${proof.refused.account} refused with ${proof.refused.error}`);
+  console.log('Transactions:');
+  for (const tx of proof.transactions) {
+    console.log(`  ${tx.label.padEnd(12)} ${txLink(tx.hash as `0x${string}`)}  block ${tx.block}  gas ${tx.gasUsed}  from ${tx.from}`);
+  }
+  fs.writeFileSync(PROOF_RECORD, `${JSON.stringify(proof, null, 2)}\n`);
+  console.log(`Wrote ${path.relative(REPO_ROOT, PROOF_RECORD).replaceAll('\\', '/')}`);
+}
+
 async function main(): Promise<number> {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: { 'rpc-url': { type: 'string' }, deployment: { type: 'string' }, state: { type: 'string' } },
   });
   const phase = positionals[0];
-  if (positionals.length !== 1 || (phase !== 'setup' && phase !== 'claim')) throw new ProofSetupError(USAGE);
+  if (positionals.length !== 1 || (phase !== 'setup' && phase !== 'claim' && phase !== 'record')) throw new ProofSetupError(USAGE);
+  const stateFile = path.resolve(values.state ?? DEFAULT_STATE);
+  const deploymentFile = path.resolve(values.deployment ?? DEFAULT_DEPLOYMENT);
+  if (phase === 'record') {
+    // A fork's transactions are not on Basescan, so a record built from one would publish links that lead nowhere.
+    if (values['rpc-url'] !== undefined) throw new ProofSetupError('record reads Base Sepolia itself; --rpc-url is only for rehearsing setup and claim.');
+    const { publicClient } = await connectBaseSepolia(loadRpcEnv(process.env));
+    await record(publicClient, deploymentFile, stateFile);
+    return 0;
+  }
   const env = loadProofEnv(process.env, values['rpc-url']);
   const { publicClient, wallet } = await connectBaseSepolia(env.rpcUrl);
   const owner = wallet(env.payerKey);
   const agent = wallet(env.workerKey);
-  const stateFile = path.resolve(values.state ?? DEFAULT_STATE);
   if (env.rehearsal) console.log('Rehearsal on a local fork of Base Sepolia. Nothing here reaches a public network.');
   if (phase === 'setup') {
-    await setup(publicClient, owner, agent, path.resolve(values.deployment ?? DEFAULT_DEPLOYMENT), stateFile, env.rehearsal);
+    await setup(publicClient, owner, agent, deploymentFile, stateFile, env.rehearsal);
   } else {
     await claim(publicClient, owner, agent, stateFile, env.rehearsal);
   }

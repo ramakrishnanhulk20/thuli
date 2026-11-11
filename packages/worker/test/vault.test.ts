@@ -1,22 +1,38 @@
 // Not covered here: the viem port against a real chain, which the local-fork rehearsal runs end to end
 // (packages/contracts/script/rehearse.mjs), and the vault's own on-chain checks (packages/contracts/test).
+// buildProofRecord is fed hand-built receipts and views: the reads behind it are proven only by running
+// `npm run prove:vault -- record` against Base Sepolia, and nothing here checks how the website shows the record.
 import fs from 'node:fs';
 import {
   createPublicClient,
   custom,
   decodeFunctionData,
   encodeAbiParameters,
+  encodeEventTopics,
   encodeFunctionResult,
+  erc20Abi,
+  getAddress,
   multicall3Abi,
   type Chain,
   type PublicClient,
   type Transport,
 } from 'viem';
 import { describe, expect, it } from 'vitest';
-import { ChainError, type Address, type MerkleHash } from '@thuli/core';
+import { ChainError, CHAINS, parseAddress, type Address, type MerkleHash } from '@thuli/core';
 import { FACTORY_ABI, VAULT_ABI } from '../src/vault/abi.ts';
 import { baseSepoliaChain, CLAIMED_BATCH, vaultPort, type Wallet } from '../src/vault/chain.ts';
-import { claimants, Deployment, loadProofEnv, ProofSetupError, ProofState } from '../src/vault/proof.ts';
+import {
+  buildProofRecord,
+  claimants,
+  Deployment,
+  loadProofEnv,
+  loadRpcEnv,
+  ProofFailed,
+  ProofSetupError,
+  ProofState,
+  type ProofLog,
+  type ProofReceipt,
+} from '../src/vault/proof.ts';
 import {
   buildRoot,
   checkRoot,
@@ -437,6 +453,220 @@ describe('the proof helpers', () => {
   it('refuses a state file or deployment record for another chain or with extra fields', () => {
     expect(Deployment.safeParse({ chainId: 8453, factory: VAULT }).success).toBe(false);
     expect(ProofState.safeParse({ chainId: 84532, extra: true }).success).toBe(false);
+  });
+
+  it('reads only the RPC for the record phase, naming it without its value when it is unusable (C40)', () => {
+    expect(loadRpcEnv({ BASE_SEPOLIA_RPC_URL: ' https://sepolia.base.org ' })).toBe('https://sepolia.base.org');
+    try {
+      loadRpcEnv({ BASE_SEPOLIA_RPC_URL: 'http://rpc.example/secret-path-123' });
+      expect.unreachable();
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProofSetupError);
+      expect(String(error)).toMatch(/BASE_SEPOLIA_RPC_URL/);
+      expect(String(error)).not.toContain('secret-path-123');
+    }
+  });
+});
+
+describe('buildProofRecord', () => {
+  const SEED = `0x${'6a'.repeat(32)}` as const;
+  const { a: PAID, b: REFUSED } = claimants(SEED);
+  const USDC = parseAddress(CHAINS['base-sepolia'].usdc);
+  const ROOT = buildRoot([{ account: PAID, cumulativeAmount: CAP }], VAULT, 84532).root;
+  const CLAIMABLE_AT = Number(NOW) + 3600;
+  const HASH = {
+    createVault: `0x${'c1'.repeat(32)}`,
+    approve: `0x${'c2'.repeat(32)}`,
+    deposit: `0x${'c3'.repeat(32)}`,
+    postRoot: `0x${'c4'.repeat(32)}`,
+    claim: `0x${'c5'.repeat(32)}`,
+  } as const;
+  type Step = keyof typeof HASH;
+  // encodeEventTopics is typed for log filters, where a topic may be null or a list; every indexed argument is set here.
+  const filled = (topics: readonly unknown[]) => topics as ProofLog['topics'];
+
+  const vaultCreated = (): ProofLog => ({
+    address: FACTORY,
+    topics: filled(encodeEventTopics({ abi: FACTORY_ABI, eventName: 'VaultCreated', args: { vault: VAULT, owner: OWNER, agent: AGENT } })),
+    data: encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'uint64' }, { type: 'uint32' }], [USDC, CAP, TERMS.endTime, 3600]),
+  });
+  const rootPosted = (claimableAt = CLAIMABLE_AT): ProofLog => ({
+    address: VAULT,
+    topics: filled(encodeEventTopics({ abi: VAULT_ABI, eventName: 'RootPosted', args: { root: ROOT } })),
+    data: encodeAbiParameters([{ type: 'uint256' }, { type: 'uint64' }], [CAP, BigInt(claimableAt)]),
+  });
+  // The first claim after the delay also activates the root, so a real claim receipt carries this before Claimed.
+  const rootActivated = (): ProofLog => ({
+    address: VAULT,
+    topics: filled(encodeEventTopics({ abi: VAULT_ABI, eventName: 'RootActivated', args: { root: ROOT } })),
+    data: '0x',
+  });
+  const claimedEvent = (account: Address, amount: bigint): ProofLog => ({
+    address: VAULT,
+    topics: filled(encodeEventTopics({ abi: VAULT_ABI, eventName: 'Claimed', args: { account } })),
+    data: encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [amount, amount]),
+  });
+  const transfer = (from: Address, to: Address, value: bigint): ProofLog => ({
+    address: USDC,
+    topics: filled(encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: { from, to } })),
+    data: encodeAbiParameters([{ type: 'uint256' }], [value]),
+  });
+
+  function goodInput() {
+    const receipt = (step: Step, from: Address, to: Address, block: bigint, gasUsed: bigint, logs: ProofLog[]): ProofReceipt => ({
+      transactionHash: HASH[step],
+      status: 'success',
+      blockNumber: block,
+      gasUsed,
+      from,
+      to,
+      logs,
+    });
+    const state = ProofState.parse({
+      chainId: 84532,
+      factory: FACTORY,
+      vault: VAULT,
+      owner: OWNER,
+      agent: AGENT,
+      seed: SEED,
+      root: ROOT,
+      published: publishList([{ account: PAID, cumulativeAmount: CAP }]),
+      createdAtBlock: 100,
+      endTime: Number(TERMS.endTime),
+      claimableAt: CLAIMABLE_AT,
+      transactions: [
+        { label: 'createVault', hash: HASH.createVault, from: OWNER, gasUsed: '1686371' },
+        { label: 'approve', hash: HASH.approve, from: OWNER, gasUsed: '55437' },
+        { label: 'deposit', hash: HASH.deposit, from: OWNER, gasUsed: '100114' },
+        { label: 'postRoot', hash: HASH.postRoot, from: AGENT, gasUsed: '75112' },
+        { label: 'claim A', hash: HASH.claim, from: AGENT, gasUsed: '145907' },
+      ],
+    });
+    return {
+      state,
+      deployment: Deployment.parse({ chainId: 84532, factory: FACTORY.toLowerCase() }),
+      chain: {
+        receipts: [
+          receipt('createVault', OWNER, FACTORY, 100n, 1_686_371n, [vaultCreated()]),
+          receipt('approve', OWNER, USDC, 101n, 55_437n, []),
+          receipt('deposit', OWNER, VAULT, 102n, 100_114n, [transfer(OWNER, VAULT, 2n * CAP)]),
+          receipt('postRoot', AGENT, VAULT, 103n, 75_112n, [rootPosted()]),
+          receipt('claim', AGENT, VAULT, 2_000n, 145_907n, [rootActivated(), claimedEvent(PAID, CAP), transfer(VAULT, PAID, CAP)]),
+        ],
+        vaultState: {
+          token: USDC,
+          owner: OWNER,
+          agent: AGENT,
+          perWalletCap: CAP,
+          rootDelay: 3600,
+          deposited: 2n * CAP,
+          totalPaid: CAP,
+          activeRoot: ROOT as string,
+        },
+        claimedByPaid: CAP,
+        refusedSimulation: 'InvalidProof',
+      },
+      now: new Date('2026-11-11T06:00:00.000Z'),
+    };
+  }
+  type Input = ReturnType<typeof goodInput>;
+  const receiptOf = (input: Input, step: Step) => input.chain.receipts.find((receipt) => receipt.transactionHash === HASH[step]) as ProofReceipt;
+
+  it('C32 seen from outside: the record root is the vault active root and the paid amount is what the vault says it paid', () => {
+    const input = goodInput();
+    const record = buildProofRecord(input);
+    expect(record).toEqual({
+      schema: 1,
+      network: 'base-sepolia',
+      chainId: 84532,
+      explorer: 'https://sepolia.basescan.org',
+      factory: FACTORY,
+      vault: VAULT,
+      token: USDC,
+      owner: OWNER,
+      agent: AGENT,
+      perWalletCap: '1000000',
+      rootDelaySeconds: 3600,
+      root: ROOT,
+      claimableAt: CLAIMABLE_AT,
+      paid: { account: PAID, amount: '1000000' },
+      refused: { account: REFUSED, error: 'InvalidProof' },
+      deposited: '2000000',
+      totalPaid: '1000000',
+      transactions: [
+        { label: 'createVault', hash: HASH.createVault, block: 100, gasUsed: 1_686_371, from: OWNER },
+        { label: 'approve', hash: HASH.approve, block: 101, gasUsed: 55_437, from: OWNER },
+        { label: 'deposit', hash: HASH.deposit, block: 102, gasUsed: 100_114, from: OWNER },
+        { label: 'postRoot', hash: HASH.postRoot, block: 103, gasUsed: 75_112, from: AGENT },
+        { label: 'claim', hash: HASH.claim, block: 2000, gasUsed: 145_907, from: AGENT },
+      ],
+      recordedAt: '2026-11-11T06:00:00.000Z',
+    });
+    expect(record.root).toBe(input.chain.vaultState.activeRoot);
+    expect(BigInt(record.paid.amount)).toBe(input.chain.vaultState.totalPaid);
+    expect(BigInt(record.paid.amount)).toBe(input.chain.claimedByPaid);
+  });
+
+  it('C1: every address in the record is in the one checksummed form, even when the state and the chain give lowercase', () => {
+    const input = goodInput();
+    const lower = (address: string) => address.toLowerCase() as Address;
+    const state = { ...input.state, factory: lower(FACTORY), vault: lower(VAULT), owner: lower(OWNER), agent: lower(AGENT) };
+    for (const receipt of input.chain.receipts) {
+      receipt.from = lower(receipt.from);
+      receipt.to = lower(receipt.to as string);
+      receipt.logs = receipt.logs.map((log) => ({ ...log, address: lower(log.address) }));
+    }
+    const view = input.chain.vaultState;
+    Object.assign(view, { token: lower(view.token), owner: lower(view.owner), agent: lower(view.agent) });
+
+    const record = buildProofRecord({ ...input, state });
+    const addresses = [...JSON.stringify(record).matchAll(/\b0x[0-9a-fA-F]{40}\b/g)].map(([hex]) => hex);
+    expect(addresses).toHaveLength(12);
+    for (const address of addresses) expect(address).toBe(getAddress(address));
+    expect(record.transactions.map((tx) => tx.from)).toEqual([OWNER, OWNER, OWNER, AGENT, AGENT]);
+  });
+
+  describe('the record is refused unless the chain agrees with every line', () => {
+    const refusals: [string, (input: Input) => void, RegExp][] = [
+      ['a failed receipt', (input) => void (receiptOf(input, 'deposit').status = 'reverted'), /deposit transaction 0x[0-9a-f]+ did not succeed/],
+      ['a wrong sender', (input) => void (receiptOf(input, 'claim').from = OWNER), /claim transaction was sent by 0x[0-9a-fA-F]+, not the agent/],
+      [
+        'a missing Claimed event',
+        (input) => void (receiptOf(input, 'claim').logs = [rootActivated(), transfer(VAULT, PAID, CAP)]),
+        /does not hold one vault Claimed event paying claimant A 1000000/,
+      ],
+      [
+        'a Transfer of the wrong amount',
+        (input) => void (receiptOf(input, 'claim').logs = [rootActivated(), claimedEvent(PAID, CAP), transfer(VAULT, PAID, CAP - 1n)]),
+        /does not hold one USDC Transfer of 1000000 from the vault to claimant A/,
+      ],
+      ['a totalPaid that disagrees', (input) => void (input.chain.vaultState.totalPaid = 2n * CAP), /totalPaid is 2000000, not the 1000000/],
+      ['a root that disagrees', (input) => void (input.chain.vaultState.activeRoot = `0x${'99'.repeat(32)}`), /active root is not the saved root/],
+      ['a refusal that is not InvalidProof', (input) => void (input.chain.refusedSimulation = 'NotAgent'), /not refused with InvalidProof \(got NotAgent\)/],
+      ['a claimant B static call that succeeded', (input) => void (input.chain.refusedSimulation = 'success'), /\(got success\)/],
+      ['a claimed() that disagrees', (input) => void (input.chain.claimedByPaid = 0n), /claimed\(claimant A\) is 0/],
+      ['a state missing a transaction', (input) => void input.state.transactions.pop(), /lists 4 transactions/],
+      ['a transaction the chain does not know', (input) => void input.chain.receipts.splice(1, 1), /no receipt for the approve transaction/],
+      ['a transaction sent to another contract', (input) => void (receiptOf(input, 'deposit').to = TOKEN), /deposit transaction was not sent to the vault/],
+      ['a deployment record naming another factory', (input) => void (input.deployment = Deployment.parse({ chainId: 84532, factory: TOKEN })), /another factory/],
+      ['a createVault without the factory event', (input) => void (receiptOf(input, 'createVault').logs = []), /VaultCreated/],
+      ['a RootPosted for another claimableAt', (input) => void (receiptOf(input, 'postRoot').logs = [rootPosted(CLAIMABLE_AT + 1)]), /RootPosted/],
+      [
+        'a saved list that does not rebuild the saved root',
+        (input) => void (input.state.published = publishList([{ account: PAID, cumulativeAmount: CAP - 1n }])),
+        /does not rebuild to the saved root/,
+      ],
+      ['a vault on another token', (input) => void (input.chain.vaultState.token = TOKEN), /token is not Base Sepolia USDC/],
+      ['a vault with another agent', (input) => void (input.chain.vaultState.agent = OWNER), /agent is not the saved agent/],
+      ['a vault with another cap', (input) => void (input.chain.vaultState.perWalletCap = 2n * CAP), /perWalletCap is 2000000/],
+    ];
+
+    it.each(refusals)('refuses %s', (_name, spoil, failure) => {
+      const input = goodInput();
+      spoil(input);
+      expect(() => buildProofRecord(input)).toThrow(ProofFailed);
+      expect(() => buildProofRecord(input)).toThrow(failure);
+    });
   });
 });
 

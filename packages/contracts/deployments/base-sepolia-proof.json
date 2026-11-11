@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "network": "base-sepolia",
+  "chainId": 84532,
+  "explorer": "https://sepolia.basescan.org",
+  "factory": "0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56",
+  "vault": "0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034",
+  "token": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "owner": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
+  "agent": "0xBedcF312f0070295c73bff4De974F372aa03Dee6",
+  "perWalletCap": "1000000",
+  "rootDelaySeconds": 3600,
+  "root": "0x1d575779216ee7c9f5a6883fda38a3d538a05fc4bab059498ace8ba5cae221c1",
+  "claimableAt": 1794375097,
+  "paid": {
+    "account": "0xFE2B7D1707A725E2D8D6040506D26a28A98a5CdD",
+    "amount": "1000000"
+  },
+  "refused": {
+    "account": "0xb2864c5C992f22E6d8A6A47945c0E897C440DAf7",
+    "error": "InvalidProof"
+  },
+  "deposited": "2000000",
+  "totalPaid": "1000000",
+  "transactions": [
+    {
+      "label": "createVault",
+      "hash": "0xda041583c1c4170d470e537c7d36f41fc1912b398758a3612d492960e45bd13c",
+      "block": 57248098,
+      "gasUsed": 1686371,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "approve",
+      "hash": "0x8568fcfa06c6839f00829bb4e817e6c4dc0972e74ca1cb4856122db8be3fcfee",
+      "block": 57248111,
+      "gasUsed": 55437,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "deposit",
+      "hash": "0x6ccc12d3ad823b4163964d895db1765017bf963b040edbb425f5e36a976100f2",
+      "block": 57248123,
+      "gasUsed": 100114,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "postRoot",
+      "hash": "0x3c4db8655abb753e91ee260a65d74a4ebf93d130fe0d0d1ede912ef4d4bea0db",
+      "block": 57248143,
+      "gasUsed": 75112,
+      "from": "0xBedcF312f0070295c73bff4De974F372aa03Dee6"
+    },
+    {
+      "label": "claim",
+      "hash": "0x67d821afd5bfd7e33af6c73382c2bc53f8d50370ef0b516c0320e04b54a9ed28",
+      "block": 57266597,
+      "gasUsed": 145907,
+      "from": "0xBedcF312f0070295c73bff4De974F372aa03Dee6"
+    }
+  ],
+  "recordedAt": "2026-11-11T06:58:08.800Z"
+}
