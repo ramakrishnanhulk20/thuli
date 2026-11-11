@@ -415,10 +415,12 @@ describe('fundingBursts', () => {
     const candidates = Array.from({ length: 100_000 }, (_, i) => candidate('a4', i, ETH + BigInt(100_000 - i) * 10n ** 9n));
     const started = performance.now();
     const bursts = fundingBursts(candidates, DEFAULT_SETTINGS);
-    expect(performance.now() - started).toBeLessThan(1_000);
+    // The bound is the title's 5 seconds: a quadratic pass over 100,000 candidates takes minutes, and a tighter bound
+    // fails on a loaded machine without the code being any slower.
+    expect(performance.now() - started).toBeLessThan(5_000);
     expect(bursts.size).toBe(100_000);
     expect(bursts.get(synthetic('a4', 0))).toBe(100_000);
-  });
+  }, 30_000);
 });
 
 describe('funderKind', () => {
