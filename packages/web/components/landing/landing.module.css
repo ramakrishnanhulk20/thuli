@@ -1,0 +1,707 @@
+/* Shared frame */
+.section {
+  --pad: clamp(20px, 3vw, 48px);
+
+  position: relative;
+  padding: clamp(96px, 14vh, 180px) var(--pad);
+  border-top: 1px solid var(--color-line);
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.inner {
+  max-width: 1360px;
+  margin: 0 auto;
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.labelMark {
+  color: var(--color-accent);
+}
+
+.heading {
+  max-width: 16ch;
+  margin-top: 20px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(2.25rem, 5vw, 5rem);
+  line-height: 1.02;
+  color: var(--color-ink);
+}
+
+.body {
+  max-width: 52ch;
+  margin-top: 24px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.linkRow {
+  margin-top: 32px;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.linkLabel,
+.cardLinkLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.linkLabel::after,
+.cardLinkLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.link:hover .linkLabel::after,
+.cardLink:hover .cardLinkLabel::after {
+  transform: scaleX(1);
+}
+
+.linkArrow {
+  flex: none;
+  transition: transform 200ms var(--ease-out-expo);
+}
+
+.link:hover .linkArrow {
+  transform: translateX(3px);
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Case file: the stacked layout first, then the pinned layout on top of it */
+.caseInner {
+  display: flex;
+  flex-direction: column;
+  gap: 40px;
+}
+
+.caseWallet {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--color-ink-3);
+}
+
+.caseStageWrap {
+  width: 100%;
+}
+
+.caseSvg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 78svh;
+}
+
+.caseSteps {
+  display: flex;
+  flex-direction: column;
+  gap: 40px;
+}
+
+.caseCounter {
+  display: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.stepCounter {
+  margin-bottom: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.stepHeading {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(1.75rem, 3vw, 3rem);
+  line-height: 1.05;
+  color: var(--color-ink);
+}
+
+.stepBody {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 17px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.stepLink {
+  margin-top: 24px;
+}
+
+.reasonCard {
+  margin: 18px 0;
+  padding: 18px 20px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-night-2);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  padding: 3px 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--color-ink);
+}
+
+.chipHold {
+  border-color: var(--color-hold);
+  color: var(--color-hold);
+}
+
+/* The reason can hold a 66 character transaction hash with no spaces, which would otherwise widen the whole text column. */
+.reasonText {
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.reasonRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin-top: 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.cardLink {
+  color: var(--color-ink-2);
+}
+
+.reasonRun {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-ink-3);
+  overflow-wrap: anywhere;
+}
+
+/* The drawing. Fill and stroke come from classes so the tokens stay real variables. */
+.svgCorner {
+  fill: none;
+  stroke: var(--color-ink-3);
+  stroke-width: 1;
+}
+
+.svgTrail {
+  fill: none;
+  stroke: var(--color-ink-3);
+  stroke-width: 1.5;
+  transition: stroke 300ms ease;
+}
+
+.svgTrailBright {
+  stroke: var(--color-ink);
+}
+
+.svgFanLine {
+  fill: none;
+  stroke: var(--color-ink-3);
+  stroke-width: 1;
+}
+
+.svgW {
+  fill: var(--color-ink);
+  transition: fill 250ms ease;
+}
+
+.svgDot {
+  fill: var(--color-ink-3);
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0);
+  transition:
+    transform 200ms var(--ease-out-expo),
+    fill 250ms ease;
+}
+
+.svgDotOn {
+  transform: scale(1);
+}
+
+.svgHeld {
+  fill: var(--color-hold);
+}
+
+.svgNode {
+  fill: var(--color-night);
+  stroke: var(--color-ink-3);
+  stroke-width: 1.5;
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0);
+  transition: transform 250ms var(--ease-out-expo);
+}
+
+.svgNodeOn {
+  transform: scale(1);
+}
+
+.svgFunder {
+  fill: var(--color-night);
+  stroke: var(--color-accent);
+  stroke-width: 1.5;
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0);
+  transition:
+    transform 250ms var(--ease-out-expo),
+    stroke 300ms ease;
+}
+
+.svgFunderOn {
+  transform: scale(1);
+}
+
+.svgFunderBright {
+  stroke: var(--color-ink);
+}
+
+.svgText {
+  font-family: var(--font-mono);
+  fill: var(--color-ink-3);
+  opacity: 0;
+  transition: opacity 250ms ease;
+}
+
+.svgTextOn {
+  opacity: 1;
+}
+
+.svgTextSoft {
+  fill: var(--color-ink-2);
+}
+
+.svgTextAccent {
+  fill: var(--color-accent);
+  transition-duration: 300ms;
+}
+
+.svgFact {
+  font-family: var(--font-mono);
+  fill: var(--color-ink-2);
+}
+
+.svgStamp {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  fill: var(--color-hold);
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: rotate(-6deg) scale(1.3);
+  transition:
+    opacity 300ms var(--ease-out-expo),
+    transform 300ms var(--ease-out-expo);
+}
+
+.svgStampOn {
+  opacity: 1;
+  transform: rotate(-6deg) scale(1);
+}
+
+.svgPulseRing {
+  fill: none;
+  stroke: var(--color-ink);
+  stroke-width: 1;
+  opacity: 0;
+}
+
+/* Pinned layout: 768px and wider, motion allowed */
+@media (min-width: 768px) and (prefers-reduced-motion: no-preference) {
+  .case {
+    height: 100svh;
+    padding: 0 var(--pad);
+  }
+
+  .caseInner {
+    display: grid;
+    grid-template-columns: minmax(0, 40%) minmax(0, 60%);
+    grid-template-rows: 1fr auto auto auto 1fr;
+    gap: 0;
+    height: 100%;
+  }
+
+  .caseHead {
+    grid-column: 1;
+    grid-row: 2;
+    max-width: 440px;
+  }
+
+  .caseSteps {
+    display: grid;
+    grid-column: 1;
+    grid-row: 3;
+    min-height: 320px;
+    max-width: 440px;
+    margin-top: 28px;
+  }
+
+  .caseCounter {
+    display: block;
+    grid-column: 1;
+    grid-row: 4;
+    margin-top: 20px;
+  }
+
+  .caseStageWrap {
+    display: flex;
+    grid-column: 2;
+    grid-row: 1 / -1;
+    align-items: center;
+  }
+
+  .stepCounter {
+    display: none;
+  }
+
+  /* The five blocks share one cell, so the box is as tall as the tallest and the counter never sits on a block. */
+  .caseStep {
+    grid-area: 1 / 1;
+    min-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(16px);
+    transition:
+      opacity 350ms var(--ease-out-expo),
+      transform 350ms var(--ease-out-expo),
+      visibility 0s linear 350ms;
+  }
+
+  .case[data-step='1'] .caseStep[data-n='1'],
+  .case[data-step='2'] .caseStep[data-n='2'],
+  .case[data-step='3'] .caseStep[data-n='3'],
+  .case[data-step='4'] .caseStep[data-n='4'],
+  .case[data-step='5'] .caseStep[data-n='5'] {
+    opacity: 1;
+    visibility: visible;
+    transform: none;
+    transition:
+      opacity 350ms var(--ease-out-expo),
+      transform 350ms var(--ease-out-expo),
+      visibility 0s;
+  }
+
+  .svgPulseRing {
+    animation: pulse 1.8s ease-out infinite;
+  }
+}
+
+.reasonRest {
+  visibility: visible;
+}
+
+@media (min-width: 768px) and (prefers-reduced-motion: no-preference) {
+  .reasonRest {
+    visibility: hidden;
+  }
+}
+
+/* Measured */
+.figures {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 48px;
+  margin-top: 72px;
+}
+
+.figureMark {
+  color: var(--color-accent);
+}
+
+.figure {
+  position: relative;
+  margin-top: 18px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: clamp(4rem, 9vw, 9rem);
+  line-height: 0.9;
+  color: var(--color-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.figureLabel {
+  max-width: 22ch;
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.figureNote {
+  max-width: 34ch;
+  margin-top: 10px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* Feedback */
+.feedback {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 64px;
+  margin-top: 72px;
+}
+
+.feedbackText .body:first-child {
+  margin-top: 0;
+}
+
+.rowLabel {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-ink-3);
+}
+
+.bars {
+  margin-top: 16px;
+}
+
+.barRow {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 12px;
+  height: 28px;
+  margin-bottom: 0;
+}
+
+.barTag {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-2);
+}
+
+.barTrack {
+  height: 14px;
+}
+
+.barFill {
+  height: 14px;
+  border-radius: 2px;
+}
+
+.barFillOld {
+  background: var(--color-ink-3);
+}
+
+.barFillNew {
+  background: var(--color-accent);
+}
+
+.barNumber {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1;
+  color: var(--color-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.dotsBlock {
+  margin-top: 56px;
+}
+
+.dots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.dot {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  border: 1.5px solid var(--color-hold);
+  border-radius: 50%;
+  background: var(--color-hold);
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease;
+}
+
+.dotReleased {
+  border-color: var(--color-ink);
+  background: transparent;
+}
+
+.dotDrop {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  margin: -6px 0 0 -4px;
+  color: var(--color-accent);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.dotReleased .dotDrop {
+  animation: dropFall 400ms ease-out both;
+}
+
+.tally {
+  display: grid;
+  margin-top: 16px;
+}
+
+.tallyLine {
+  grid-area: 1 / 1;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1.2;
+  color: var(--color-ink);
+  opacity: 0;
+  transition: opacity 400ms ease;
+}
+
+.tallyOn {
+  opacity: 1;
+}
+
+.stillHeld {
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--color-ink-3);
+}
+
+.cost {
+  max-width: 46ch;
+  margin-top: 40px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+@media (min-width: 1024px) {
+  .feedback {
+    grid-template-columns: minmax(0, 46fr) minmax(0, 54fr);
+    gap: 64px;
+  }
+}
+
+@media (max-width: 899px) {
+  .figures {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 56px;
+  }
+}
+
+@media (max-width: 767px) {
+  .body {
+    font-size: 16px;
+  }
+}
+
+@keyframes pulse {
+  from {
+    r: 10px;
+    opacity: 0.5;
+  }
+
+  to {
+    r: 26px;
+    opacity: 0;
+  }
+}
+
+@keyframes dropFall {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  to {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+
+/* Motion writes inline styles for the reveal and the bars, so only an important rule can hold them still. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .barFill {
+    width: var(--w) !important;
+  }
+
+  .dotReleased .dotDrop {
+    animation: none;
+  }
+}
