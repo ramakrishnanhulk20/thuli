@@ -1,6 +1,7 @@
 {
   "name": "thuli",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "workspaces": [
     "packages/core",
@@ -14,6 +15,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:db": "vitest run packages/store packages/api --no-file-parallelism",
     "typecheck": "tsc -p packages/core/tsconfig.json && tsc -p packages/worker/tsconfig.json && tsc -p packages/api/tsconfig.json && tsc -p packages/store/tsconfig.json && npm --prefix packages/web run typecheck",
     "prove:slice": "node --env-file=.env --import tsx packages/worker/scripts/prove-slice.ts",
     "replay:robo": "node --env-file=.env --import tsx packages/worker/scripts/replay-robo.ts",
@@ -31,8 +33,12 @@
     "contracts:test": "forge test --root packages/contracts",
     "contracts:lint": "npm run lint --prefix packages/contracts",
     "vault:deploy": "node --env-file=.env packages/contracts/script/deploy.mjs",
+    "vault:create": "node --env-file-if-exists=.env --env-file-if-exists=.env.payer --import tsx packages/worker/scripts/create-vault.ts",
+    "campaign:create": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/create-campaign.ts",
     "prove:vault": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/prove-vault.ts",
-    "db:migrate": "node --env-file=.env --import tsx packages/store/scripts/migrate.ts"
+    "db:migrate": "node --env-file-if-exists=.env --import tsx packages/store/scripts/migrate.ts",
+    "worker": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/worker.ts",
+    "rehearse:campaign": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/rehearse-campaign.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
