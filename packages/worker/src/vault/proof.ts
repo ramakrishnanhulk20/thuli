@@ -81,6 +81,20 @@ export function loadRpcEnv(source: Record<string, string | undefined>): string {
   return rpcUrl;
 }
 
+/** Base Sepolia's public endpoint, the one .env.example ships with. It is rate-limited; verify makes about a dozen calls. */
+export const PUBLIC_BASE_SEPOLIA_RPC = 'https://sepolia.base.org';
+
+/**
+ * The RPC for verify: BASE_SEPOLIA_RPC_URL when it is set, else Base Sepolia's public endpoint, so checking the record
+ * needs no account anywhere. A value that is set but is not https is refused, never swapped for the public one.
+ *
+ * @throws ProofSetupError naming BASE_SEPOLIA_RPC_URL, never its value (C40).
+ */
+export function loadVerifyRpc(source: Record<string, string | undefined>): { rpcUrl: string; usesPublic: boolean } {
+  if ((source.BASE_SEPOLIA_RPC_URL ?? '').trim() === '') return { rpcUrl: PUBLIC_BASE_SEPOLIA_RPC, usesPublic: true };
+  return { rpcUrl: loadRpcEnv(source), usesPublic: false };
+}
+
 /** A fresh claimant seed. Testnet only: it sits in the proof's state file so both phases derive the same wallets. */
 export function newSeed(): Hex {
   return toHex(randomBytes(32));
@@ -217,6 +231,41 @@ const PROOF_STEPS: readonly ProofStep[] = [
   { label: 'postRoot', saved: 'postRoot', signer: 'agent', target: 'vault' },
   { label: 'claim', saved: 'claim A', signer: 'agent', target: 'vault' },
 ];
+
+const DecimalText = z.string().regex(/^(0|[1-9][0-9]{0,77})$/);
+
+/** The committed base-sepolia-proof.json as buildProofRecord writes it. Strict, so a file with any other field is refused. */
+export const ProofRecordFile = z.strictObject({
+  schema: z.literal(1),
+  network: z.literal('base-sepolia'),
+  chainId: z.literal(84532),
+  explorer: z.literal('https://sepolia.basescan.org'),
+  factory: AddressField,
+  vault: AddressField,
+  token: AddressField,
+  owner: AddressField,
+  agent: AddressField,
+  perWalletCap: DecimalText,
+  rootDelaySeconds: z.int().min(0),
+  root: Hash32,
+  claimableAt: z.int().positive(),
+  paid: z.strictObject({ account: AddressField, amount: DecimalText }),
+  refused: z.strictObject({ account: AddressField, error: z.literal('InvalidProof') }),
+  deposited: DecimalText,
+  totalPaid: DecimalText,
+  transactions: z
+    .array(
+      z.strictObject({
+        label: z.enum(PROOF_STEPS.map((step) => step.label) as [ProofLabel, ...ProofLabel[]]),
+        hash: Hash32,
+        block: z.int().positive(),
+        gasUsed: z.int().positive(),
+        from: AddressField,
+      }),
+    )
+    .max(PROOF_STEPS.length),
+  recordedAt: z.iso.datetime(),
+});
 
 function must(ok: boolean, failure: string): asserts ok {
   if (!ok) throw new ProofFailed(failure);
@@ -361,4 +410,155 @@ export function buildProofRecord(input: { state: ProofState; deployment: Deploym
     transactions,
     recordedAt: now.toISOString(),
   };
+}
+
+export interface ProofCheck {
+  /** The same on every run, so a failure names the check. */
+  name: string;
+  pass: boolean;
+  /** What was checked when it passed, or what the chain showed instead. */
+  detail: string;
+}
+
+/** What prove-vault verify reads: public chain data only, nothing from the private state file. */
+export interface VerifyChain {
+  /** The receipt of each transaction the record lists. One the chain does not know is left out. */
+  receipts: readonly ProofReceipt[];
+  /** The vault's state() today. */
+  vaultState: ProofVaultState;
+  claimedByPaid: bigint;
+  claimedByRefused: bigint;
+}
+
+/**
+ * Checks a committed proof record against public chain data, so anyone with an RPC URL and the two committed files can
+ * check it: the record names the deployed factory; each of the five transactions has a successful receipt in the
+ * recorded block, sent by the recorded sender, who is the owner or the agent its step needs, with the recorded gas used;
+ * the createVault receipt holds the factory's VaultCreated naming the recorded vault, owner, agent, token and cap; the
+ * postRoot receipt holds the vault's RootPosted with the recorded root and claimableAt; the claim receipt holds the
+ * vault's Claimed paying the paid account the recorded amount and one Base Sepolia USDC Transfer of it from the vault to
+ * that account; state() today shows the recorded token, owner, agent, cap and delay and totalPaid at least the recorded
+ * one; claimed(paid account) is at least the recorded amount; claimed(refused account) is 0. Later claims may raise the
+ * two running totals, so those are at least, not equal. Pure: prove-vault verify makes the reads.
+ *
+ * Not checked, because it needs the private claim list behind the root: that the refused account's claim reverts.
+ *
+ * @returns Every check, passed or not, in a fixed order. Nothing throws: a check that cannot be read fails.
+ */
+export function verifyProofRecord(record: ProofRecord, deployment: Deployment, chain: VerifyChain): ProofCheck[] {
+  const checks: ProofCheck[] = [];
+  const check = (name: string, passed: string, failureOf: () => string | null) => {
+    let failure: string | null;
+    try {
+      failure = failureOf();
+    } catch {
+      failure = 'the record or the chain data could not be read';
+    }
+    checks.push({ name, pass: failure === null, detail: failure ?? passed });
+  };
+  const listed = (label: ProofLabel) => record.transactions.filter((tx) => tx.label === label);
+  const receiptOf = (label: ProofLabel) => {
+    const [tx, ...others] = listed(label);
+    if (tx === undefined || others.length > 0) return undefined;
+    return chain.receipts.find((receipt) => receipt.transactionHash.toLowerCase() === tx.hash.toLowerCase());
+  };
+  const paid = record.paid.account;
+  const amount = BigInt(record.paid.amount);
+
+  check('factory', `the record names the factory in base-sepolia.json, ${deployment.factory}`, () =>
+    sameAddress(record.factory, deployment.factory) ? null : `the record names ${record.factory}, base-sepolia.json names ${deployment.factory}`,
+  );
+
+  for (const step of PROOF_STEPS) {
+    const signer = step.signer === 'owner' ? record.owner : record.agent;
+    const [tx] = listed(step.label);
+    check(
+      `${step.label} transaction`,
+      `${tx?.hash} succeeded in block ${tx?.block}, sent by the ${step.signer} ${tx?.from}, ${tx?.gasUsed} gas`,
+      () => {
+        if (tx === undefined || listed(step.label).length !== 1) return `the record does not list exactly one ${step.label} transaction`;
+        if (!sameAddress(tx.from, signer)) return `the record says ${tx.from} sent it, not the ${step.signer} ${signer}`;
+        const receipt = receiptOf(step.label);
+        if (receipt === undefined) return `the chain has no receipt for ${tx.hash}`;
+        if (receipt.status !== 'success') return `${tx.hash} did not succeed`;
+        if (receipt.blockNumber !== BigInt(tx.block)) return `${tx.hash} is in block ${receipt.blockNumber}, not ${tx.block}`;
+        if (!sameAddress(receipt.from, tx.from)) return `${tx.hash} was sent by ${receipt.from}, not ${tx.from}`;
+        if (receipt.gasUsed !== BigInt(tx.gasUsed)) return `${tx.hash} used ${receipt.gasUsed} gas, not ${tx.gasUsed}`;
+        return null;
+      },
+    );
+  }
+
+  const noReceipt = (label: ProofLabel) => `there is no ${label} receipt to read`;
+  check('VaultCreated', 'the factory logged VaultCreated for the recorded vault, owner, agent, token and cap', () => {
+    const receipt = receiptOf('createVault');
+    if (receipt === undefined) return noReceipt('createVault');
+    const created = eventsFrom(receipt, deployment.factory, FACTORY_ABI).flatMap((event) => (event.eventName === 'VaultCreated' ? [event.args] : []));
+    const [args] = created;
+    if (args === undefined || created.length !== 1) return `the createVault receipt holds ${created.length} VaultCreated events from the factory, not one`;
+    const differ = [
+      sameAddress(args.vault, record.vault) ? [] : ['vault'],
+      sameAddress(args.owner, record.owner) ? [] : ['owner'],
+      sameAddress(args.agent, record.agent) ? [] : ['agent'],
+      sameAddress(args.token, record.token) ? [] : ['token'],
+      args.perWalletCap === BigInt(record.perWalletCap) ? [] : ['cap'],
+    ].flat();
+    return differ.length === 0 ? null : `VaultCreated names another ${differ.join(', ')} than the record`;
+  });
+
+  check('RootPosted', `the vault logged RootPosted for root ${record.root}, claimable at unix ${record.claimableAt}`, () => {
+    const receipt = receiptOf('postRoot');
+    if (receipt === undefined) return noReceipt('postRoot');
+    const posted = eventsFrom(receipt, record.vault, VAULT_ABI).flatMap((event) => (event.eventName === 'RootPosted' ? [event.args] : []));
+    const [args] = posted;
+    if (args === undefined || posted.length !== 1) return `the postRoot receipt holds ${posted.length} RootPosted events from the vault, not one`;
+    if (args.root.toLowerCase() !== record.root.toLowerCase()) return `RootPosted names root ${args.root}, not ${record.root}`;
+    if (args.claimableAt !== BigInt(record.claimableAt)) return `RootPosted says claimable at ${args.claimableAt}, not ${record.claimableAt}`;
+    return null;
+  });
+
+  check('Claimed', `the vault logged Claimed paying ${paid} ${amount}`, () => {
+    const receipt = receiptOf('claim');
+    if (receipt === undefined) return noReceipt('claim');
+    const claimed = eventsFrom(receipt, record.vault, VAULT_ABI).flatMap((event) => (event.eventName === 'Claimed' ? [event.args] : []));
+    const [args] = claimed;
+    if (args === undefined || claimed.length !== 1) return `the claim receipt holds ${claimed.length} Claimed events from the vault, not one`;
+    if (!sameAddress(args.account, paid) || args.amount !== amount) return `Claimed pays ${args.account} ${args.amount}, not ${paid} ${amount}`;
+    return null;
+  });
+
+  check('USDC Transfer', `USDC moved ${amount} from the vault to ${paid}`, () => {
+    if (!sameAddress(record.token, BASE_SEPOLIA.usdc)) return `the record's token ${record.token} is not Base Sepolia USDC`;
+    const receipt = receiptOf('claim');
+    if (receipt === undefined) return noReceipt('claim');
+    const moved = eventsFrom(receipt, record.token, erc20Abi).flatMap((event) =>
+      event.eventName === 'Transfer' && sameAddress(event.args.from, record.vault) ? [event.args] : [],
+    );
+    const [args] = moved;
+    if (args === undefined || moved.length !== 1) return `the claim receipt holds ${moved.length} USDC Transfers from the vault, not one`;
+    if (!sameAddress(args.to, paid) || args.value !== amount) return `the USDC Transfer sends ${args.value} to ${args.to}, not ${amount} to ${paid}`;
+    return null;
+  });
+
+  const view = chain.vaultState;
+  check('vault terms', "the vault's state() shows the recorded token, owner, agent, cap and delay", () => {
+    const differ = [
+      sameAddress(view.token, record.token) ? [] : ['token'],
+      sameAddress(view.owner, record.owner) ? [] : ['owner'],
+      sameAddress(view.agent, record.agent) ? [] : ['agent'],
+      view.perWalletCap === BigInt(record.perWalletCap) ? [] : ['cap'],
+      view.rootDelay === record.rootDelaySeconds ? [] : ['delay'],
+    ].flat();
+    return differ.length === 0 ? null : `state() shows another ${differ.join(', ')} than the record`;
+  });
+  check('totalPaid', `state() shows ${view.totalPaid} paid, at least the recorded ${record.totalPaid}`, () =>
+    view.totalPaid >= BigInt(record.totalPaid) ? null : `state() shows ${view.totalPaid} paid, less than the recorded ${record.totalPaid}`,
+  );
+  check('claimed(paid)', `claimed(${paid}) is ${chain.claimedByPaid}, at least the recorded ${amount}`, () =>
+    chain.claimedByPaid >= amount ? null : `claimed(${paid}) is ${chain.claimedByPaid}, less than the recorded ${amount}`,
+  );
+  check('claimed(refused)', `claimed(${record.refused.account}) is 0`, () =>
+    chain.claimedByRefused === 0n ? null : `claimed(${record.refused.account}) is ${chain.claimedByRefused}, not 0`,
+  );
+  return checks;
 }

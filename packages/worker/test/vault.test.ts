@@ -1,7 +1,8 @@
 // Not covered here: the viem port against a real chain, which the local-fork rehearsal runs end to end
 // (packages/contracts/script/rehearse.mjs), and the vault's own on-chain checks (packages/contracts/test).
-// buildProofRecord is fed hand-built receipts and views: the reads behind it are proven only by running
-// `npm run prove:vault -- record` against Base Sepolia, and nothing here checks how the website shows the record.
+// buildProofRecord and verifyProofRecord are fed hand-built receipts and views: the reads behind them are proven only by
+// running `npm run prove:vault -- record` and `-- verify` against Base Sepolia, and nothing here checks how the website
+// shows the record.
 import fs from 'node:fs';
 import {
   createPublicClient,
@@ -27,9 +28,13 @@ import {
   Deployment,
   loadProofEnv,
   loadRpcEnv,
+  loadVerifyRpc,
   ProofFailed,
+  ProofRecordFile,
   ProofSetupError,
   ProofState,
+  PUBLIC_BASE_SEPOLIA_RPC,
+  verifyProofRecord,
   type ProofLog,
   type ProofReceipt,
 } from '../src/vault/proof.ts';
@@ -466,9 +471,16 @@ describe('the proof helpers', () => {
       expect(String(error)).not.toContain('secret-path-123');
     }
   });
+
+  it('lets verify fall back to the public endpoint only when the RPC is unset, never when it is set wrong (C40)', () => {
+    expect(loadVerifyRpc({})).toEqual({ rpcUrl: PUBLIC_BASE_SEPOLIA_RPC, usesPublic: true });
+    expect(loadVerifyRpc({ BASE_SEPOLIA_RPC_URL: '  ' })).toEqual({ rpcUrl: PUBLIC_BASE_SEPOLIA_RPC, usesPublic: true });
+    expect(loadVerifyRpc({ BASE_SEPOLIA_RPC_URL: 'https://rpc.example/k' })).toEqual({ rpcUrl: 'https://rpc.example/k', usesPublic: false });
+    expect(() => loadVerifyRpc({ BASE_SEPOLIA_RPC_URL: 'http://rpc.example/secret-path-123' })).toThrow(/^Missing or invalid in \.env: BASE_SEPOLIA_RPC_URL/);
+  });
 });
 
-describe('buildProofRecord', () => {
+describe('the proof record', () => {
   const SEED = `0x${'6a'.repeat(32)}` as const;
   const { a: PAID, b: REFUSED } = claimants(SEED);
   const USDC = parseAddress(CHAINS['base-sepolia'].usdc);
@@ -666,6 +678,95 @@ describe('buildProofRecord', () => {
       spoil(input);
       expect(() => buildProofRecord(input)).toThrow(ProofFailed);
       expect(() => buildProofRecord(input)).toThrow(failure);
+    });
+  });
+
+  describe('the record is checkable by anyone with an RPC URL and the two committed files', () => {
+    // The record goes through JSON and the committed file's shape, the way verify reads it from disk.
+    function verifyInput() {
+      const input = goodInput();
+      const record = ProofRecordFile.parse(JSON.parse(JSON.stringify(buildProofRecord(input))));
+      const chain = { receipts: input.chain.receipts, vaultState: input.chain.vaultState, claimedByPaid: CAP, claimedByRefused: 0n };
+      return { record, deployment: input.deployment, chain };
+    }
+    type Verify = ReturnType<typeof verifyInput>;
+    const chainReceipt = (v: Verify, step: Step) => v.chain.receipts.find((receipt) => receipt.transactionHash === HASH[step]) as ProofReceipt;
+    const recordTx = (v: Verify, step: Step) => v.record.transactions.find((tx) => tx.label === step) as Verify['record']['transactions'][number];
+    const failedChecks = (v: Verify) =>
+      verifyProofRecord(v.record, v.deployment, v.chain)
+        .filter((check) => !check.pass)
+        .map((check) => check.name);
+
+    it('passes every check, in a fixed order, on the record buildProofRecord wrote', () => {
+      const v = verifyInput();
+      const checks = verifyProofRecord(v.record, v.deployment, v.chain);
+      expect(checks.map((check) => check.name)).toEqual([
+        'factory',
+        'createVault transaction',
+        'approve transaction',
+        'deposit transaction',
+        'postRoot transaction',
+        'claim transaction',
+        'VaultCreated',
+        'RootPosted',
+        'Claimed',
+        'USDC Transfer',
+        'vault terms',
+        'totalPaid',
+        'claimed(paid)',
+        'claimed(refused)',
+      ]);
+      expect(checks.filter((check) => !check.pass)).toEqual([]);
+      expect(checks.find((check) => check.name === 'claim transaction')?.detail).toBe(
+        `${HASH.claim} succeeded in block 2000, sent by the agent ${AGENT}, 145907 gas`,
+      );
+    });
+
+    it('still passes once later claims have raised the two running totals', () => {
+      const v = verifyInput();
+      v.chain.vaultState.totalPaid = 3n * CAP;
+      v.chain.claimedByPaid = 2n * CAP;
+      expect(failedChecks(v)).toEqual([]);
+    });
+
+    it('reads the committed record file through the same shape, and refuses a file with any other field', () => {
+      const committed = JSON.parse(fs.readFileSync(new URL('deployments/base-sepolia-proof.json', CONTRACTS), 'utf8')) as Record<string, unknown>;
+      expect(ProofRecordFile.safeParse(committed).success).toBe(true);
+      expect(ProofRecordFile.safeParse({ ...committed, seed: `0x${'6a'.repeat(32)}` }).success).toBe(false);
+    });
+
+    it('fails the transaction and both checks read from its receipt when a recorded hash is not on chain', () => {
+      const v = verifyInput();
+      recordTx(v, 'claim').hash = `0x${'0e'.repeat(32)}`;
+      expect(failedChecks(v)).toEqual(['claim transaction', 'Claimed', 'USDC Transfer']);
+    });
+
+    const failures: [string, string, (v: Verify) => void][] = [
+      ['factory', 'a record naming another factory', (v) => void (v.record.factory = TOKEN)],
+      ['createVault transaction', 'a receipt that reverted', (v) => void (chainReceipt(v, 'createVault').status = 'reverted')],
+      ['approve transaction', 'a receipt in another block', (v) => void (chainReceipt(v, 'approve').blockNumber += 1n)],
+      ['deposit transaction', 'a receipt from another sender', (v) => void (chainReceipt(v, 'deposit').from = AGENT)],
+      ['postRoot transaction', 'a receipt with other gas used', (v) => void (chainReceipt(v, 'postRoot').gasUsed += 1n)],
+      ['claim transaction', 'a record naming the owner as the claim sender', (v) => void (recordTx(v, 'claim').from = OWNER)],
+      ['VaultCreated', 'a createVault receipt without the event', (v) => void (chainReceipt(v, 'createVault').logs = [])],
+      ['RootPosted', 'a record with another claimableAt', (v) => void (v.record.claimableAt += 1)],
+      ['Claimed', 'a claim receipt without Claimed', (v) => void (chainReceipt(v, 'claim').logs = [rootActivated(), transfer(VAULT, PAID, CAP)])],
+      [
+        'USDC Transfer',
+        'a Transfer of another amount',
+        (v) => void (chainReceipt(v, 'claim').logs = [rootActivated(), claimedEvent(PAID, CAP), transfer(VAULT, PAID, CAP - 1n)]),
+      ],
+      ['vault terms', 'a vault with another delay', (v) => void (v.chain.vaultState.rootDelay = 7200)],
+      ['vault terms', 'a vault with another agent', (v) => void (v.chain.vaultState.agent = OWNER)],
+      ['totalPaid', 'a vault that paid less than recorded', (v) => void (v.chain.vaultState.totalPaid = CAP - 1n)],
+      ['claimed(paid)', 'a paid account that claimed less than recorded', (v) => void (v.chain.claimedByPaid = CAP - 1n)],
+      ['claimed(refused)', 'a refused account that was paid', (v) => void (v.chain.claimedByRefused = 1n)],
+    ];
+
+    it.each(failures)('fails only the %s check on %s', (check, _what, spoil) => {
+      const v = verifyInput();
+      spoil(v);
+      expect(failedChecks(v)).toEqual([check]);
     });
   });
 });

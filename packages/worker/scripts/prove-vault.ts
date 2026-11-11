@@ -7,6 +7,9 @@
 //   npm run prove:vault -- record  reads the saved run back from Base Sepolia, loading no key and sending nothing, and
 //                                  only when every receipt, event and view agrees writes the public record
 //                                  packages/contracts/deployments/base-sepolia-proof.json for the site and the README
+//   npm run prove:vault -- verify  checks that committed record against Base Sepolia with only an RPC URL (the public
+//                                  endpoint when BASE_SEPOLIA_RPC_URL is unset) and the two committed files, so anyone
+//                                  can run it; --record FILE checks another copy
 //
 // Rehearse setup and claim on a local fork with --rpc-url http://127.0.0.1:PORT --deployment FILE --state FILE
 // (rehearse.mjs does). Every phase refuses any chain but 84532. Claimant keys are never stored: both are derived from a
@@ -37,11 +40,14 @@ import {
   Deployment,
   loadProofEnv,
   loadRpcEnv,
+  loadVerifyRpc,
   newSeed,
   PROOF_TERMS,
   ProofFailed,
+  ProofRecordFile,
   ProofSetupError,
   ProofState,
+  verifyProofRecord,
 } from '../src/vault/proof.ts';
 import { buildRoot, postRoot, readPublishedList, RootError, type CampaignRecord } from '../src/vault/root.ts';
 
@@ -50,7 +56,8 @@ const DEFAULT_DEPLOYMENT = path.join(REPO_ROOT, 'packages', 'contracts', 'deploy
 const DEFAULT_STATE = path.join(REPO_ROOT, 'data', 'vault-proof', 'state.json');
 const PROOF_RECORD = path.join(REPO_ROOT, 'packages', 'contracts', 'deployments', 'base-sepolia-proof.json');
 const MAX_FILE_BYTES = 64 * 1024;
-const USAGE = 'Usage: npm run prove:vault -- setup|claim|record [--rpc-url http://127.0.0.1:PORT] [--deployment FILE] [--state FILE]';
+const USAGE =
+  'Usage: npm run prove:vault -- setup|claim|record [--rpc-url http://127.0.0.1:PORT] [--deployment FILE] [--state FILE], or verify [--record FILE] [--deployment FILE]';
 
 type Client = PublicClient<Transport, Chain>;
 type Logged = Sent & { label: string };
@@ -334,15 +341,61 @@ async function record(client: Client, deploymentFile: string, stateFile: string)
   console.log(`Wrote ${path.relative(REPO_ROOT, PROOF_RECORD).replaceAll('\\', '/')}`);
 }
 
+// Public reads only, and no key or private file: the receipts, state() and claimed() of the two recorded accounts.
+async function verify(client: Client, deploymentFile: string, recordFile: string): Promise<number> {
+  const deployment = readJson(Deployment, deploymentFile, 'deployment record');
+  const proof = readJson(ProofRecordFile, recordFile, 'proof record');
+  const code = await client.getCode({ address: proof.vault });
+  if (code === undefined || code === '0x') throw new ProofFailed(`vault: there is no contract at the recorded vault ${proof.vault}`);
+
+  const receipts: TransactionReceipt[] = [];
+  for (const tx of proof.transactions) {
+    try {
+      receipts.push(await client.getTransactionReceipt({ hash: tx.hash as `0x${string}` }));
+    } catch (error) {
+      // verifyProofRecord fails the check of the transaction whose receipt is missing.
+      if (!(error instanceof TransactionReceiptNotFoundError)) throw error;
+    }
+  }
+  const blockNumber = await client.getBlockNumber();
+  const read = { address: proof.vault, abi: VAULT_ABI, blockNumber } as const;
+  const vaultState = await client.readContract({ ...read, functionName: 'state' });
+  const claimedByPaid = await client.readContract({ ...read, functionName: 'claimed', args: [proof.paid.account] });
+  const claimedByRefused = await client.readContract({ ...read, functionName: 'claimed', args: [proof.refused.account] });
+
+  const checks = verifyProofRecord(proof, deployment, { receipts, vaultState, claimedByPaid, claimedByRefused });
+  console.log(`Checking ${path.relative(REPO_ROOT, recordFile).replaceAll('\\', '/')} against Base Sepolia at block ${blockNumber}:`);
+  for (const { name, pass, detail } of checks) console.log(`  ${pass ? 'pass' : 'FAIL'}  ${name.padEnd(24)} ${detail}`);
+  console.log("Not checked: that the refused wallet's claim reverts. That needs the private claim list behind the root, so only the record phase repeats it.");
+  const failed = checks.filter((entry) => !entry.pass).map((entry) => entry.name);
+  if (failed.length > 0) {
+    console.error(`prove-vault verify failed: ${failed.join(', ')}`);
+    return 1;
+  }
+  console.log(`All ${checks.length} checks pass. The vault on Basescan: ${addressLink(proof.vault)}`);
+  return 0;
+}
+
 async function main(): Promise<number> {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
-    options: { 'rpc-url': { type: 'string' }, deployment: { type: 'string' }, state: { type: 'string' } },
+    options: { 'rpc-url': { type: 'string' }, deployment: { type: 'string' }, state: { type: 'string' }, record: { type: 'string' } },
   });
   const phase = positionals[0];
-  if (positionals.length !== 1 || (phase !== 'setup' && phase !== 'claim' && phase !== 'record')) throw new ProofSetupError(USAGE);
+  const phases = ['setup', 'claim', 'record', 'verify'];
+  if (positionals.length !== 1 || phase === undefined || !phases.includes(phase)) throw new ProofSetupError(USAGE);
   const stateFile = path.resolve(values.state ?? DEFAULT_STATE);
   const deploymentFile = path.resolve(values.deployment ?? DEFAULT_DEPLOYMENT);
+  if (phase === 'verify') {
+    if (values['rpc-url'] !== undefined || values.state !== undefined) {
+      throw new ProofSetupError('verify needs no state file and reads Base Sepolia itself; it takes only --record FILE and --deployment FILE.');
+    }
+    const { rpcUrl, usesPublic } = loadVerifyRpc(process.env);
+    if (usesPublic) console.log(`BASE_SEPOLIA_RPC_URL is not set, so this reads Base Sepolia through its public endpoint ${rpcUrl}.`);
+    const { publicClient } = await connectBaseSepolia(rpcUrl);
+    return verify(publicClient, deploymentFile, path.resolve(values.record ?? PROOF_RECORD));
+  }
+  if (values.record !== undefined) throw new ProofSetupError(USAGE);
   if (phase === 'record') {
     // A fork's transactions are not on Basescan, so a record built from one would publish links that lead nowhere.
     if (values['rpc-url'] !== undefined) throw new ProofSetupError('record reads Base Sepolia itself; --rpc-url is only for rehearsing setup and claim.');
