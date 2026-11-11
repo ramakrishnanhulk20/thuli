@@ -6,6 +6,7 @@ import {
   Facts,
   holdForReview,
   parseAddress,
+  type AccountState,
   type Address,
   type FactName,
   type Outcome,
@@ -219,6 +220,29 @@ export async function screenOneWallet(wallet: string, deps: SingleScreenDeps): P
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Reads one address's nonce and code as of the latest finalized Ethereum block, with the same client, timeout and
+ * offchain lookups off as factsAtFinalizedBlock (C38, C41). Empty code comes back as "0x", the raw eth_getCode answer
+ * the replay's states hold, so core's funderKind reads both the same way. The single-wallet screening does not call it.
+ *
+ * @throws the client's error when the block, the nonce or the code cannot be read; nothing is guessed.
+ */
+export function accountStateAtFinalizedBlock(sources: Pick<FactSources, 'rpcUrl'>): (address: Address) => Promise<AccountState> {
+  const client = createPublicClient({
+    chain: mainnet,
+    transport: http(sources.rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1 }),
+    ccipRead: false,
+  });
+  return async (address) => {
+    const block = await client.getBlock({ blockTag: 'finalized' });
+    const [nonce, code] = await Promise.all([
+      client.getTransactionCount({ address, blockNumber: block.number }),
+      client.getCode({ address, blockNumber: block.number }),
+    ]);
+    return { nonce, code: code ?? '0x' };
+  };
 }
 
 /**
