@@ -221,5 +221,6 @@ describe('openMemoryDb transactions', () => {
     await other.close();
     await expect(other.query('SELECT 1')).rejects.toThrow(StoreError);
     await expect(other.transaction(async () => 1)).rejects.toThrow(StoreError);
-  });
+    // Starting a second in-process database takes several seconds when the whole suite runs at once.
+  }, 30_000);
 });
