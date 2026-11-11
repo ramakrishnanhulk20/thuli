@@ -25,11 +25,11 @@ flowchart TB
 
   API["API package: free check, paid screen, campaign routes"]
   FAC["x402 facilitator"]
-  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays")]
+  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
 
   subgraph Worker["Worker, run as scripts"]
-    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims"]
-    SCRIPTS["Replay, scoring and export scripts"]
+    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims, check an appeal"]
+    SCRIPTS["Replay, scoring, export and operator scripts"]
   end
 
   subgraph Screening["Screening code"]
@@ -52,14 +52,14 @@ flowchart TB
     P1["Planned: paid data through Kite Passport, Nansen and Allium"]
     P2["Planned: Dolphin summaries"]
     P3["Planned: owner sign-in and campaign upload"]
-    P4["Planned: public appeal routes"]
+    P4["Planned: owner settles appeals in the site"]
     P5["Planned: hosted worker and database"]
-    P6["Planned: Base mainnet"]
+    P6["Planned: Base mainnet vaults and real payments"]
   end
 
   VIS --> PAGES
   AGT -->|"pays 0.05 USDC over x402"| ROUTES
-  WAL -->|"signed ask, ticket"| ROUTES
+  WAL -->|"signed ask, signed appeal, ticket"| ROUTES
   PAGES -->|"reads"| FILES
   PAGES -->|"free check"| ROUTES
   ROUTES -->|"all but /api/search"| API
@@ -67,11 +67,12 @@ flowchart TB
   API --> DB
   API -->|"screens one wallet"| FACTS
   API -->|"claimed, claimable"| VAULT
-  DB <-->|"asks, decisions, lists, relays"| LOOP
-  DB ~~~ SCRIPTS
+  DB <-->|"asks, decisions, lists, relays, appeals"| LOOP
+  SCRIPTS -->|"registers campaigns, settles appeals"| DB
   LOOP -->|"screens each ask"| FACTS
   LOOP -->|"VaultCreated log"| FACTORY
   LOOP -->|"postRoot, claim"| VAULT
+  LOOP -->|"sends each appealed decision"| REPPO
   FACTORY -->|"creates"| VAULT
   VAULT -->|"pays"| WAL
   SCRIPTS -->|"replays a claim list"| FACTS
@@ -94,11 +95,11 @@ flowchart TB
   class P1,P2,P3,P4,P5,P6 planned
 ```
 
-The free check and the paid route run the same screening inside the request. The paid route is described in [Check a wallet and the paid API](/docs/paid-api).
+The free check and the paid route run the same screening inside the request. A paid request answers within 240 seconds, and a paid result is stored so the same payment header fetches it again. The paid route is described in [Check a wallet and the paid API](/docs/paid-api). The vault factory is also deployed on Base mainnet, and its runtime code is identical to the Base Sepolia factory. Source verification on Basescan is still pending. No vault has been created on Base mainnet and no real payment has been made yet. The public campaign and every other address stay on Base Sepolia with test money.
 
 ## One wallet through an open campaign
 
-A wallet signs an ask. The worker screens it, gives an approved wallet a slot, and posts the list's root to the campaign's vault. Once the vault's delay is over, the worker submits each claim, so the wallet is paid without paying gas. Every step here is in the code today.
+A wallet signs an ask. A wallet that has never been used on Ethereum is turned away at the door and nothing is stored. The worker screens the rest, gives an approved wallet a slot, and posts the list's root to the campaign's vault, recording the signed post before it sends it. Once the vault's delay is over, the worker submits each claim, so the wallet is paid without paying gas. A wallet that was not approved in full can appeal in one signed line. The worker sends Thuli's decision, with anything that identifies the wallet taken out and never the wallet's own words, to the outside check. The check is advice, and an operator's command makes the owner's call. Every step here is in the code today.
 
 ```mermaid
 sequenceDiagram
@@ -110,16 +111,18 @@ sequenceDiagram
   participant ETH as Ethereum RPC and Blockscout
   participant SV as SERV Reasoning
   participant V as Vault on Base Sepolia
+  participant R as Reppo evaluation API
+  participant O as Operator command
 
   W->>W: Sign the ask text as a personal message
   W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
-  API->>API: checkAsk: a valid address, signed in the last 600 seconds
-  API->>ETH: Read the wallet's code, a contract cannot ask yet
-  API->>API: The signature must match the rebuilt ask text
-  API->>DB: Store the ask as queued, the first ask per wallet stands
+  API->>API: checkAsk: a valid address, signed in the last 600 seconds, the signature matches the rebuilt ask text
+  API->>ETH: Only then read the wallet's code, a contract cannot ask yet
+  API->>ETH: Read its sent count and balance, a wallet with neither is answered neverUsed and nothing is stored
+  API->>DB: Store the ask as queued while slots and room are left, the first ask per wallet stands
   API-->>W: 202 queued
   K->>DB: Take the oldest queued ask, leased for 300 seconds
-  K->>ETH: Read the wallet's facts at the latest finalized block
+  K->>ETH: Read the wallet's facts at the latest finalized block, and its first funder's code and sent count
   K->>DB: Read the first funders of the campaign's other asks
   K->>K: Link asks that share a funder, set start and ceiling in code
   K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
@@ -128,10 +131,12 @@ sequenceDiagram
   K->>DB: Store the decision, an approved wallet takes the next free slot
   K->>DB: Build the list from the slot holders, store it as a new list version
   K->>K: Read the stored text back and rebuild the root from it
-  K->>V: Check the vault against the factory log, then postRoot
-  K->>DB: Mark the version posted with its transaction
+  K->>V: Check the vault against the factory log, simulate and sign postRoot
+  K->>DB: Record the hash and nonce, the version is sending
+  K->>V: Send the signed post and wait for its receipt
+  K->>DB: Mark the version posted with the claimable time the receipt holds
   V->>V: The root waits out its delay, and the owner can cancel it
-  K->>V: Read state, and claimable for every listed wallet
+  K->>V: Read state, and claimed for every listed wallet
   K->>DB: Mark the version active, queue a relay for each wallet still owed
   K->>DB: Take the oldest waiting relay
   K->>V: Simulate, then send claim(account, cumulativeAmount, proof) from the agent key
@@ -139,6 +144,12 @@ sequenceDiagram
   K->>DB: Mark the relay confirmed
   W->>API: GET /api/campaigns/:id/asks/:wallet
   API-->>W: The decision, and a claim ticket once the list is active
+  W->>API: POST /api/campaigns/:id/appeals with wallet, one line of text, signedAt, signature (not approved in full)
+  API->>DB: Store the appeal, bound to the decision it disputes
+  K->>R: Send Thuli's decision with identifiers removed, never the appellant's text
+  R-->>K: Route ship, review or block, and a note
+  K->>DB: Store the route and note, the ask is unchanged
+  O->>DB: Settle it: reversed to an approval, which takes the next free slot, or upheld
 ```
 
 Whoever submits a claim, the vault pays only the wallet named in the list. More on who can do what in [The reward vault](/docs/vault).
@@ -163,7 +174,7 @@ flowchart TB
   end
 
   subgraph worker["packages/worker"]
-    CAMPW["campaign: loop, screen, facts, publish, relay, vault"]
+    CAMPW["campaign: loop, screen, facts, publish, relay, vault, appeals"]
     SINGLE["screen/single"]
     REPLAY["replay: decide, runner, scoring, export"]
     REPPO["reppo: client, feedback"]
@@ -173,7 +184,7 @@ flowchart TB
   end
 
   subgraph store["packages/store"]
-    SCAMP["campaigns"]
+    SCAMP["campaigns, appeals"]
     SROWS["paymentClaims, limits, checkCache, sweep"]
     SDB["db, migrate"]
   end
@@ -206,6 +217,7 @@ flowchart TB
   CAMPW --> SINGLE
   CAMPW --> REPLAY
   CAMPW --> VAULTW
+  CAMPW --> REPPO
   CAMPW --> SCAMP
   SINGLE --> READ
   SINGLE --> REPLAY

@@ -1,9 +1,13 @@
 # Thuli threat model
 
-Written 27 Oct 2026 at the architecture gate, before any code, by an independent review pass working only from a plain
+Written 27 Oct 2026 at the architecture gate, before any code, by an independent reader working only from a plain
 functional description of the system. Sections A and B say what kind of system this is and what an attacker would go
 after. Section C is the definition of done: the build is finished only when every numbered invariant below is upheld
 and shown by its test.
+
+Rules C48 to C59 were added on 11 Nov 2026, from the build of the live campaign and appeals. Each names the file and
+function that upholds it and the test that shows it. Everything in this file describes the code at that date; nothing is
+hosted, and the live campaign runs on Base Sepolia with test money.
 
 ## A) App-class risk profile
 
@@ -219,9 +223,13 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   itself. This is a structural fan-out rule over the data we hold, backed by provider labels, not a hand-kept list of
   exchange addresses. It misses a farm running its own high fan-out funder. Shown by: wallets whose only shared fact is
   one exchange withdrawal address land in separate clusters.
-- **C17. Appeals advise, owners decide.** No appeal outcome changes a decision, a published list or a payout until the
-  campaign owner confirms it from a signed-in session. Shown by: an appeal whose model answer is "reverse" changes
-  nothing until the owner acts.
+- **C17. Appeals advise, owners decide.** The outside check's answer (ship, review or block) is advice. It is never
+  read when an appeal is settled, and it changes no decision, list or payout. An appeal changes an outcome only when the
+  campaign owner's call is settled, and only toward an approval (C57). Owner sign-in is not built, so an operator's
+  command settles appeals: `npm run appeal:settle`, a dry run unless `--write` is given. No signed-in session supplies the
+  owner's confirmation yet. Shown by: `packages/worker/test/campaignAppeals.test.ts`, "records Reppo's %s route, its note,
+  the evaluation id and the credits, and leaves the ask alone (C11, C23)" for each of ship, review and block, and "settles
+  only with --write, passes the store's refusal on, and a reversal takes a slot the list then carries (C11, C44)".
 - **C18. Every decision is traceable, and a published list is frozen.** Each decision records its rule version, facts
   snapshot, model request ids and data receipts. Publish is refused while any wallet is queued or any decision was made
   under an older rule version. After publish, changes come only through C17, each creating a new public list version
@@ -259,8 +267,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   spellings of one address, sent to two copies, cost one model run between them, and a client past its ceiling is refused.
 - **C25. No paid result goes out without a settled payment for that exact request.** The route uses x402's upfront
   flow: the facilitator settles the signed payment before the screening runs, so a result never goes out on an unsettled
-  authorization, and a second copy of one `PAYMENT-SIGNATURE` fails at settlement because its nonce is spent. The
-  payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
+  authorization. A second copy of one `PAYMENT-SIGNATURE` is refused (its nonce is spent, or it names another wallet) or,
+  for the wallet the payment was made for and within a day of the settlement, redeemed: it gets that payment's stored
+  result and settles nothing (C48). The payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
   price (the exact scheme needs strict equality), inside its validity window. The route settles on the network the
   configuration names: it is proved on Base Sepolia, and Base mainnet is supported by configuration and has not been
   run. Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
@@ -273,7 +282,7 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   route's timeout plus 30 seconds is refused, and a used claim is remembered until its validBefore, so no copy of a header
   can outlive its claim. With a database configured the claims live in Postgres, shared by every server copy and kept
   across a restart. Once a settlement is confirmed the buyer gets the result whatever the store does: a claim the store
-  could not mark used stays held, so no copy is served. Before that, a store that cannot be reached refuses, and nothing
+  could not mark settled stays held, so no copy is served. Before that, a store that cannot be reached refuses, and nothing
   is settled on a claim the store could not record. Shown by: one header sent 10 times at once to two copies over one
   database is settled and served once.
   Non-goal, only when no database is configured: claims then live in each server's memory, so after a restart a copy sent
@@ -283,7 +292,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   Non-goal: when a settlement's outcome is unknown and recording the claim as unsure fails as well, the claim stays held
   by a request that is gone, so the same header cannot retry before its validBefore. That takes two failures at once.
 - **C26. The paid path cannot cost more than it earns.** The worst-case cost of one paid screening is a stated number
-  below the price, enforced by a per-request spend cap. Shown by: the cap holds for a wallet that triggers all four hops.
+  below the price, enforced by a per-request spend cap of 12 SERV calls. One payment buys at most two screenings
+  (`REDEEM_SCREEN_TRIES`), however often its header comes back (C48). Shown by: the cap holds for a wallet that triggers
+  all four hops; a payment whose screening always runs out of time buys two screenings and then the stored time-up hold.
 
 **Vault**
 - **C27. Nobody is paid more than their current entitlement, in total, across all roots.** Each leaf carries a
@@ -388,7 +399,7 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   with any funder and no link ends at the start, and with a link of its own stays a hold.
 
 
-**Known gaps, scheduled or accepted (backend review, 10 Nov)**
+**Known gaps, scheduled or accepted (found 10 Nov)**
 - Farms funded through a batch-send contract (Disperse, a router) are not grouped, because an internal transfer names the
   contract and contracts never link. Candidate fix: attribute an internal transfer to the signer of its parent transaction.
 - A sweep into a contract wallet (a Safe, a forwarder) never links, so one contract collector avoids A3. Candidate fix:
@@ -409,9 +420,188 @@ or attack that demonstrates it. A change that touches an invariant also carries 
 
 **Demo campaign**
 - **C44. The demo pays at most 20 USDC, 1 USDC each, only to wallets that proved control.** A slot is taken only by a
-  wallet that signed to ask and was approved; held or excluded wallets do not use one. The contract caps each wallet at
+  wallet that signed to ask and was approved, or whose appeal the owner reversed to an approval; held or excluded wallets
+  do not use one. The contract caps each wallet at
   1 USDC and the vault holds only the demo deposit. Shown by: 30 signed asks from farm wallets on a fork; no more than
   20 USDC leaves the vault and no address gets more than 1 USDC.
+
+**The live campaign, its worker and appeals (C48 to C59, added 11 Nov 2026 from the build of the live campaign and appeals)**
+- **C48. A paid request ends before the host ends it, and a settled payment always ends with a stored result.** Every
+  paid request answers within 240 seconds of its first line (`REQUEST_DEADLINE_MS`), under the host's 300. It settles
+  nothing unless the time left covers two settle calls, the slowest receipt read and the start of a screening (120.5
+  seconds), and it starts a screening only with 20 seconds left. After settling, one payment buys at most two screenings
+  (`REDEEM_SCREEN_TRIES`). A screening that runs out of time before the last try answers "settled, send the same payment
+  header again" and the payment stays settled; when the last try runs out of time, or both are used with no result
+  stored, a code-written "ran out of time" hold is stored and served. The result is stored with the payment before it is
+  sent, and the same header, for the same wallet, fetches it again for a day with no settlement and no screening. A cut
+  screening is stopped through its signal and keeps its running place until it has really ended. Upheld by: `createApp`
+  and `byDeadline` in `packages/api/src/app.ts`, `REQUEST_DEADLINE_MS` in `packages/api/src/config.ts`, and
+  `redeemPayment`, `markPaymentSettled` and `servePayment` in `packages/store/src/paymentClaims.ts`. Non-goal: a crash
+  in the instant between the facilitator settling a payment and the store recording it as settled leaves that payment
+  unredeemable; the settlement is on chain and the payment is refunded by hand. Non-goal: a redeem does not check the
+  signature again, so anyone who rebuilds the header from the settlement on chain can fetch that wallet's stored result;
+  it buys no screening the payment did not already buy, and the free check gives that screening to anyone. Shown by:
+  `packages/api/test/payment.test.ts`, "ends before the host ends it, with its result or the settled-retry answer, and the
+  same header then gets the result", "settles nothing when too little of the deadline is left to settle and screen, so
+  nothing is spent" and "C25, C26: a payment whose screening always runs out of time buys two screenings, then the stored
+  time-up hold, however often its header comes back"; `packages/store/test/paymentClaims.test.ts`, "C26: counts one
+  screening per taking of the claim, gives back only the owner's unstarted try, and answers spent at
+  REDEEM_SCREEN_TRIES".
+- **C49. Every piece of outbound work an unauthenticated request can cause has a per-caller ceiling and a global
+  ceiling, and the free local checks run first.** A model call, a chain read and an outside paid check each sit behind
+  both. An ask or an appeal is checked for shape, size, time and signature before any chain is read; the wallet-type
+  reads of every caller and both POST routes stop at 600 a minute, the door reads at 300 a minute, and the ticket's vault
+  reads at 600 a minute, each counted in the store before the read is made, and a count that cannot be read refuses. One
+  caller gets 20 requests a minute across asks and appeals, 5 asks and 2 appeals an hour. Appeals are 10 a UTC day for
+  one campaign and 20 across all. The worker runs at most 2,000 model screenings a UTC day across every campaign, counted
+  in one store statement before SERV is called, and sends each appeal to the outside check once. Upheld by:
+  `countPost`, `countedTypeReader` and the door and ticket reads in `packages/api/src/campaigns.ts`; `checkAsk` and
+  `checkAppeal` in `packages/core`; `addAppeal` in `packages/store/src/appeals.ts`; and `decisionFor` in
+  `packages/worker/src/campaign/screen.ts`. Non-goal: the ceilings protect money and the RPC, not a campaign's service.
+  An attacker with many addresses and aged wallets can use up a day's screening budget, and real asks then wait until
+  after midnight UTC. Shown by: `packages/api/test/campaigns.test.ts`, "C42: door reads stop at 300 a minute across every
+  caller with 503 busy and nothing stored, then open again", "C24, C42: wallet-type reads stop at 600 a minute across both
+  POST routes and every caller, with 503 busy and no read, one count per chain read", "C42: a bad signature causes no
+  chain read of any kind, while a good one reads the code on both chains and the door" and "C24, C42: a caller files two
+  appeals an hour, the day takes 20, and the 21st is 429 with Retry-After to midnight"; `packages/store/test/appeals.test.ts`,
+  "C24: one campaign takes at most 10 appeals a day, another campaign still queues, and the 21st of the day is busy";
+  `packages/worker/test/campaignWorker.test.ts`, "(h) runs no model screening past the day budget: the ask keeps its
+  tries and waits past midnight, a never-used wallet is still decided, and the next day screens again (C11, C24, C26)".
+- **C50. An ask that cost its sender nothing is never stored or counted, and the ask queue is bounded.** A wallet with no
+  transaction sent and no balance on Ethereum is answered `{"neverUsed": true}` after its signature and type are checked,
+  and nothing is stored, queued or counted for it. A read that fails, times out or is not a whole number is "busy", never
+  "used" and never "never used". A campaign answers "full" when every slot is taken, when 200 asks wait undecided, or at
+  its lifetime cap of the larger of 1,000 and 100 asks for each slot. Held history does not count against the backlog.
+  Locking a campaign this way costs an attacker the cap times one funded wallet. Upheld by: `neverUsedOnEthereum` and the
+  ask route in `packages/api/src/campaigns.ts`, and `addAsk` and `askLifetimeCap` in `packages/store/src/campaigns.ts`.
+  Non-goal: that price is at least 1,000 wallets that each hold a balance or have sent a transaction, and one set of
+  funded wallets can fill every campaign's cap. Shown by: `packages/api/test/campaigns.test.ts`, "C24, C42: 1,000
+  never-used wallets store nothing and take no cap, so the next honest wallet is still queued", "C11, fail closed: a count
+  or balance read that fails, is missing or is not a whole number is 503 and stores nothing", "C24: the route answers
+  full while 200 asks wait undecided, and queues again once one of them is decided" and "C24: the route answers full at
+  the lifetime cap, and an ask refused as full, exists or closed spends no global count"; `packages/store/test/campaigns.test.ts`,
+  "C24: an ask is full at 200 undecided asks and queued again once one is decided, and full when no slot is left".
+- **C51. The worker records its own chain write before the network can know it, sends it at most once per nonce, and calls
+  it dead only on proof.** The post of a list is simulated, signed and recorded with its hash and nonce (the list is
+  `sending`) before it is broadcast. Nothing more is posted for a campaign while one of its lists is `sending`. A
+  `sending` list is settled on proof only: a receipt for any transaction sent at its nonce; the vault showing its root
+  pending or paid; the nonce used by another transaction with no receipt and no root on the vault on every read for 120
+  seconds; or, with no node showing any of its
+  transactions for 600 seconds and the nonce unused, a second signature of the same list at the same nonce, at most 5
+  times in a process. One nonce can carry only one mined transaction, so a resend replaces the lost post and never adds a
+  second. Upheld by: `recordedPort`, `settleSending` and `resend` in `packages/worker/src/campaign/publish.ts`,
+  `signPostRoot` and `broadcast` in `packages/worker/src/campaign/vault.ts`, and `markListSending`, `markListResent` and
+  `markListUnsent` in `packages/store/src/campaigns.ts`. Non-goal: a resend, then a restart, then the earlier transaction
+  landing, then the owner cancelling that root, all before the next run, can post a cancelled list again; the owner's
+  pause stops it. A resend takes fresh fees with no bump, so a node that still holds the lost transaction at the same fee
+  may refuse it; the worker tries again 10 minutes later. Shown by: `packages/worker/test/campaignWorker.test.ts`, "(a)
+  signs the same version again at the same nonce once no node has shown it for RESEND_AFTER_SECONDS, recording it first
+  (C27, C32)", "(b) builds a version again once another transaction used its nonce, and the next publish signs at a fresh
+  nonce", "(c) records the post once when the lost transaction lands after its resend: only one of the two is ever
+  mined", "(d) signs no other version while one is sending, even when the slot holders change" and "builds a genuinely
+  dead post again only after CANCEL_MARGIN_SECONDS, then signs it at a fresh nonce"; `packages/store/test/campaigns.test.ts`,
+  "C27, C32: a sent list keeps its nonce with its hash, a resend replaces only the hash, and unsent clears both".
+- **C52. A step that ran out of time performs no write and no send afterwards.** At its limit the loop aborts the step's
+  signal, and every step checks it before each store write, each signature and each send. Two records are kept even then,
+  because dropping them would hide a real send: a claim already on the network is recorded as sent, and an evaluation id
+  the outside check returned is stored. What the step held stays leased until the lease runs out. Upheld by: `bounded` in
+  `packages/worker/src/campaign/loop.ts`, and `checkpoint` and `StepStopped` in `packages/worker/src/campaign/vault.ts`,
+  called in `publish.ts`, `relay.ts`, `screen.ts` and `appeals.ts`. Shown by: `packages/worker/test/campaignWorker.test.ts`,
+  "sends nothing and writes nothing once its publish is told to stop", "sends nothing from a publish that ran past its
+  limit, once a newer list has been posted", "records a claim it broadcast as sent with its hash, even when told to stop
+  right after the send (C27)" and "bounds every step with a timeout, so a hung reader or chain cannot stop the loop
+  (C41)"; `packages/worker/test/campaignAppeals.test.ts`, "stops at its limit before any write, but always keeps an
+  evaluation id it was given (C23, C41)".
+- **C53. A zero from a vault read is never taken to mean "paid".** A paused vault answers 0 to every `claimable()` and
+  refuses every claim, so the worker reads the paused flag with the roots and works out what a wallet is owed as its
+  listed amount less `claimed()`. While the vault is paused nothing is marked active and nothing is queued, and a waiting
+  claim is given back with its try handed back, so a pause of any length uses up none of its tries. The ticket route
+  leaves `claimed` and `claimable` out when a read fails and never shows a failed read as zero. Upheld by: `activateCheck`
+  and `relayNext` in `packages/worker/src/campaign/relay.ts`, `roots` and `claimedOf` in `vault.ts`, and `readAmounts` in
+  `packages/api/src/campaigns.ts`. Non-goal: a pause also stops every claim for as long as it lasts, so it is a blunt way
+  for an owner to stop further lists. Shown by: `packages/worker/test/campaignWorker.test.ts`, "never reads a paused vault
+  as paid: the owed wallets are queued once it is unpaused", "marks nothing and queues nothing while the vault is paused,
+  and after the unpause queues exactly the owed wallets", "queues a wallet paid part of its cumulative amount under an
+  earlier version for the rest, read from claimed()", "(g) uses up none of a claim's tries while the vault is paused,
+  says so once, and claims it after the unpause (C44)" and "(g) gives a claim back the same way when its simulation
+  reverts with the pause error a lagging read missed".
+- **C54. A campaign's slots are covered by what its vault holds, and it is served only by the agent its vault names.**
+  Registering a campaign reads the vault from its creation transaction and refuses when `--agent` is not the vault's
+  agent, and when reward times slots is more than the vault still holds (deposited less paid). Posting refuses unless the
+  worker's key is the vault's agent, the vault came from the recorded factory with the recorded terms, and the vault can
+  pay everything both lists may still owe. Upheld by: `campaignFromVault` in `packages/worker/src/campaign/register.ts`,
+  and `verifyVault`, `checkRoot` and `postRoot` in `packages/worker/src/vault/root.ts`. Shown by:
+  `packages/worker/test/registerCampaign.test.ts`, "counts what the vault still holds, deposited less paid, against
+  reward times slots, and refuses when it is short" and "refuses an --agent that is not the vault's agent, in any
+  spelling of the right one accepting it (C1)"; `packages/worker/test/vault.test.ts`, "refuses a campaign record that
+  names an agent other than this worker" and "sends nothing from a key that is not the vault agent";
+  `packages/worker/test/campaignWorker.test.ts`, "posts nothing for a vault the factory did not log in the recorded
+  block, or logged with other terms".
+- **C55. A hold caused by an outage can be screened again by an operator; a decided hold never is, except through an
+  appeal.** `campaign:requeue` moves a failed ask, the A1 hold left when every try at screening ran out, back to the queue
+  from the start. It never touches a decided ask, a decided hold included, an ask that holds a slot, or a failed ask that
+  has an appeal. The only other way a decided ask changes is the owner settling an appeal toward an approval (C57). No
+  command can approve a wallet directly. Upheld by: `requeueFailedAsk` in `packages/store/src/campaigns.ts`, `requeueAsk`
+  in `packages/worker/src/campaign/register.ts`, and `settleAppeal` in `packages/store/src/appeals.ts`. Shown by:
+  `packages/store/test/campaigns.test.ts`, "C11: requeueFailedAsk screens a failed ask again from the start, and never
+  touches a decided, waiting or slotted ask"; `packages/store/test/appeals.test.ts`, "C11, C17: requeueFailedAsk refuses
+  a failed ask that has an appeal, saying so, and queues one that has none"; `packages/worker/test/registerCampaign.test.ts`,
+  "puts only a failed ask back in the queue, and only with --write".
+- **C56. A paid call that cannot be deduplicated gets a durable mark first and is never repeated on an ambiguous
+  outcome.** The outside check charges for every submit and cannot tell that a text was sent twice. The worker marks the
+  appeal in the store before it sends, makes one POST with no retry and a 30 second deadline, and stores the evaluation
+  id at once; a later try looks that id up and submits nothing. A refusal that cannot have charged (402, 400, 401 or 404)
+  takes the mark back so a later try may send. Any other outcome keeps the mark, and the appeal ends unchecked with
+  nothing sent again. Of two workers holding one appeal after a lease ran out, at most one is told to send. Upheld by:
+  `appealNext` and `submitOnce` in `packages/worker/src/campaign/appeals.ts`; `markAppealSubmitting`,
+  `clearAppealSubmitting` and `noteAppealEval` in `packages/store/src/appeals.ts`; and `submitEvaluationOnce` and
+  `submitCannotHaveCharged` in `packages/worker/src/reppo/client.ts`. Non-goal: when the store cannot keep an evaluation
+  id after a paid submit, that one check is paid for and its verdict lost, the lesser harm than paying twice; the log
+  names the id so the operator can look it up. Shown by: `packages/worker/test/campaignAppeals.test.ts`, "pays once when the
+  write keeping the evaluation id fails, ends the appeal unchecked, and logs the id for a look-up by hand (cut A)", "pays
+  once when the process stops after the submit returns, before the id is kept (cut B)", "never pays twice for a cut after
+  the mark and before the POST: the appeal ends unchecked", "pays once with two workers on one appeal after a lease ran
+  out, whichever of them stalls", "clears the mark on a 402 and on a 400, so a later run submits once" and "keeps the mark
+  after a timeout, a 5xx or a 409, and never sends a second POST for any of them"; `packages/worker/test/reppoClient.test.ts`,
+  "makes exactly one request whatever comes back, and tells a refusal that cannot have charged from one that may have";
+  `packages/store/test/appeals.test.ts`, "C23: the submit mark is set once on a checking appeal with no id, survives a
+  lease expiry and a release, and stays private".
+- **C57. An appeal is bound to the decision it was filed against; the outside check is advice; only the owner's settlement
+  changes an outcome, and only toward an approval.** The appeal keeps the action and rule it disputes. If the ask no
+  longer has them, the check ends unchecked with the cause "the decision changed after the appeal", and a reversal is
+  refused. A reversal must name `full` or `partial`, more generous than the appealed action, on an ask that still holds
+  it; an upheld appeal changes nothing but the appeal. A reversed ask takes the next free slot while slots are left, and
+  the next list carries it like any slot holder. The outside check's score, route and note are never read when an appeal
+  is settled. Upheld by: `addAppeal`, `takeAppeal`, `planSettlement` and `settleAppeal` in
+  `packages/store/src/appeals.ts`. Non-goal, while owner sign-in is not built: an operator's command makes the owner's
+  call. Shown by: `packages/store/test/appeals.test.ts`, "C11, C17: takeAppeal ends an appeal whose ask lost the appealed
+  action or rule unchecked, with its cause, and never hands it out", "C11: settleAppeal refuses an appeal that is not open,
+  a reversal with no action or no more generous one, and a changed ask" and "C11, C44, C27: a reversal approves the ask,
+  takes the next slot while one is left, and slotHolders lists it once"; `packages/worker/test/campaignAppeals.test.ts`,
+  "settles only with --write, passes the store's refusal on, and a reversal takes a slot the list then carries (C11, C44)".
+- **C58. Text from an outsider reaches an operator's terminal only quoted, on one line.** An appeal's text must be one
+  line (no line break, tab, other control character, or U+2028 or U+2029) at the API and again in the store. The operator's
+  list prints the appellant's text, the owner's note and the outside check's words as one quoted string after a fixed
+  label, so none can pass for a line of the command's own. Upheld by: `isOneLine` and `checkAppeal` in
+  `packages/core/src/appeal.ts`, `addAppeal` in `packages/store/src/appeals.ts`, and `appealLines` in
+  `packages/worker/src/campaign/appeals.ts`. Shown by: `packages/worker/test/campaignAppeals.test.ts`, "prints outside
+  text quoted on one line, so a text with quotes and backslashes cannot pass for the command's own lines (C34, C40)";
+  `packages/core/test/appeal.test.ts`, "C34, C40: refuses a text that is not one line, every break, tab and control
+  character, even when correctly signed"; `packages/api/test/campaigns.test.ts`, "C34, C40: refuses an appeal whose text is
+  not one line with its fixed cause, before any chain read".
+- **C59. Nothing that identifies a wallet reaches the outside judge, and the appellant's own words reach no model.** The
+  text sent to the outside check is built from the stored record of the decision written as words and counts, the
+  appealed outcome and Thuli's reason, with every address, hash, amount and date removed, then scanned for an address, a
+  hash, an amount, a date or time and any number of seven digits or more; if anything is found nothing is sent. The step
+  that builds it is handed only those three fields, so the appellant's text cannot be in it, and the campaign path sends
+  that text to no model. The text is read only by the operator's list. Upheld by: `reppoInput` and `stripIdentifiers`
+  in `packages/core/src/reppo.ts`, `identifyingPart` in `packages/worker/src/reppo/feedback.ts`, and `outsideInput` in
+  `packages/worker/src/campaign/appeals.ts`. Non-goal: names, such as an ENS name, are not caught; no stored fact or
+  reason holds one. Shown by: `packages/worker/test/campaignAppeals.test.ts`, "sends Thuli's decision built by the offline
+  builder, never the appellant's text, which the step never receives (C35)", "refuses to send a record with an address in
+  it, or a text that still holds a time, and ends the check unchecked (C35)" and "holds nothing that identifies a wallet,
+  an amount or a time in the text it sends"; `packages/core/test/reppo.test.ts`, "throws rather than send a hex run still
+  in the payload".
 
 ### C.2 General standards, applied to this system
 1. **Primitives over lists.** Addresses: one library parser and checksum function (C1). Signatures: one verifier for
@@ -457,8 +647,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
      wallets looks alone and can be approved, and an ask once decided is not screened again. Screening a whole claim
      list at once, as the replay does, has no such gap (C15).
    - Funding passed through other wallets, for campaign asks. A campaign ask is linked through the wallet's direct
-     first funder only. The replay follows a funding back through up to 6 single-use pass-through wallets
-     (`MAX_TRACE_HOPS`); a campaign ask does not.
+     first funder only, where the offline replay follows a funding back through up to 6 single-use pass-through wallets
+     (`MAX_TRACE_HOPS`). To fix: run the same trace on each ask, which costs more chain reads for every ask against the
+     same ceilings (C49).
    - High-volume funders. A first funder with 10,000 or more transactions sent (`HIGH_VOLUME_NONCE`, read when the ask
      is screened), or with contract code, is treated as an exchange or service and links nobody, so wallets funded
      straight from such an address are not linked by funding (C16).
@@ -481,3 +672,28 @@ or attack that demonstrates it. A change that touches an invariant also carries 
    - Lists posted while asks are queued. C18's refusal to publish while a wallet is queued belongs to an owner-run
      publish step, which is not built. The campaign worker posts a list as soon as the slot holders change, without
      waiting for queued asks, and each change is a new list version shown beside the old ones.
+   - Screening reads a wallet's Ethereum history only. A wallet used mostly on other chains looks new, which can
+     cut it to a partial reward. To fix: read the same facts on each other chain, which needs a reader and a rule for every
+     chain.
+   - Owner sign-in is not built, so an operator's command settles appeals (`npm run appeal:settle`, a dry run unless
+     `--write` is given). No signed-in session supplies the owner's confirmation (C17). To fix: owner sign-in with a
+     signed message (C6, C10) and an owner route that calls the same settlement.
+   - The scorecard does not score appeals yet. `appeal:export` writes checked appeals, with the outside check's whole
+     verdict and the owner's outcome, as input for the next rulebook change, and nothing reads that file. To fix: add the
+     exported appeals to the scorecard's input.
+   - No Reppo evaluation has been run for an appeal yet. The tests use a stand-in for the outside check. To fix: credit
+     the Reppo account and run one, then record the result.
+   - The paid route's two named limits (C48). A crash between the facilitator settling a payment and the store recording
+     it leaves that payment unredeemable, refunded by hand; to fix, read settlements from the chain on a schedule and
+     record any that have no claim. A redeem does not check the signature again; to fix, check it on every redeem, at
+     the cost of one more verification for each fetch.
+   - The price of locking a campaign (C50). An attacker needs at least 1,000 wallets that each hold a balance or have
+     sent a transaction, and one set of funded wallets can fill every campaign's cap. To fix: a higher bar for an ask,
+     such as a minimum age or balance, which would also turn away real new wallets.
+   - The day's screening budget (C49). An attacker with many addresses and aged wallets can use up the 2,000 model
+     screenings of a UTC day, and real asks then wait until after midnight. To fix: a larger budget, or a small cost for
+     each ask.
+   - The worker's posts after a stop (C51). A resend, a restart, the earlier transaction landing and the owner's cancel,
+     all before the next run, can post a cancelled list again. To fix: read the owner's cancel from the vault's logs, not
+     only from its state. A resend takes fresh fees with no bump, so a node holding the lost transaction at the same fee
+     may refuse it. To fix: raise the fee on each resend by the amount nodes ask to replace a transaction.
