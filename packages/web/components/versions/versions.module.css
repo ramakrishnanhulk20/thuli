@@ -1,0 +1,372 @@
+.page {
+  --pad: clamp(20px, 3vw, 48px);
+
+  padding: 72px var(--pad) 120px;
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.inner {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.labelMark {
+  color: var(--color-accent);
+}
+
+.title {
+  max-width: 18ch;
+  margin-top: 20px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(2.25rem, 5vw, 4.5rem);
+  line-height: 1.02;
+  color: var(--color-ink);
+}
+
+.h2 {
+  margin-top: 20px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 600;
+  font-weight: 600;
+  font-size: clamp(1.75rem, 3vw, 2.5rem);
+  line-height: 1.1;
+  color: var(--color-ink);
+}
+
+.body {
+  max-width: 52ch;
+  margin-top: 24px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.run {
+  margin-top: 20px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.section {
+  margin-top: 96px;
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Scorecard */
+.scorecard {
+  position: relative;
+  margin-top: 72px;
+}
+
+.headRow,
+.row {
+  display: grid;
+  grid-template-columns: 40% 30% 30%;
+}
+
+.headRow {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.row {
+  padding: 28px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.measure {
+  padding-right: 24px;
+}
+
+.measureName {
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.measurePlain {
+  max-width: 36ch;
+  margin-top: 6px;
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.valueCell {
+  padding-right: 16px;
+}
+
+.tag {
+  display: none;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.number {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: clamp(2rem, 4vw, 3.25rem);
+  line-height: 1;
+  color: var(--color-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.numberAccent {
+  color: var(--color-accent);
+}
+
+.counts {
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-ink-3);
+}
+
+.counts + .counts {
+  margin-top: 4px;
+}
+
+/* Blocked decisions */
+.verdicts {
+  margin-top: 16px;
+}
+
+.verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.group {
+  padding: 2px 8px;
+  border: 1px solid var(--color-line);
+  border-radius: 4px;
+  color: var(--color-ink-2);
+}
+
+.dim {
+  color: var(--color-ink-3);
+}
+
+.actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.arrow {
+  flex: none;
+  color: var(--color-ink-3);
+}
+
+.actionHold {
+  color: var(--color-hold);
+}
+
+.actionFull {
+  color: var(--color-full);
+}
+
+.actionPartial {
+  color: var(--color-partial);
+}
+
+.actionExclude {
+  color: var(--color-exclude);
+}
+
+.routesLine {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  color: var(--color-ink-3);
+}
+
+/* Control group */
+.controls {
+  display: flex;
+  gap: 48px;
+  margin-top: 40px;
+}
+
+.control {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.controlLabel {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.controlNote {
+  max-width: 40ch;
+  margin-top: 10px;
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+/* Not covered */
+.notCovered {
+  max-width: 70ch;
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
+}
+
+.notCovered li {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.notCovered li + li {
+  margin-top: 14px;
+}
+
+.itemMark {
+  flex: none;
+  margin-top: 0.5em;
+  color: var(--color-ink-3);
+}
+
+/* Foot link */
+.footLink {
+  margin-top: 72px;
+}
+
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.linkLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.linkLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.link:hover .linkLabel::after {
+  transform: scaleX(1);
+}
+
+.linkArrow {
+  flex: none;
+  transition: transform 200ms var(--ease-out-expo);
+}
+
+.link:hover .linkArrow {
+  transform: translateX(3px);
+}
+
+@media (max-width: 767px) {
+  .page {
+    padding-bottom: 96px;
+  }
+
+  .body {
+    font-size: 16px;
+  }
+
+  .headRow {
+    display: none;
+  }
+
+  .row {
+    grid-template-columns: 1fr 1fr;
+    gap: 20px 24px;
+  }
+
+  .measure {
+    grid-column: 1 / -1;
+    padding-right: 0;
+  }
+
+  .valueCell {
+    padding-right: 0;
+  }
+
+  .tag {
+    display: block;
+  }
+
+  .controls {
+    flex-direction: column;
+    gap: 48px;
+  }
+}
+
+/* Motion writes inline styles for the row reveal, so only an important rule can hold the rows still. */
+@media (prefers-reduced-motion: reduce) {
+  .reveal {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
