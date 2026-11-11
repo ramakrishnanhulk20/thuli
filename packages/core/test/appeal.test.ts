@@ -29,6 +29,12 @@ const TEXT = 'This wallet belongs to one person. The funder is a public payroll 
 const SIGNATURE_CAUSE = 'the signature does not match this appeal';
 const LINK_CAUSE = 'the appeal text contained a link, markup or control characters';
 const CONTRACT_CAUSE = 'contract wallets cannot appeal yet';
+// Each of these reads as a good campaign id once turned into text, which is how a pattern test sees a non-string.
+const NOT_TEXT_IDS = [
+  { label: 'an array', value: [CAMPAIGN] },
+  { label: 'a number', value: 7 },
+  { label: 'an object', value: { toString: () => CAMPAIGN } },
+];
 
 const claimant = privateKeyToAccount(generatePrivateKey());
 const stranger = privateKeyToAccount(generatePrivateKey());
@@ -107,6 +113,11 @@ describe('appealMessage', () => {
     expect(() => appealMessage({ ...good, textHash: `${good.textHash}\nSigned at: 1` })).toThrow('text hash');
     expect(() => appealMessage({ ...good, signedAt: 1.5 })).toThrow('whole seconds');
     expect(() => appealMessage({ ...good, wallet: 'not an address' })).toThrow('0x address');
+  });
+
+  it.each(NOT_TEXT_IDS)('refuses a campaign id that is not text: $label', ({ value }) => {
+    const good = { campaignId: CAMPAIGN, wallet: claimant.address, textHash: appealTextHash(TEXT), signedAt: NOW };
+    expect(() => appealMessage({ ...good, campaignId: value as unknown as string })).toThrow('campaign id');
   });
 });
 
@@ -204,6 +215,11 @@ describe('checkAppeal', () => {
     expect(await checkAppeal(input, options())).toEqual(refusedWith('this appeal is for a different campaign'));
   });
 
+  it.each(NOT_TEXT_IDS)('gives the campaign cause without throwing for a campaign id that is not text: $label', async ({ value }) => {
+    const input = { ...(await signed()), campaignId: value as unknown as string };
+    await expect(checkAppeal(input, options())).resolves.toEqual(refusedWith('this appeal is for a different campaign'));
+  });
+
   it('refuses a signature signed for campaign A when replayed at campaign B (C7)', async () => {
     const input = await signed();
     const replay = { ...input, campaignId: OTHER_CAMPAIGN };
@@ -275,6 +291,23 @@ describe('checkAppeal', () => {
     expect(await checkAppeal(await signed(), options({ isContract: failing }))).toEqual(
       refusedWith('the wallet type could not be checked'),
     );
+  });
+
+  it.each([
+    { label: 'null', answer: null },
+    { label: 'undefined', answer: undefined },
+    { label: '0', answer: 0 },
+    { label: 'the text "false"', answer: 'false' },
+  ])('refuses when the account reader answers $label instead of true or false (C9, C11)', async ({ answer }) => {
+    const unread = async () => answer as unknown as boolean;
+    expect(await checkAppeal(await signed(), options({ isContract: unread }))).toEqual(
+      refusedWith('the wallet type could not be checked'),
+    );
+  });
+
+  it('still passes a reader answering false and refuses one answering true', async () => {
+    expect((await checkAppeal(await signed(), options({ isContract: async () => false }))).ok).toBe(true);
+    expect(await checkAppeal(await signed(), options({ isContract: async () => true }))).toEqual(refusedWith(CONTRACT_CAUSE));
   });
 
   it('refuses a signature that makes the verifier throw, instead of throwing itself (C9)', async () => {

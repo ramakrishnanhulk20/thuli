@@ -8,17 +8,17 @@ import { leastGenerous, OutcomeSchema, type Outcome } from './outcome.ts';
 export const MAX_APPEAL_CHARS = 1000;
 export const APPEAL_WINDOW_SECONDS = 600;
 // A device clock can run a little fast, so a signature may be dated this far ahead of ours.
-const FUTURE_SKEW_SECONDS = 60;
+export const FUTURE_SKEW_SECONDS = 60;
 
 export const APPEAL_ADVICE = ['reverse', 'uphold', 'unclear'] as const;
 export type AppealAdvice = (typeof APPEAL_ADVICE)[number];
 
 // No spaces, line breaks or colons: a line break in an id could forge the other lines of the signed text, and the
 // appeal store's key is the id, a colon and the wallet.
-const CAMPAIGN_ID = /^[A-Za-z0-9._-]{1,128}$/;
+export const CAMPAIGN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 const TEXT_HASH = /^0x[0-9a-f]{64}$/;
 // Exactly 65 bytes as text. viem also takes other shapes, and whatever passes here goes into storage (C41).
-const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
+export const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
 const MAX_REQUEST_ID_CHARS = 128;
 
 // One plain-text rule for model reasons and appeal text, so the two can never drift apart.
@@ -71,7 +71,10 @@ export function appealTextHash(text: string): string {
  * @throws AddressError when the wallet is not an address.
  */
 export function appealMessage(a: { campaignId: string; wallet: string; textHash: string; signedAt: number }): string {
-  if (!CAMPAIGN_ID.test(a.campaignId)) throw new AppealError('a campaign id is letters, digits, dots, dashes or underscores');
+  // RegExp.test turns a non-string into text first, so an array holding a good id would otherwise pass.
+  if (typeof a.campaignId !== 'string' || !CAMPAIGN_ID.test(a.campaignId)) {
+    throw new AppealError('a campaign id is letters, digits, dots, dashes or underscores');
+  }
   if (!TEXT_HASH.test(a.textHash)) throw new AppealError('the text hash must come from appealTextHash');
   if (!Number.isSafeInteger(a.signedAt) || a.signedAt < 0) throw new AppealError('the signing time must be whole seconds');
   return `Thuli appeal v1\nCampaign: ${a.campaignId}\nWallet: ${parseAddress(a.wallet)}\nAppeal text SHA-256: ${a.textHash}\nSigned at: ${a.signedAt}\n`;
@@ -81,7 +84,8 @@ export function appealMessage(a: { campaignId: string; wallet: string; textHash:
  * Checks one signed appeal. The hash and the signed message are rebuilt here from the stored text and the campaign the
  * server expected, so a signature only verifies for exactly this text, campaign, wallet and time (C7, C8). Contract
  * wallets are refused outright, the one rule C9 allows until sign-in shares a verifier; a delegated EOA keeps its own key
- * and counts as a wallet, so isContract must reflect accountType 'contract' only (C20). Anything that throws is a refusal.
+ * and counts as a wallet, so isContract must reflect accountType 'contract' only (C20). Anything that throws is a refusal,
+ * and so is any isContract answer but true or false.
  *
  * The first failed check in this order gives the cause, always a fixed text: address, text length, text content, campaign,
  * signing time, contract wallet, signature.
@@ -114,11 +118,15 @@ export async function checkAppeal(
   if (!(age <= APPEAL_WINDOW_SECONDS)) return refuse('the signature is too old');
   if (!(age >= -FUTURE_SKEW_SECONDS)) return refuse('the signature is dated in the future');
 
+  let contract: unknown;
   try {
-    if (await opts.isContract(wallet)) return refuse('contract wallets cannot appeal yet');
+    contract = await opts.isContract(wallet);
   } catch {
     return refuse('the wallet type could not be checked');
   }
+  if (contract === true) return refuse('contract wallets cannot appeal yet');
+  // Only a plain false lets the wallet on, so a reader that answers null for "unknown" fails closed (C11).
+  if (contract !== false) return refuse('the wallet type could not be checked');
 
   if (typeof input.signature !== 'string' || !SIGNATURE.test(input.signature)) return refuse(SIGNATURE_CAUSE);
   const textHash = appealTextHash(text);

@@ -13,5 +13,6 @@ export * from './graphVersions.ts';
 export * from './replayScore.ts';
 export * from './reppo.ts';
 export * from './appeal.ts';
+export * from './ask.ts';
 export * from './leaf.ts';
 export * from './money.ts';
