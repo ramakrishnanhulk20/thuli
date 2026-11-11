@@ -109,6 +109,8 @@ class StandInVault implements CampaignVault {
   stopBeforeBroadcast = 0;
   /** The next post is mined and reverts. */
   revertNextPost = false;
+  /** Posts a node shows as waiting to be mined, by hash, so a read of their receipt answers pending. */
+  readonly inPool = new Set<string>();
   private gate: Promise<void> | null = null;
   private readonly signedPosts = new Map<string, { root: MerkleHash; declaredTotal: bigint }>();
   private readonly postReceipts = new Map<string, { ok: boolean; claimableAt: bigint }>();
@@ -303,6 +305,7 @@ class StandInVault implements CampaignVault {
 
   async postReceipt(_vault: Address, _root: MerkleHash, hash: `0x${string}`, _waitMs: number) {
     this.calls.push('postReceipt');
+    if (this.inPool.has(hash)) return { state: 'pending' as const };
     const receipt = this.postReceipts.get(hash);
     if (receipt === undefined) return { state: 'unknown' as const };
     return receipt.ok
@@ -1170,6 +1173,127 @@ describe('a refused answer', () => {
     ]);
     expect(await getAsk(db, CAMPAIGN, wallet.address)).toMatchObject({ status: 'decided', action: 'hold', rule: 'A1', slot: null });
     expect(REFUSED_ANSWER_TRIES).toBe(3);
+  });
+});
+
+describe('found by a second independent check of the worker', () => {
+  const statuses = async () => (await listVersions(db, CAMPAIGN)).map((version) => version.status);
+  const SINGLE_READ_MISSING: Facts['missing'] = ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'];
+
+  // What collectBasicFacts reads for a wallet that never sent or received anything: age 0 from a history read in full,
+  // no transaction sent, plain account, and no funder found, which it names in missing.
+  function neverUsed(overrides: Partial<Facts> = {}): Facts {
+    return basicRead(freshFunder(), {
+      walletAgeDays: 0,
+      txCountAtSnapshot: 0,
+      firstFunder: null,
+      evidenceTxs: [],
+      missing: [...SINGLE_READ_MISSING, 'firstFunder'],
+      ...overrides,
+    });
+  }
+
+  it('builds no list again while its post was seen within UNSENT_AFTER_SECONDS: a sighting starts the count again (C27, C32)', async () => {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    vault.stopBeforeBroadcast = 1;
+    await expect(publishCheck(worker, CAMPAIGN)).rejects.toThrow('stopped between recording the post and sending it');
+    const hash = (await latestList(db, CAMPAIGN))?.postTx as string;
+    const start = clock.getTime();
+    const at = (seconds: number) => {
+      clock = new Date(start + seconds * 1000);
+    };
+
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    at(300);
+    vault.inPool.add(hash);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    vault.inPool.delete(hash);
+    at(UNSENT_AFTER_SECONDS + 1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    expect(await statuses()).toEqual(['sending']);
+
+    // Missing on every read for a full, unbroken UNSENT_AFTER_SECONDS after that still builds it again, for now.
+    at(2 * UNSENT_AFTER_SECONDS);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [] });
+    at(2 * UNSENT_AFTER_SECONDS + 1);
+    expect(await reconcileCheck(worker, CAMPAIGN)).toMatchObject({ unsent: [1] });
+    expect(await statuses()).toEqual(['built']);
+  });
+
+  it('records a claim it broadcast as sent with its hash, even when told to stop right after the send (C27)', async () => {
+    await createCampaign(db, terms());
+    const vault = new StandInVault(3n * REWARD);
+    const worker = deps(vault);
+    await ask(basicRead(freshFunder()));
+    await screenAll(worker);
+    await publishCheck(worker, CAMPAIGN);
+    vault.advance(ROOT_DELAY);
+    await activateCheck(worker, CAMPAIGN);
+    const stop = new AbortController();
+    const send = vault.sendClaim.bind(vault);
+    let broadcast = '';
+    vault.sendClaim = async (at, ticket) => {
+      broadcast = await send(at, ticket);
+      stop.abort();
+      return broadcast as `0x${string}`;
+    };
+
+    await expect(relayNext(worker, stop.signal)).rejects.toThrow('ran past its time limit');
+    const rows = await db.query<{ status: string; tx: string | null }>('SELECT status, tx FROM claim_relays WHERE campaign_id = $1', [CAMPAIGN]);
+    expect(rows).toEqual([{ status: 'sent', tx: broadcast }]);
+    expect(vault.sent.filter((fn) => fn === 'claim')).toHaveLength(1);
+  });
+
+  it('decides a wallet that was never used by code alone: hold under A1, on its first try, with no SERV call (C11, C12, C24, C26)', async () => {
+    await createCampaign(db, terms());
+    const serv = confirmingServ();
+    const wallet = await ask(neverUsed());
+    const outcomes = await screenAll(deps(new StandInVault(3n * REWARD), serv));
+
+    expect(outcomes).toEqual([
+      { kind: 'decided', campaignId: CAMPAIGN, wallet: wallet.address, action: 'hold', rule: 'A1', slot: null, servRequestId: null },
+    ]);
+    expect(serv.viaGraph).not.toHaveBeenCalled();
+    expect(serv.viaV2).not.toHaveBeenCalled();
+    expect(decideWallet).not.toHaveBeenCalled();
+    expect(await getAsk(db, CAMPAIGN, wallet.address)).toMatchObject({
+      status: 'decided',
+      action: 'hold',
+      shareBps: 0,
+      rule: 'A1',
+      reason: 'A1: This wallet has never been used on Ethereum, so there is nothing to screen.',
+      citedTxs: [],
+      notChecked: ['sharedDepositAddress', 'sweptToSharedCollector', 'claimPaidToOtherAddress', 'fundingBurst', 'passThroughFunding'],
+      servRequestId: null,
+      slot: null,
+      facts: { ageDays: 0, txCount: 0, accountType: 'eoa', funder: null },
+    });
+  });
+
+  it('still asks the model about a wallet that sent a transaction, has a funder, was not read in full, or does not start on hold under A1', async () => {
+    await createCampaign(db, terms());
+    await createCampaign(db, terms({ id: 'no-partial', settings: { groupMinSize: 2, funderFanoutMin: 2, allowPartial: false } }));
+    const serv = confirmingServ();
+    const funder = { address: freshFunder(), kind: 'unknown' as const, fanoutInList: null, hopsTraced: 1 };
+    // Each differs from a never-used wallet in one fact. The first four still start on hold under A1 with a hold ceiling.
+    const wallets = [
+      await ask(neverUsed({ txCountAtSnapshot: 1 })),
+      await ask(neverUsed({ firstFunder: funder })),
+      await ask(neverUsed({ walletAgeDays: null, missing: [...SINGLE_READ_MISSING, 'firstFunder', 'walletAgeDays'] })),
+      await ask(neverUsed({ accountType: 'unknown', missing: [...SINGLE_READ_MISSING, 'firstFunder', 'accountType'] })),
+      // Nothing missing: the start is partial under A8, and with partial off it is hold under A8, never A1.
+      await ask(neverUsed({ missing: SINGLE_READ_MISSING })),
+      await ask(neverUsed({ missing: SINGLE_READ_MISSING }), 'no-partial'),
+    ];
+    await screenAll(deps(new StandInVault(3n * REWARD), serv), [CAMPAIGN, 'no-partial']);
+
+    const modelled = new Set(vi.mocked(decideWallet).mock.calls.map(([row]) => row.wallet));
+    expect(modelled).toEqual(new Set(wallets.map((wallet) => wallet.address)));
+    expect(vi.mocked(serv.viaGraph).mock.calls.length).toBeGreaterThanOrEqual(wallets.length);
   });
 });
 

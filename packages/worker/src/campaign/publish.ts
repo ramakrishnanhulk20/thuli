@@ -23,6 +23,7 @@ import {
   NO_VAULT_BLOCK,
   vaultRecordFor,
   type ChainDeps,
+  type PostReceipt,
 } from './vault.ts';
 
 export type PublishOutcome =
@@ -105,10 +106,31 @@ async function rootDelayOf(deps: ChainDeps, campaign: Campaign): Promise<bigint 
 }
 
 /**
+ * Whether a sending version's transaction is taken never to land, given what this read found of it. Every rule about
+ * when our own post is dead lives here and only here. For now: no node knew it on every read for UNSENT_AFTER_SECONDS
+ * without a break, counted from when this process first found it missing. Any sighting, pending or mined, clears that
+ * count, because a transaction a node has just shown can still be mined; calling it dead then would sign the root again
+ * with a fresh nonce while the first one can still land (C27, C32).
+ */
+async function postNeverLands(deps: ChainDeps, campaign: Campaign, sending: ListVersion, seen: PostReceipt['state']): Promise<boolean> {
+  const missing = campaignMemory(deps.memory, campaign.id).missingSince;
+  if (seen !== 'unknown') {
+    missing.delete(sending.version);
+    return false;
+  }
+  const now = deps.now().getTime();
+  const since = missing.get(sending.version) ?? now;
+  missing.set(sending.version, since);
+  if (now - since < UNSENT_AFTER_SECONDS * 1000) return false;
+  missing.delete(sending.version);
+  return true;
+}
+
+/**
  * Settles a version recorded as sending from what the network knows of its transaction: mined and successful, posted
  * with the claimable time the transaction's own RootPosted log holds, so the existing cancel rule applies to it after
- * its margin and its root is never sent again; mined and reverted, built again; unknown to every node for
- * UNSENT_AFTER_SECONDS, built again; still pending, left as it is. Returns false while it stays sending.
+ * its margin and its root is never sent again; mined and reverted, built again; unknown and proven never to land
+ * (postNeverLands), built again; otherwise left as it is. Returns false while it stays sending.
  */
 async function settleSending(
   deps: ChainDeps,
@@ -118,25 +140,20 @@ async function settleSending(
   signal: AbortSignal | undefined,
 ): Promise<boolean> {
   const id = campaign.id;
-  const missing = campaignMemory(deps.memory, id).missingSince;
   if (sending.postTx === null) throw new RootError(`list version ${sending.version} is sending with no transaction on record`);
   const hash = sending.postTx as `0x${string}`;
   const receipt = await deps.chain.postReceipt(parseAddress(campaign.vault), sending.root as `0x${string}`, hash, 0);
+  const lost = await postNeverLands(deps, campaign, sending, receipt.state);
   if (receipt.state === 'pending') return false;
   if (receipt.state === 'unknown') {
-    const now = deps.now().getTime();
-    const since = missing.get(sending.version) ?? now;
-    missing.set(sending.version, since);
-    if (now - since < UNSENT_AFTER_SECONDS * 1000) return false;
+    if (!lost) return false;
     checkpoint(signal, 'recording a post as unsent');
     if (await markListUnsent(deps.db, id, sending.version)) {
       outcome.unsent.push(sending.version);
       deps.log(`reconcile ${id}: no node knows the post ${hash} of list version ${sending.version} after ${UNSENT_AFTER_SECONDS} s, so it is built again`);
     }
-    missing.delete(sending.version);
     return true;
   }
-  missing.delete(sending.version);
   checkpoint(signal, 'recording what became of a post');
   if (!receipt.ok) {
     if (await markListUnsent(deps.db, id, sending.version)) {

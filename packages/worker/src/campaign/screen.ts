@@ -9,6 +9,7 @@ import {
   type Address,
   type Outcome,
   type Settings,
+  type Start,
 } from '@thuli/core';
 import {
   decideAsk,
@@ -153,12 +154,27 @@ async function askersAmong(db: Db, campaignId: string, candidates: readonly Addr
 
 // The single-wallet screening's decision path, unchanged: the code's start and ceiling, then decideWallet in auto mode,
 // whose output checks run under the current rulebook because nothing here can name another (C12, C13).
-async function decideOnce(wallet: Address, facts: Facts, settings: Settings, serv: DecideDeps): Promise<DecisionRecord> {
-  const start = computeStart(facts, settings);
-  const { ceiling } = computeCeiling(facts, settings);
-  const record = await decideWallet({ wallet, start, ceiling, facts }, settings, serv, 'auto');
+async function decideOnce(
+  wallet: Address,
+  row: { facts: Facts; start: Start; ceiling: Outcome },
+  settings: Settings,
+  serv: DecideDeps,
+): Promise<DecisionRecord> {
+  const record = await decideWallet({ wallet, ...row }, settings, serv, 'auto');
   if (record === null) throw new ScreenRefused(SCREEN_CAUSES.noAnswer);
   return record;
+}
+
+/** The reason stored for a wallet decided by code because it was never used. */
+export const NEVER_USED_REASON = 'A1: This wallet has never been used on Ethereum, so there is nothing to screen.';
+
+/**
+ * True when the wallet's own facts show it was never used on Ethereum: no transaction sent, a plain account with no
+ * code, and no first funder in a history that was read, its age known. A failed read leaves the count, the account
+ * type or the age unknown, so it is never taken for an empty wallet and goes to the model as before.
+ */
+function neverUsed(single: Facts): boolean {
+  return single.txCountAtSnapshot === 0 && single.accountType === 'eoa' && single.firstFunder === null && single.walletAgeDays !== null;
 }
 
 /** A decision for decideAsk, and whether it is the code-written hold the output checks put in place of a refused answer. */
@@ -183,7 +199,28 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps):
     () => campaignFacts(taken.wallet, single, { links, askers }, settings),
     CAMPAIGN_SCREEN_CAUSES.links,
   );
-  const record = await decideOnce(taken.wallet, facts, settings, serv);
+  const start = computeStart(facts, settings);
+  const { ceiling } = computeCeiling(facts, settings);
+  // Safe without the model: such a wallet starts on hold under A1 and its ceiling is hold before any model runs, so a
+  // SERV answer could only have written the reason. Deciding it here means a free new key costs no SERV run (C24, C26),
+  // and the outcome is exactly the code's start and ceiling, which approve nothing (C11, C12). Nothing was refused, so
+  // the refused-answer retry does not apply.
+  if (neverUsed(single) && start.outcome === 'hold' && start.rule === 'A1' && ceiling === 'hold') {
+    const decision: AskDecision = {
+      campaignId: taken.campaignId,
+      wallet: taken.wallet,
+      action: 'hold',
+      shareBps: 0,
+      rule: 'A1',
+      reason: NEVER_USED_REASON,
+      citedTxs: [],
+      notChecked,
+      facts: askFactsOf(facts),
+      servRequestId: null,
+    };
+    return { decision, refused: false };
+  }
+  const record = await decideOnce(taken.wallet, { facts, start, ceiling }, settings, serv);
   const decision: AskDecision = {
     campaignId: taken.campaignId,
     wallet: taken.wallet,
@@ -236,7 +273,9 @@ async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal:
 /**
  * Screens the oldest waiting ask of any campaign, through the same path as every other screening (C12): the wallet's
  * own facts from the single-wallet reader taken into single-wallet scope, linked to the campaign's other asks by
- * campaignFacts, the code's start and ceiling, then SERV and the output checks in decideWallet. The decision is stored
+ * campaignFacts, the code's start and ceiling, then SERV and the output checks in decideWallet. A wallet whose own facts
+ * show it was never used, and whose start and ceiling are both hold under A1, is decided by code with NEVER_USED_REASON
+ * and no SERV call, on its first try. The decision is stored
  * by decideAsk, which gives an approved ask the next slot while slots are left (C44), with every cited hash lowercase
  * (C13) and the public facts it rested on.
  *

@@ -106,8 +106,10 @@ export async function activateCheck(deps: ChainDeps, campaignId: string, signal?
  * A claim is simulated before it is sent. One that would revert with NothingToClaim is confirmed without a transaction,
  * because the vault has paid that wallet everything it is owed already; any other revert, a claim that reverts on
  * chain, or any failed call gives the relay back for another try after retryDelaySeconds for its attempt, and the store
- * ends it failed at its attempt limit (C41). A broadcast claim is marked sent with its hash before the wait, so a worker that stops mid-wait leaves a record,
- * and the next try's simulation finds NothingToClaim if it landed (C27).
+ * ends it failed at its attempt limit (C41). A broadcast claim is marked sent with its hash before the wait, even when
+ * the step was told to stop during the send, so a worker that stops mid-wait leaves a record, and the next try's
+ * simulation finds NothingToClaim if it landed (C27). The signal is checked before the send and before every other
+ * write, never between the send and its record.
  *
  * @returns idle when no relay is waiting; relayed with the status the store recorded and the cause in fixed words.
  * @throws StoreError only when the store cannot hand out or record a relay at all.
@@ -148,7 +150,7 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
     }
     checkpoint(signal, 'sending a claim');
     tx = await deps.chain.sendClaim(vault, ticket);
-    checkpoint(signal, 'recording a sent claim');
+    // No checkpoint here: a claim on the network is always recorded, abort or not, so a stop never hides our own send.
     await markRelay(deps.db, key, { status: 'sent', tx: tx.toLowerCase() }, deps.now());
     const receipt = await deps.chain.confirmClaim(tx);
     gasUsed = receipt.gasUsed;
