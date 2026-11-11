@@ -10,6 +10,7 @@
     "@coinbase/cdp-sdk": "1.61.0",
     "@hono/node-server": "2.1.6",
     "@thuli/core": "0.1.0",
+    "@thuli/store": "0.1.0",
     "@thuli/worker": "0.1.0",
     "@x402/core": "2.30.0",
     "@x402/evm": "2.30.0",

@@ -28,6 +28,7 @@ coverage/
 cache/
 artifacts/
 typechain-types/
+*.tsbuildinfo
 broadcast/
 *.log
 .DS_Store
@@ -36,3 +37,7 @@ broadcast/
 # Replay data and caches (large, rebuilt by scripts)
 data/
 !.env.api.example
+
+# Written by the Next.js dev server and build
+packages/web/AGENTS.md
+next-env.d.ts
