@@ -336,7 +336,7 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
                 {signing ? 'Waiting for your wallet' : 'Sign and ask'}
               </button>
             )}
-            <p className={styles.panelNote}>Thuli then reads this wallet&apos;s public history on Ethereum and decides. One ask per wallet.</p>
+            <p className={styles.panelNote}>Thuli then reads this wallet&apos;s public history on Ethereum or Base, whichever is older, and decides. One ask per wallet.</p>
             {notice === null || notice === 'unreachable' ? null : (
               <p className={styles.notice} role="alert" data-notice={notice}>
                 {notice === 'bad' ? mine?.cause : NOTICE_TEXT[notice]}

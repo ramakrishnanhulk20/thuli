@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { relativeTime } from '@/lib/check';
-import { addressLink, ETHEREUM_CHAIN, shortAddress } from '@/lib/explorer';
+import { addressLink, historyChainId, shortAddress } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
 import { formatInt } from '@/lib/format';
 import {
@@ -40,15 +40,16 @@ function Fact({ name, children }: { name: string; children: ReactNode }) {
   );
 }
 
-function Facts({ ask }: { ask: AskJson }) {
+export function Facts({ ask }: { ask: AskJson }) {
   const { facts } = ask;
   if (facts === null) return null;
   const funder = facts.funder;
-  // The funder is a wallet Thuli read on Ethereum, so it opens on the Ethereum explorer.
-  const funderLink = funder === null ? null : addressLink(ETHEREUM_CHAIN, funder.address);
+  // The funder opens on the explorer of the chain that was read: a Base screening found it on Base.
+  const funderLink = funder === null ? null : addressLink(historyChainId(facts.chain), funder.address);
   const fanout = funder === null ? null : funderFanoutText(funder);
   return (
     <div className={styles.facts} data-facts>
+      <Fact name="History read on">{facts.chain === 'base' ? 'Base' : 'Ethereum'}</Fact>
       <Fact name="Wallet age">{facts.ageDays === null ? 'not read' : `${formatInt(facts.ageDays)} days`}</Fact>
       <Fact name="Transactions sent">{facts.txCount === null ? 'not read' : formatInt(facts.txCount)}</Fact>
       <Fact name="First funder">
@@ -128,7 +129,7 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
             {ask.reason === null ? '' : displayReason(ask.reason)}
           </p>
           <p className={styles.citedLabel}>Cited transactions</p>
-          <CitedList hashes={ask.citedTxs ?? []} />
+          <CitedList hashes={ask.citedTxs ?? []} chain={ask.facts?.chain ?? 'ethereum'} />
           <Facts ask={ask} />
           {ask.appeal ? <BoardCheck appeal={ask.appeal} /> : null}
         </div>

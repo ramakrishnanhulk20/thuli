@@ -14,6 +14,8 @@ import {
   explorerAddressUrl,
   explorerBase,
   explorerTxUrl,
+  historyChainId,
+  historyTxUrl,
   txLink,
   txUrl,
   verifiedSourceUrl,
@@ -127,6 +129,33 @@ describe('the Ethereum history links', () => {
     expect(addressUrl(LOWER)).toBe(`https://etherscan.io/address/${LOWER}`);
     expect(txUrl(upper(HASH))).toBeNull();
     expect(addressUrl(CHECKSUMMED)).toBeNull();
+  });
+});
+
+describe('the history links of a screened wallet', () => {
+  it('names the chain id of the chain that was read', () => {
+    expect(historyChainId('ethereum')).toBe(1);
+    expect(historyChainId('base')).toBe(8453);
+    expect(historyChainId('ethereum')).toBe(ETHEREUM_CHAIN);
+    expect(historyChainId('base')).toBe(BASE_CHAIN);
+  });
+
+  it('links a lowercase hash on the explorer of that chain', () => {
+    expect(historyTxUrl('ethereum', HASH)).toBe(`${explorerBase(ETHEREUM_CHAIN)}/tx/${HASH}`);
+    expect(historyTxUrl('base', HASH)).toBe(`${explorerBase(BASE_CHAIN)}/tx/${HASH}`);
+    expect(historyTxUrl('base', HASH)).not.toBe(historyTxUrl('ethereum', HASH));
+  });
+
+  it('gives no link, on either chain, for an uppercase hash, a short one, or one with a trailing character', () => {
+    const bad = [upper(HASH), HASH.slice(0, 40), `${HASH}0`, `${HASH}\n`, ` ${HASH}`, HASH.replace('0x', '0X'), '', 'not a hash'];
+    for (const chain of ['ethereum', 'base'] as const) {
+      for (const hash of bad) expect(historyTxUrl(chain, hash), `${chain} ${JSON.stringify(hash)}`).toBeNull();
+    }
+  });
+
+  it('leaves the Ethereum helpers as they were', () => {
+    expect(txUrl(HASH)).toBe(historyTxUrl('ethereum', HASH));
+    expect(addressUrl(LOWER)).toBe(`${explorerBase(ETHEREUM_CHAIN)}/address/${LOWER}`);
   });
 });
 

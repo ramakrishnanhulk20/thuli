@@ -1,3 +1,5 @@
+import type { ScreenedChain } from '@/lib/campaign';
+
 // The only file that names an explorer host. test/explorer.test.ts reads the site's sources and fails if another file does,
 // so moving the site to another explorer is a change to the constants here and nowhere else.
 
@@ -98,6 +100,20 @@ const ETHEREUM_EXPLORER = explorerBase(ETHEREUM_CHAIN) as string;
 /** A link only for a lowercase 0x and 64 hex characters. Anything else gets no link at all. */
 export function txUrl(hash: string): string | null {
   return TX_HASH.test(hash) ? `${ETHEREUM_EXPLORER}/tx/${hash}` : null;
+}
+
+/** The chain id of the chain a campaign ask was screened on: the one whose history of the wallet was older. */
+export function historyChainId(chain: ScreenedChain): number {
+  return chain === 'base' ? BASE_CHAIN : ETHEREUM_CHAIN;
+}
+
+/**
+ * A link for a transaction a screening cited, on the explorer of the chain it was read on. It reads a hash as strictly as
+ * txUrl does, and gives no link when that chain has no explorer in the table.
+ */
+export function historyTxUrl(chain: ScreenedChain, hash: string): string | null {
+  const base = explorerBase(historyChainId(chain));
+  return base !== null && TX_HASH.test(hash) ? `${base}/tx/${hash}` : null;
 }
 
 /** A link only for a lowercase 0x and 40 hex characters. Anything else gets no link at all. */

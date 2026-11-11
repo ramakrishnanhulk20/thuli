@@ -498,7 +498,7 @@ export function refusalWords(kind: RefusalKind, retryAfter: string | null = null
     case 'neverUsed':
       return {
         heading: 'This wallet has never been used',
-        body: 'It has sent no transaction and holds nothing on Ethereum, so there is nothing to screen. Ask with a wallet you have used for a while.',
+        body: 'It has sent no transaction and holds nothing on Ethereum or Base, so there is nothing to screen. Ask with a wallet you have used for a while.',
         note: 'Nothing was stored, and signing cost nothing.',
       };
     case 'contract':
@@ -646,7 +646,7 @@ export function groupText(groupSize: number | null): string {
 export const WHAT_TO_DO_LABEL = 'WHAT TO DO';
 
 export const NEW_WALLET_ADVICE =
-  'This wallet has never been used on Ethereum, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.';
+  'This wallet has never been used on Ethereum or Base, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.';
 
 /**
  * Whether a held wallet is told what to do: the screening read zero transactions sent and found no first funder, so the

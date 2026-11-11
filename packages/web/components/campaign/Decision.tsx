@@ -1,16 +1,29 @@
 import type { ReactNode } from 'react';
-import { shortHash, txUrl } from '@/lib/explorer';
+import { historyTxUrl, shortHash } from '@/lib/explorer';
 import { displayReason, ruleMeaning } from '@/lib/rules';
-import { NEW_WALLET_ADVICE, NOT_CHECKED_INTRO, notCheckedLine, outcomeWords, showsWhatToDo, WHAT_TO_DO_LABEL, type AskJson, type Payout } from '@/lib/campaign';
+import {
+  NEW_WALLET_ADVICE,
+  NOT_CHECKED_INTRO,
+  notCheckedLine,
+  outcomeWords,
+  showsWhatToDo,
+  WHAT_TO_DO_LABEL,
+  type AskJson,
+  type Payout,
+  type ScreenedChain,
+} from '@/lib/campaign';
 import styles from './campaign.module.css';
 
-/** Cited transactions as links, laid out as on the check page. Plain text only. */
-export function CitedList({ hashes }: { hashes: readonly string[] }) {
+/**
+ * Cited transactions as links, laid out as on the check page. Plain text only. The chain is the one the screening read,
+ * so each hash opens where it can be found.
+ */
+export function CitedList({ hashes, chain }: { hashes: readonly string[]; chain: ScreenedChain }) {
   if (hashes.length === 0) return <p className={styles.none}>None</p>;
   return (
     <ul className={styles.txList} data-cited>
       {hashes.map((hash, index) => {
-        const link = txUrl(hash);
+        const link = historyTxUrl(chain, hash);
         return (
           <li key={`${hash}-${index}`}>
             {link === null ? (
@@ -59,7 +72,7 @@ export function DecisionView({ ask, payout, appeal = null }: { ask: AskJson; pay
         {displayReason(ask.reason)}
       </p>
       <p className={styles.citedLabel}>Cited transactions</p>
-      <CitedList hashes={ask.citedTxs ?? []} />
+      <CitedList hashes={ask.citedTxs ?? []} chain={ask.facts?.chain ?? 'ethereum'} />
 
       {ask.notChecked === null || ask.notChecked.length === 0 ? null : (
         <>

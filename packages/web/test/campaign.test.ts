@@ -1,8 +1,12 @@
 // Covers the ask message, a signature over it against core's own check, every fixture against the API's schema, the
 // guards, the request mapping, the choice of panel and the payout sentences. It does not cover drawing, the wallet
 // connection or polling; the browser script runs those against a page with an injected test wallet.
+import fs from 'node:fs';
+import path from 'node:path';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { privateKeyToAccount } from 'viem/accounts';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   APPEAL_COUNTER_FROM,
   APPEAL_MAX_CHARS,
@@ -83,8 +87,19 @@ import {
   type Ticket,
 } from '../lib/campaign';
 import { notCheckedText } from '../lib/check';
+import { BASE_CHAIN, ETHEREUM_CHAIN, explorerBase } from '../lib/explorer';
 import { formatUsdc6 } from '../lib/vaultProof';
 import { buildFixtures, CAMPAIGN_ID, fixtureWallet, type AskKind } from './campaignFixtures';
+
+// The components import the site's own modules as '@/lib/...', which this test runner does not map, so each one is
+// handed the real module it stands for.
+vi.mock('@/lib/campaign', () => import('../lib/campaign'));
+vi.mock('@/lib/check', () => import('../lib/check'));
+vi.mock('@/lib/explorer', () => import('../lib/explorer'));
+vi.mock('@/lib/format', () => import('../lib/format'));
+vi.mock('@/lib/rules', () => import('../lib/rules'));
+const { Facts } = await import('../components/campaign/Board');
+const { CitedList } = await import('../components/campaign/Decision');
 
 // The core and API packages are loaded by a computed path so the site's own type check does not follow into their sources.
 const loadPackage = (name: string): Promise<any> => import(/* @vite-ignore */ name);
@@ -538,7 +553,7 @@ describe('the plain line for a held wallet that has no history', () => {
 
   it('says exactly what the wallet should do, in the words the page shows', () => {
     expect(NEW_WALLET_ADVICE).toBe(
-      'This wallet has never been used on Ethereum, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.',
+      'This wallet has never been used on Ethereum or Base, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.',
     );
   });
 
@@ -1133,7 +1148,7 @@ describe('a wallet that has never been used', () => {
   it('says it in three lines: the heading, the body, and that nothing was stored', () => {
     expect(refusalWords('neverUsed')).toEqual({
       heading: 'This wallet has never been used',
-      body: 'It has sent no transaction and holds nothing on Ethereum, so there is nothing to screen. Ask with a wallet you have used for a while.',
+      body: 'It has sent no transaction and holds nothing on Ethereum or Base, so there is nothing to screen. Ask with a wallet you have used for a while.',
       note: 'Nothing was stored, and signing cost nothing.',
     });
   });
@@ -1269,5 +1284,79 @@ describe('the appeal text on one line', () => {
     const post = classifyAppealAnswer(400, { error: 'the appeal text must be one line' });
     expect(post).toEqual({ kind: 'bad', cause: 'the appeal text must be one line' });
     if (post.kind === 'bad') expect(appealRefusalText(post)).toBe('the appeal text must be one line');
+  });
+});
+
+describe('the chain a decision read', () => {
+  const funder = fixtureWallet(900);
+  const facts = (chain: 'ethereum' | 'base') => (fx.ask('hold', signer.address, null, 5, { chain }) as unknown as AskJson);
+  const names = (markup: string) => [...markup.matchAll(/<p class="[^"]*">([^<]*)<\/p>/g)].map((match) => match[1]);
+
+  it('shows "History read on" as the first row of the facts, with the chain that was read', () => {
+    for (const [chain, words] of [['base', 'Base'], ['ethereum', 'Ethereum']] as const) {
+      const markup = renderToStaticMarkup(createElement(Facts, { ask: facts(chain) }));
+      expect(names(markup)[0], chain).toBe('History read on');
+      expect(markup, chain).toMatch(new RegExp(`History read on</p><div class="[^"]*">${words}</div>`));
+      expect(markup.indexOf('History read on')).toBeLessThan(markup.indexOf('Wallet age'));
+      expect(names(markup).filter((name) => name === 'History read on')).toHaveLength(1);
+    }
+  });
+
+  it('opens the funder on the explorer of the chain that was read', () => {
+    const lowered = funder.toLowerCase();
+    const onBase = renderToStaticMarkup(createElement(Facts, { ask: facts('base') }));
+    expect(onBase).toContain(`href="${explorerBase(BASE_CHAIN)}/address/${lowered}"`);
+    expect(onBase).not.toContain(`${explorerBase(ETHEREUM_CHAIN)}/address/`);
+    const onEthereum = renderToStaticMarkup(createElement(Facts, { ask: facts('ethereum') }));
+    expect(onEthereum).toContain(`href="${explorerBase(ETHEREUM_CHAIN)}/address/${lowered}"`);
+    expect(onEthereum).not.toContain(`${explorerBase(BASE_CHAIN)}/address/`);
+  });
+
+  it('shows no facts block for an ask with no facts', () => {
+    const none = fx.ask('failed', signer.address) as unknown as AskJson;
+    expect(none.facts).toBeNull();
+    expect(renderToStaticMarkup(createElement(Facts, { ask: none }))).toBe('');
+  });
+
+  it('links each cited transaction on the explorer of that chain, and gives a bad hash no link', () => {
+    const hashes = ['0x4e7e84ae76bcede030f2e71a8776c59b376bc838b42f7c52c190aae2e074e68c', '0xa91898bfe55aad41d5295aac670976adcea7bd1366773db8a28de12f1198de67'];
+    const onBase = renderToStaticMarkup(createElement(CitedList, { hashes, chain: 'base' }));
+    for (const hash of hashes) expect(onBase).toContain(`href="${explorerBase(BASE_CHAIN)}/tx/${hash}"`);
+    expect(onBase).not.toContain(explorerBase(ETHEREUM_CHAIN) as string);
+    const onEthereum = renderToStaticMarkup(createElement(CitedList, { hashes, chain: 'ethereum' }));
+    for (const hash of hashes) expect(onEthereum).toContain(`href="${explorerBase(ETHEREUM_CHAIN)}/tx/${hash}"`);
+    const bad = renderToStaticMarkup(createElement(CitedList, { hashes: ['0xABC', hashes[0] as string], chain: 'base' }));
+    expect(bad).not.toContain('/tx/0xABC');
+    expect(bad).toContain(`/tx/${hashes[0]}`);
+    expect(renderToStaticMarkup(createElement(CitedList, { hashes: [], chain: 'base' }))).toContain('None');
+  });
+
+  describe('the words that name the chains', () => {
+    const read = (...parts: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...parts), 'utf8');
+    const campaignFolder = fs.readdirSync(path.join(import.meta.dirname, '..', 'components', 'campaign')).filter((name) => name.endsWith('.tsx') || name.endsWith('.ts'));
+    const everything = [...campaignFolder.map((name) => read('components', 'campaign', name)), read('lib', 'campaign.ts')].join('\n');
+
+    it('say Ethereum or Base in the ask note, the never-used refusal and the new-wallet advice', () => {
+      expect(read('components', 'campaign', 'AskPanel.tsx')).toContain(
+        'Thuli then reads this wallet&apos;s public history on Ethereum or Base, whichever is older, and decides. One ask per wallet.',
+      );
+      expect(refusalWords('neverUsed').body).toBe(
+        'It has sent no transaction and holds nothing on Ethereum or Base, so there is nothing to screen. Ask with a wallet you have used for a while.',
+      );
+      expect(NEW_WALLET_ADVICE).toBe(
+        'This wallet has never been used on Ethereum or Base, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.',
+      );
+    });
+
+    it('no longer hold the three old sentences', () => {
+      expect(everything).not.toContain("Thuli then reads this wallet&apos;s public history on Ethereum and decides");
+      expect(everything).not.toContain('holds nothing on Ethereum, so there is nothing to screen');
+      expect(everything).not.toContain('has never been used on Ethereum, so nothing sets it apart');
+    });
+
+    it('name Ethereum alone nowhere in the campaign folder or its words', () => {
+      const alone = everything.split('\n').filter((line) => /on Ethereum/.test(line) && !/on Ethereum or Base/.test(line));
+      expect(alone).toEqual([]);
+    });
   });
 });
