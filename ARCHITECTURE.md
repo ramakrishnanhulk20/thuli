@@ -181,12 +181,12 @@ chain but Base Sepolia.
 | Factory deploy transaction | `0x5019bb52542ab56a619a0512a97fe1ad9bec61635025871b11fca532224df7f7`, block `57247894` |
 | Deployment record | `packages/contracts/deployments/base-sepolia.json`, written by `npm run vault:deploy` |
 | Proof vault | `0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`, created in block `57248098` |
-| Proof vault record | `data/vault-proof/state.json`, written by `npm run prove:vault -- setup`. The `data` folder is not committed, so this file exists only on the machine that ran the proof. |
+| Proof vault record | `packages/contracts/deployments/base-sepolia-proof.json`, rebuilt by `npm run prove:vault -- record`, which reads the run back from Base Sepolia, loads no key and sends nothing. |
 
 The proof vault pays Base Sepolia test USDC, caps each wallet at 1 USDC, holds 2 USDC, delays every root by one hour,
 and takes claims until unix `1794976286` (18 Nov 2026, 04:31:26 UTC). Its first root lists one wallet at 1 USDC and
-became claimable at unix `1794375097` (11 Nov 2026, 05:31:37 UTC). The record holds the four setup transactions
-(createVault, approve, deposit, postRoot); the claim step adds a fifth entry when it runs, and the record has none yet.
+became claimable at unix `1794375097` (11 Nov 2026, 05:31:37 UTC). The record holds five transactions: the four setup
+ones (createVault, approve, deposit, postRoot) and the claim.
 Show live values from `state()` (4.2), never from these notes: the end time moves when the owner extends it or pauses.
 
 The two records write addresses in different letter case (the factory lowercase, the vault checksummed). Case does not
@@ -333,8 +333,9 @@ claim now), then simulate `claim(account, cumulativeAmount, proof)` so an `Inval
 for a signature. The proof run does the same: it rebuilds the tree from the published list, checks the rebuilt root
 equals `state().activeRoot`, reads `claimable`, then simulates and sends `claim`.
 
-No file or route serves a wallet its proof or a campaign's published list yet, and nothing yet turns a decision's share
-into a wallet's `cumulativeAmount` (the proof run wrote its amount by hand). See 4.8.
+A decision's share becomes a leaf amount through `shareOf` in `packages/core/src/money.ts`, and `buildClaimList` and
+`claimTicket` in `packages/worker/src/vault/claimList.ts` build a campaign's list and one wallet's claim ticket. What is
+still missing is a route that serves a wallet its claim ticket, and a service that posts lists. See 4.8.
 
 ### 4.4 The paid API
 
@@ -445,8 +446,27 @@ Health: `GET /api/x402/health` returns `{"network": "eip155:84532", "payTo": "<a
 "one wallet on Ethereum, no claim list"}`, with `network` set to `eip155:8453` on Base. No payment, no limits.
 
 Mounting. The API is a Hono app built by `createApp(config: ApiConfig, deps: ApiDeps): Hono` in
-`packages/api/src/app.ts`. Its routes carry their full paths, so the Next.js app can hand every request under
-`/api/x402/` and `/api/check` to the app's `fetch` unchanged. The pieces:
+`packages/api/src/app.ts`. Its routes carry their full paths, and the website serves them itself:
+`packages/web/app/api/x402/[...path]/route.ts` and `packages/web/app/api/check/[[...path]]/route.ts` hand every GET and
+POST under `/api/x402/` and `/api/check` to the app unchanged. Both run on Node.js, are always dynamic, and allow 300
+seconds, because a paid request may settle twice, read a receipt and run a 120 second screening. Every answer, whatever
+its status, carries `cache-control: no-store`, on the site and on the standalone server alike.
+
+Inside the site, `thuliApi()` in `packages/web/lib/server/thuliApi.ts` builds the API once per server copy, from the
+process environment, through `siteApi(env, files)`, the API package's one entry (`@thuli/api/site`, source
+`packages/api/src/site.ts`). The site's settings are the names in `.env.web.example` at the repository root. The stores:
+
+- With `DATABASE_URL` set, Postgres through `connectPostgres`, shared by every copy. The schema is brought up to date
+  once, before the first request is handled.
+- With `DATABASE_URL` unset outside production, an in-process Postgres, with one warning that its state is lost on
+  restart.
+- In production the site needs both `DATABASE_URL` and `TRUSTED_CLIENT_HEADER`. Without either, or with any setting
+  missing, malformed or forbidden (a variable ending in `PRIVATE_KEY` included), there is no API: every request answers
+  503 `{"busy": true}` and the cause is logged once, by variable name, never with a value. The site never serves a
+  result from a half-configured API. Production means `NODE_ENV` as the server runs, not as the site was built.
+
+The rulebook and the store's migrations travel inside the server bundle as text, so they load wherever the built site
+runs, whatever path the host gives its files. The pieces the site and the standalone server share:
 
 - `loadApiConfig(env)` in `packages/api/src/config.ts` reads and checks the settings: `X402_NETWORK` (`base` or
   `base-sepolia`, no default); `PAYTO_ADDRESS_TESTNET` on Base Sepolia or `PAYTO_ADDRESS` on Base; `CDP_API_KEY_ID`,
@@ -458,14 +478,19 @@ Mounting. The API is a Hono app built by `createApp(config: ApiConfig, deps: Api
 - `deps.stores` is where the claims, limits and cached checks live: `postgresStores(connectPostgres(url), now)` from
   `packages/api/src/stores.ts` when `DATABASE_URL` is set, and this process's memory when it is left out. The app
   starts a sweep of the store on every 200th request without waiting for it.
-- `liveScreen(env)` in `packages/api/src/live.ts` returns `deps.screen`, the real screening (4.5).
+- `liveScreen(env, rulebook?)` in `packages/api/src/live.ts` returns `deps.screen`, the real screening (4.5). It reads
+  the rulebook from the repository unless it is handed the text, as the site hands it the copy in its bundle.
 - `packages/api/src/server.ts` runs the same app on its own, on port 8787 by default (`npm run api:dev`). With
   `DATABASE_URL` set it brings the schema up to date once at start, then sweeps at start and every 10 minutes.
 
-The app reads the caller's IP from the Node socket through `@hono/node-server`, which a Next.js route handler does not
-provide. Inside Next.js, `TRUSTED_CLIENT_HEADER` must name the header the host writes the caller's IP into, such as
-`x-vercel-forwarded-for`; without it every POST answers 400. The package has no entry file or exports map, so it is
-imported by file path, the way it imports the worker today (`@thuli/worker/src/screen/single.ts`).
+The standalone server reads the caller's IP from the Node socket through `@hono/node-server`. A Next.js route handler
+has no socket, so inside the site the caller comes from a header. In production that is `TRUSTED_CLIENT_HEADER`, which
+must name the header the host writes the caller's IP into, `x-vercel-forwarded-for` on Vercel. Outside production it is
+`x-forwarded-for`, which Next's own server fills from the socket when a request carries none.
+
+The API package exports only `@thuli/api/site`. Its declaration, `packages/api/site.d.ts`, is all the site's TypeScript
+sees, because the package's sources import with `.ts` extensions the site's settings do not allow. A test fails to
+compile if the declaration and the source ever disagree.
 
 ### 4.4b The free check
 
@@ -688,7 +713,9 @@ no model is called. `summary.json` names that version in `run.rulebook`. No file
 Sections 1 to 3 draw the whole system. On 11 Nov 2026 the code does not have the parts below; each was checked by
 searching the code.
 
-- Postgres. There is no database code or driver. Appeals and run state live in local files.
+- Postgres for campaigns, appeals and jobs. `packages/store` exists (Postgres through `pg`, with tables for payment
+  claims, leases, rate events, day counts and the check cache), and the paid and free routes use it when
+  `DATABASE_URL` is set, while campaigns, appeals and jobs have no tables yet.
 - The web app's own routes for sign-in, campaigns, checks, appeals and publishing. `packages/web` has no API route
   handlers.
 - The job queue. Nothing queues or takes jobs: the paid route screens inside the request, and the replays run as
@@ -698,8 +725,9 @@ searching the code.
 - A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
   one machine.
 - Base mainnet contracts. Only the Base Sepolia record exists (4.1).
-- The money module in section 3 ("shares to base units, round down"). Nothing turns a decision's share into a leaf
-  amount.
+- Serving claim tickets. A decision's share becomes a leaf amount through `shareOf` in `packages/core/src/money.ts`,
+  and `buildClaimList` and `claimTicket` in `packages/worker/src/vault/claimList.ts` build the list and one wallet's
+  ticket, but no route serves a wallet its claim ticket and no service posts lists.
 - Half-built: the root signer. `postRoot` in `packages/worker/src/vault/root.ts` runs every check before it posts, but
   only the vault proof script calls it. No service takes a published list and posts its root.
 - Half-built: the paid route inside the web app. It exists as the standalone Hono app in 4.4 and is not mounted in
