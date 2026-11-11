@@ -13,6 +13,7 @@ import {
   APPEALS_DAY_MAX,
   APPEALS_PER_CAMPAIGN_DAY,
   campaignAppealsCounter,
+  clearAppealSubmitting,
   getAppeal,
   markAppealSubmitting,
   markAppealUnchecked,
@@ -521,6 +522,27 @@ for (const { name, open } of TARGETS) {
       expect(await noteAppealEval(db, key(2), 'eval_2', plus(317))).toBe(true);
       expect(await markAppealSubmitting(db, key(2), plus(318))).toBe(false);
       expect((await ownerAppeals(db, CAMPAIGN))[1]).toMatchObject({ submitStartedAt: null, checkNote: null });
+    });
+
+    it('C23: clearAppealSubmitting takes back the mark of a checking appeal with no id, and no other, so a later try may submit', async () => {
+      await createCampaign(db, terms());
+      for (const n of [1, 2, 3]) expect(await decided(n, 'hold', { record: RECORD })).toEqual({ slot: null });
+      for (const n of [1, 2, 3]) expect(await addAppeal(db, appeal(n), plus(n))).toBe('queued');
+      for (const n of [1, 2, 3]) expect(await takeAppeal(db, plus(10), 300, 6)).toMatchObject({ wallet: wallet(n) });
+      for (const n of [1, 2]) expect(await markAppealSubmitting(db, key(n), plus(11))).toBe(true);
+      expect(await noteAppealEval(db, key(2), 'eval_2', plus(12))).toBe(true);
+      expect(await clearAppealSubmitting(db, key(1), plus(13))).toBe(true);
+      // Refused: the mark is already gone, an evaluation exists, and wallet 3 was never marked.
+      for (const n of [1, 2, 3]) expect(await clearAppealSubmitting(db, key(n), plus(13))).toBe(false);
+      expect((await ownerAppeals(db, CAMPAIGN)).map((row) => row.submitStartedAt)).toEqual([null, plus(11), null]);
+      expect(await markAppealSubmitting(db, key(1), plus(14))).toBe(true);
+      // Refused once the appeal is no longer checking, and the mark comes back with the next take.
+      expect(await releaseAppeal(db, key(1), plus(15), 6, 0)).toBe('queued');
+      expect(await clearAppealSubmitting(db, key(1), plus(16))).toBe(false);
+      expect(await takeAppeal(db, plus(17), 300, 6)).toMatchObject({ wallet: wallet(1), submitStarted: true });
+      expect(await clearAppealSubmitting(db, { campaignId: 'not a campaign!', wallet: wallet(1) }, plus(18))).toBe(false);
+      await expect(clearAppealSubmitting(db, key(1), new Date(Number.NaN))).rejects.toThrow(StoreError);
+      expect((await ownerAppeals(db, CAMPAIGN))[0]?.submitStartedAt).toEqual(plus(14));
     });
 
     it('C11, C17: requeueFailedAsk refuses a failed ask that has an appeal, saying so, and queues one that has none', async () => {

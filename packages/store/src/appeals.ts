@@ -531,9 +531,11 @@ export async function releaseAppeal(
 /**
  * Marks that a worker is about to submit this appeal to the outside check, before the call. The check charges for
  * every submit and cannot recognise one sent twice, so this mark is the one durable record that a submit may have been
- * paid for: it is never cleared, and takeAppeal returns it as submitStarted (C23). Only an appeal that is checking, has
- * no evaluation id and no mark yet is marked, so of two workers holding one appeal after a lease ran out, at most one is
- * told to submit. One statement. now is checked like every caller's time and kept as the mark.
+ * paid for, and takeAppeal returns it as submitStarted (C23). It stays for good once an evaluation id is kept or the
+ * outcome of the submit is unknown; the only way back is clearAppealSubmitting, after a definite refusal that cannot
+ * have charged. Only an appeal that is checking, has no evaluation id and no mark yet is marked, so of two workers
+ * holding one appeal after a lease ran out, at most one is told to submit. One statement. now is checked like every
+ * caller's time and kept as the mark.
  * @returns true when this call set the mark, so the caller may submit; false, changing nothing, otherwise.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when now is not a valid Date.
  */
@@ -546,6 +548,28 @@ export async function markAppealSubmitting(db: Db, key: AppealKey, now: Date): P
       WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking' AND reppo_eval_id IS NULL AND submit_started_at IS NULL
      RETURNING wallet`,
     [campaignId, wallet, nowAt],
+  );
+  return rows.length === 1;
+}
+
+/**
+ * Takes back the submit mark when the outside check answered the submit with a definite refusal before any evaluation
+ * existed, one that cannot have charged: out of credit, a bad request, a bad key. Nothing was sent, so a later try may
+ * submit again. An ambiguous outcome (no reply, a timeout, a server error) must never call this: the submit may have
+ * landed and been paid for, and only the mark stops it being paid for twice (C23). Only for an appeal that is checking,
+ * has the mark and has no evaluation id. One statement. now is checked like every caller's time.
+ * @returns true when this call cleared the mark; false, changing nothing, otherwise.
+ * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when now is not a valid Date.
+ */
+export async function clearAppealSubmitting(db: Db, key: AppealKey, now: Date): Promise<boolean> {
+  instant(now);
+  const { campaignId, wallet } = keyOf(key);
+  if (campaignId === null) return false;
+  const rows = await db.query(
+    `UPDATE appeals SET submit_started_at = NULL
+      WHERE campaign_id = $1 AND wallet = $2 AND check_status = 'checking' AND reppo_eval_id IS NULL AND submit_started_at IS NOT NULL
+     RETURNING wallet`,
+    [campaignId, wallet],
   );
   return rows.length === 1;
 }
