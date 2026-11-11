@@ -1,9 +1,21 @@
 // Not covered here: the viem port against a real chain, which the local-fork rehearsal runs end to end
 // (packages/contracts/script/rehearse.mjs), and the vault's own on-chain checks (packages/contracts/test).
 import fs from 'node:fs';
+import {
+  createPublicClient,
+  custom,
+  decodeFunctionData,
+  encodeAbiParameters,
+  encodeFunctionResult,
+  multicall3Abi,
+  type Chain,
+  type PublicClient,
+  type Transport,
+} from 'viem';
 import { describe, expect, it } from 'vitest';
 import { ChainError, type Address, type MerkleHash } from '@thuli/core';
 import { FACTORY_ABI, VAULT_ABI } from '../src/vault/abi.ts';
+import { baseSepoliaChain, CLAIMED_BATCH, vaultPort, type Wallet } from '../src/vault/chain.ts';
 import { claimants, Deployment, loadProofEnv, ProofSetupError, ProofState } from '../src/vault/proof.ts';
 import {
   buildRoot,
@@ -54,6 +66,8 @@ interface FakeChain {
   chainId: number;
   created: VaultTerms[];
   recordsPending: boolean;
+  activeRoot: MerkleHash;
+  pendingRoot: MerkleHash;
 }
 
 function fakePort(overrides: Partial<FakeChain> = {}) {
@@ -67,11 +81,13 @@ function fakePort(overrides: Partial<FakeChain> = {}) {
     chainId: 84532,
     created: [TERMS],
     recordsPending: true,
+    activeRoot: NO_ROOT,
+    pendingRoot: NO_ROOT,
     ...overrides,
   };
   const sent: { root: MerkleHash; declaredTotal: bigint }[] = [];
   const lookups: { factory: Address; vault: Address; block: bigint }[] = [];
-  let pending = NO_ROOT;
+  let pending = chain.pendingRoot;
   const port: VaultPort = {
     signer: AGENT,
     chainId: async () => chain.chainId,
@@ -85,6 +101,7 @@ function fakePort(overrides: Partial<FakeChain> = {}) {
       endTime: TERMS.endTime,
       rootDelay: TERMS.rootDelay,
       paused: chain.paused,
+      activeRoot: chain.activeRoot,
       pendingRoot: pending,
       claimed: new Map(listed.map((account) => [account, chain.claimed[account] ?? 0n])),
     }),
@@ -112,6 +129,7 @@ function snapshot(overrides: Partial<VaultSnapshot> = {}): VaultSnapshot {
     endTime: TERMS.endTime,
     rootDelay: TERMS.rootDelay,
     paused: false,
+    activeRoot: NO_ROOT,
     pendingRoot: NO_ROOT,
     claimed: new Map(),
     ...overrides,
@@ -139,13 +157,13 @@ describe('checkRoot, the server half of C32', () => {
 
   it('declares the capped sum, counting a wallet above the cap at the cap', () => {
     const list = [...twoWallets, { account: OWNER, cumulativeAmount: 50_000_000n }];
-    const result = checkRoot(list, snapshot({ deposited: 2_500_000n, claimed: claimedOf(list) }));
+    const result = checkRoot(list, [], snapshot({ deposited: 2_500_000n, claimed: claimedOf(list) }));
     expect(result).toEqual({ declaredTotal: 2_500_000n, owed: 2_500_000n });
   });
 
   it('refuses a list the deposit cannot cover', () => {
     const view = snapshot({ deposited: 1_499_999n, claimed: claimedOf(twoWallets) });
-    expect(() => checkRoot(twoWallets, view)).toThrow(/owes 1500000 base units but the vault has 1499999 left/);
+    expect(() => checkRoot(twoWallets, [], view)).toThrow(/may still pay 1500000 base units but the vault has 1499999 left/);
   });
 
   // Ported from review: Bob is dropped after claiming, so the deposit is gone although the list fits it on paper.
@@ -160,7 +178,7 @@ describe('checkRoot, the server half of C32', () => {
       perWalletCap: 100_000_000n,
       claimed: claimedOf(list, { [ALICE]: 100_000_000n }),
     });
-    expect(() => checkRoot(list, view)).toThrow(/owes 100000000 base units but the vault has 0 left/);
+    expect(() => checkRoot(list, [], view)).toThrow(/may still pay 100000000 base units but the vault has 0 left/);
   });
 
   it('counts only what each listed wallet is still owed', () => {
@@ -174,11 +192,57 @@ describe('checkRoot, the server half of C32', () => {
       perWalletCap: 100_000_000n,
       claimed: claimedOf(list, { [ALICE]: 100_000_000n }),
     });
-    expect(checkRoot(list, view)).toEqual({ declaredTotal: 200_000_000n, owed: 100_000_000n });
+    expect(checkRoot(list, [], view)).toEqual({ declaredTotal: 200_000_000n, owed: 100_000_000n });
+  });
+
+  // Ported from review round 3: the snapshot before Bob claims shows nothing paid, yet Bob, dropped from R2, can still
+  // claim under the active R1 during R2's delay, after which Carol cannot be paid.
+  it('refuses R2, judged with the active R1 it drops Bob from', () => {
+    const r1 = [
+      { account: ALICE, cumulativeAmount: 100_000_000n },
+      { account: BOB, cumulativeAmount: 100_000_000n },
+    ];
+    const r2 = [
+      { account: ALICE, cumulativeAmount: 100_000_000n },
+      { account: CAROL, cumulativeAmount: 100_000_000n },
+    ];
+    const view = snapshot({
+      deposited: 200_000_000n,
+      perWalletCap: 100_000_000n,
+      claimed: new Map([ALICE, BOB, CAROL].map((account) => [account, 0n])),
+    });
+    expect(checkRoot(r2, [], view).owed).toBe(200_000_000n);
+    expect(() => checkRoot(r2, r1, view)).toThrow(/may still pay 300000000 base units but the vault has 200000000 left/);
+  });
+
+  it('counts each wallet once, at the larger of its active and new amounts', () => {
+    const r1 = [
+      { account: ALICE, cumulativeAmount: 100_000_000n },
+      { account: BOB, cumulativeAmount: 100_000_000n },
+    ];
+    const r2 = [
+      { account: ALICE, cumulativeAmount: 60_000_000n },
+      { account: BOB, cumulativeAmount: 100_000_000n },
+      { account: CAROL, cumulativeAmount: 50_000_000n },
+    ];
+    const view = snapshot({
+      deposited: 250_000_000n,
+      totalPaid: 40_000_000n,
+      perWalletCap: 100_000_000n,
+      claimed: new Map([[ALICE, 40_000_000n], [BOB, 0n], [CAROL, 0n]]),
+    });
+    expect(checkRoot(r2, r1, view)).toEqual({ declaredTotal: 210_000_000n, owed: 210_000_000n });
+    expect(() => checkRoot(r2, r1, { ...view, deposited: 249_999_999n })).toThrow(RootError);
+  });
+
+  it('refuses a malformed entry in the active list', () => {
+    const view = snapshot({ claimed: new Map([[ALICE, 0n]]) });
+    const badActive = [{ account: ALICE, cumulativeAmount: -1n }];
+    expect(() => checkRoot([{ account: ALICE, cumulativeAmount: 1n }], badActive, view)).toThrow(/active list entry 0/);
   });
 
   it('refuses a snapshot that is missing a listed wallet', () => {
-    expect(() => checkRoot(twoWallets, snapshot())).toThrow(/has no claimed amount for/);
+    expect(() => checkRoot(twoWallets, [], snapshot())).toThrow(/has no claimed amount for/);
   });
 
   it('refuses every malformed list', () => {
@@ -194,8 +258,8 @@ describe('checkRoot, the server half of C32', () => {
       ],
     ];
     const rich = snapshot({ deposited: 10n ** 30n, claimed: new Map([[ALICE, 0n]]) });
-    for (const list of bad) expect(() => checkRoot(list, rich)).toThrow(RootError);
-    expect(() => checkRoot(twoWallets, snapshot({ perWalletCap: 0n, claimed: claimedOf(twoWallets) }))).toThrow(RootError);
+    for (const list of bad) expect(() => checkRoot(list, [], rich)).toThrow(RootError);
+    expect(() => checkRoot(twoWallets, [], snapshot({ perWalletCap: 0n, claimed: claimedOf(twoWallets) }))).toThrow(RootError);
   });
 });
 
@@ -253,7 +317,43 @@ describe('postRoot (C30, C32, C39)', () => {
 
   it('sends nothing when money promised to the list already left with dropped wallets', async () => {
     const { port, sent } = fakePort({ deposited: 2_000_000n, totalPaid: 2_000_000n, claimed: { [ALICE]: 1_000_000n } });
-    await expect(postRoot(port, CAMPAIGN, twoWallets)).rejects.toThrow(/owes 500000 base units but the vault has 0 left/);
+    await expect(postRoot(port, CAMPAIGN, twoWallets)).rejects.toThrow(/may still pay 500000 base units but the vault has 0 left/);
+    expect(sent).toEqual([]);
+  });
+
+  it('judges the new list together with the active list it was given, and posts when both fit', async () => {
+    const active = [{ account: CAROL, cumulativeAmount: 1_000_000n }];
+    const activeRoot = buildRoot(active, VAULT, 84532).root;
+    const tight = fakePort({ activeRoot, deposited: 2_000_000n });
+    await expect(postRoot(tight.port, CAMPAIGN, twoWallets, { activePublished: publishList(active) })).rejects.toThrow(
+      /may still pay 2500000 base units but the vault has 2000000 left/,
+    );
+    expect(tight.sent).toEqual([]);
+    const roomy = fakePort({ activeRoot, deposited: 2_500_000n });
+    const posted = await postRoot(roomy.port, CAMPAIGN, twoWallets, { activePublished: publishList(active) });
+    expect(posted.declaredTotal).toBe(1_500_000n);
+  });
+
+  it('sends nothing unless the given active list rebuilds the vault active root exactly', async () => {
+    const active = [{ account: CAROL, cumulativeAmount: 1_000_000n }];
+    const activeRoot = buildRoot(active, VAULT, 84532).root;
+    const missing = fakePort({ activeRoot });
+    await expect(postRoot(missing.port, CAMPAIGN, twoWallets)).rejects.toThrow(/rebuilds the vault active root/);
+    const wrong = fakePort({ activeRoot });
+    const other = publishList([{ account: CAROL, cumulativeAmount: 999_999n }]);
+    await expect(postRoot(wrong.port, CAMPAIGN, twoWallets, { activePublished: other })).rejects.toThrow(
+      /rebuilds the vault active root/,
+    );
+    const none = fakePort();
+    await expect(postRoot(none.port, CAMPAIGN, twoWallets, { activePublished: publishList(active) })).rejects.toThrow(
+      /no active root/,
+    );
+    expect([...missing.sent, ...wrong.sent, ...none.sent]).toEqual([]);
+  });
+
+  it('sends nothing while another root is pending, since it could activate first and pay an unchecked list', async () => {
+    const { port, sent } = fakePort({ pendingRoot: fixture.root as MerkleHash });
+    await expect(postRoot(port, CAMPAIGN, twoWallets)).rejects.toThrow(/still pending/);
     expect(sent).toEqual([]);
   });
 
@@ -338,6 +438,74 @@ describe('the proof helpers', () => {
     expect(Deployment.safeParse({ chainId: 8453, factory: VAULT }).success).toBe(false);
     expect(ProofState.safeParse({ chainId: 84532, extra: true }).success).toBe(false);
   });
+});
+
+describe('the viem port reads (C41)', () => {
+  it('reads 100,000 wallets 1,000 per call, one request at a time, every call at the pinned block', async () => {
+    const pinned = '0x10';
+    let inFlight = 0;
+    let peak = 0;
+    let batches = 0;
+    const blockTags = new Set<string>();
+    const vaultState = {
+      token: TOKEN,
+      owner: OWNER,
+      agent: AGENT,
+      perWalletCap: CAP,
+      endTime: TERMS.endTime,
+      rootDelay: 3600,
+      deposited: 2_000_000n,
+      totalPaid: 0n,
+      activeRoot: NO_ROOT,
+      pendingRoot: NO_ROOT,
+      pendingClaimableAt: 0n,
+      paused: false,
+    };
+    const transport = custom({
+      async request({ method, params }: { method: string; params: unknown }) {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          if (method === 'eth_chainId') return '0x14a34';
+          if (method === 'eth_getBlockByNumber') {
+            return { number: pinned, timestamp: '0x6b4a8864', hash: `0x${'11'.repeat(32)}`, transactions: [] };
+          }
+          if (method !== 'eth_call') throw new Error(`unexpected ${method}`);
+          const [call, block] = params as [{ to: string; data: `0x${string}` }, string];
+          blockTags.add(block);
+          if (call.to.toLowerCase() === VAULT.toLowerCase()) {
+            return encodeFunctionResult({ abi: VAULT_ABI, functionName: 'state', result: vaultState });
+          }
+          batches += 1;
+          const { args } = decodeFunctionData({ abi: multicall3Abi, data: call.data });
+          const calls = args[0] as readonly unknown[];
+          const seven = encodeAbiParameters([{ type: 'uint256' }], [7n]);
+          return encodeFunctionResult({
+            abi: multicall3Abi,
+            functionName: 'aggregate3',
+            result: calls.map(() => ({ success: true, returnData: seven })),
+          });
+        } finally {
+          inFlight -= 1;
+        }
+      },
+    });
+    const client = createPublicClient({ chain: baseSepoliaChain('http://127.0.0.1:1'), transport }) as PublicClient<
+      Transport,
+      Chain
+    >;
+    const port = vaultPort(client, { account: { address: AGENT } } as unknown as Wallet);
+    const wallets = Array.from({ length: 100_000 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, '0')}` as Address);
+
+    const read = await port.readSnapshot(VAULT, wallets);
+    expect(peak).toBe(1);
+    expect(batches).toBe(100_000 / CLAIMED_BATCH);
+    expect([...blockTags]).toEqual([pinned]);
+    expect(read.blockNumber).toBe(16n);
+    expect(read.claimed.size).toBe(100_000);
+    expect(read.claimed.get(wallets[99_999] as Address)).toBe(7n);
+  }, 60_000);
 });
 
 const artifact = (name: string) => new URL(`out/${name}.sol/${name}.json`, CONTRACTS);

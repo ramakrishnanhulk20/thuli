@@ -47,6 +47,8 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     uint32 public constant MAX_ROOT_DELAY = 30 days;
     /// @notice How far ahead of now the end time may be set, at creation or by an extension.
     uint64 public constant MAX_END_AHEAD = 365 days;
+    /// @notice The least claim time a vault must have after one root delay, so it can always run at least one root.
+    uint32 public constant MIN_CLAIM_WINDOW = 1 hours;
 
     /// @notice The reward token. Fee-on-transfer tokens are refused at deposit.
     IERC20 public immutable token;
@@ -119,6 +121,7 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     error AgentIsOwner();
     error ZeroCap();
     error EndTimeOutOfRange(uint64 endTime);
+    error EndTimeTooSoon(uint64 endTime, uint256 earliest);
     error RootDelayOutOfRange(uint32 rootDelay);
     error ZeroAmount();
     error CampaignEnded();
@@ -143,10 +146,11 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
     /// @param owner_ The project running the campaign. Deposits, cancels roots, rotates the agent, withdraws after end.
     /// @param agent_ Thuli's root-posting key. Must differ from the owner.
     /// @param perWalletCap_ The most one wallet can ever receive. Must be above zero.
-    /// @param endTime_ When claims stop. Must be in the future and at most 365 days from now.
+    /// @param endTime_ When claims stop. At least one root delay plus one hour from now, so a root posted at once can
+    /// still pay, and at most 365 days from now.
     /// @param rootDelay_ Seconds every root waits before it pays, from 1 hour to 30 days.
     /// @dev Reverts with OwnableInvalidOwner for a zero owner, ZeroAddress for a zero token or agent, AgentIsOwner,
-    /// ZeroCap, EndTimeOutOfRange or RootDelayOutOfRange. Emits OwnershipTransferred and AgentChanged.
+    /// ZeroCap, RootDelayOutOfRange, EndTimeTooSoon or EndTimeOutOfRange. Emits OwnershipTransferred and AgentChanged.
     constructor(
         address token_,
         address owner_,
@@ -158,10 +162,10 @@ contract ThuliVault is Ownable2Step, Pausable, ReentrancyGuard {
         if (token_ == address(0) || agent_ == address(0)) revert ZeroAddress();
         if (agent_ == owner_) revert AgentIsOwner();
         if (perWalletCap_ == 0) revert ZeroCap();
-        if (endTime_ <= block.timestamp || endTime_ > block.timestamp + MAX_END_AHEAD) {
-            revert EndTimeOutOfRange(endTime_);
-        }
         if (rootDelay_ < MIN_ROOT_DELAY || rootDelay_ > MAX_ROOT_DELAY) revert RootDelayOutOfRange(rootDelay_);
+        uint256 earliest = block.timestamp + rootDelay_ + MIN_CLAIM_WINDOW;
+        if (endTime_ < earliest) revert EndTimeTooSoon(endTime_, earliest);
+        if (endTime_ > block.timestamp + MAX_END_AHEAD) revert EndTimeOutOfRange(endTime_);
 
         token = IERC20(token_);
         perWalletCap = perWalletCap_;

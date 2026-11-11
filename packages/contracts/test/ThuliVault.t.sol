@@ -68,12 +68,26 @@ contract ThuliVaultTest is VaultTestBase {
     function testCreateVaultEndTimeBounds() public {
         uint64 nowTs = uint64(block.timestamp);
         uint64 yearOut = nowTs + 365 days;
-        vm.expectRevert(abi.encodeWithSelector(ThuliVault.EndTimeOutOfRange.selector, nowTs));
-        factory.createVault(address(usd), owner, agent, CAP, nowTs, DELAY);
+        uint64 earliest = nowTs + DELAY + 1 hours;
         vm.expectRevert(abi.encodeWithSelector(ThuliVault.EndTimeOutOfRange.selector, yearOut + 1));
         factory.createVault(address(usd), owner, agent, CAP, yearOut + 1, DELAY);
-        assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, nowTs + 1, DELAY)).endTime(), nowTs + 1);
+        assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, earliest, DELAY)).endTime(), earliest);
         assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, yearOut, DELAY)).endTime(), yearOut);
+    }
+
+    /// A vault must be able to run at least one root: its end is at least one delay plus one hour away.
+    function testCreateVaultRefusesAnEndTooSoonForOneRoot() public {
+        uint64 nowTs = uint64(block.timestamp);
+        uint256 earliest = nowTs + 30 days + 1 hours;
+        vm.expectRevert(abi.encodeWithSelector(ThuliVault.EndTimeTooSoon.selector, nowTs, earliest));
+        factory.createVault(address(usd), owner, agent, CAP, nowTs, 30 days);
+        vm.expectRevert(abi.encodeWithSelector(ThuliVault.EndTimeTooSoon.selector, uint64(earliest - 1), earliest));
+        factory.createVault(address(usd), owner, agent, CAP, uint64(earliest - 1), 30 days);
+
+        ThuliVault tight = ThuliVault(factory.createVault(address(usd), owner, agent, CAP, uint64(earliest), 30 days));
+        vm.prank(agent);
+        tight.postRoot(bytes32(uint256(1)), 0);
+        assertEq(tight.state().pendingClaimableAt, earliest - 1 hours);
     }
 
     function testCreateVaultRootDelayBounds() public {
@@ -81,8 +95,9 @@ contract ThuliVaultTest is VaultTestBase {
         factory.createVault(address(usd), owner, agent, CAP, end, 1 hours - 1);
         vm.expectRevert(abi.encodeWithSelector(ThuliVault.RootDelayOutOfRange.selector, uint32(30 days + 1)));
         factory.createVault(address(usd), owner, agent, CAP, end, 30 days + 1);
+        uint64 longEnd = uint64(block.timestamp) + 60 days;
         assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, end, 1 hours)).rootDelay(), 1 hours);
-        assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, end, 30 days)).rootDelay(), 30 days);
+        assertEq(ThuliVault(factory.createVault(address(usd), owner, agent, CAP, longEnd, 30 days)).rootDelay(), 30 days);
     }
 
     function testDepositPullsTokensAndEmits() public {
@@ -394,6 +409,28 @@ contract ThuliVaultTest is VaultTestBase {
         assertEq(vault.state().activeRoot, StandardTree.root(tree));
     }
 
+    /// C30, ported from review: a stolen key posts, the owner pauses and investigates past the root's raw delay, then
+    /// rotates the agent while still paused. The rotation must drop the root, never record it as active.
+    function testRotatingWhilePausedPastTheRawDelayDropsTheRoot() public {
+        _deposit(100e6);
+        bytes32[] memory bad = _three(100e6, 0, 0);
+        _post(bad, 100e6);
+        skip(10 minutes);
+        vm.prank(owner);
+        vault.pause();
+        skip(2 * DELAY);
+        vm.expectEmit(true, false, false, false, address(vault));
+        emit ThuliVault.RootCancelled(StandardTree.root(bad));
+        vm.prank(owner);
+        vault.setAgent(makeAddr("fresh"));
+        vm.prank(owner);
+        vault.unpause();
+        skip(10 * DELAY);
+        ThuliVault.VaultState memory s = vault.state();
+        assertEq(s.activeRoot, bytes32(0));
+        assertEq(s.pendingRoot, bytes32(0));
+    }
+
     function testStateWhilePausedWithNoPendingRoot() public {
         vm.prank(owner);
         vault.pause();
@@ -616,11 +653,57 @@ contract ThuliVaultTest is VaultTestBase {
         hostile.arm(target, 10e6, aliceProof);
         target.claim(alice, 10e6, aliceProof);
 
+        _assertGuardRefused(hostile);
+        assertEq(hostile.balanceOf(alice), 10e6);
+        assertEq(target.totalPaid(), 10e6);
+    }
+
+    /// The reward token calls back into the vault while deposit pulls it in; the reentrancy guard refuses it.
+    function testDepositBlocksReentryFromTheToken() public {
+        ReentrantToken hostile = new ReentrantToken();
+        ThuliVault target = ThuliVault(factory.createVault(address(hostile), owner, agent, CAP, end, DELAY));
+        hostile.mint(owner, 20e6);
+        vm.prank(owner);
+        hostile.approve(address(target), 20e6);
+        hostile.arm(target, 10e6, new bytes32[](0));
+        vm.prank(owner);
+        target.deposit(20e6);
+        _assertGuardRefused(hostile);
+        assertEq(target.deposited(), 20e6);
+    }
+
+    /// The reward token calls back into the vault while the owner withdraws; the reentrancy guard refuses it.
+    function testWithdrawBlocksReentryFromTheToken() public {
+        ReentrantToken hostile = new ReentrantToken();
+        ThuliVault target = ThuliVault(factory.createVault(address(hostile), owner, agent, CAP, end, DELAY));
+        hostile.mint(owner, 20e6);
+        vm.startPrank(owner);
+        hostile.approve(address(target), 20e6);
+        target.deposit(20e6);
+        vm.stopPrank();
+        vm.warp(end);
+        hostile.arm(target, 10e6, new bytes32[](0));
+        vm.prank(owner);
+        target.withdrawAfterEnd(owner);
+        _assertGuardRefused(hostile);
+        assertEq(hostile.balanceOf(owner), 20e6);
+    }
+
+    /// A stray token sent to the vault calls back into it while being rescued; the reentrancy guard refuses it.
+    function testRescueBlocksReentryFromTheStrayToken() public {
+        ReentrantToken stray = new ReentrantToken();
+        stray.mint(address(vault), 5e6);
+        stray.arm(vault, 1, new bytes32[](0));
+        vm.prank(owner);
+        vault.rescue(address(stray), owner, 5e6);
+        _assertGuardRefused(stray);
+        assertEq(stray.balanceOf(owner), 5e6);
+    }
+
+    function _assertGuardRefused(ReentrantToken hostile) internal view {
         assertTrue(hostile.reentered());
         assertFalse(hostile.reentrySucceeded());
         assertEq(hostile.reentryError(), abi.encodeWithSelector(ReentrancyGuard.ReentrancyGuardReentrantCall.selector));
-        assertEq(hostile.balanceOf(alice), 10e6);
-        assertEq(target.totalPaid(), 10e6);
     }
 
     function testWithdrawAfterEndSendsEverythingLeft() public {
@@ -762,6 +845,17 @@ contract ThuliVaultTest is VaultTestBase {
         assertEq(s.pendingRoot, bytes32(0));
         assertEq(s.pendingClaimableAt, 0);
         assertEq(s.deposited, 30e6);
+    }
+
+    /// A later root may lower a wallet below what it already received (C27); claimable must say zero, never revert.
+    function testClaimableIsZeroWhenALeafIsBelowWhatWasClaimed() public {
+        _deposit(30e6);
+        bytes32[] memory tree = _three(10e6, 10e6, 10e6);
+        _postAndWait(tree, 30e6);
+        _claim(tree, alice, 10e6);
+        assertEq(vault.claimable(alice, 5e6), 0);
+        assertEq(vault.claimable(alice, 10e6), 0);
+        assertEq(vault.claimable(alice, 12e6), 2e6);
     }
 
     function testClaimableMatchesWhatAClaimWouldPay() public {

@@ -294,6 +294,10 @@ or attack that demonstrates it. A work order that carries an invariant also carr
 - **C31. The owner cannot pull funds out from under claimants.** Only the owner can withdraw, only after the campaign
   ends, and the end time can never move earlier. A pause moves the end later by exactly the time spent paused, and no
   withdrawal runs while paused, so pausing cannot run out the claim window. Claims pay only the address in the leaf.
+  Non-goal, by Ram's decision on 11 Nov: the vault protects claimants from a hacked Thuli server and from early
+  withdrawal, not from the project that funds it. The owner may name a new agent, and a list that agent posts replaces the
+  old one after the root delay. Every agent change and every root is public on chain, so claimants get that delay as
+  notice. The owner can swap a stolen agent key this way and keep the campaign running.
   Shown by: a withdrawal before the end reverts; a claim submitted by a third party pays the leaf's address; a pause of
   any length extends the end by that length.
 - **C32. The chain matches the public list.** Before signing, the server rebuilds the root from the published list and

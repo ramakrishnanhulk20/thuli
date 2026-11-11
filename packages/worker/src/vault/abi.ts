@@ -65,6 +65,19 @@ export const VAULT_ABI = [
   },
   {
     "type": "function",
+    "name": "MIN_CLAIM_WINDOW",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint32",
+        "internalType": "uint32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MIN_ROOT_DELAY",
     "inputs": [],
     "outputs": [
@@ -809,6 +822,22 @@ export const VAULT_ABI = [
         "name": "endTime",
         "type": "uint64",
         "internalType": "uint64"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "EndTimeTooSoon",
+    "inputs": [
+      {
+        "name": "endTime",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "earliest",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ]
   },

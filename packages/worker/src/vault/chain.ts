@@ -25,6 +25,9 @@ const RECEIPT_TIMEOUT_MS = 180_000;
 // Multicall3 sits at this address on Base Sepolia, as on most chains; it lets every snapshot read share one block.
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const VAULT_CREATED = getAbiItem({ abi: FACTORY_ABI, name: 'VaultCreated' });
+// Public nodes rate-limit by request size and by requests in flight, so claimed() is read 1,000 wallets per eth_call,
+// one call at a time: 100,000 wallets are 100 calls in a row, never 100 at once (C41).
+export const CLAIMED_BATCH = 1_000;
 
 export class ChainCallError extends Error {
   override name = 'ChainCallError';
@@ -44,13 +47,7 @@ export interface Connection {
  * @throws ChainCallError when the RPC is on any chain but 84532.
  */
 export async function connectBaseSepolia(rpcUrl: string): Promise<Connection> {
-  const chain = defineChain({
-    id: BASE_SEPOLIA.id,
-    name: 'Base Sepolia',
-    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-    rpcUrls: { default: { http: [rpcUrl] } },
-    contracts: { multicall3: { address: MULTICALL3 } },
-  });
+  const chain = baseSepoliaChain(rpcUrl);
   const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2 });
   const publicClient = createPublicClient({ chain, transport });
   const reported = await publicClient.getChainId();
@@ -61,6 +58,17 @@ export async function connectBaseSepolia(rpcUrl: string): Promise<Connection> {
     publicClient,
     wallet: (privateKey) => createWalletClient({ account: privateKeyToAccount(privateKey), chain, transport }),
   };
+}
+
+/** Base Sepolia as viem needs it, with Multicall3 so snapshot reads can share one block. */
+export function baseSepoliaChain(rpcUrl: string): Chain {
+  return defineChain({
+    id: BASE_SEPOLIA.id,
+    name: 'Base Sepolia',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [rpcUrl] } },
+    contracts: { multicall3: { address: MULTICALL3 } },
+  });
 }
 
 export interface Sent {
@@ -99,21 +107,24 @@ export function vaultPort(publicClient: PublicClient<Transport, Chain>, agent: W
     async readSnapshot(vault, accounts) {
       const block = await publicClient.getBlock({ blockTag: 'latest' });
       const blockNumber = block.number;
-      const [state, claimed] = await Promise.all([
-        publicClient.readContract({ address: vault, abi: VAULT_ABI, functionName: 'state', blockNumber }),
-        accounts.length === 0
-          ? Promise.resolve([] as bigint[])
-          : publicClient.multicall({
-              contracts: accounts.map((account) => ({
-                address: vault,
-                abi: VAULT_ABI,
-                functionName: 'claimed' as const,
-                args: [account] as const,
-              })),
-              allowFailure: false,
-              blockNumber,
-            }),
-      ]);
+      const state = await publicClient.readContract({ address: vault, abi: VAULT_ABI, functionName: 'state', blockNumber });
+      const claimed = new Map<Address, bigint>();
+      for (let start = 0; start < accounts.length; start += CLAIMED_BATCH) {
+        const batch = accounts.slice(start, start + CLAIMED_BATCH);
+        // batchSize 0 keeps viem from splitting the batch into calls it would send all at once.
+        const results = await publicClient.multicall({
+          contracts: batch.map((account) => ({
+            address: vault,
+            abi: VAULT_ABI,
+            functionName: 'claimed' as const,
+            args: [account] as const,
+          })),
+          allowFailure: false,
+          batchSize: 0,
+          blockNumber,
+        });
+        batch.forEach((account, i) => claimed.set(account, results[i] as bigint));
+      }
       return {
         blockNumber,
         timestamp: block.timestamp,
@@ -124,8 +135,9 @@ export function vaultPort(publicClient: PublicClient<Transport, Chain>, agent: W
         endTime: state.endTime,
         rootDelay: BigInt(state.rootDelay),
         paused: state.paused,
+        activeRoot: state.activeRoot,
         pendingRoot: state.pendingRoot,
-        claimed: new Map(accounts.map((account, i) => [account, claimed[i] as bigint])),
+        claimed,
       };
     },
     async findVaultCreated(factory, vault, block) {

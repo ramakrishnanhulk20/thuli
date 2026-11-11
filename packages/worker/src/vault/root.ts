@@ -53,11 +53,13 @@ export interface VaultSnapshot {
   endTime: bigint;
   rootDelay: bigint;
   paused: boolean;
+  activeRoot: MerkleHash;
   pendingRoot: MerkleHash;
   claimed: ReadonlyMap<Address, bigint>;
 }
 
 const MAX_UINT256 = 2n ** 256n - 1n;
+const NO_ROOT = `0x${'00'.repeat(32)}`;
 // Every leaf sits in memory while the tree is built; a list this long is not one campaign's claim list (C41).
 export const MAX_ROOT_ENTRIES = 100_000;
 const MAX_PUBLISHED_BYTES = MAX_ROOT_ENTRIES * 120;
@@ -74,47 +76,79 @@ export function buildRoot(entries: readonly VaultEntry[], vault: string, chainId
 }
 
 /**
- * The server half of C32: a list is postable only if every entry is well formed and the vault can still pay it.
+ * The server half of C32: a new list is postable only if the vault can pay everything it may still owe, both while
+ * the new root waits out its delay and after it activates.
  *
- * Each wallet is owed min(amount, cap) minus what it has already claimed, never less than zero, because the vault pays
- * no more than the cap and only the difference (C27). The sum of what is owed must fit in what is left, deposited minus
- * totalPaid. Checking against the whole deposit would miss money already paid to wallets a later list drops.
+ * During the delay the active root keeps paying its own list, so a wallet can still collect up to its capped amount
+ * there; once the new root activates, up to its capped amount on the new list. Over the union of both lists each wallet
+ * may therefore still receive max(capped active, capped new) minus what it has already claimed, never less than zero
+ * (C27). That sum must fit in what is left, deposited minus totalPaid, every value read at the snapshot's one block.
+ * Judging only the new list would miss a wallet the new list drops that drains the deposit during the delay.
  *
- * @returns declaredTotal, the capped cumulative sum that postRoot declares to the vault, and owed, the new money due.
- * @throws RootError for an empty or oversized list, a malformed or repeated entry, a snapshot missing a listed wallet,
- *   or a list that owes more than the vault has left.
+ * @param activeEntries The published list whose root is the vault's active root; empty when the vault has none.
+ * @returns declaredTotal, the new list's capped cumulative sum, which postRoot declares to the vault, and owed.
+ * @throws RootError for an empty or oversized new list, a malformed or repeated entry in either list, a snapshot
+ *   missing a listed wallet, or lists that may still pay more than the vault has left.
  */
-export function checkRoot(entries: readonly VaultEntry[], snapshot: VaultSnapshot): { declaredTotal: bigint; owed: bigint } {
+export function checkRoot(
+  entries: readonly VaultEntry[],
+  activeEntries: readonly VaultEntry[],
+  snapshot: VaultSnapshot,
+): { declaredTotal: bigint; owed: bigint } {
   const { perWalletCap, deposited, totalPaid } = snapshot;
   if (perWalletCap <= 0n) throw new RootError('the cap must be above zero');
   if (totalPaid > deposited) throw new RootError('the vault reports paying more than was deposited');
   if (entries.length === 0) throw new RootError('the list is empty');
-  if (entries.length > MAX_ROOT_ENTRIES) throw new RootError(`the list is longer than ${MAX_ROOT_ENTRIES} wallets`);
-  const seen = new Set<Address>();
+  const fresh = cappedAmounts(entries, perWalletCap, 'entry');
+  const active = cappedAmounts(activeEntries, perWalletCap, 'active list entry');
   let declaredTotal = 0n;
+  for (const capped of fresh.values()) declaredTotal += capped;
   let owed = 0n;
+  for (const account of new Set([...active.keys(), ...fresh.keys()])) {
+    const claimed = snapshot.claimed.get(account);
+    if (claimed === undefined) throw new RootError(`the snapshot has no claimed amount for ${account}`);
+    const fromActive = active.get(account) ?? 0n;
+    const fromFresh = fresh.get(account) ?? 0n;
+    const due = fromActive > fromFresh ? fromActive : fromFresh;
+    if (due > claimed) owed += due - claimed;
+  }
+  const left = deposited - totalPaid;
+  if (owed > left) throw new RootError(`the lists may still pay ${owed} base units but the vault has ${left} left`);
+  return { declaredTotal, owed };
+}
+
+/** Each wallet's amount capped at `cap`, after checking every entry is well formed and no wallet appears twice. */
+function cappedAmounts(entries: readonly VaultEntry[], cap: bigint, label: string): Map<Address, bigint> {
+  if (entries.length > MAX_ROOT_ENTRIES) throw new RootError(`a list is longer than ${MAX_ROOT_ENTRIES} wallets`);
+  const capped = new Map<Address, bigint>();
   entries.forEach((entry, i) => {
     let account: Address;
     try {
       account = parseAddress(entry.account);
     } catch {
-      throw new RootError(`entry ${i} has a malformed address`);
+      throw new RootError(`${label} ${i} has a malformed address`);
     }
     const amount = entry.cumulativeAmount;
     if (typeof amount !== 'bigint' || amount < 0n || amount > MAX_UINT256) {
-      throw new RootError(`entry ${i} has a malformed amount`);
+      throw new RootError(`${label} ${i} has a malformed amount`);
     }
-    if (seen.has(account)) throw new RootError(`entry ${i} repeats ${account}`);
-    seen.add(account);
-    const claimed = snapshot.claimed.get(account);
-    if (claimed === undefined) throw new RootError(`the snapshot has no claimed amount for ${account}`);
-    const capped = amount < perWalletCap ? amount : perWalletCap;
-    declaredTotal += capped;
-    if (capped > claimed) owed += capped - claimed;
+    if (capped.has(account)) throw new RootError(`${label} ${i} repeats ${account}`);
+    capped.set(account, amount < cap ? amount : cap);
   });
-  const left = deposited - totalPaid;
-  if (owed > left) throw new RootError(`the list owes ${owed} base units but the vault has ${left} left`);
-  return { declaredTotal, owed };
+  return capped;
+}
+
+/** Every wallet on any of the lists, in the one address form; malformed ones are left for checkRoot to refuse. */
+function walletsOn(...lists: readonly (readonly VaultEntry[])[]): Address[] {
+  const wallets = new Set<Address>();
+  for (const entry of lists.flat()) {
+    try {
+      wallets.add(parseAddress(entry.account));
+    } catch {
+      // checkRoot names the malformed entry.
+    }
+  }
+  return [...wallets];
 }
 
 /**
@@ -163,7 +197,8 @@ export interface VaultPort {
   /** The address of the key that signs, which must be the vault's agent. */
   readonly signer: Address;
   chainId(): Promise<number>;
-  /** The vault's state and claimed(account) for each of `accounts`, every value read at the same block. */
+  /** The vault's state and claimed(account) for each of `accounts`, every value read at the same block. The active
+   * and pending roots are as state() reports them, a root whose delay is over counting as active. */
   readSnapshot(vault: Address, accounts: readonly Address[]): Promise<VaultSnapshot>;
   /** Every VaultCreated that `factory` logged for `vault` in `block`. */
   findVaultCreated(factory: Address, vault: Address, block: bigint): Promise<VaultTerms[]>;
@@ -185,9 +220,11 @@ export interface PostedRoot {
  *
  * Nothing is sent unless: the chain is one we run on; verifyVault proves the factory made this vault with the record's
  * terms; the signer is the vault's agent; the vault is not paused and the root's delay would end before the campaign
- * does; checkRoot passes on the list as published against one block's snapshot; and the root built from the caller's
- * entries equals the root rebuilt from the published text, which catches a list that changed between checking and
- * signing. `expectedRoot`, when given, must match too.
+ * does; no root is pending, since one could activate before this transaction lands and pay a list nobody checked;
+ * `activePublished`, the published list of the vault's active root, rebuilds that root exactly; checkRoot passes on
+ * both lists against one block's snapshot; and the root built from the caller's entries equals the root rebuilt from
+ * the published text, which catches a list that changed between checking and signing. `expectedRoot`, when given,
+ * must match too.
  *
  * @throws ChainError, RootError, or the port's error when the transaction fails.
  */
@@ -195,7 +232,7 @@ export async function postRoot(
   port: VaultPort,
   campaign: CampaignRecord,
   entries: readonly VaultEntry[],
-  options: { expectedRoot?: string } = {},
+  options: { activePublished?: string; expectedRoot?: string } = {},
 ): Promise<PostedRoot> {
   const chainId = await port.chainId();
   parseChain(chainId);
@@ -204,13 +241,22 @@ export async function postRoot(
 
   const published = publishList(entries);
   const list = readPublishedList(published);
-  const snapshot = await port.readSnapshot(vault, list.map((entry) => parseAddress(entry.account)));
+  const activeList = options.activePublished === undefined ? [] : readPublishedList(options.activePublished);
+  const snapshot = await port.readSnapshot(vault, walletsOn(list, activeList));
   if (snapshot.agent !== port.signer) throw new RootError('this key is not the vault agent; nothing was posted');
   if (snapshot.paused) throw new RootError('the vault is paused, so it refuses new roots; nothing was posted');
   if (snapshot.timestamp + snapshot.rootDelay >= snapshot.endTime) {
     throw new RootError('a root posted now could not pay before the end; nothing was posted');
   }
-  const { declaredTotal } = checkRoot(list, snapshot);
+  if (snapshot.pendingRoot !== NO_ROOT) {
+    throw new RootError('a root is still pending; wait until it activates or the owner cancels it. Nothing was posted');
+  }
+  if (snapshot.activeRoot === NO_ROOT) {
+    if (activeList.length > 0) throw new RootError('an active list was given but the vault has no active root');
+  } else if (!rebuildsTo(activeList, vault, chainId, snapshot.activeRoot)) {
+    throw new RootError('no published list given rebuilds the vault active root; nothing was posted');
+  }
+  const { declaredTotal } = checkRoot(list, activeList, snapshot);
   const first = buildRoot(entries, vault, chainId);
   const second = buildRoot(list, vault, chainId);
   if (first.root !== second.root) throw new RootError('the root rebuilt from the published list differs; nothing was posted');
@@ -222,4 +268,13 @@ export async function postRoot(
   const after = await port.readSnapshot(vault, []);
   if (after.pendingRoot !== first.root) throw new RootError('the vault does not show the posted root as pending');
   return { root: first.root, declaredTotal, hash: sent.hash, gasUsed: sent.gasUsed, published };
+}
+
+function rebuildsTo(list: readonly VaultEntry[], vault: Address, chainId: number, root: MerkleHash): boolean {
+  if (list.length === 0) return false;
+  try {
+    return buildRoot(list, vault, chainId).root === root;
+  } catch {
+    return false;
+  }
 }
