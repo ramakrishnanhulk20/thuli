@@ -164,6 +164,9 @@ export type ProofState = z.infer<typeof ProofState>;
 export const Deployment = z.object({ chainId: z.literal(84532), factory: AddressField });
 export type Deployment = z.infer<typeof Deployment>;
 
+/** deployments/base.json, the Base mainnet factory record, in the same shape as base-sepolia.json. */
+export const BaseDeployment = z.object({ chainId: z.literal(8453), factory: AddressField });
+
 const BASE_SEPOLIA = CHAINS['base-sepolia'];
 
 export type ProofLabel = 'createVault' | 'approve' | 'deposit' | 'postRoot' | 'claim';
@@ -239,9 +242,9 @@ export interface ProofChain {
   refusedSimulation: 'InvalidProof' | string;
 }
 
-interface ProofStep {
-  label: ProofLabel;
-  /** The label the setup and claim phases saved the transaction under. */
+export interface ProofStep {
+  label: ProofLabel | 'withdraw';
+  /** The label the phases saved the transaction under. */
   saved: string;
   signer: 'owner' | 'agent';
   target: 'factory' | 'token' | 'vault';
@@ -254,6 +257,39 @@ const PROOF_STEPS: readonly ProofStep[] = [
   { label: 'postRoot', saved: 'postRoot', signer: 'agent', target: 'vault' },
   { label: 'claim', saved: 'claim A', signer: 'agent', target: 'vault' },
 ];
+
+/** The Base mainnet proof's steps: the same five, saved under their own names, then the owner's withdrawal. */
+export const BASE_PROOF_STEPS: readonly ProofStep[] = [
+  ...PROOF_STEPS.map((step) => ({ ...step, saved: step.label })),
+  { label: 'withdraw', saved: 'withdraw', signer: 'owner', target: 'vault' },
+];
+
+/**
+ * What a proof record is checked against on one network: its chain, the USDC it pays, the proof's fixed terms and the
+ * steps it took. With a withdraw step the record must also show the owner taking back the rest and the vault empty.
+ */
+export interface RecordProfile {
+  network: string;
+  chainId: number;
+  explorer: string;
+  usdc: string;
+  perWalletCap: bigint;
+  rootDelay: number;
+  steps: readonly ProofStep[];
+  /** The committed deployment record's file name, as checks name it. */
+  deploymentFile: string;
+}
+
+const SEPOLIA_PROFILE: RecordProfile = {
+  deploymentFile: 'base-sepolia.json',
+  network: 'base-sepolia',
+  chainId: 84532,
+  explorer: 'https://sepolia.basescan.org',
+  usdc: CHAINS['base-sepolia'].usdc,
+  perWalletCap: PROOF_TERMS.perWalletCap,
+  rootDelay: PROOF_TERMS.rootDelay,
+  steps: PROOF_STEPS,
+};
 
 const DecimalText = z.string().regex(/^(0|[1-9][0-9]{0,77})$/);
 
@@ -335,20 +371,65 @@ function eventsFrom<const abi extends typeof VAULT_ABI | typeof FACTORY_ABI | ty
  * @throws ProofFailed naming the first check the chain did not agree with.
  */
 export function buildProofRecord(input: { state: ProofState; deployment: Deployment; chain: ProofChain; now: Date }): ProofRecord {
+  const { a, b } = claimants(input.state.seed as Hex);
+  return recordFor(input, SEPOLIA_PROFILE, { paid: a, refused: b }, SEPOLIA_NAMES) as ProofRecord;
+}
+
+/** How a network's messages name the two wallets and the token. */
+interface RecordNames {
+  paid: string;
+  refused: string;
+  usdc: string;
+  listOrigin: string;
+}
+
+const SEPOLIA_NAMES: RecordNames = { paid: 'claimant A', refused: 'claimant B', usdc: 'Base Sepolia USDC', listOrigin: ' from the saved seed' };
+const BASE_NAMES: RecordNames = { paid: 'the paid wallet', refused: 'the refused wallet', usdc: 'Base USDC', listOrigin: '' };
+
+/** The saved run as the record builder reads it, the same on both networks. */
+interface RecordState {
+  factory: string;
+  vault: string;
+  owner: string;
+  agent: string;
+  root: string;
+  published: string;
+  claimableAt: number;
+  transactions: readonly { label: string; hash: string }[];
+}
+
+/** A proof record on any network. ProofRecord and BaseProofRecord are its two exact shapes. */
+type PublicProofRecord = Omit<ProofRecord, 'network' | 'chainId' | 'explorer' | 'transactions'> & {
+  network: string;
+  chainId: number;
+  explorer: string;
+  withdrawn?: { to: string; amount: string };
+  transactions: Array<{ label: ProofStep['label']; hash: string; block: number; gasUsed: number; from: string }>;
+};
+
+// The checks buildProofRecord documents, for one network's profile. With a withdraw step it also requires the owner to
+// have taken back exactly what the claim left and the vault to hold nothing.
+function recordFor(
+  input: { state: RecordState; deployment: { factory: string }; chain: ProofChain & { vaultBalance?: bigint }; now: Date },
+  profile: RecordProfile,
+  wallets: { paid: Address; refused: Address },
+  names: RecordNames,
+): PublicProofRecord {
   const { state, deployment, chain, now } = input;
   const factory = parseAddress(deployment.factory);
   const vault = parseAddress(state.vault);
   const owner = parseAddress(state.owner);
   const agent = parseAddress(state.agent);
-  const token = parseAddress(BASE_SEPOLIA.usdc);
+  const token = parseAddress(profile.usdc);
   const root = state.root.toLowerCase();
   must(sameAddress(state.factory, factory), 'the proof state names another factory than the deployment record');
 
-  must(state.transactions.length === PROOF_STEPS.length, `the proof state lists ${state.transactions.length} transactions, not the five of a finished run`);
+  const steps = profile.steps;
+  must(state.transactions.length === steps.length, `the proof state lists ${state.transactions.length} transactions, not the ${steps.length} of a finished run`);
   const signers = { owner, agent };
   const targets = { factory, token, vault };
-  const receipts = new Map<ProofLabel, ProofReceipt>();
-  const transactions = PROOF_STEPS.map((step) => {
+  const receipts = new Map<ProofStep['label'], ProofReceipt>();
+  const transactions = steps.map((step) => {
     const saved = state.transactions.filter((tx) => tx.label === step.saved);
     const hash = saved[0]?.hash.toLowerCase();
     must(saved.length === 1 && hash !== undefined, `the proof state does not hold exactly one ${step.label} transaction`);
@@ -360,7 +441,7 @@ export function buildProofRecord(input: { state: ProofState; deployment: Deploym
     receipts.set(step.label, receipt);
     return { label: step.label, hash, block: Number(receipt.blockNumber), gasUsed: Number(receipt.gasUsed), from: parseAddress(receipt.from) };
   });
-  const receiptOf = (label: ProofLabel) => receipts.get(label) as ProofReceipt;
+  const receiptOf = (label: ProofStep['label']) => receipts.get(label) as ProofReceipt;
 
   const created = eventsFrom(receiptOf('createVault'), factory, FACTORY_ABI).flatMap((event) =>
     event.eventName === 'VaultCreated' ? [event.args] : [],
@@ -375,48 +456,66 @@ export function buildProofRecord(input: { state: ProofState; deployment: Deploym
     'the postRoot receipt does not hold the vault RootPosted event for the saved root and claimableAt',
   );
 
-  const { a, b } = claimants(state.seed as Hex);
+  const { paid: a, refused: b } = wallets;
   let entries: VaultEntry[];
   let rebuilt: string;
   try {
     entries = readPublishedList(state.published);
-    rebuilt = buildRoot(entries, vault, BASE_SEPOLIA.id).root.toLowerCase();
+    rebuilt = buildRoot(entries, vault, profile.chainId).root.toLowerCase();
   } catch {
     throw new ProofFailed('the saved list is not a list the vault can hash');
   }
-  must(entries.length === 1 && entries.every((entry) => sameAddress(entry.account, a)), 'the saved list does not hold only claimant A from the saved seed');
+  must(entries.length === 1 && entries.every((entry) => sameAddress(entry.account, a)), `the saved list does not hold only ${names.paid}${names.listOrigin}`);
   must(rebuilt === root, 'the saved list does not rebuild to the saved root');
 
   const view = chain.vaultState;
-  must(sameAddress(view.token, token), "the vault's token is not Base Sepolia USDC");
+  must(sameAddress(view.token, token), `the vault's token is not ${names.usdc}`);
   must(sameAddress(view.owner, owner), "the vault's owner is not the saved owner");
   must(sameAddress(view.agent, agent), "the vault's agent is not the saved agent");
-  must(view.perWalletCap === PROOF_TERMS.perWalletCap, `the vault's perWalletCap is ${view.perWalletCap}, not ${PROOF_TERMS.perWalletCap}`);
-  must(view.rootDelay === PROOF_TERMS.rootDelay, `the vault's rootDelay is ${view.rootDelay}, not ${PROOF_TERMS.rootDelay}`);
+  must(view.perWalletCap === profile.perWalletCap, `the vault's perWalletCap is ${view.perWalletCap}, not ${profile.perWalletCap}`);
+  must(view.rootDelay === profile.rootDelay, `the vault's rootDelay is ${view.rootDelay}, not ${profile.rootDelay}`);
   must(view.activeRoot.toLowerCase() === root, "the vault's active root is not the saved root");
 
   const amount = view.perWalletCap;
   const claimed = eventsFrom(receiptOf('claim'), vault, VAULT_ABI).flatMap((event) => (event.eventName === 'Claimed' ? [event.args] : []));
   must(
     claimed.length === 1 && claimed.every((args) => sameAddress(args.account, a) && args.amount === amount),
-    `the claim receipt does not hold one vault Claimed event paying claimant A ${amount}`,
+    `the claim receipt does not hold one vault Claimed event paying ${names.paid} ${amount}`,
   );
   const transfers = eventsFrom(receiptOf('claim'), token, erc20Abi).flatMap((event) =>
     event.eventName === 'Transfer' && sameAddress(event.args.from, vault) ? [event.args] : [],
   );
   must(
     transfers.length === 1 && transfers.every((args) => sameAddress(args.to, a) && args.value === amount),
-    `the claim receipt does not hold one USDC Transfer of ${amount} from the vault to claimant A`,
+    `the claim receipt does not hold one USDC Transfer of ${amount} from the vault to ${names.paid}`,
   );
   must(view.totalPaid === amount, `the vault's totalPaid is ${view.totalPaid}, not the ${amount} the claim paid`);
-  must(chain.claimedByPaid === amount, `claimed(claimant A) is ${chain.claimedByPaid}, not the ${amount} the claim paid`);
-  must(chain.refusedSimulation === 'InvalidProof', `claimant B with A's proof was not refused with InvalidProof (got ${chain.refusedSimulation})`);
+  must(chain.claimedByPaid === amount, `claimed(${names.paid}) is ${chain.claimedByPaid}, not the ${amount} the claim paid`);
+  must(chain.refusedSimulation === 'InvalidProof', `${names.refused} with ${names.paid}'s proof was not refused with InvalidProof (got ${chain.refusedSimulation})`);
+
+  let withdrawn: { to: Address; amount: string } | undefined;
+  if (receipts.has('withdraw')) {
+    const left = view.deposited - view.totalPaid;
+    const back = eventsFrom(receiptOf('withdraw'), vault, VAULT_ABI).flatMap((event) => (event.eventName === 'Withdrawn' ? [event.args] : []));
+    const moved = eventsFrom(receiptOf('withdraw'), token, erc20Abi).flatMap((event) =>
+      event.eventName === 'Transfer' && sameAddress(event.args.from, vault) ? [event.args] : [],
+    );
+    must(
+      back.length === 1 &&
+        back.every((event) => sameAddress(event.to, owner) && event.amount === left) &&
+        moved.length === 1 &&
+        moved.every((event) => sameAddress(event.to, owner) && event.value === left),
+      `the withdraw receipt does not return the ${left} left in the vault to the owner`,
+    );
+    must(chain.vaultBalance === 0n, `the vault still holds ${chain.vaultBalance} base units of USDC after the withdrawal`);
+    withdrawn = { to: owner, amount: left.toString() };
+  }
 
   return {
     schema: 1,
-    network: 'base-sepolia',
-    chainId: BASE_SEPOLIA.id,
-    explorer: BASE_SEPOLIA.explorer,
+    network: profile.network,
+    chainId: profile.chainId,
+    explorer: profile.explorer,
     factory,
     vault,
     token,
@@ -428,11 +527,78 @@ export function buildProofRecord(input: { state: ProofState; deployment: Deploym
     claimableAt: state.claimableAt,
     paid: { account: a, amount: amount.toString() },
     refused: { account: b, error: 'InvalidProof' },
+    ...(withdrawn === undefined ? {} : { withdrawn }),
     deposited: view.deposited.toString(),
     totalPaid: view.totalPaid.toString(),
     transactions,
     recordedAt: now.toISOString(),
   };
+}
+
+/** The saved Base mainnet run. Written phase by phase, so root, list and claimableAt stay null until the root is posted. */
+export const BaseProofState = z.strictObject({
+  chainId: z.literal(8453),
+  factory: AddressField,
+  vault: AddressField,
+  owner: AddressField,
+  agent: AddressField,
+  paid: AddressField,
+  refused: AddressField,
+  root: Hash32.nullable(),
+  published: z.string().max(10_000).nullable(),
+  createdAtBlock: z.int().positive(),
+  endTime: z.int().positive(),
+  claimableAt: z.int().positive().nullable(),
+  transactions: z
+    .array(z.strictObject({ label: z.string().max(64), hash: Hash32, from: AddressField, gasUsed: z.string().regex(/^[0-9]+$/) }))
+    .max(16),
+});
+export type BaseProofState = z.infer<typeof BaseProofState>;
+
+/** The public record of the Base mainnet proof: the Base Sepolia record's lines, plus the owner's withdrawal. */
+export type BaseProofRecord = Omit<ProofRecord, 'network' | 'chainId' | 'explorer' | 'transactions'> & {
+  network: 'base';
+  chainId: 8453;
+  explorer: 'https://basescan.org';
+  withdrawn: { to: string; amount: string };
+  transactions: Array<{ label: ProofStep['label']; hash: string; block: number; gasUsed: number; from: string }>;
+};
+
+/** base-proof.json as buildBaseProofRecord writes it. Strict, so a file with any other field is refused. */
+export const BaseProofRecordFile = z.strictObject({
+  ...ProofRecordFile.shape,
+  network: z.literal('base'),
+  chainId: z.literal(8453),
+  explorer: z.literal('https://basescan.org'),
+  withdrawn: z.strictObject({ to: AddressField, amount: DecimalText }),
+  transactions: z
+    .array(
+      z.strictObject({
+        label: z.enum(BASE_PROOF_STEPS.map((step) => step.label) as [ProofStep['label'], ...ProofStep['label'][]]),
+        hash: Hash32,
+        block: z.int().positive(),
+        gasUsed: z.int().positive(),
+        from: AddressField,
+      }),
+    )
+    .max(BASE_PROOF_STEPS.length),
+});
+
+/**
+ * The public record of the Base mainnet proof, under the same checks as buildProofRecord with `profile`'s chain, USDC
+ * and terms, plus the withdrawal: the owner took back exactly what the claim left, and the vault holds no USDC.
+ *
+ * @throws ProofFailed naming the first check the chain did not agree with, or a state with no posted root yet.
+ */
+export function buildBaseProofRecord(
+  input: { state: BaseProofState; deployment: { factory: string }; chain: ProofChain & { vaultBalance: bigint }; now: Date },
+  profile: RecordProfile,
+): BaseProofRecord {
+  const { state } = input;
+  const { root, published, claimableAt } = state;
+  must(root !== null && published !== null && claimableAt !== null, 'the proof state has no posted root yet');
+  const recordState = { ...state, root, published, claimableAt };
+  return recordFor({ ...input, state: recordState }, profile, { paid: state.paid, refused: state.refused }, BASE_NAMES) as BaseProofRecord;
 }
 
 export interface ProofCheck {
@@ -469,6 +635,17 @@ export interface VerifyChain {
  * @returns Every check, passed or not, in a fixed order. Nothing throws: a check that cannot be read fails.
  */
 export function verifyProofRecord(record: ProofRecord, deployment: Deployment, chain: VerifyChain): ProofCheck[] {
+  return checksFor(record, deployment, chain, SEPOLIA_PROFILE, SEPOLIA_NAMES);
+}
+
+// The checks verifyProofRecord documents, for one network's profile.
+function checksFor(
+  record: PublicProofRecord,
+  deployment: { factory: string },
+  chain: VerifyChain,
+  profile: RecordProfile,
+  names: RecordNames,
+): ProofCheck[] {
   const checks: ProofCheck[] = [];
   const check = (name: string, passed: string, failureOf: () => string | null) => {
     let failure: string | null;
@@ -479,8 +656,8 @@ export function verifyProofRecord(record: ProofRecord, deployment: Deployment, c
     }
     checks.push({ name, pass: failure === null, detail: failure ?? passed });
   };
-  const listed = (label: ProofLabel) => record.transactions.filter((tx) => tx.label === label);
-  const receiptOf = (label: ProofLabel) => {
+  const listed = (label: ProofStep['label']) => record.transactions.filter((tx) => tx.label === label);
+  const receiptOf = (label: ProofStep['label']) => {
     const [tx, ...others] = listed(label);
     if (tx === undefined || others.length > 0) return undefined;
     return chain.receipts.find((receipt) => receipt.transactionHash.toLowerCase() === tx.hash.toLowerCase());
@@ -488,11 +665,11 @@ export function verifyProofRecord(record: ProofRecord, deployment: Deployment, c
   const paid = record.paid.account;
   const amount = BigInt(record.paid.amount);
 
-  check('factory', `the record names the factory in base-sepolia.json, ${deployment.factory}`, () =>
-    sameAddress(record.factory, deployment.factory) ? null : `the record names ${record.factory}, base-sepolia.json names ${deployment.factory}`,
+  check('factory', `the record names the factory in ${profile.deploymentFile}, ${deployment.factory}`, () =>
+    sameAddress(record.factory, deployment.factory) ? null : `the record names ${record.factory}, ${profile.deploymentFile} names ${deployment.factory}`,
   );
 
-  for (const step of PROOF_STEPS) {
+  for (const step of profile.steps) {
     const signer = step.signer === 'owner' ? record.owner : record.agent;
     const [tx] = listed(step.label);
     check(
@@ -551,7 +728,7 @@ export function verifyProofRecord(record: ProofRecord, deployment: Deployment, c
   });
 
   check('USDC Transfer', `USDC moved ${amount} from the vault to ${paid}`, () => {
-    if (!sameAddress(record.token, BASE_SEPOLIA.usdc)) return `the record's token ${record.token} is not Base Sepolia USDC`;
+    if (!sameAddress(record.token, profile.usdc)) return `the record's token ${record.token} is not ${names.usdc}`;
     const receipt = receiptOf('claim');
     if (receipt === undefined) return noReceipt('claim');
     const moved = eventsFrom(receipt, record.token, erc20Abi).flatMap((event) =>
@@ -583,5 +760,52 @@ export function verifyProofRecord(record: ProofRecord, deployment: Deployment, c
   check('claimed(refused)', `claimed(${record.refused.account}) is 0`, () =>
     chain.claimedByRefused === 0n ? null : `claimed(${record.refused.account}) is ${chain.claimedByRefused}, not 0`,
   );
+  return checks;
+}
+
+/**
+ * The Base mainnet record checked against public chain data: every check verifyProofRecord makes, with `profile`'s
+ * chain, USDC and steps (the withdrawal's receipt included), then that the withdraw receipt holds the vault's Withdrawn
+ * and the USDC Transfer returning the recorded amount to the owner, and that the vault holds no USDC now.
+ *
+ * @returns Every check, passed or not, in a fixed order. Nothing throws: a check that cannot be read fails.
+ */
+export function verifyBaseProofRecord(
+  record: BaseProofRecord,
+  deployment: { factory: string },
+  chain: VerifyChain & { vaultBalance: bigint },
+  profile: RecordProfile,
+): ProofCheck[] {
+  const checks = checksFor(record, deployment, chain, profile, BASE_NAMES);
+  const [tx] = record.transactions.filter((entry) => entry.label === 'withdraw');
+  const receipt = tx === undefined ? undefined : chain.receipts.find((candidate) => candidate.transactionHash.toLowerCase() === tx.hash.toLowerCase());
+  const amount = BigInt(record.withdrawn.amount);
+  let failure: string | null = null;
+  try {
+    if (receipt === undefined) {
+      failure = 'there is no withdraw receipt to read';
+    } else {
+      const back = eventsFrom(receipt, record.vault, VAULT_ABI).flatMap((event) => (event.eventName === 'Withdrawn' ? [event.args] : []));
+      const moved = eventsFrom(receipt, record.token, erc20Abi).flatMap((event) =>
+        event.eventName === 'Transfer' && sameAddress(event.args.from, record.vault) ? [event.args] : [],
+      );
+      const returned =
+        back.length === 1 &&
+        back.every((event) => sameAddress(event.to, record.withdrawn.to) && event.amount === amount) &&
+        moved.length === 1 &&
+        moved.every((event) => sameAddress(event.to, record.withdrawn.to) && event.value === amount);
+      if (!sameAddress(record.withdrawn.to, record.owner)) failure = `the record says ${record.withdrawn.to} took the rest, not the owner`;
+      else if (!returned) failure = `the withdraw receipt does not return ${amount} to the owner`;
+    }
+  } catch {
+    failure = 'the record or the chain data could not be read';
+  }
+  checks.push({ name: 'Withdrawn', pass: failure === null, detail: failure ?? `the vault returned ${amount} to the owner ${record.withdrawn.to}` });
+  const empty = chain.vaultBalance === 0n;
+  checks.push({
+    name: 'vault empty',
+    pass: empty,
+    detail: empty ? 'the vault holds no USDC' : `the vault still holds ${chain.vaultBalance} base units of USDC`,
+  });
   return checks;
 }

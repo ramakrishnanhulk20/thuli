@@ -3,6 +3,7 @@
 //
 //   npm run vault:verify                        the factory and the proof vault, from the two committed records
 //   npm run vault:verify -- --vault-tx HASH     also the vault that createVault transaction made (repeat for more)
+//   npm run vault:verify -- --network base      the Base mainnet factory, and its proof vault once base-proof.json exists
 //
 // Needs EXPLORER_API_KEY. EXPLORER_API_URL and BASE_SEPOLIA_RPC_URL are optional: the Etherscan V2 endpoint and Base
 // Sepolia's public RPC. A vault's constructor arguments come from the factory's VaultCreated log in its creation
@@ -17,13 +18,13 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { decodeEventLog, encodeAbiParameters, getAddress, parseAbi } from 'viem';
 
-const CHAIN_ID = 84532;
+const NETWORKS = {
+  'base-sepolia': { chainId: 84532, record: 'base-sepolia.json', proof: 'base-sepolia-proof.json', explorer: 'https://sepolia.basescan.org', rpcName: 'BASE_SEPOLIA_RPC_URL', defaultRpc: 'https://sepolia.base.org' },
+  base: { chainId: 8453, record: 'base.json', proof: 'base-proof.json', explorer: 'https://basescan.org', rpcName: 'BASE_RPC_URL', defaultRpc: undefined },
+};
 const CONTRACTS = fileURLToPath(new URL('..', import.meta.url));
-const DEPLOYMENT = path.join(CONTRACTS, 'deployments', 'base-sepolia.json');
-const PROOF_RECORD = path.join(CONTRACTS, 'deployments', 'base-sepolia-proof.json');
+const DEPLOYMENTS = path.join(CONTRACTS, 'deployments');
 const DEFAULT_API = 'https://api.etherscan.io/v2/api';
-const DEFAULT_RPC = 'https://sepolia.base.org';
-const BASESCAN = 'https://sepolia.basescan.org';
 const TIMEOUT_MS = 30_000;
 // Both records are a few hundred bytes; a file far past this is not one of them.
 const MAX_RECORD_BYTES = 64 * 1024;
@@ -49,15 +50,18 @@ function httpsOr(value, fallback, name) {
 }
 
 function settings() {
-  const { values } = parseArgs({ options: { 'vault-tx': { type: 'string', multiple: true } }, strict: true, allowPositionals: false });
+  const { values } = parseArgs({ options: { 'vault-tx': { type: 'string', multiple: true }, network: { type: 'string' } }, strict: true, allowPositionals: false });
+  const net = NETWORKS[values.network ?? 'base-sepolia'];
+  if (net === undefined) throw new VerifyError('--network must be base or base-sepolia.');
   const key = (process.env.EXPLORER_API_KEY ?? '').trim();
   if (key === '') throw new VerifyError('EXPLORER_API_KEY must be set in .env: an Etherscan API key.');
   const api = httpsOr(process.env.EXPLORER_API_URL, DEFAULT_API, 'EXPLORER_API_URL');
-  const rpcUrl = httpsOr(process.env.BASE_SEPOLIA_RPC_URL, DEFAULT_RPC, 'BASE_SEPOLIA_RPC_URL');
+  const rpcUrl = httpsOr(process.env[net.rpcName], net.defaultRpc, net.rpcName);
+  if (rpcUrl === undefined) throw new VerifyError(`${net.rpcName} must be set in .env to an https RPC.`);
   hidden = [key, api, rpcUrl];
   const vaultTxs = values['vault-tx'] ?? [];
   if (vaultTxs.some((hash) => !TX_HASH.test(hash))) throw new VerifyError('--vault-tx must be 0x and 64 hex characters.');
-  return { key, api, rpcUrl, vaultTxs };
+  return { key, api, rpcUrl, vaultTxs, net };
 }
 
 function readRecord(file) {
@@ -124,10 +128,10 @@ function verifyOne(target, config) {
   // forge needs no private key to verify, so none is handed to it.
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/PRIVATE_KEY$/i.test(name)));
   const verifierUrl = new URL(config.api);
-  verifierUrl.searchParams.set('chainid', String(CHAIN_ID));
+  verifierUrl.searchParams.set('chainid', String(config.net.chainId));
   Object.assign(env, { ETHERSCAN_API_KEY: config.key, VERIFIER_URL: verifierUrl.toString() });
   hidden.push(verifierUrl.toString());
-  const args = ['verify-contract', target.address, target.contract, '--chain', String(CHAIN_ID), '--verifier', 'etherscan', '--watch'];
+  const args = ['verify-contract', target.address, target.contract, '--chain', String(config.net.chainId), '--verifier', 'etherscan', '--watch'];
   if (target.constructorArgs !== undefined) args.push('--constructor-args', target.constructorArgs);
   const run = spawnSync(forgeBinary(), args, { cwd: CONTRACTS, env, encoding: 'utf8', timeout: 600_000 });
   process.stdout.write(hide(run.stdout));
@@ -137,7 +141,7 @@ function verifyOne(target, config) {
 
 async function sourceOf(config, address) {
   const url = new URL(config.api);
-  url.search = new URLSearchParams({ chainid: String(CHAIN_ID), module: 'contract', action: 'getsourcecode', address, apikey: config.key }).toString();
+  url.search = new URLSearchParams({ chainid: String(config.net.chainId), module: 'contract', action: 'getsourcecode', address, apikey: config.key }).toString();
   const body = await (await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) })).json();
   const first = Array.isArray(body.result) ? body.result[0] : undefined;
   return first !== undefined && first.SourceCode !== '' && first.ContractName !== '' ? first : undefined;
@@ -146,19 +150,21 @@ async function sourceOf(config, address) {
 async function main() {
   const config = settings();
   const chainId = Number.parseInt(await rpc(config.rpcUrl, 'eth_chainId', []), 16);
-  if (chainId !== CHAIN_ID) throw new VerifyError(`The RPC is on chain ${chainId}; this runs only on ${CHAIN_ID}.`);
+  if (chainId !== config.net.chainId) throw new VerifyError(`The RPC is on chain ${chainId}; this runs only on ${config.net.chainId}.`);
 
-  const deployment = readRecord(DEPLOYMENT);
-  if (deployment.chainId !== CHAIN_ID) throw new VerifyError('base-sepolia.json is not a Base Sepolia record.');
+  const deployment = readRecord(path.join(DEPLOYMENTS, config.net.record));
+  if (deployment.chainId !== config.net.chainId) throw new VerifyError(`${config.net.record} is not a record for chain ${config.net.chainId}.`);
   const factory = getAddress(deployment.factory);
-  const proof = readRecord(PROOF_RECORD);
-  const proofTx = proof.transactions?.find((tx) => tx.label === 'createVault')?.hash;
-  if (typeof proofTx !== 'string' || !TX_HASH.test(proofTx)) throw new VerifyError('base-sepolia-proof.json holds no createVault transaction.');
+  const proofFile = path.join(DEPLOYMENTS, config.net.proof);
+  // On Base mainnet the proof record exists only after the real run, so until then the factory alone is checked.
+  const proof = config.net.chainId === 8453 && !fs.existsSync(proofFile) ? undefined : readRecord(proofFile);
+  const proofTx = proof?.transactions?.find((tx) => tx.label === 'createVault')?.hash;
+  if (proof !== undefined && (typeof proofTx !== 'string' || !TX_HASH.test(proofTx))) throw new VerifyError(`${config.net.proof} holds no createVault transaction.`);
 
   const targets = [{ address: factory, contract: FACTORY_CONTRACT }];
-  const hashes = [...new Set([proofTx, ...config.vaultTxs].map((hash) => hash.toLowerCase()))];
+  const hashes = [...new Set([...(proofTx === undefined ? [] : [proofTx]), ...config.vaultTxs].map((hash) => hash.toLowerCase()))];
   for (const hash of hashes) targets.push(await vaultFrom(config.rpcUrl, factory, hash));
-  if (!same(targets[1].address, proof.vault)) throw new VerifyError('The proof record names another vault than its createVault transaction made.');
+  if (proof !== undefined && !same(targets[1].address, proof.vault)) throw new VerifyError('The proof record names another vault than its createVault transaction made.');
 
   let failed = 0;
   for (const target of targets) {
@@ -174,7 +180,7 @@ async function main() {
       continue;
     }
     const matched = source.SimilarMatch ? `, the same code as ${getAddress(source.SimilarMatch)}` : '';
-    console.log(`  ${target.address}: ${source.ContractName}, ${source.CompilerVersion}${matched}  ${BASESCAN}/address/${target.address}#code`);
+    console.log(`  ${target.address}: ${source.ContractName}, ${source.CompilerVersion}${matched}  ${config.net.explorer}/address/${target.address}#code`);
   }
   if (failed > 0) throw new VerifyError(`${failed} step(s) failed; see the lines above.`);
 }
