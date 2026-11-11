@@ -9,7 +9,6 @@ import {
   choosePanel,
   classifyAskAnswer,
   currentStep,
-  explorerFor,
   fetchAsk,
   fetchBoard,
   fetchCampaign,
@@ -25,12 +24,14 @@ import {
   LIST_STATUS_WORDS,
   mergeBoard,
   newestFirst,
+  NEW_WALLET_ADVICE,
   NOT_CHECKED_INTRO,
   notCheckedLine,
   outcomeWords,
   payoutFor,
   postAsk,
   readyVariant,
+  showsWhatToDo,
   statusLine,
   usdc,
   walletAmount,
@@ -302,12 +303,10 @@ describe('what the page says', () => {
     expect(mergeBoard(merged, first)).toHaveLength(6);
   });
 
-  it('names the chains and their explorers', () => {
+  it('names the chains', () => {
     expect(chainName(84532)).toBe('Base Sepolia');
     expect(chainName(8453)).toBe('Base');
-    expect(explorerFor(84532)).toBe('https://sepolia.basescan.org');
-    expect(explorerFor(8453)).toBe('https://basescan.org');
-    expect(explorerFor(1)).toBeNull();
+    expect(chainName(1)).toBe('chain 1');
   });
 
   it('writes USDC as the vault page does, the time to the minute in UTC, and the campaign status', () => {
@@ -435,5 +434,43 @@ describe('currentStep', () => {
     expect(step('failed')).toBeNull();
     expect(step('fullNoSlot')).toBeNull();
     expect(step('full', { slot: null })).toBeNull();
+  });
+});
+
+describe('the plain line for a held wallet that has no history', () => {
+  const noHistory = { txCount: 0, funder: null, ageDays: 0, groupSize: null };
+  const held = (facts: Record<string, unknown> = noHistory) => fx.ask('hold', signer.address, null, 5, facts) as unknown as AskJson;
+
+  it('says exactly what the wallet should do, in the words the page shows', () => {
+    expect(NEW_WALLET_ADVICE).toBe(
+      'This wallet has never been used on Ethereum, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.',
+    );
+  });
+
+  it('shows for a decided hold with zero transactions sent and no first funder', () => {
+    expect(showsWhatToDo(held())).toBe(true);
+  });
+
+  it('does not show for a hold whose wallet has a funder, or has sent anything, or whose counts were not read', () => {
+    expect(showsWhatToDo(held({ ...noHistory, funder: { address: signer.address, kind: 'wallet', fanout: 1, hops: 1 } }))).toBe(false);
+    expect(showsWhatToDo(held({ ...noHistory, txCount: 1 }))).toBe(false);
+    expect(showsWhatToDo(held({ ...noHistory, txCount: null }))).toBe(false);
+  });
+
+  it('does not show for the linked-family hold the fixtures use, nor for any other outcome', () => {
+    expect(showsWhatToDo(fx.ask('hold', signer.address) as unknown as AskJson)).toBe(false);
+    for (const kind of ['full', 'partial', 'fullNoSlot', 'exclude'] as const) {
+      expect(showsWhatToDo(fx.ask(kind, signer.address, 3, 5, noHistory) as unknown as AskJson)).toBe(false);
+    }
+  });
+
+  it('does not show for a screening that failed, or one still running', () => {
+    expect(showsWhatToDo({ ...(fx.ask('failed', signer.address) as unknown as AskJson), facts: { ...noHistory, accountType: 'eoa', burstWallets: null, missing: [] } })).toBe(false);
+    expect(showsWhatToDo(fx.ask('queued', signer.address) as unknown as AskJson)).toBe(false);
+    expect(showsWhatToDo(fx.ask('screening', signer.address) as unknown as AskJson)).toBe(false);
+  });
+
+  it('does not show when the answer carries no facts', () => {
+    expect(showsWhatToDo({ ...held(), facts: null })).toBe(false);
   });
 });

@@ -285,18 +285,13 @@ export function mergeBoard(current: readonly AskJson[], fresh: readonly AskJson[
 
 // ---------------------------------------------------------------- what the page says
 
-const CHAINS = new Map<number, { name: string; explorer: string }>([
-  [84532, { name: 'Base Sepolia', explorer: 'https://sepolia.basescan.org' }],
-  [8453, { name: 'Base', explorer: 'https://basescan.org' }],
+const CHAIN_NAMES = new Map<number, string>([
+  [84532, 'Base Sepolia'],
+  [8453, 'Base'],
 ]);
 
 export function chainName(chain: number): string {
-  return CHAINS.get(chain)?.name ?? `chain ${chain}`;
-}
-
-/** The explorer a chain's addresses and transactions are read on, or null for a chain Thuli has no explorer for. */
-export function explorerFor(chain: number): string | null {
-  return CHAINS.get(chain)?.explorer ?? null;
+  return CHAIN_NAMES.get(chain) ?? `chain ${chain}`;
 }
 
 export const LIST_STATUS_WORDS: Record<ListStatus, string> = {
@@ -486,6 +481,22 @@ export function funderFanoutText(funder: { kind: string; fanout: number | null }
 export function groupText(groupSize: number | null): string {
   if (groupSize === null) return 'None';
   return groupSize === 1 ? '1 wallet that asked here' : `${formatInt(groupSize)} wallets that asked here`;
+}
+
+// ---------------------------------------------------------------- a held wallet that has never been used
+
+export const WHAT_TO_DO_LABEL = 'WHAT TO DO';
+
+export const NEW_WALLET_ADVICE =
+  'This wallet has never been used on Ethereum, so nothing sets it apart from one made a minute ago. Ask with a wallet you have used for a while.';
+
+/**
+ * Whether a held wallet is told what to do: the screening read zero transactions sent and found no first funder, so the
+ * hold comes from there being nothing to read. A hold for any other reason, a failed screening, one still running and an
+ * answer with no facts get no line, because the line would then be a guess about the wallet.
+ */
+export function showsWhatToDo(ask: AskJson): boolean {
+  return ask.status === 'decided' && ask.action === 'hold' && ask.facts !== null && ask.facts.txCount === 0 && ask.facts.funder === null;
 }
 
 // ---------------------------------------------------------------- the how-it-goes steps

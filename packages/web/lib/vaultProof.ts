@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { BASE_SEPOLIA } from './contracts';
+import { BASE_SEPOLIA_CHAIN, BASE_SEPOLIA_EXPLORER, explorerAddressUrl, explorerTxUrl, verifiedSourceUrl } from './explorer';
 import { formatInt } from './format';
 
 export const PROOF_STEP_LABELS = ['createVault', 'approve', 'deposit', 'postRoot', 'claim'] as const;
 export type ProofStepLabel = (typeof PROOF_STEP_LABELS)[number];
 
-const PROOF_EXPLORER = 'https://sepolia.basescan.org';
 const TX_HASH = /^0x[0-9a-f]{64}$/;
-// The record keeps checksummed addresses, so both cases are accepted here and links use the text as written.
+// The record keeps checksummed addresses, so both cases are accepted here. The links normalise the case themselves.
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const WHOLE_DIGITS = /^[0-9]+$/;
 const ERROR_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
@@ -96,7 +96,7 @@ function wholeNumber(parent: Record<string, unknown>, key: string, least: number
  * Checks a parsed record before the page uses it and returns it typed.
  *
  * @throws VaultProofError when the schema is not 1, the chain is not Base Sepolia (84532), the factory is not
- * BASE_SEPOLIA.factory (compared in lowercase), the explorer is not https://sepolia.basescan.org, a transaction hash is
+ * BASE_SEPOLIA.factory (compared in lowercase), the explorer is not the Basescan address lib/explorer.ts names, a transaction hash is
  * not 0x and 64 lowercase hex characters, the five step labels are not present once each, or a value the page shows
  * (an address, an amount, the delay, the refusal error) is malformed.
  */
@@ -106,7 +106,7 @@ export function checkVaultProof(raw: unknown): VaultProofRecord {
   if (raw.chainId !== BASE_SEPOLIA.chainId) return fail(`chainId is ${String(raw.chainId)}, not ${BASE_SEPOLIA.chainId}`);
   const factory = address(raw, 'factory');
   if (factory.toLowerCase() !== BASE_SEPOLIA.factory) return fail('factory is not the Base Sepolia factory in lib/contracts.ts');
-  if (raw.explorer !== PROOF_EXPLORER) return fail(`explorer is not exactly ${PROOF_EXPLORER}`);
+  if (raw.explorer !== BASE_SEPOLIA_EXPLORER) return fail(`explorer is not exactly ${BASE_SEPOLIA_EXPLORER}`);
 
   address(raw, 'vault');
   address(raw, 'token');
@@ -239,12 +239,12 @@ export function describeVaultProof(record: VaultProofRecord): VaultProofView {
       name: stepName(transaction.label),
       hash: transaction.hash,
       shortHash: shortHash(transaction.hash),
-      href: `${record.explorer}/tx/${transaction.hash}`,
+      href: explorerTxUrl(BASE_SEPOLIA_CHAIN, transaction.hash),
       gas: `${formatInt(transaction.gasUsed)} GAS`,
     })),
     paid: { short: shortAddress(record.paid.account), amount: formatUsdc6(record.paid.amount) },
     refused: { short: shortAddress(record.refused.account), error: record.refused.error },
-    vaultUrl: `${record.explorer}/address/${record.vault}`,
-    factoryUrl: `${BASE_SEPOLIA.explorer}/address/${BASE_SEPOLIA.factory}`,
+    vaultUrl: explorerAddressUrl(BASE_SEPOLIA_CHAIN, record.vault),
+    factoryUrl: verifiedSourceUrl(BASE_SEPOLIA.factory),
   };
 }

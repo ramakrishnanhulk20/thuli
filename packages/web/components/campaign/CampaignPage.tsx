@@ -1,10 +1,11 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { chainName, explorerFor, fetchCampaign, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
-import { shortAddress } from '@/lib/explorer';
+import { chainName, fetchCampaign, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
+import { addressLink, shortAddress } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { WalletProvider } from '../wallet/WalletProvider';
+import { ArrowLink } from './ArrowLink';
 import { AskPanel } from './AskPanel';
 import { Board } from './Board';
 import { Lists } from './Lists';
@@ -20,7 +21,7 @@ type Load = { status: 'loading' } | { status: 'none' } | { status: 'found'; camp
 function Head({ campaign }: { campaign: CampaignView }) {
   const reward = usdc(campaign.rewardPerWallet);
   const { counts } = campaign;
-  const explorer = explorerFor(campaign.chain);
+  const vaultLink = addressLink(campaign.chain, campaign.vault);
   const filled = campaign.maxSlots === 0 ? 0 : Math.min(100, (counts.slotsTaken / campaign.maxSlots) * 100);
   const figures = [
     { number: `${counts.slotsTaken} of ${campaign.maxSlots}`, label: 'SLOTS TAKEN' },
@@ -56,10 +57,10 @@ function Head({ campaign }: { campaign: CampaignView }) {
       <p className={styles.vaultLine} data-vault-line>
         <span>
           VAULT{' '}
-          {explorer === null ? (
+          {vaultLink === null ? (
             shortAddress(campaign.vault)
           ) : (
-            <a className={styles.inline} href={`${explorer}/address/${campaign.vault}`} target="_blank" rel="noopener noreferrer">
+            <a className={styles.inline} href={vaultLink} target="_blank" rel="noopener noreferrer">
               <span className={styles.inlineLabel}>{shortAddress(campaign.vault)}</span>
             </a>
           )}
@@ -114,6 +115,10 @@ export function CampaignPage({ campaignId, walletConnectProjectId }: { campaignI
       </div>
       <Board campaignId={campaignId} />
       <Lists campaignId={campaignId} campaign={campaign} />
+      <div className={styles.ownerLine} data-owner-link>
+        <p className={styles.ownerText}>Running a reward drop of your own?</p>
+        <ArrowLink href="/campaign/start">Start a campaign</ArrowLink>
+      </div>
     </>
   );
 }

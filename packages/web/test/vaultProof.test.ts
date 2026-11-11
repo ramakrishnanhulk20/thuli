@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { BASE_SEPOLIA } from '../lib/contracts';
+import { VERIFIED_SOURCE_BASE } from '../lib/explorer';
 import { formatInt } from '../lib/format';
 import {
   checkVaultProof,
@@ -80,7 +81,7 @@ describe('checkVaultProof', () => {
 
   it('throws when the explorer is not exactly https://sepolia.basescan.org', () => {
     expect(() => checkVaultProof(copy((r) => (r.explorer = 'https://sepolia.basescan.org/')))).toThrow(/explorer/);
-    expect(() => checkVaultProof(copy((r) => (r.explorer = BASE_SEPOLIA.explorer)))).toThrow(/explorer/);
+    expect(() => checkVaultProof(copy((r) => (r.explorer = VERIFIED_SOURCE_BASE)))).toThrow(/explorer/);
     expect(() => checkVaultProof(copy((r) => delete r.explorer))).toThrow(/explorer/);
   });
 
@@ -162,7 +163,7 @@ describe('describeVaultProof', () => {
     expect(view.delay).toBe(delayText(original.rootDelaySeconds));
     expect(view.paid).toEqual({ short: shortAddress(original.paid.account), amount: formatUsdc6(original.paid.amount) });
     expect(view.refused).toEqual({ short: shortAddress(original.refused.account), error: original.refused.error });
-    expect(view.vaultUrl).toBe(`${original.explorer}/address/${original.vault}`);
-    expect(view.factoryUrl).toBe(`${BASE_SEPOLIA.explorer}/address/${BASE_SEPOLIA.factory}`);
+    expect(view.vaultUrl).toBe(`${original.explorer}/address/${original.vault.toLowerCase()}`);
+    expect(view.factoryUrl).toBe(`${VERIFIED_SOURCE_BASE}/address/${BASE_SEPOLIA.factory}`);
   });
 });

@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { BASE_CHAIN, BASE_SEPOLIA_CHAIN, explorerTxUrl } from './explorer';
 import { formatUsdc6 } from './vaultProof';
 
-const NETWORKS = new Map<string, { name: string; explorer: string }>([
-  ['eip155:84532', { name: 'Base Sepolia', explorer: 'https://sepolia.basescan.org' }],
-  ['eip155:8453', { name: 'Base', explorer: 'https://basescan.org' }],
+const NETWORKS = new Map<string, { name: string; chain: number }>([
+  ['eip155:84532', { name: 'Base Sepolia', chain: BASE_SEPOLIA_CHAIN }],
+  ['eip155:8453', { name: 'Base', chain: BASE_CHAIN }],
 ]);
 
 const TX_HASH = /^0x[0-9a-f]{64}$/;
@@ -116,7 +117,7 @@ export function checkPaidExample(terms: unknown, answer: unknown): PaidExample {
     reason,
     transaction,
     transactionShort: `${transaction.slice(0, 10)}…${transaction.slice(-6)}`,
-    settlementUrl: `${network.explorer}/tx/${transaction}`,
+    settlementUrl: explorerTxUrl(network.chain, transaction),
   };
 }
 

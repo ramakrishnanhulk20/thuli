@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { motion } from 'motion/react';
 import { BASE_SEPOLIA } from '@/lib/contracts';
+import { explorerAddressUrl } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { NAV_LINKS } from './SiteNav';
 import styles from './site.module.css';
@@ -48,7 +49,8 @@ export function SiteFooter() {
   // The docs have their own page frame and no site footer.
   if (pathname === '/docs' || pathname.startsWith('/docs/')) return null;
 
-  const { factory, explorer } = BASE_SEPOLIA;
+  const { chainId, factory } = BASE_SEPOLIA;
+  const factoryUrl = explorerAddressUrl(chainId, factory);
   const shortFactory = `${factory.slice(0, 6)}…${factory.slice(-4)}`;
 
   return (
@@ -84,7 +86,7 @@ export function SiteFooter() {
           <h2 className={styles.columnLabel}>ON CHAIN</h2>
           <ul className={styles.footLinks}>
             <li>
-              <a href={`${explorer}/address/${factory}`} target="_blank" rel="noopener noreferrer" className={styles.footLink}>
+              <a href={factoryUrl} target="_blank" rel="noopener noreferrer" className={styles.footLink}>
                 <span className={styles.footLinkLabel}>Vault factory on Base Sepolia</span>
                 <span className={styles.footAddress}>{shortFactory}</span>
               </a>

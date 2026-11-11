@@ -2,8 +2,8 @@
 
 import { useId, type ReactNode } from 'react';
 import { THULI_AGENT } from '@/lib/contracts';
-import { explorerAddressUrl, coverageLine, DELAY_CHOICES, formatAmount, readAmount, REASONS, USDC_BASE_SEPOLIA, type Reason, type TermsCheck, type TermsForm } from '@/lib/owner';
-import { shortAddress } from '@/lib/explorer';
+import { addressLink, BASE_SEPOLIA_CHAIN, shortAddress } from '@/lib/explorer';
+import { coverageLine, DELAY_CHOICES, formatAmount, readAmount, REASONS, USDC_BASE_SEPOLIA, type Reason, type TermsCheck, type TermsForm } from '@/lib/owner';
 import { ExplorerLink } from './ExplorerLink';
 import styles from './owner.module.css';
 
@@ -66,7 +66,7 @@ export function TermsEditor({ form, onChange, check, balance, noEth, checking, r
         <span className={styles.fieldLabel}>REWARD TOKEN</span>
         <p className={styles.fixed}>
           <span>USDC on Base Sepolia</span>
-          <ExplorerLink href={explorerAddressUrl(USDC_BASE_SEPOLIA)}>{shortAddress(USDC_BASE_SEPOLIA)}</ExplorerLink>
+          <ExplorerLink href={addressLink(BASE_SEPOLIA_CHAIN, USDC_BASE_SEPOLIA)}>{shortAddress(USDC_BASE_SEPOLIA)}</ExplorerLink>
         </p>
       </div>
 
@@ -161,7 +161,7 @@ export function TermsEditor({ form, onChange, check, balance, noEth, checking, r
       <div data-field="agent">
         <span className={styles.fieldLabel}>AGENT</span>
         <p className={styles.fixed}>
-          <ExplorerLink href={explorerAddressUrl(THULI_AGENT)}>{shortAddress(THULI_AGENT)}</ExplorerLink>
+          <ExplorerLink href={addressLink(BASE_SEPOLIA_CHAIN, THULI_AGENT)}>{shortAddress(THULI_AGENT)}</ExplorerLink>
         </p>
         <Helper id={`${base}-agent-note`}>The only address that may post lists.</Helper>
       </div>

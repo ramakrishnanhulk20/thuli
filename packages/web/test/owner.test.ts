@@ -11,6 +11,7 @@ import {
   ContractFunctionZeroDataError,
   encodeAbiParameters,
   encodeErrorResult,
+  encodeEventTopics,
   encodeFunctionData,
   erc20Abi,
   HttpRequestError,
@@ -33,14 +34,14 @@ import {
   describeDelay,
   depositRequest,
   endOfDay,
-  explorerAddressUrl,
-  explorerTxUrl,
   formatAmount,
   holdsOf,
   isNotAVault,
   loadResume,
+  NOT_ON_NETWORK_MILLISECONDS,
   packResume,
   readAmount,
+  readCreation,
   readResume,
   reasonFor,
   REASONS,
@@ -49,9 +50,14 @@ import {
   settle,
   stageFor,
   termsFromChain,
+  termsFromRecord,
   termsSummary,
   USDC_BASE_SEPOLIA,
   vaultMatches,
+  WAIT_LIMIT_KEY,
+  waitLimit,
+  watchCreation,
+  type ResumeRecord,
   type Terms,
   type VaultState,
 } from '../lib/owner';
@@ -331,6 +337,7 @@ describe('the reasons', () => {
       endTooFar: 'The end can be at most 365 days away.',
       token: "The token refused the transfer. Check the wallet's USDC balance.",
       network: 'The network refused this transaction. Nothing moved.',
+      notOnNetwork: 'This transaction is not on the network. Nothing moved.',
       other: 'This could not be sent. Nothing moved.',
     });
   });
@@ -373,7 +380,7 @@ describe('the reasons', () => {
     expect(reasonFor(new Error('boom at /secret/path.ts:12'), 'deposit')).not.toContain('boom');
   });
 
-  it('only ever gives one of the nine sentences, whatever error comes in', () => {
+  it('only ever gives one of the ten sentences, whatever error comes in', () => {
     const sentences = new Set<string>(Object.values(REASONS));
     const errors = [new Error('x'), asRevert('ZeroCap'), asString('Bad stuff at C:\secret', 'deposit'), new InsufficientFundsError(), { message: 'raw' }, 'text', 7, null];
     for (const error of errors) for (const step of ['create', 'approve', 'deposit'] as const) expect(sentences.has(reasonFor(error, step))).toBe(true);
@@ -522,15 +529,6 @@ describe('the words under a row and the links', () => {
     expect(describeDelay(172_800)).toBe('2 days');
     expect(describeDelay(90)).toBe('90 seconds');
   });
-
-  it('links an address or a hash on the explorer the footer uses, and gives no link for anything else', () => {
-    expect(explorerAddressUrl(VAULT)).toBe(`${BASE_SEPOLIA.explorer}/address/${VAULT}`);
-    expect(explorerTxUrl(HASH)).toBe(`${BASE_SEPOLIA.explorer}/tx/${HASH}`);
-    for (const bad of ['', '0x12', 'javascript:alert(1)', `${VAULT}x`, ' ' + VAULT]) {
-      expect(explorerAddressUrl(bad)).toBeNull();
-      expect(explorerTxUrl(bad)).toBeNull();
-    }
-  });
 });
 
 describe('waiting for the chain to show a change', () => {
@@ -567,5 +565,157 @@ describe('waiting for the chain to show a change', () => {
     expect(calls).toBe(4);
     const dead = await settle(async () => Promise.reject(new Error('down')), () => true, { tries: 2, wait: noWait });
     expect(dead).toEqual({ ok: false, value: null });
+  });
+});
+
+describe('a creation that was sent and not yet seen', () => {
+  const sent: ResumeRecord = { vault: null, txHash: HASH, cap: '1000000', deposit: '20000000', endTime: 1_800_000_000, rootDelay: 3600 };
+  const made: ResumeRecord = { ...sent, vault: VAULT };
+
+  it('is kept with its hash and the accepted terms, and no vault', () => {
+    expect(readResume(packResume(sent))).toEqual(sent);
+    expect(readResume(packResume(made))).toEqual(made);
+    expect(termsFromRecord(sent)).toEqual({ cap: 1_000_000n, deposit: 20_000_000n, endTime: 1_800_000_000, rootDelay: 3600 });
+  });
+
+  it('is refused when it has neither a vault nor a hash, or when what it has is not a vault or a hash', () => {
+    expect(readResume(JSON.stringify({ ...sent, txHash: null }))).toBeNull();
+    expect(readResume(JSON.stringify({ cap: sent.cap, deposit: sent.deposit, endTime: sent.endTime, rootDelay: sent.rootDelay }))).toBeNull();
+    expect(readResume(JSON.stringify({ ...sent, vault: null, txHash: 'not a hash' }))).toBeNull();
+    expect(readResume(JSON.stringify({ ...sent, vault: '0x12' }))).toBeNull();
+    expect(readResume(JSON.stringify({ ...sent, vault: 42 }))).toBeNull();
+  });
+
+  it('is found again under the wallet, and a damaged one is removed', () => {
+    const map = new Map<string, string>();
+    const storage = { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => void map.set(key, value), removeItem: (key: string) => void map.delete(key) };
+    saveResume(storage, WALLET, 84532, sent);
+    expect(loadResume(storage, WALLET, 84532)).toEqual(sent);
+    map.set(resumeKey(WALLET, 84532), JSON.stringify({ ...sent, vault: null, txHash: null }));
+    expect(loadResume(storage, WALLET, 84532)).toBeNull();
+    expect(map.has(resumeKey(WALLET, 84532))).toBe(false);
+  });
+});
+
+describe('reading a creation receipt', () => {
+  const log = (owner: string, address: string = BASE_SEPOLIA.factory) => ({
+    address,
+    topics: encodeEventTopics({ abi: FACTORY_ABI, eventName: 'VaultCreated', args: { vault: VAULT, owner, agent: THULI_AGENT } as never }),
+    data: encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'uint64' }, { type: 'uint32' }], [USDC_BASE_SEPOLIA, 1_000_000n, 1_800_000_000n, 3600]),
+  });
+
+  it('finds the vault and the terms in the factory log when the transaction succeeded', () => {
+    const read = readCreation({ status: 'success', logs: [log(WALLET)] }, WALLET.toLowerCase());
+    expect(read).toEqual({ kind: 'created', vault: VAULT, cap: 1_000_000n, endTime: 1_800_000_000n, rootDelay: 3600 });
+  });
+
+  it('is reverted when the transaction was mined and failed, whatever logs it has', () => {
+    expect(readCreation({ status: 'reverted', logs: [] }, WALLET)).toEqual({ kind: 'reverted' });
+    expect(readCreation({ status: 'reverted', logs: [log(WALLET)] }, WALLET)).toEqual({ kind: 'reverted' });
+  });
+
+  it('finds no vault in a log from another contract, for another owner, or in no logs', () => {
+    expect(readCreation({ status: 'success', logs: [log(WALLET, VAULT)] }, WALLET)).toEqual({ kind: 'no-event' });
+    expect(readCreation({ status: 'success', logs: [log(VAULT)] }, WALLET)).toEqual({ kind: 'no-event' });
+    expect(readCreation({ status: 'success', logs: [] }, WALLET)).toEqual({ kind: 'no-event' });
+  });
+});
+
+describe('waiting for a sent creation to show up', () => {
+  const LIMIT = NOT_ON_NETWORK_MILLISECONDS;
+  const clock = () => {
+    const state = { time: 0, waits: 0 };
+    return {
+      state,
+      now: () => state.time,
+      wait: async (ms: number) => {
+        state.time += ms;
+        state.waits += 1;
+      },
+    };
+  };
+
+  it('gives the network 120 seconds, and a test can only shorten that', () => {
+    expect(LIMIT).toBe(120_000);
+    expect(WAIT_LIMIT_KEY).toBe('thuli.owner.waitLimitMs');
+    expect(waitLimit(null)).toBe(120_000);
+    expect(waitLimit('5000')).toBe(5000);
+    for (const raw of ['', 'abc', '0', '-5', 'NaN', 'Infinity', '120001', '9999999']) expect(waitLimit(raw)).toBe(120_000);
+    expect(waitLimit('120000')).toBe(120_000);
+  });
+
+  it('ends with the receipt when the network shows one', async () => {
+    const { now, wait, state } = clock();
+    let polls = 0;
+    const outcome = await watchCreation(
+      HASH,
+      { receipt: async () => (++polls >= 3 ? { status: 'success' } : null), known: async () => true },
+      { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait },
+    );
+    expect(outcome).toEqual({ kind: 'mined', receipt: { status: 'success' } });
+    expect(state.time).toBe(4000);
+  });
+
+  it('hands back a reverted receipt as a receipt, for the page to read', async () => {
+    const { now, wait } = clock();
+    const outcome = await watchCreation(HASH, { receipt: async () => ({ status: 'reverted' }), known: async () => true }, { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait });
+    expect(outcome).toEqual({ kind: 'mined', receipt: { status: 'reverted' } });
+  });
+
+  it('ends as not on the network once the network has said it does not know it for the whole limit', async () => {
+    const { now, wait, state } = clock();
+    const outcome = await watchCreation(HASH, { receipt: async () => null, known: async () => false }, { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait });
+    expect(outcome).toEqual({ kind: 'not-on-network' });
+    expect(state.time).toBeGreaterThanOrEqual(LIMIT);
+    expect(state.time).toBeLessThan(LIMIT + 2000 + 1);
+  });
+
+  it('keeps waiting as long as the network knows the transaction, however long it takes', async () => {
+    const { now, wait, state } = clock();
+    let polls = 0;
+    const outcome = await watchCreation(
+      HASH,
+      { receipt: async () => (++polls > 400 ? { status: 'success' } : null), known: async () => true },
+      { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait },
+    );
+    expect(outcome.kind).toBe('mined');
+    expect(state.time).toBeGreaterThan(LIMIT * 5);
+  });
+
+  it('starts the count again when the network knows it for a moment, and does not count a read that failed', async () => {
+    const { now, wait } = clock();
+    let polls = 0;
+    const outcome = await watchCreation(
+      HASH,
+      {
+        receipt: async () => null,
+        known: async () => {
+          polls += 1;
+          if (polls === 30) return true;
+          if (polls > 30 && polls < 40) throw new Error('offline');
+          return false;
+        },
+      },
+      { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait },
+    );
+    expect(outcome).toEqual({ kind: 'not-on-network' });
+    expect(polls).toBeGreaterThan(30 + 9 + 59);
+  });
+
+  it('stops quietly when the page asks it to', async () => {
+    const { now, wait } = clock();
+    let stop = false;
+    const outcome = await watchCreation(
+      HASH,
+      {
+        receipt: async () => {
+          stop = true;
+          return null;
+        },
+        known: async () => true,
+      },
+      { limitMilliseconds: LIMIT, pollMilliseconds: 2000, now, wait, stopped: () => stop },
+    );
+    expect(outcome).toEqual({ kind: 'stopped' });
   });
 });

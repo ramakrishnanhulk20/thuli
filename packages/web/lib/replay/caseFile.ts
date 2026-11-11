@@ -1,3 +1,4 @@
+import { ETHEREUM_CHAIN, explorerTxUrl } from '../explorer';
 import { loadFamily, loadShard, loadSummary, replayRoot } from './load';
 
 /** The one farm wallet the home page follows back to its funder. */
@@ -81,7 +82,7 @@ export function buildCaseFile(options: { wallet?: string; root?: string } = {}):
     reason: detail.reason,
     tx: hash,
     txShort: short(hash, 10, 6),
-    txUrl: `https://etherscan.io/tx/${hash}`,
+    txUrl: explorerTxUrl(ETHEREUM_CHAIN, hash),
     requestId: detail.serv.requestId,
   };
 }

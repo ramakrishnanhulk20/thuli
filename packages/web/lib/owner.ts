@@ -1,4 +1,4 @@
-import { parseAbi, type Address } from 'viem';
+import { parseAbi, parseEventLogs, type Address } from 'viem';
 import { STATE_SIGNATURE } from './attacks';
 import { formatUtcMinute } from './campaign';
 import { BASE_SEPOLIA, THULI_AGENT } from './contracts';
@@ -193,6 +193,7 @@ export const REASONS = {
   endTooFar: 'The end can be at most 365 days away.',
   token: "The token refused the transfer. Check the wallet's USDC balance.",
   network: 'The network refused this transaction. Nothing moved.',
+  notOnNetwork: 'This transaction is not on the network. Nothing moved.',
   other: 'This could not be sent. Nothing moved.',
 } as const;
 
@@ -258,9 +259,14 @@ export function reasonFor(error: unknown, step: CallStep): Reason {
 
 // ---------------------------------------------------------------- the record kept in this browser
 
+/**
+ * What is kept for one wallet. The hash is kept the moment the wallet returns it, with the terms it was sent for, so a
+ * record can have a hash and no vault yet. The vault is added once the factory's log has been read. A record with neither
+ * is no record.
+ */
 export interface ResumeRecord {
-  vault: string;
-  txHash: string;
+  vault: string | null;
+  txHash: string | null;
   cap: string;
   deposit: string;
   endTime: number;
@@ -281,7 +287,10 @@ export function packResume(record: ResumeRecord): string {
   return JSON.stringify({ vault, txHash, cap, deposit, endTime, rootDelay });
 }
 
-/** Reads a kept record back. Anything that is not exactly the six fields in the right shapes is no record at all. */
+/**
+ * Reads a kept record back. Anything that is not exactly the six fields in the right shapes is no record at all, and so
+ * is a record that has neither a vault nor a hash.
+ */
 export function readResume(raw: string | null): ResumeRecord | null {
   if (raw === null) return null;
   let parsed: unknown;
@@ -292,8 +301,9 @@ export function readResume(raw: string | null): ResumeRecord | null {
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
   const { vault, txHash, cap, deposit, endTime, rootDelay } = parsed as Record<string, unknown>;
-  if (typeof vault !== 'string' || !ADDRESS.test(vault)) return null;
-  if (typeof txHash !== 'string' || !HASH.test(txHash)) return null;
+  if (vault !== null && (typeof vault !== 'string' || !ADDRESS.test(vault))) return null;
+  if (txHash !== null && (typeof txHash !== 'string' || !HASH.test(txHash))) return null;
+  if (vault === null && txHash === null) return null;
   if (typeof cap !== 'string' || !BASE_UNITS.test(cap)) return null;
   if (typeof deposit !== 'string' || !BASE_UNITS.test(deposit)) return null;
   if (typeof endTime !== 'number' || !Number.isSafeInteger(endTime) || endTime <= 0) return null;
@@ -369,6 +379,11 @@ export function isNotAVault(error: unknown): boolean {
   return linksOf(error).some((link) => link.name === 'ContractFunctionZeroDataError' || link.name === 'ContractFunctionRevertedError');
 }
 
+/** The terms a sent creation was accepted with, as the record kept them. They are the owner's choice, not yet the chain's. */
+export function termsFromRecord(record: ResumeRecord): Terms {
+  return { cap: BigInt(record.cap), deposit: BigInt(record.deposit), endTime: record.endTime, rootDelay: record.rootDelay };
+}
+
 /** The terms as the chain holds them. Only the planned deposit comes from the record, because the chain has no plan. */
 export function termsFromChain(state: VaultState, record: ResumeRecord): Terms {
   return { cap: state.perWalletCap, deposit: BigInt(record.deposit), endTime: Number(state.endTime), rootDelay: state.rootDelay };
@@ -390,15 +405,6 @@ export function stageFor(input: { deposited: bigint; planned: bigint; allowance:
 
 // ---------------------------------------------------------------- links and waiting
 
-/** Links to the explorer the site's footer uses. A value that is not an address or a hash gets no link at all. */
-export function explorerAddressUrl(address: string): string | null {
-  return ADDRESS.test(address) ? `${BASE_SEPOLIA.explorer}/address/${address}` : null;
-}
-
-export function explorerTxUrl(hash: string): string | null {
-  return HASH.test(hash) ? `${BASE_SEPOLIA.explorer}/tx/${hash}` : null;
-}
-
 /**
  * Reads again until the answer is enough, because the public endpoint can answer from a node a block behind the one that
  * took the last transaction. A read that throws counts as not yet. Gives the last answer either way.
@@ -419,4 +425,87 @@ export async function settle<T>(
     }
   }
   return { ok: false, value: last };
+}
+
+// ---------------------------------------------------------------- a creation that was sent
+
+export type CreationRead =
+  | { kind: 'created'; vault: Address; cap: bigint; endTime: bigint; rootDelay: number }
+  | { kind: 'reverted' }
+  | { kind: 'no-event' };
+
+/**
+ * What a creation receipt says. A transaction that was mined and failed is reverted. One that succeeded is read for the
+ * factory's VaultCreated log with this wallet as owner, and the vault and the terms come from that log, so what the page
+ * shows next is what the chain recorded.
+ */
+export function readCreation(receipt: { status: string; logs: readonly unknown[] }, wallet: string): CreationRead {
+  if (receipt.status !== 'success') return { kind: 'reverted' };
+  const made = parseEventLogs({ abi: FACTORY_ABI, eventName: 'VaultCreated', logs: receipt.logs as never }).find(
+    (log) => log.address.toLowerCase() === BASE_SEPOLIA.factory && log.args.owner.toLowerCase() === wallet.toLowerCase(),
+  );
+  if (made === undefined) return { kind: 'no-event' };
+  return { kind: 'created', vault: made.args.vault, cap: made.args.perWalletCap, endTime: made.args.endTime, rootDelay: made.args.rootDelay };
+}
+
+/** How long a sent creation may be unknown to the network before the page calls it lost. */
+export const NOT_ON_NETWORK_MILLISECONDS = 120_000;
+
+/** The browser setting a test may set to shorten that wait. Nothing in the site sets it. */
+export const WAIT_LIMIT_KEY = 'thuli.owner.waitLimitMs';
+
+/** The wait to use: the setting when it is a number above zero and no longer than the real limit, otherwise the limit. */
+export function waitLimit(raw: string | null): number {
+  if (raw === null) return NOT_ON_NETWORK_MILLISECONDS;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 && value <= NOT_ON_NETWORK_MILLISECONDS ? value : NOT_ON_NETWORK_MILLISECONDS;
+}
+
+export interface CreationReads<R> {
+  /** The receipt, or null while the network has none. */
+  receipt(hash: string): Promise<R | null>;
+  /** Whether the network knows the transaction at all, mined or still waiting. */
+  known(hash: string): Promise<boolean>;
+}
+
+export type CreationOutcome<R> = { kind: 'mined'; receipt: R } | { kind: 'not-on-network' } | { kind: 'stopped' };
+
+/**
+ * Waits for a sent creation. It ends with the receipt, mined or reverted, whenever the network has one. A transaction the
+ * network knows but has not mined is waited for as long as it takes. It ends as not on the network only after the network
+ * has answered, again and again, that it does not know the hash, for the whole limit. A read that fails does not count
+ * as an answer, and one answer that the network knows it starts the count again.
+ */
+export async function watchCreation<R>(
+  hash: string,
+  reads: CreationReads<R>,
+  options: { limitMilliseconds: number; pollMilliseconds: number; now: () => number; wait: (milliseconds: number) => Promise<void>; stopped?: () => boolean },
+): Promise<CreationOutcome<R>> {
+  let unknownSince: number | null = null;
+  for (;;) {
+    if (options.stopped?.() === true) return { kind: 'stopped' };
+    let receipt: R | null = null;
+    try {
+      receipt = await reads.receipt(hash);
+    } catch {
+      receipt = null;
+    }
+    if (options.stopped?.() === true) return { kind: 'stopped' };
+    if (receipt !== null) return { kind: 'mined', receipt };
+
+    let known: boolean | undefined;
+    try {
+      known = await reads.known(hash);
+    } catch {
+      known = undefined;
+    }
+    if (known === false) {
+      const at = options.now();
+      if (unknownSince === null) unknownSince = at;
+      else if (at - unknownSince >= options.limitMilliseconds) return { kind: 'not-on-network' };
+    } else {
+      unknownSince = null;
+    }
+    await options.wait(options.pollMilliseconds);
+  }
 }

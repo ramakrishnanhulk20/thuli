@@ -1,7 +1,6 @@
 'use client';
 
-import { shortAddress, shortHash } from '@/lib/explorer';
-import { explorerAddressUrl, explorerTxUrl } from '@/lib/owner';
+import { addressLink, BASE_SEPOLIA_CHAIN, shortAddress, shortHash, txLink } from '@/lib/explorer';
 import { ArrowLink } from '../campaign/ArrowLink';
 import campaign from '../campaign/campaign.module.css';
 import { CopyButton } from './CopyButton';
@@ -10,7 +9,8 @@ import styles from './owner.module.css';
 
 interface FundedCardProps {
   vault: string;
-  txHash: string;
+  /** The creation transaction, when the record has kept it. */
+  txHash: string | null;
   onRestart: () => void;
 }
 
@@ -24,18 +24,20 @@ export function FundedCard({ vault, txHash, onRestart }: FundedCardProps) {
       <div className={styles.fact}>
         <p className={styles.factLabel}>Vault</p>
         <div className={styles.factLine} data-fact="vault">
-          <ExplorerLink href={explorerAddressUrl(vault)}>{shortAddress(vault)}</ExplorerLink>
+          <ExplorerLink href={addressLink(BASE_SEPOLIA_CHAIN, vault)}>{shortAddress(vault)}</ExplorerLink>
           <CopyButton value={vault} label="vault address" />
         </div>
       </div>
-      <div className={styles.fact}>
-        <p className={styles.factLabel}>Creation transaction</p>
-        <div className={styles.factLine} data-fact="transaction">
-          <ExplorerLink href={explorerTxUrl(txHash)}>{shortHash(txHash)}</ExplorerLink>
-          <CopyButton value={txHash} label="creation transaction" />
+      {txHash === null ? null : (
+        <div className={styles.fact}>
+          <p className={styles.factLabel}>Creation transaction</p>
+          <div className={styles.factLine} data-fact="transaction">
+            <ExplorerLink href={txLink(BASE_SEPOLIA_CHAIN, txHash)}>{shortHash(txHash)}</ExplorerLink>
+            <CopyButton value={txHash} label="creation transaction" />
+          </div>
+          <p className={styles.afterSend}>Send this to Thuli to open screening for your vault.</p>
         </div>
-        <p className={styles.afterSend}>Send this to Thuli to open screening for your vault.</p>
-      </div>
+      )}
       <p className={styles.afterNote}>Campaigns are opened by hand while Thuli is in testing. Screening starts once Thuli has registered your vault.</p>
       <div className={styles.fundedLinks}>
         <ArrowLink href="/campaign">See the live demo campaign</ArrowLink>

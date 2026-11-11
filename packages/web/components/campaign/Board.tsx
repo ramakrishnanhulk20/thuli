@@ -2,12 +2,12 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { relativeTime } from '@/lib/check';
-import { addressUrl, shortAddress } from '@/lib/explorer';
+import { addressLink, ETHEREUM_CHAIN, shortAddress } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
 import { formatInt } from '@/lib/format';
 import { BOARD_PAGE_SIZE, fetchBoard, funderFanoutText, funderKindWords, groupText, mergeBoard, outcomeWords, type AskJson } from '@/lib/campaign';
 import { Drop } from '../Drop';
-import { CitedList } from './Decision';
+import { CitedList, WhatToDo } from './Decision';
 import { useNow, useVisibleInterval } from './useVisibleInterval';
 import styles from './campaign.module.css';
 
@@ -26,8 +26,8 @@ function Facts({ ask }: { ask: AskJson }) {
   const { facts } = ask;
   if (facts === null) return null;
   const funder = facts.funder;
-  // The route sends the funder in checksummed form; the explorer link helper accepts only lowercase.
-  const funderLink = funder === null ? null : addressUrl(funder.address.toLowerCase());
+  // The funder is a wallet Thuli read on Ethereum, so it opens on the Ethereum explorer.
+  const funderLink = funder === null ? null : addressLink(ETHEREUM_CHAIN, funder.address);
   const fanout = funder === null ? null : funderFanoutText(funder);
   return (
     <div className={styles.facts} data-facts>
@@ -75,6 +75,7 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
       </button>
       {open ? (
         <div id={detailsId} className={styles.rowOpen} data-row-open>
+          <WhatToDo ask={ask} />
           <p className={styles.reason} data-reason>
             {ask.reason === null ? '' : displayReason(ask.reason)}
           </p>

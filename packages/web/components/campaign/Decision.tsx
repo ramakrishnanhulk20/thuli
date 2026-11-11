@@ -1,6 +1,6 @@
 import { shortHash, txUrl } from '@/lib/explorer';
 import { displayReason, ruleMeaning } from '@/lib/rules';
-import { NOT_CHECKED_INTRO, notCheckedLine, outcomeWords, type AskJson, type Payout } from '@/lib/campaign';
+import { NEW_WALLET_ADVICE, NOT_CHECKED_INTRO, notCheckedLine, outcomeWords, showsWhatToDo, WHAT_TO_DO_LABEL, type AskJson, type Payout } from '@/lib/campaign';
 import styles from './campaign.module.css';
 
 /** Cited transactions as links, laid out as on the check page. Plain text only. */
@@ -26,6 +26,17 @@ export function CitedList({ hashes }: { hashes: readonly string[] }) {
   );
 }
 
+/** For a held wallet that has never been used: what to do about it, in plain words, directly above the model's reason. */
+export function WhatToDo({ ask }: { ask: AskJson }) {
+  if (!showsWhatToDo(ask)) return null;
+  return (
+    <div className={styles.todoBlock} data-what-to-do>
+      <h3 className={styles.todoLabel}>{WHAT_TO_DO_LABEL}</h3>
+      <p className={styles.todoLine}>{NEW_WALLET_ADVICE}</p>
+    </div>
+  );
+}
+
 /** A decided ask as its owner sees it: the outcome, the reason, what was not checked, and what happens to the reward. */
 export function DecisionView({ ask, payout }: { ask: AskJson; payout: Payout }) {
   if (ask.action === null || ask.rule === null || ask.reason === null) return null;
@@ -42,6 +53,7 @@ export function DecisionView({ ask, payout }: { ask: AskJson; payout: Payout }) 
         <span className={styles.ruleChip} data-rule>{`RULE ${ask.rule}`}</span>
         {meaning === ask.rule ? null : <p className={styles.ruleMeaning}>{meaning}</p>}
       </div>
+      <WhatToDo ask={ask} />
       <p className={styles.reason} data-reason>
         {displayReason(ask.reason)}
       </p>

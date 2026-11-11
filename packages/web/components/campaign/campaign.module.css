@@ -439,6 +439,28 @@
   color: var(--color-ink-2);
 }
 
+/* The plain line for a held wallet that has never been used: a mono label without the drop mark, then a line in ink */
+.todoBlock {
+  margin-top: 20px;
+}
+
+.todoLabel {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.todoLine {
+  max-width: 60ch;
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--color-ink);
+}
+
 .reason {
   margin-top: 16px;
   font-family: var(--font-body);
@@ -780,6 +802,18 @@
 
 .listDim {
   color: var(--color-ink-3);
+}
+
+/* The line that points a project to its own page, under the posted lists */
+.ownerLine {
+  margin-top: 48px;
+}
+
+.ownerText {
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--color-ink-2);
 }
 
 @media (max-width: 1023px) {
