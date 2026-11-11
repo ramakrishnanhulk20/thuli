@@ -37,6 +37,7 @@ broadcast/
 # Replay data and caches (large, rebuilt by scripts)
 data/
 !.env.api.example
+!.env.web.example
 
 # Written by the Next.js dev server and build
 packages/web/AGENTS.md

@@ -13,6 +13,7 @@ import {
   CHECK_KEEP_SECONDS,
   CHECK_PATH,
   createApp,
+  HEALTH_PATH,
   SCREEN_PATH,
 } from '../src/app.ts';
 import type { ApiConfig } from '../src/config.ts';
@@ -372,6 +373,46 @@ describe.each(BACKENDS)('POST /api/check, on $name', (backend) => {
     const paid = await app.fetch(new Request(url(SCREEN_PATH), post({ wallet: WALLET })), socketFrom(CALLER));
     expect(paid.status).toBe(402);
     warn.mockRestore();
+  });
+
+  it('marks every answer from both routes cache-control: no-store, whatever its status', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const now = () => new Date();
+    const { gate, release } = gated();
+    const { app, checkAs, screen } = await checkApp({
+      now,
+      screen: async (wallet) => {
+        if (wallet === walletNumber(9)) return null as unknown as SingleScreen;
+        await gate;
+        return screenResult(wallet);
+      },
+    });
+    const send = (path: string, init?: RequestInit) => app.fetch(new Request(url(path), init), socketFrom(CALLER));
+    const replies: Response[] = [
+      await app.request(HEALTH_PATH),
+      await app.request(CHECK_HEALTH_PATH),
+      await app.request('/api/x402/nothing-here'),
+      await send(SCREEN_PATH, post({ wallet: WALLET })),
+      await send(SCREEN_PATH, post('not json')),
+      await send(CHECK_PATH, post({ wallet: 'a'.repeat(5000) })),
+      await app.fetch(new Request(url(CHECK_PATH), post({ wallet: WALLET }))),
+      await checkAs(OTHER)(walletNumber(9)),
+    ];
+    const screening = checkAs(CALLER)(WALLET);
+    await vi.waitFor(() => expect(screen).toHaveBeenCalledWith(WALLET));
+    replies.push(await checkAs(OTHER)(WALLET));
+    // The minute counts before the body is read, so bad bodies reach the 429 without starting anything.
+    const flood = () => app.fetch(new Request(url(CHECK_PATH), post({})), socketFrom('198.51.100.43'));
+    for (let index = 0; index <= CLIENT_MAX_PER_MINUTE; index += 1) replies.push(await flood());
+    release();
+    replies.push(await screening);
+    const down = await checkApp({ now, stores: failing(await freshStores(now), ['checkLimits.countRequest', 'limits.enter']) });
+    replies.push(await down.check(WALLET), await down.app.fetch(new Request(url(SCREEN_PATH), post({ wallet: WALLET })), socketFrom(CALLER)));
+    expect(new Set(replies.map((reply) => reply.status))).toEqual(new Set([200, 202, 400, 402, 404, 413, 429, 500, 503]));
+    for (const reply of replies) expect(reply.headers.get('cache-control'), String(reply.status)).toBe('no-store');
+    warn.mockRestore();
+    error.mockRestore();
   });
 
   it('applies the paid route request rules: 413, the same 400 bodies, and 400 when the client address cannot be read', async () => {

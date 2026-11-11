@@ -1,7 +1,9 @@
+import fs from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
 import { serve } from '@hono/node-server';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
+import { decodePaymentResponseHeader } from '@x402/core/http';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { wrapFetchWithPayment } from '@x402/fetch';
 import { createPublicClient, erc20Abi, http } from 'viem';
@@ -15,7 +17,7 @@ import { PaidScreenResponse } from '../src/schema.ts';
 import { PayerKeyError, takePayerAccount } from './payer-key.ts';
 
 const ROBO_FARM_WALLET = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
-const USAGE = 'Usage: npm run prove:paid -- [--wallet <address>]';
+const USAGE = 'Usage: npm run prove:paid -- [--wallet <address>] [--url <http origin of a running site>] [--save <file for the 200 body>]';
 const REPLAYS = 10;
 const RPC_TIMEOUT_MS = 15_000;
 // The screening's own limit is 2 minutes; settlement and the reply fit in the rest (C41).
@@ -26,18 +28,42 @@ class UsageError extends Error {
   override name = 'UsageError';
 }
 
-function readWallet(): Address {
-  let values: { wallet?: string | undefined };
+interface Options {
+  wallet: Address;
+  /** The origin of a site already serving the paid route, such as http://localhost:3300. Null runs the API in this process. */
+  origin: string | null;
+  /** Where to write the 200 body, exactly as received. */
+  save: string | null;
+}
+
+function readOptions(): Options {
+  let values: { wallet?: string | undefined; url?: string | undefined; save?: string | undefined };
   try {
-    values = parseArgs({ options: { wallet: { type: 'string' } }, strict: true, allowPositionals: false }).values;
+    values = parseArgs({
+      options: { wallet: { type: 'string' }, url: { type: 'string' }, save: { type: 'string' } },
+      strict: true,
+      allowPositionals: false,
+    }).values;
   } catch {
     throw new UsageError(USAGE);
   }
+  let wallet: Address;
   try {
-    return parseAddress(values.wallet ?? ROBO_FARM_WALLET);
+    wallet = parseAddress(values.wallet ?? ROBO_FARM_WALLET);
   } catch (error) {
     throw new UsageError(`Wallet address rejected: ${error instanceof AddressError ? error.message : 'unreadable'}`);
   }
+  let origin: string | null = null;
+  if (values.url !== undefined) {
+    // An origin and nothing else, so the request goes to the paid route's own path and no query or credential rides along.
+    const parsed = URL.canParse(values.url) ? new URL(values.url) : null;
+    const bare = parsed !== null && parsed.pathname === '/' && parsed.search === '' && parsed.username === '' && parsed.password === '';
+    if (parsed === null || !bare || (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')) {
+      throw new UsageError('--url must be an http or https origin with no path, such as http://localhost:3300.');
+    }
+    origin = parsed.origin;
+  }
+  return { wallet, origin, save: values.save ?? null };
 }
 
 function usdc(units: bigint): string {
@@ -105,7 +131,7 @@ async function waitForChange(read: () => Promise<bigint>, before: bigint): Promi
 }
 
 async function main(): Promise<number> {
-  const wallet = readWallet();
+  const { wallet, origin, save } = readOptions();
   // The API runs in this process, so the payer key leaves the environment before the API reads it (C39).
   const account = takePayerAccount(process.env);
   const config = loadApiConfig(process.env);
@@ -122,7 +148,9 @@ async function main(): Promise<number> {
     return 3;
   }
 
-  const server = await listen(config);
+  // A running site is paid as any buyer would pay it; it must be configured with the same network and payTo as this env.
+  const server = origin === null ? await listen(config) : { origin, close: () => undefined };
+  console.log(`paid route at:    ${server.origin}${SCREEN_PATH}`);
   try {
     let sentSignature: string | null = null;
     const recordingFetch: typeof fetch = async (input, init) => {
@@ -140,9 +168,15 @@ async function main(): Promise<number> {
     console.log(`wallet screened:  ${wallet}`);
     if (outcome.status !== 200 || outcome.paymentStatus !== 'settled') {
       console.error(`The paid call did not return a result: status ${outcome.status}, payment ${outcome.paymentStatus}.`);
+      // The reason is a fixed code. The message beside it can quote a contract call or an RPC URL, so it is not printed.
+      const header = response.headers.get('payment-response');
+      const reason = header === null ? 'none given' : (decodePaymentResponseHeader(header).errorReason ?? 'none given');
+      console.error(`reason:           ${reason}`);
       return 1;
     }
     const result = PaidScreenResponse.parse(outcome.body);
+    // The body as it arrived, once it has passed the reply's own schema; nothing is added or reordered.
+    if (save !== null) fs.writeFileSync(save, `${JSON.stringify(outcome.body, null, 2)}\n`);
     const { decision, payment } = result;
     console.log(`decision:         ${decision.action}, rule ${decision.rule}, share ${decision.shareBps} bps`);
     console.log(`reason:           ${decision.reason}`);

@@ -239,6 +239,8 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
  * ceiling but the minute. It never buys data and never takes payment (C24). A store failure before the screening
  * answers 503 {busy: true} and starts nothing; once a screening has run its result goes out even if it cannot be cached.
  * GET /api/check/health returns the scope, the rulebook version and the price, "free".
+ *
+ * Every answer from every route, whatever its status, carries cache-control: no-store.
  */
 export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   const now = deps.now ?? (() => new Date());
@@ -552,6 +554,13 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   };
 
   const app = new Hono<AppEnv>();
+
+  // Every answer belongs to one caller and one moment: a decision, a payment's terms, a busy or a pending. Outermost, so
+  // it reaches errors and unknown paths too, and no browser or CDN in front ever serves one answer to someone else.
+  app.use(async (c, next) => {
+    await next();
+    c.res.headers.set('cache-control', 'no-store');
+  });
 
   // Counted per app, not drawn at random, so a test can tell exactly which request sweeps.
   let requestsSeen = 0;

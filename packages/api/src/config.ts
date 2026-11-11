@@ -3,7 +3,7 @@ import { HTTPFacilitatorClient, type FacilitatorClient } from '@x402/core/server
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
 
-/** Ram set this on 6 Nov. A constant in code, so neither the environment nor a request can change what a screening costs. */
+/** Set on 6 Nov. A constant in code, so neither the environment nor a request can change what a screening costs. */
 export const PRICE = '$0.05';
 /** PRICE in USDC base units (6 decimals). The exact scheme needs the payment to equal this, not exceed it. */
 export const PRICE_UNITS = '50000';

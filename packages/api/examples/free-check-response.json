@@ -1,0 +1,21 @@
+{
+  "wallet": "0x59170D55BbA35AF1f1f9c3D6B1f678fbb68A760E",
+  "checkedAt": "2026-11-11T07:46:49.853Z",
+  "scope": "one wallet on Ethereum, no claim list",
+  "rulebook": "v2",
+  "decision": {
+    "action": "full",
+    "shareBps": 10000,
+    "rule": "A9",
+    "reason": "A9: The wallet is 1,353 days old with 56 pre-snapshot activities. No linked claim-wallet group, shared funding, shared-collector sweeps, wallet-made group links, shared exchange claimants, or onward claim payment is recorded; first-funder details are unknown.",
+    "citedTxs": []
+  },
+  "servRequestId": "0f2e52c2-4485-417c-a183-247c9071fc49",
+  "notChecked": [
+    "group",
+    "sharedDepositAddress",
+    "fundingBurst",
+    "claimPaidToOtherAddress"
+  ],
+  "cached": false
+}
