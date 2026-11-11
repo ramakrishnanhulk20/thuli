@@ -153,6 +153,14 @@
   background: var(--color-accent);
 }
 
+.slowedLine {
+  margin-top: 16px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
 .vaultLine {
   display: flex;
   flex-wrap: wrap;

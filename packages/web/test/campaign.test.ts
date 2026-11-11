@@ -3,8 +3,9 @@
 // connection or polling; the browser script runs those against a page with an injected test wallet.
 import { privateKeyToAccount } from 'viem/accounts';
 import { describe, expect, it } from 'vitest';
-import { askBody, askMessage, SIGNATURE, signedAtNow } from '../lib/ask';
+import { askBody, askMessage, isOwnKeySignature, SIGNATURE, signedAtNow } from '../lib/ask';
 import {
+  ceilingWords,
   chainName,
   choosePanel,
   classifyAskAnswer,
@@ -24,6 +25,7 @@ import {
   LIST_STATUS_WORDS,
   mergeBoard,
   newestFirst,
+  pollDelay,
   NEW_WALLET_ADVICE,
   NOT_CHECKED_INTRO,
   notCheckedLine,
@@ -31,6 +33,9 @@ import {
   payoutFor,
   postAsk,
   readyVariant,
+  refusalWords,
+  SLOWED_LINE,
+  SLOWED_POLL_MILLISECONDS,
   showsWhatToDo,
   statusLine,
   usdc,
@@ -56,6 +61,7 @@ const {
   ClosedBody,
   ErrorBody,
   ExistsBody,
+  FullBody,
   QueuedBody,
 } = await loadPackage('../../api/src/schema');
 
@@ -158,11 +164,20 @@ describe('the requests', () => {
   const reply = (status: number, body: unknown) => (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
 
   it('reads a campaign, and reads a 404, a bad body, another status and a failed request as none', async () => {
-    expect(await fetchCampaign(CAMPAIGN_ID, reply(200, fx.campaign()))).toEqual(fx.campaign());
-    expect(await fetchCampaign(CAMPAIGN_ID, reply(404, { error: 'no such campaign' }))).toBeNull();
-    expect(await fetchCampaign(CAMPAIGN_ID, reply(200, { name: 'x' }))).toBeNull();
-    expect(await fetchCampaign(CAMPAIGN_ID, reply(503, { busy: true }))).toBeNull();
-    expect(await fetchCampaign(CAMPAIGN_ID, (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch)).toBeNull();
+    expect(await fetchCampaign(CAMPAIGN_ID, reply(200, fx.campaign()))).toEqual({ kind: 'found', campaign: fx.campaign() });
+    expect(await fetchCampaign(CAMPAIGN_ID, reply(404, { error: 'no such campaign' }))).toEqual({ kind: 'none' });
+    expect(await fetchCampaign(CAMPAIGN_ID, reply(200, { name: 'x' }))).toEqual({ kind: 'none' });
+    expect(await fetchCampaign(CAMPAIGN_ID, reply(503, { busy: true }))).toEqual({ kind: 'none' });
+    expect(await fetchCampaign(CAMPAIGN_ID, (async () => { throw new TypeError('Failed to fetch'); }) as typeof fetch)).toEqual({ kind: 'none' });
+  });
+
+  it('reads a 429 on any read route as busy, never as none or as an error', async () => {
+    expect(await fetchCampaign(CAMPAIGN_ID, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
+    expect(await fetchAsk(CAMPAIGN_ID, signer.address, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, fx.board(2)))).toEqual({ kind: 'page', asks: fx.board(2).asks });
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(500, {}))).toEqual({ kind: 'failed' });
+    expect(BusyBody.safeParse({ busy: true }).success).toBe(true);
   });
 
   it('reads an ask lookup as found, none or error', async () => {
@@ -197,12 +212,26 @@ describe('the requests', () => {
     expect(JSON.parse(String(seen[0]?.init?.body))).toEqual(signed);
   });
 
+  it('reads Retry-After off a 429 when it posts, and only then', async () => {
+    const signed = { wallet: signer.address, signedAt: 1_800_000_000, signature: `0x${'b'.repeat(130)}` };
+    const answer = (status: number, body: unknown, headers: Record<string, string> = {}) => (async () => new Response(JSON.stringify(body), { status, headers })) as unknown as typeof fetch;
+    expect(await postAsk(CAMPAIGN_ID, signed, answer(429, { busy: true }, { 'Retry-After': '7200' }))).toEqual({ kind: 'ceiling', retryAfter: '7200' });
+    expect(await postAsk(CAMPAIGN_ID, signed, answer(429, { busy: true }))).toEqual({ kind: 'limit' });
+    expect(await postAsk(CAMPAIGN_ID, signed, answer(409, { full: true }))).toEqual({ kind: 'full' });
+    expect(await postAsk(CAMPAIGN_ID, signed, answer(409, { closed: true }))).toEqual({ kind: 'closed' });
+  });
+
   it('maps each answer of the ask route', () => {
     const exists = fx.ask('full', signer.address, 1);
     expect(classifyAskAnswer(202, { queued: true })).toEqual({ kind: 'queued' });
     expect(classifyAskAnswer(200, { exists: true, ask: exists })).toEqual({ kind: 'exists', ask: exists });
     expect(classifyAskAnswer(409, { closed: true })).toEqual({ kind: 'closed' });
+    expect(classifyAskAnswer(409, { full: true })).toEqual({ kind: 'full' });
     expect(classifyAskAnswer(429, { busy: true })).toEqual({ kind: 'limit' });
+    expect(classifyAskAnswer(429, { busy: true }, null)).toEqual({ kind: 'limit' });
+    expect(classifyAskAnswer(429, { busy: true }, '7200')).toEqual({ kind: 'ceiling', retryAfter: '7200' });
+    expect(classifyAskAnswer(429, { busy: true }, 'soon')).toEqual({ kind: 'ceiling', retryAfter: 'soon' });
+    expect(classifyAskAnswer(409, { full: true }, '60')).toEqual({ kind: 'full' });
     expect(classifyAskAnswer(400, { error: 'the signature is too old' })).toEqual({ kind: 'bad', cause: 'the signature is too old' });
     expect(classifyAskAnswer(413, { error: 'the body is too large' })).toEqual({ kind: 'bad', cause: 'the body is too large' });
     expect(classifyAskAnswer(404, { error: 'no such campaign' })).toEqual({ kind: 'gone' });
@@ -213,7 +242,7 @@ describe('the requests', () => {
 });
 
 describe('choosePanel', () => {
-  const base: PanelInput = { connected: true, ask: null, looking: false, signing: false, sent: false, unreachable: false };
+  const base: PanelInput = { connected: true, ask: null, looking: false, signing: false, sent: false, refused: false, unreachable: false };
 
   it('offers the connect choices to a wallet that is not connected, whatever else is true', () => {
     expect(choosePanel({ ...base, connected: false })).toBe('connect');
@@ -241,12 +270,24 @@ describe('choosePanel', () => {
     expect(choosePanel({ ...base, unreachable: true, ask: asView('full') })).toBe('decided');
   });
 
+  it('shows a refusal in place of the ask, until the wallet has an ask of its own', () => {
+    expect(choosePanel({ ...base, refused: true })).toBe('refused');
+    expect(choosePanel({ ...base, refused: true, unreachable: true })).toBe('refused');
+    expect(choosePanel({ ...base, refused: true, ask: asView('queued') })).toBe('screening');
+    expect(choosePanel({ ...base, refused: true, ask: asView('hold') })).toBe('decided');
+    expect(choosePanel({ ...base, refused: true, signing: true })).toBe('signing');
+    expect(choosePanel({ ...base, refused: true, connected: false })).toBe('connect');
+  });
+
   it('closes, fills or opens the ready state from the campaign and the clock', () => {
     expect(readyVariant(campaign, NOW)).toBe('open');
     expect(readyVariant({ ...campaign, status: 'closed' }, NOW)).toBe('closed');
     expect(readyVariant(campaign, Date.parse(campaign.closesAt))).toBe('closed');
     expect(readyVariant(campaign, Date.parse(campaign.opensAt) - 1)).toBe('closed');
     expect(readyVariant({ ...campaign, counts: { ...campaign.counts, slotsLeft: 0 } }, NOW)).toBe('full');
+    expect(readyVariant({ ...campaign, counts: { ...campaign.counts, asksLeft: 0 } }, NOW)).toBe('stopped');
+    expect(readyVariant({ ...campaign, counts: { ...campaign.counts, slotsLeft: 0, asksLeft: 0 } }, NOW)).toBe('full');
+    expect(readyVariant({ ...campaign, status: 'closed', counts: { ...campaign.counts, asksLeft: 0 } }, NOW)).toBe('closed');
     expect(isAcceptingAsks(campaign, NOW)).toBe(true);
   });
 });
@@ -492,5 +533,103 @@ describe('a list that is being sent', () => {
     expect(sending.status).toBe('sending');
     expect(sending.postTx).toMatch(/^0x[0-9a-f]{64}$/);
     expect(sending.claimableAt).toBeNull();
+  });
+});
+
+describe('the words for a refused ask', () => {
+  it('says the campaign has stopped taking requests when it has none left but has slots', () => {
+    expect(refusalWords('stopped')).toEqual({
+      heading: 'This campaign has stopped taking requests',
+      body: 'It has screened as many wallets as it set out to. No new request can be sent.',
+    });
+  });
+
+  it('says the campaign is full, and that nothing was spent', () => {
+    expect(refusalWords('full')).toEqual({
+      heading: 'This campaign is full',
+      body: 'Your request was not taken, and nothing was spent. Signing a message costs nothing.',
+    });
+  });
+
+  it('says it is a smart contract wallet that cannot ask yet', () => {
+    expect(refusalWords('contract')).toEqual({
+      heading: 'This looks like a smart contract wallet',
+      body: 'Wallets that sign through a contract cannot ask yet. Ask with a wallet that signs with its own key.',
+    });
+  });
+
+  it('says the day is used up, and when to come back, from the Retry-After header', () => {
+    expect(refusalWords('ceiling', '7200')).toEqual({ heading: 'Thuli has taken all the requests it screens in a day', body: 'Try again in about 2 hours.' });
+    expect(refusalWords('ceiling', null).body).toBe('Try again tomorrow.');
+  });
+
+  it('writes the wait from seconds: whole hours from an hour up, five-minute steps below it, tomorrow when there is no number', () => {
+    const cases: [string | null, string][] = [
+      ['30', 'Try again in about 5 minutes.'],
+      ['1', 'Try again in about 5 minutes.'],
+      ['300', 'Try again in about 5 minutes.'],
+      ['301', 'Try again in about 10 minutes.'],
+      ['3599', 'Try again in about 60 minutes.'],
+      ['3600', 'Try again in about 1 hour.'],
+      ['3601', 'Try again in about 2 hours.'],
+      ['7200', 'Try again in about 2 hours.'],
+      ['86400', 'Try again in about 24 hours.'],
+      [null, 'Try again tomorrow.'],
+      ['', 'Try again tomorrow.'],
+      ['soon', 'Try again tomorrow.'],
+      ['0', 'Try again tomorrow.'],
+      ['-5', 'Try again tomorrow.'],
+      ['12.5', 'Try again tomorrow.'],
+      ['Wed, 21 Oct 2026 07:28:00 GMT', 'Try again tomorrow.'],
+    ];
+    for (const [header, words] of cases) expect(ceilingWords(header), String(header)).toBe(words);
+  });
+
+  it('accepts the new answers the API sends', () => {
+    expect(FullBody.safeParse({ full: true }).success).toBe(true);
+    expect(FullBody.safeParse({ full: false }).success).toBe(false);
+    expect(BusyBody.safeParse({ busy: true }).success).toBe(true);
+    expect(CampaignSchema.safeParse(fx.campaign({ counts: { ...campaign.counts, asksLeft: 0 } })).success).toBe(true);
+    expect(CampaignSchema.safeParse(fx.campaign({ counts: { ...campaign.counts, slotsLeft: 0, asksLeft: 0 } })).success).toBe(true);
+    expect(isCampaignView(fx.campaign({ counts: { ...campaign.counts, asksLeft: 0 } }))).toBe(true);
+    expect(isCampaignView(fx.campaign({ counts: { ...campaign.counts, asksLeft: undefined } }))).toBe(false);
+  });
+});
+
+describe('the poll delay while reads are slowed', () => {
+  it('keeps the usual delay when reads are fine, and waits 30 seconds when a route said busy', () => {
+    expect(SLOWED_POLL_MILLISECONDS).toBe(30_000);
+    expect(pollDelay(10_000, false)).toBe(10_000);
+    expect(pollDelay(4000, false)).toBe(4000);
+    expect(pollDelay(10_000, true)).toBe(30_000);
+    expect(pollDelay(4000, true)).toBe(30_000);
+  });
+
+  it('never polls faster than usual because of a pause', () => {
+    expect(pollDelay(60_000, true)).toBe(60_000);
+  });
+
+  it('has one plain line for the pause', () => {
+    expect(SLOWED_LINE).toBe('Updates are paused for a moment.');
+  });
+});
+
+describe('a signature that is not from one key', () => {
+  it('is only a signature of exactly 65 bytes: 0x and 130 hex characters', () => {
+    expect(isOwnKeySignature(`0x${'a'.repeat(130)}`)).toBe(true);
+    expect(isOwnKeySignature(`0x${'A1'.repeat(65)}`)).toBe(true);
+    expect(isOwnKeySignature(`0x${'a'.repeat(128)}`)).toBe(false);
+    expect(isOwnKeySignature(`0x${'a'.repeat(132)}`)).toBe(false);
+    expect(isOwnKeySignature('a'.repeat(130))).toBe(false);
+    expect(isOwnKeySignature(`0x${'g'.repeat(130)}`)).toBe(false);
+    expect(isOwnKeySignature('0x')).toBe(false);
+    expect(isOwnKeySignature('')).toBe(false);
+  });
+
+  it('accepts a real signature from a key, and refuses what a contract wallet usually sends', async () => {
+    const signature = await signer.signMessage({ message: askMessage({ campaignId: CAMPAIGN_ID, wallet: signer.address, signedAt: 1_800_000_000 }) });
+    expect(isOwnKeySignature(signature)).toBe(true);
+    expect(isOwnKeySignature(`0x${'00'.repeat(66)}${signature.slice(2)}`)).toBe(false);
+    expect(isOwnKeySignature(`0x${'12'.repeat(32)}`)).toBe(false);
   });
 });

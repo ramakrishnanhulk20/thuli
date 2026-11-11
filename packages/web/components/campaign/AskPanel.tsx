@@ -2,26 +2,30 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useConnection, useDisconnect, useSignMessage } from 'wagmi';
-import { askMessage, signedAtNow } from '@/lib/ask';
+import { askMessage, isOwnKeySignature, signedAtNow } from '@/lib/ask';
 import {
   choosePanel,
   currentStep,
   fetchAsk,
   NOTICE_TEXT,
   payoutFor,
+  pollDelay,
   postAsk,
   READY_TEXT,
   readyVariant,
+  refusalWords,
   UNREACHABLE_TEXT,
   type AskView,
   type CampaignView,
   type Notice,
+  type RefusalKind,
   type Step,
 } from '@/lib/campaign';
 import { shortAddress } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { ConnectChoices } from '../wallet/ConnectButton';
 import { DecisionView } from './Decision';
+import { useReadPause } from './useReadPause';
 import { useVisibleInterval } from './useVisibleInterval';
 import styles from './campaign.module.css';
 
@@ -49,9 +53,21 @@ interface Session {
   sent: boolean;
   notice: Notice | null;
   cause: string;
+  /** The ask cannot go ahead, and nothing the visitor can press here changes that. */
+  refusal: { kind: RefusalKind; retryAfter: string | null } | null;
 }
 
-const freshSession = (wallet: string): Session => ({ wallet, view: null, checked: false, lookupFailed: false, signing: false, sent: false, notice: null, cause: '' });
+const freshSession = (wallet: string): Session => ({
+  wallet,
+  view: null,
+  checked: false,
+  lookupFailed: false,
+  signing: false,
+  sent: false,
+  notice: null,
+  cause: '',
+  refusal: null,
+});
 
 interface AskPanelProps {
   campaignId: string;
@@ -60,9 +76,22 @@ interface AskPanelProps {
   onGone: () => void;
   /** Told which step of "How it goes" the visitor is on, so the steps beside the panel can light it. */
   onStep: (step: Step | null) => void;
+  /** Told when the lookup route is slowed or free again, so the page can show its one line. */
+  onSlowed: (route: string, slowed: boolean) => void;
 }
 
-export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanelProps) {
+/** A refusal stands in place of the ask: a heading and a body, with no button to press. */
+function Refusal({ kind, retryAfter }: { kind: RefusalKind; retryAfter: string | null }) {
+  const words = refusalWords(kind, retryAfter);
+  return (
+    <div aria-live="polite" data-refusal={kind}>
+      <h3 className={`${styles.panelTitle} ${styles.waitTitle}`}>{words.heading}</h3>
+      <p className={styles.panelBody}>{words.body}</p>
+    </div>
+  );
+}
+
+export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }: AskPanelProps) {
   const connection = useConnection();
   const { mutate: disconnect } = useDisconnect();
   const { mutateAsync: signMessage } = useSignMessage();
@@ -72,6 +101,8 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
   const [signedAt, setSignedAt] = useState(() => signedAtNow());
   const lastSigned = useRef<(Signed & { madeAt: number }) | null>(null);
   const current = useRef<string | null>(null);
+  const pause = useReadPause('asks', onSlowed);
+  const { busy: pauseBusy, ok: pauseOk, quiet: pauseQuiet } = pause;
 
   // A session that belongs to another wallet is never shown: the first render after a switch already starts clean.
   const mine: Session | null = address === null ? null : session !== null && session.wallet === address ? session : freshSession(address);
@@ -83,16 +114,24 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
 
   const lookUp = useCallback(
     async (wallet: string, initial: boolean) => {
+      if (pauseQuiet()) return;
       const found = await fetchAsk(campaignId, wallet);
+      if (found.kind === 'busy') {
+        // A first lookup that is told to slow down stays on "checking" and is tried again after the pause.
+        pauseBusy();
+        return;
+      }
       if (found.kind === 'found') {
+        pauseOk();
         patch(wallet, { view: found.view, sent: false, lookupFailed: false, ...(initial ? { checked: true } : {}) });
       } else if (found.kind === 'none') {
+        pauseOk();
         patch(wallet, { lookupFailed: false, ...(initial ? { checked: true } : {}) });
       } else if (initial) {
         patch(wallet, { lookupFailed: true, checked: true });
       }
     },
-    [campaignId, patch],
+    [campaignId, patch, pauseBusy, pauseOk, pauseQuiet],
   );
 
   useEffect(() => {
@@ -116,6 +155,7 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
     looking: mine !== null && !mine.checked,
     signing,
     sent: mine?.sent ?? false,
+    refused: (mine?.refusal ?? null) !== null,
     unreachable: (mine?.lookupFailed ?? false) || notice === 'unreachable',
   });
 
@@ -132,12 +172,14 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
   useEffect(() => {
     onStep(step);
   }, [step, onStep]);
+  const checked = mine?.checked ?? false;
+  const retryingFirstLookup = mine !== null && !checked && pause.slowed;
   useVisibleInterval(
     () => {
-      if (address !== null) void lookUp(address, false);
+      if (address !== null) void lookUp(address, !checked);
     },
-    waiting ? QUEUED_POLL_MILLISECONDS : PAYOUT_POLL_MILLISECONDS,
-    address !== null && (waiting || approvedUnpaid),
+    pollDelay(waiting ? QUEUED_POLL_MILLISECONDS : PAYOUT_POLL_MILLISECONDS, pause.slowed),
+    address !== null && (waiting || approvedUnpaid || retryingFirstLookup),
   );
 
   async function send(signed: Signed) {
@@ -155,6 +197,12 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
         break;
       case 'closed':
         patch(signed.wallet, { notice: 'closed' });
+        break;
+      case 'full':
+        patch(signed.wallet, { refusal: { kind: 'full', retryAfter: null } });
+        break;
+      case 'ceiling':
+        patch(signed.wallet, { refusal: { kind: 'ceiling', retryAfter: result.retryAfter } });
         break;
       case 'limit':
         patch(signed.wallet, { notice: 'limit' });
@@ -182,6 +230,11 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
       signature = await signMessage({ message: askMessage({ campaignId, wallet: address, signedAt: at }) });
     } catch {
       patch(address, { signing: false, notice: 'declined' });
+      return;
+    }
+    // A contract wallet answers with a signature of another length. The route cannot check it, so it is not sent.
+    if (!isOwnKeySignature(signature)) {
+      patch(address, { signing: false, refusal: { kind: 'contract', retryAfter: null } });
       return;
     }
     await send({ wallet: address, signedAt: at, signature });
@@ -230,7 +283,23 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
         {panel === 'checking' ? <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2> : null}
         {panel === 'checking' ? walletRow : null}
 
-        {panel === 'ready' || panel === 'signing' ? (
+        {(panel === 'ready' || panel === 'signing') && variant === 'stopped' ? (
+          <>
+            <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2>
+            {walletRow}
+            <Refusal kind="stopped" retryAfter={null} />
+          </>
+        ) : null}
+
+        {panel === 'refused' && mine?.refusal ? (
+          <>
+            <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2>
+            {walletRow}
+            <Refusal kind={mine.refusal.kind} retryAfter={mine.refusal.retryAfter} />
+          </>
+        ) : null}
+
+        {(panel === 'ready' || panel === 'signing') && variant !== 'stopped' ? (
           <>
             <h2 id="ask-title" className={styles.visuallyHidden}>Ask for a slot</h2>
             {walletRow}
@@ -238,13 +307,12 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep }: AskPanel
             <pre className={styles.message} data-message>{message}</pre>
             {variant === 'closed' ? (
               <p className={styles.panelBody} data-closed>{READY_TEXT.closed}</p>
+            ) : variant === 'full' ? (
+              <p className={styles.panelBody} data-full>{READY_TEXT.full}</p>
             ) : (
-              <>
-                {variant === 'full' ? <p className={styles.panelBody} data-full>{READY_TEXT.full}</p> : null}
-                <button type="button" className={styles.primary} disabled={signing} onClick={onSign} data-sign>
-                  {signing ? 'Waiting for your wallet' : 'Sign and ask'}
-                </button>
-              </>
+              <button type="button" className={styles.primary} disabled={signing} onClick={onSign} data-sign>
+                {signing ? 'Waiting for your wallet' : 'Sign and ask'}
+              </button>
             )}
             <p className={styles.panelNote}>Thuli then reads this wallet&apos;s public history on Ethereum and decides. One ask per wallet.</p>
             {notice === null || notice === 'unreachable' ? null : (

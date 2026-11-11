@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { chainName, fetchCampaign, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
+import { chainName, fetchCampaign, pollDelay, SLOWED_LINE, statusLine, usdc, type CampaignView, type Step } from '@/lib/campaign';
 import { addressLink, shortAddress } from '@/lib/explorer';
 import { Drop } from '../Drop';
 import { WalletProvider } from '../wallet/WalletProvider';
@@ -11,6 +11,7 @@ import { Board } from './Board';
 import { Lists } from './Lists';
 import { NoCampaign } from './NoCampaign';
 import { Steps } from './Steps';
+import { useReadPause } from './useReadPause';
 import { useNow, useVisibleInterval } from './useVisibleInterval';
 import styles from './campaign.module.css';
 
@@ -18,7 +19,7 @@ const REFRESH_MILLISECONDS = 10_000;
 
 type Load = { status: 'loading' } | { status: 'none' } | { status: 'found'; campaign: CampaignView };
 
-function Head({ campaign }: { campaign: CampaignView }) {
+function Head({ campaign, slowed }: { campaign: CampaignView; slowed: boolean }) {
   const reward = usdc(campaign.rewardPerWallet);
   const { counts } = campaign;
   const vaultLink = addressLink(campaign.chain, campaign.vault);
@@ -54,6 +55,11 @@ function Head({ campaign }: { campaign: CampaignView }) {
           </div>
         ))}
       </div>
+      {slowed ? (
+        <p className={styles.slowedLine} role="status" data-slowed>
+          {SLOWED_LINE}
+        </p>
+      ) : null}
       <p className={styles.vaultLine} data-vault-line>
         <span>
           VAULT{' '}
@@ -76,20 +82,33 @@ export function CampaignPage({ campaignId, walletConnectProjectId }: { campaignI
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [step, setStep] = useState<Step | null>(1);
   const now = useNow(30_000);
+  const [slowedRoutes, setSlowedRoutes] = useState<Record<string, boolean>>({});
+  const reportSlowed = useCallback((route: string, slowed: boolean) => {
+    setSlowedRoutes((before) => (before[route] === slowed ? before : { ...before, [route]: slowed }));
+  }, []);
+  const anySlowed = Object.values(slowedRoutes).some(Boolean);
+  const { slowed, busy, ok, quiet } = useReadPause('campaign', reportSlowed);
 
   const refresh = useCallback(async () => {
-    const campaign = await fetchCampaign(campaignId);
+    if (quiet()) return;
+    const read = await fetchCampaign(campaignId);
+    if (read.kind === 'busy') {
+      busy();
+      return;
+    }
+    ok();
     setLoad((before) => {
-      if (campaign !== null) return { status: 'found', campaign };
+      if (read.kind === 'found') return { status: 'found', campaign: read.campaign };
       // A refresh that fails keeps the campaign already on screen; only the first read can say there is none.
       return before.status === 'found' ? before : { status: 'none' };
     });
-  }, [campaignId]);
+  }, [campaignId, busy, ok, quiet]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
-  useVisibleInterval(() => void refresh(), REFRESH_MILLISECONDS, load.status === 'found');
+  // A first read that was told to slow down has nothing to refresh yet, so it is tried again after the pause.
+  useVisibleInterval(() => void refresh(), pollDelay(REFRESH_MILLISECONDS, slowed), load.status === 'found' || (load.status === 'loading' && slowed));
 
   if (load.status === 'none') return <NoCampaign />;
   if (load.status === 'loading') {
@@ -106,14 +125,14 @@ export function CampaignPage({ campaignId, walletConnectProjectId }: { campaignI
   const { campaign } = load;
   return (
     <>
-      <Head campaign={campaign} />
+      <Head campaign={campaign} slowed={anySlowed} />
       <div className={styles.askRow}>
         <WalletProvider walletConnectProjectId={walletConnectProjectId}>
-          <AskPanel campaignId={campaignId} campaign={campaign} now={now} onGone={() => setLoad({ status: 'none' })} onStep={setStep} />
+          <AskPanel campaignId={campaignId} campaign={campaign} now={now} onGone={() => setLoad({ status: 'none' })} onStep={setStep} onSlowed={reportSlowed} />
         </WalletProvider>
         <Steps current={step} />
       </div>
-      <Board campaignId={campaignId} />
+      <Board campaignId={campaignId} onSlowed={reportSlowed} />
       <Lists campaignId={campaignId} campaign={campaign} />
       <div className={styles.ownerLine} data-owner-link>
         <p className={styles.ownerText}>Running a reward drop of your own?</p>

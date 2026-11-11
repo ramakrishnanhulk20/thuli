@@ -5,9 +5,10 @@ import { relativeTime } from '@/lib/check';
 import { addressLink, ETHEREUM_CHAIN, shortAddress } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
 import { formatInt } from '@/lib/format';
-import { BOARD_PAGE_SIZE, fetchBoard, funderFanoutText, funderKindWords, groupText, mergeBoard, outcomeWords, type AskJson } from '@/lib/campaign';
+import { BOARD_PAGE_SIZE, fetchBoard, funderFanoutText, funderKindWords, groupText, mergeBoard, outcomeWords, pollDelay, type AskJson } from '@/lib/campaign';
 import { Drop } from '../Drop';
 import { CitedList, WhatToDo } from './Decision';
+import { useReadPause } from './useReadPause';
 import { useNow, useVisibleInterval } from './useVisibleInterval';
 import styles from './campaign.module.css';
 
@@ -88,32 +89,46 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
   );
 }
 
-export function Board({ campaignId }: { campaignId: string }) {
+export function Board({ campaignId, onSlowed }: { campaignId: string; onSlowed: (route: string, slowed: boolean) => void }) {
   const [rows, setRows] = useState<AskJson[] | null>(null);
   const [more, setMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const now = useNow(30_000);
+  const { slowed, busy, ok, quiet } = useReadPause('board', onSlowed);
 
   const refresh = useCallback(async () => {
-    const page = await fetchBoard(campaignId, null);
-    if (page === null) return;
+    if (quiet()) return;
+    const read = await fetchBoard(campaignId, null);
+    if (read.kind === 'busy') {
+      busy();
+      return;
+    }
+    if (read.kind === 'failed') return;
+    ok();
+    const page = read.asks;
     setRows((current) => (current === null ? page : mergeBoard(current, page)));
     setMore((current) => (current ? current : page.length === BOARD_PAGE_SIZE));
-  }, [campaignId]);
+  }, [campaignId, busy, ok, quiet]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
-  useVisibleInterval(() => void refresh(), REFRESH_MILLISECONDS);
+  useVisibleInterval(() => void refresh(), pollDelay(REFRESH_MILLISECONDS, slowed));
 
   async function showEarlier() {
     if (rows === null || rows.length === 0 || loadingMore) return;
     const oldest = rows[rows.length - 1];
     if (oldest === undefined) return;
     setLoadingMore(true);
-    const page = await fetchBoard(campaignId, oldest.decidedAt ?? oldest.askedAt);
+    const read = await fetchBoard(campaignId, oldest.decidedAt ?? oldest.askedAt);
     setLoadingMore(false);
-    if (page === null) return;
+    if (read.kind === 'busy') {
+      busy();
+      return;
+    }
+    if (read.kind === 'failed') return;
+    ok();
+    const page = read.asks;
     setRows((current) => mergeBoard(current ?? [], page));
     setMore(page.length === BOARD_PAGE_SIZE);
   }

@@ -30,7 +30,7 @@ export interface CampaignView {
   status: 'open' | 'closed';
   opensAt: string;
   closesAt: string;
-  counts: { asked: number; queued: number; decided: number; held: number; slotsTaken: number; slotsLeft: number };
+  counts: { asked: number; queued: number; decided: number; held: number; slotsTaken: number; slotsLeft: number; asksLeft: number };
   lists: ListVersion[];
 }
 
@@ -119,7 +119,7 @@ export function isCampaignView(value: unknown): value is CampaignView {
     (value.status === 'open' || value.status === 'closed') &&
     isTime(value.opensAt) &&
     isTime(value.closesAt) &&
-    ['asked', 'queued', 'decided', 'held', 'slotsTaken', 'slotsLeft'].every((key) => isCount(counts[key])) &&
+    ['asked', 'queued', 'decided', 'held', 'slotsTaken', 'slotsLeft', 'asksLeft'].every((key) => isCount(counts[key])) &&
     Array.isArray(value.lists) &&
     value.lists.every(isListVersion)
   );
@@ -195,25 +195,32 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-/** The campaign, or none: a 404, any other answer, a body that is not a campaign and a failed request all read as none. */
-export async function fetchCampaign(id: string, request: Fetcher = fetch): Promise<CampaignView | null> {
+export type CampaignRead = { kind: 'found'; campaign: CampaignView } | { kind: 'busy' } | { kind: 'none' };
+
+/**
+ * The campaign. A 429 reads as busy, so the page can keep what it shows and slow down. A 404, any other answer, a body
+ * that is not a campaign and a failed request all read as none.
+ */
+export async function fetchCampaign(id: string, request: Fetcher = fetch): Promise<CampaignRead> {
   try {
     const response = await request(root(id), { cache: 'no-store' });
-    if (response.status !== 200) return null;
+    if (response.status === 429) return { kind: 'busy' };
+    if (response.status !== 200) return { kind: 'none' };
     const body = await readJson(response);
-    return isCampaignView(body) ? body : null;
+    return isCampaignView(body) ? { kind: 'found', campaign: body } : { kind: 'none' };
   } catch {
-    return null;
+    return { kind: 'none' };
   }
 }
 
-export type AskLookup = { kind: 'found'; view: AskView } | { kind: 'none' } | { kind: 'error' };
+export type AskLookup = { kind: 'found'; view: AskView } | { kind: 'none' } | { kind: 'busy' } | { kind: 'error' };
 
 /** What the campaign holds for one wallet. A 404 means the wallet has not asked; anything unexpected is an error. */
 export async function fetchAsk(id: string, wallet: string, request: Fetcher = fetch): Promise<AskLookup> {
   try {
     const response = await request(`${root(id)}/asks/${encodeURIComponent(wallet)}`, { cache: 'no-store' });
     if (response.status === 404) return { kind: 'none' };
+    if (response.status === 429) return { kind: 'busy' };
     if (response.status !== 200) return { kind: 'error' };
     const body = await readJson(response);
     return isAskView(body) ? { kind: 'found', view: body } : { kind: 'error' };
@@ -226,18 +233,21 @@ export type AskPost =
   | { kind: 'queued' }
   | { kind: 'exists'; ask: AskJson }
   | { kind: 'closed' }
+  | { kind: 'full' }
   | { kind: 'limit' }
+  /** The day's ceiling across every campaign: only that answer carries Retry-After, which is kept as it came. */
+  | { kind: 'ceiling'; retryAfter: string }
   | { kind: 'bad'; cause: string }
   | { kind: 'gone' }
   | { kind: 'unreachable' };
 
-/** Maps a status and a parsed body from the ask route to what the page shows. */
-export function classifyAskAnswer(status: number, body: unknown): AskPost {
+/** Maps a status, a parsed body and the Retry-After header from the ask route to what the page shows. */
+export function classifyAskAnswer(status: number, body: unknown, retryAfter: string | null = null): AskPost {
   if (status === 202) return isRecord(body) && body.queued === true ? { kind: 'queued' } : { kind: 'unreachable' };
   if (status === 200) return isRecord(body) && body.exists === true && isAskJson(body.ask) ? { kind: 'exists', ask: body.ask } : { kind: 'unreachable' };
   if (status === 404) return { kind: 'gone' };
-  if (status === 409) return { kind: 'closed' };
-  if (status === 429) return { kind: 'limit' };
+  if (status === 409) return isRecord(body) && body.full === true ? { kind: 'full' } : { kind: 'closed' };
+  if (status === 429) return retryAfter === null ? { kind: 'limit' } : { kind: 'ceiling', retryAfter };
   if ((status === 400 || status === 413) && isRecord(body) && isText(body.error) && body.error !== '') return { kind: 'bad', cause: body.error };
   return { kind: 'unreachable' };
 }
@@ -254,7 +264,7 @@ export async function postAsk(
       body: askBody(signed),
       cache: 'no-store',
     });
-    return classifyAskAnswer(response.status, await readJson(response));
+    return classifyAskAnswer(response.status, await readJson(response), response.headers.get('retry-after'));
   } catch {
     return { kind: 'unreachable' };
   }
@@ -262,16 +272,19 @@ export async function postAsk(
 
 export const BOARD_PAGE_SIZE = 50;
 
-/** One page of the board, newest decision first, or null when it could not be read. */
-export async function fetchBoard(id: string, before: string | null, request: Fetcher = fetch): Promise<AskJson[] | null> {
+export type BoardRead = { kind: 'page'; asks: AskJson[] } | { kind: 'busy' } | { kind: 'failed' };
+
+/** One page of the board, newest decision first; busy for a 429, failed when it could not be read. */
+export async function fetchBoard(id: string, before: string | null, request: Fetcher = fetch): Promise<BoardRead> {
   try {
     const query = before === null ? '' : `?before=${encodeURIComponent(before)}`;
     const response = await request(`${root(id)}/board${query}`, { cache: 'no-store' });
-    if (response.status !== 200) return null;
+    if (response.status === 429) return { kind: 'busy' };
+    if (response.status !== 200) return { kind: 'failed' };
     const body = await readJson(response);
-    return isBoardPage(body) ? body.asks : null;
+    return isBoardPage(body) ? { kind: 'page', asks: body.asks } : { kind: 'failed' };
   } catch {
-    return null;
+    return { kind: 'failed' };
   }
 }
 
@@ -343,7 +356,7 @@ export const NOTICE_TEXT: Record<Exclude<Notice, 'bad' | 'unreachable'>, string>
 
 export const UNREACHABLE_TEXT = 'The campaign could not be reached. Nothing was sent.';
 
-export type Panel = 'connect' | 'checking' | 'ready' | 'signing' | 'screening' | 'decided' | 'unreachable';
+export type Panel = 'connect' | 'checking' | 'ready' | 'signing' | 'screening' | 'decided' | 'refused' | 'unreachable';
 
 export interface PanelInput {
   connected: boolean;
@@ -354,6 +367,8 @@ export interface PanelInput {
   signing: boolean;
   /** The ask was accepted by the route, and the lookup has not yet returned it. */
   sent: boolean;
+  /** The route refused the ask, or the wallet answered in a way that cannot be sent: a refusal is showing. */
+  refused: boolean;
   /** The lookup failed, or the last request could not be made. */
   unreachable: boolean;
 }
@@ -364,23 +379,71 @@ export function choosePanel(input: PanelInput): Panel {
   if (input.ask !== null) return input.ask.status === 'queued' || input.ask.status === 'screening' ? 'screening' : 'decided';
   if (input.signing) return 'signing';
   if (input.sent) return 'screening';
+  if (input.refused) return 'refused';
   if (input.unreachable) return 'unreachable';
   if (input.looking) return 'checking';
   return 'ready';
 }
 
-export type ReadyVariant = 'open' | 'closed' | 'full';
+export type ReadyVariant = 'open' | 'closed' | 'full' | 'stopped';
 
-/** What the ready state offers: the sign button, a closed message in its place, or the button with a full-slots warning. */
+/**
+ * What the ready state offers: the sign button, or no button when the campaign is closed, has no slot left, or has taken
+ * every request it will take. Slots are checked first, so a campaign with neither left says its slots are gone.
+ */
 export function readyVariant(campaign: CampaignView, now: number): ReadyVariant {
   if (!isAcceptingAsks(campaign, now)) return 'closed';
-  return campaign.counts.slotsLeft === 0 ? 'full' : 'open';
+  if (campaign.counts.slotsLeft === 0) return 'full';
+  return campaign.counts.asksLeft === 0 ? 'stopped' : 'open';
 }
 
 export const READY_TEXT = {
   closed: 'This campaign is closed.',
   full: 'Every slot is taken. You can still ask, and Thuli will still decide, but no reward is left.',
 } as const;
+
+export type RefusalKind = 'stopped' | 'full' | 'ceiling' | 'contract';
+
+/**
+ * The wait to tell a visitor when the day's ceiling is used, from the seconds in Retry-After: whole hours from one hour
+ * up, five-minute steps below it. A header that is missing, not a whole positive number, or an HTTP date reads as no
+ * usable header, because the route only ever sends seconds.
+ */
+export function ceilingWords(retryAfter: string | null): string {
+  const text = retryAfter === null ? '' : retryAfter.trim();
+  const seconds = /^\d+$/.test(text) ? Number(text) : 0;
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return 'Try again tomorrow.';
+  if (seconds < 3600) return `Try again in about ${Math.ceil(Math.ceil(seconds / 60) / 5) * 5} minutes.`;
+  const hours = Math.ceil(seconds / 3600);
+  return hours === 1 ? 'Try again in about 1 hour.' : `Try again in about ${hours} hours.`;
+}
+
+/** The heading and body of a refusal that stands in place of the ask. Only the day's ceiling needs Retry-After. */
+export function refusalWords(kind: RefusalKind, retryAfter: string | null = null): { heading: string; body: string } {
+  switch (kind) {
+    case 'stopped':
+      return { heading: 'This campaign has stopped taking requests', body: 'It has screened as many wallets as it set out to. No new request can be sent.' };
+    case 'full':
+      return { heading: 'This campaign is full', body: 'Your request was not taken, and nothing was spent. Signing a message costs nothing.' };
+    case 'ceiling':
+      return { heading: 'Thuli has taken all the requests it screens in a day', body: ceilingWords(retryAfter) };
+    case 'contract':
+      return {
+        heading: 'This looks like a smart contract wallet',
+        body: 'Wallets that sign through a contract cannot ask yet. Ask with a wallet that signs with its own key.',
+      };
+  }
+}
+
+/** How long a route is left alone after it answered 429. */
+export const SLOWED_POLL_MILLISECONDS = 30_000;
+
+export const SLOWED_LINE = 'Updates are paused for a moment.';
+
+/** The wait before the next read of a route: the usual one, or 30 seconds after a 429, never shorter than the usual. */
+export function pollDelay(normalMilliseconds: number, slowed: boolean): number {
+  return slowed ? Math.max(normalMilliseconds, SLOWED_POLL_MILLISECONDS) : normalMilliseconds;
+}
 
 export interface Payout {
   lines: string[];

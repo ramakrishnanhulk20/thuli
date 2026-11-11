@@ -7,6 +7,14 @@ export const CAMPAIGN_ID = /^[A-Za-z0-9._-]{1,128}$/;
 export const SIGNATURE = /^0x[0-9a-fA-F]{130}$/;
 
 /**
+ * Whether what a wallet returned is one key's signature: exactly 65 bytes. A wallet that signs through a contract
+ * answers with another length, and the route cannot check that kind, so it is not sent.
+ */
+export function isOwnKeySignature(signature: string): boolean {
+  return SIGNATURE.test(signature);
+}
+
+/**
  * The exact text a wallet signs to ask to join a campaign: four lines, each ending in a newline, built the way
  * packages/core/src/ask.ts builds it. The server rebuilds this text and the signature only checks for exactly this
  * campaign, wallet and time, so the wallet is written in its checksummed spelling.
