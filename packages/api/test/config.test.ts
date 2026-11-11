@@ -94,6 +94,18 @@ describe('loadApiConfig', () => {
     expect(loadApiConfig(testnet({ WORKER_PRIVATE_KEY: '  ', PRIVATE_KEY_PATH: '/keys/x' })).network).toBe('base-sepolia');
   });
 
+  it('says this process must hold no private key, naming the variable but no value and no file, wherever the API runs (C40)', () => {
+    const { message } = configError(testnet({ WORKER_PRIVATE_KEY: WORKER_KEY }));
+    expect(message).toBe(
+      'WORKER_PRIVATE_KEY is set, and this process must hold no private key, because it serves the paid API to the internet. Start it without WORKER_PRIVATE_KEY.',
+    );
+    expect(message).not.toContain(WORKER_KEY.slice(2));
+    expect(message).not.toContain('.env');
+    expect(configError(testnet({ PAYER_PRIVATE_KEY: PAYER_KEY, WORKER_PRIVATE_KEY: WORKER_KEY })).message).toMatch(
+      /^PAYER_PRIVATE_KEY, WORKER_PRIVATE_KEY are set, and this process must hold no private key/,
+    );
+  });
+
   it('takes the payer key out of the environment, so the API started next in the same process sees none (C39)', () => {
     const env: Record<string, string | undefined> = testnet({ PAYER_PRIVATE_KEY: PAYER_KEY.slice(2) });
     expect(configError(env).message).toContain('PAYER_PRIVATE_KEY');

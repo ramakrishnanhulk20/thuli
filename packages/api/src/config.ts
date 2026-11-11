@@ -99,8 +99,10 @@ function refusePrivateKeys(env: Env): void {
     .filter((name) => PRIVATE_KEY_NAME.test(name) && read(env, name) !== undefined)
     .sort();
   if (held.length === 0) return;
+  // Names no file: the API runs on its own and inside the site, and each starts from a different environment.
+  const names = held.join(', ');
   throw new ConfigError(
-    `${held.join(', ')} ${held.length === 1 ? 'is' : 'are'} set, and the paid API must hold no private key. Start it with its own env file (.env.api, see .env.api.example), which names no key.`,
+    `${names} ${held.length === 1 ? 'is' : 'are'} set, and this process must hold no private key, because it serves the paid API to the internet. Start it without ${names}.`,
   );
 }
 
