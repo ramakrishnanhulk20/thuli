@@ -55,27 +55,47 @@ const TIMED_OUT = Symbol('timed out');
 
 /**
  * Runs one step, waiting at most its limit. A step that throws or runs out of time is reported, never thrown, so one
- * failing step cannot stop the others. A step left running past its limit can do no harm when it lands late: the ask or
- * relay it holds stays leased until its lease runs out, and each store write checks the state it expects first.
+ * failing step cannot stop the others. At the limit the step's signal is aborted and the step stops at its next check,
+ * before any further store write, signature or send (C41); what it held stays leased until its lease runs out.
  */
-async function bounded<T>(deps: WorkerDeps, name: StepName, label: string, work: () => Promise<T>): Promise<T | StepFailure> {
+async function bounded<T>(
+  deps: WorkerDeps,
+  name: StepName,
+  label: string,
+  work: (signal: AbortSignal) => Promise<T>,
+): Promise<T | StepFailure> {
   const limit = deps.timeouts?.[name] ?? STEP_TIMEOUTS_MS[name];
+  // Aborted at the limit, so the step itself stops: every step checks it before each store write, signature and send.
+  const stop = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeUp = new Promise<typeof TIMED_OUT>((resolve) => {
-    timer = setTimeout(() => resolve(TIMED_OUT), limit);
+    timer = setTimeout(() => {
+      stop.abort();
+      resolve(TIMED_OUT);
+    }, limit);
   });
   try {
-    const result = await Promise.race([work(), timeUp]);
-    if (result !== TIMED_OUT) return result;
-    deps.log(`${label}: stopped waiting after ${limit / 1000} s; whatever it held is tried again when its lease runs out`);
+    const result = await Promise.race([work(stop.signal), timeUp]);
+    if (result !== TIMED_OUT) {
+      if (deps.memory.failing.delete(label)) deps.log(`${label}: working again`);
+      return result;
+    }
+    noteFailure(deps, label, `stopped waiting after ${limit / 1000} s; whatever it held is tried again when its lease runs out`);
     return { kind: 'timed-out', afterMs: limit };
   } catch (error) {
     const cause = safeCause(error);
-    deps.log(`${label}: failed, ${cause}`);
+    noteFailure(deps, label, `failed, ${cause}`);
     return { kind: 'failed', cause };
   } finally {
     clearTimeout(timer);
   }
+}
+
+// A step that fails the same way on every run is logged once, then again only when its cause changes or clears.
+function noteFailure(deps: WorkerDeps, label: string, line: string): void {
+  if (deps.memory.failing.get(label) === line) return;
+  deps.memory.failing.set(label, line);
+  deps.log(`${label}: ${line}`);
 }
 
 // A reason to wait is logged when it changes, so a quiet campaign does not write the same line every five seconds. Each
@@ -102,12 +122,12 @@ async function campaignSteps(deps: WorkerDeps, campaign: Campaign): Promise<Camp
   }
   noteWaiting(deps, id, '', { kind: 'ready' });
   const report: CampaignReport = { campaignId: id, reconcile: NOT_RUN, activate: NOT_RUN, publish: NOT_RUN };
-  report.reconcile = await bounded(deps, 'reconcile', `reconcile ${id}`, () => reconcileCheck(deps, id));
+  report.reconcile = await bounded(deps, 'reconcile', `reconcile ${id}`, (signal) => reconcileCheck(deps, id, signal));
   noteWaiting(deps, id, 'reconcile', report.reconcile);
   if (report.reconcile.kind !== 'reconciled') return report;
-  report.activate = await bounded(deps, 'activate', `activate ${id}`, () => activateCheck(deps, id));
+  report.activate = await bounded(deps, 'activate', `activate ${id}`, (signal) => activateCheck(deps, id, signal));
   noteWaiting(deps, id, 'activate', report.activate);
-  report.publish = await bounded(deps, 'publish', `publish ${id}`, () => publishCheck(deps, id));
+  report.publish = await bounded(deps, 'publish', `publish ${id}`, (signal) => publishCheck(deps, id, signal));
   noteWaiting(deps, id, 'publish', report.publish);
   return report;
 }
@@ -130,7 +150,7 @@ async function campaignSteps(deps: WorkerDeps, campaign: Campaign): Promise<Camp
  */
 export async function runOnce(deps: WorkerDeps, signal?: AbortSignal): Promise<RunReport> {
   const report: RunReport = { screen: NOT_RUN, campaigns: NOT_RUN, relay: NOT_RUN };
-  report.screen = await bounded(deps, 'screen', 'screen', () => screenNextAsk(deps));
+  report.screen = await bounded(deps, 'screen', 'screen', (signal) => screenNextAsk(deps, signal));
   if (stopped(signal)) return report;
   const open = await bounded(deps, 'campaigns', 'campaigns', () => openCampaigns(deps.db, deps.now()));
   if (Array.isArray(open)) {
@@ -144,7 +164,7 @@ export async function runOnce(deps: WorkerDeps, signal?: AbortSignal): Promise<R
     report.campaigns = open;
   }
   if (stopped(signal)) return report;
-  report.relay = await bounded(deps, 'relay', 'relay', () => relayNext(deps));
+  report.relay = await bounded(deps, 'relay', 'relay', (signal) => relayNext(deps, signal));
   return report;
 }
 

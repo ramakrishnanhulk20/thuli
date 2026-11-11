@@ -11,12 +11,15 @@ import {
   type RelayStatus,
 } from '@thuli/store';
 import { claimTicket } from '../vault/claimList.ts';
-import { readPublishedList } from '../vault/root.ts';
+import { readPublishedList, RootError } from '../vault/root.ts';
 import { retryDelaySeconds } from './screen.ts';
-import { campaignHere, campaignMemory, safeCause, type ChainDeps } from './vault.ts';
+import { campaignHere, campaignMemory, checkpoint, safeCause, StepStopped, type ChainDeps } from './vault.ts';
 
 /** How long one worker holds a relay: above the 180 second receipt wait, so a claim in flight is never taken twice. */
 export const RELAY_LEASE_SECONDS = 300;
+
+/** Why activateCheck waits: a paused vault answers every claim and every claimable() with nothing. */
+export const PAUSED_VAULT = 'the vault is paused';
 
 export type ActivateOutcome =
   | { kind: 'skipped'; reason: string }
@@ -41,18 +44,22 @@ export type RelayOutcome =
  * Makes a posted list version active once the vault pays it, then queues a relay for every wallet on the active list
  * that the vault still owes. A posted version becomes active only when the vault's own clock has reached its claimable
  * time and the vault's active root is that version's root, so the store never calls a list active that the vault does
- * not pay. A wallet is queued only when claimable(account, cumulativeAmount) is above zero, so a wallet already paid,
- * under this version or an earlier one, gets no relay (C27). Relays are queued once per version in this process;
- * queueRelays leaves existing rows alone, so a restart that queues again adds nothing.
+ * not pay. While the vault is paused nothing is marked or queued (PAUSED_VAULT), because a paused vault answers 0 for
+ * every claimable(). Owed is the wallet's listed cumulative amount less claimed(wallet), all read at the block the roots
+ * were read at, and a wallet is queued when that is above zero, so a wallet paid in full, under this version or an
+ * earlier one, gets no relay, and one paid in part is relayed for the rest (C27, C44). The version is marked queued in
+ * this process only after a successful queue on an unpaused read; queueRelays leaves existing rows alone, so a restart
+ * that queues again adds nothing.
  *
  * @returns queued with what was owed and added, or skipped with the reason.
  * @throws RootError, StoreError or a chain error when a read fails or the active list's text is not a published list.
  */
-export async function activateCheck(deps: ChainDeps, campaignId: string): Promise<ActivateOutcome> {
+export async function activateCheck(deps: ChainDeps, campaignId: string, signal?: AbortSignal): Promise<ActivateOutcome> {
   const here = await campaignHere(deps, campaignId);
   if (!here.ok) return { kind: 'skipped', reason: here.reason };
   const vault = parseAddress(here.campaign.vault);
   const roots = await deps.chain.roots(vault);
+  if (roots.paused) return { kind: 'skipped', reason: PAUSED_VAULT };
 
   const due = (await listVersions(deps.db, campaignId))
     .filter((version) => version.status === 'posted' && version.root === roots.activeRoot)
@@ -60,6 +67,7 @@ export async function activateCheck(deps: ChainDeps, campaignId: string): Promis
     .at(-1);
   let activated = false;
   if (due !== undefined) {
+    checkpoint(signal, 'marking a list active');
     activated = await markListActive(deps.db, campaignId, due.version);
     if (activated) deps.log(`activate ${campaignId}: list version ${due.version} is the root the vault pays now`);
   }
@@ -73,8 +81,10 @@ export async function activateCheck(deps: ChainDeps, campaignId: string): Promis
   const text = await listText(deps.db, campaignId, active.version);
   if (text === null) return { kind: 'skipped', reason: `list version ${active.version} has no published text` };
   const entries = readPublishedList(text);
-  const claimable = await deps.chain.claimableOf(vault, entries, roots.blockNumber);
-  const owed = entries.filter((_, index) => (claimable[index] ?? 0n) > 0n);
+  const claimed = await deps.chain.claimedOf(vault, entries.map((entry) => parseAddress(entry.account)), roots.blockNumber);
+  if (claimed.length !== entries.length) throw new RootError('the vault read did not answer claimed() for every listed wallet');
+  const owed = entries.filter((entry, index) => entry.cumulativeAmount > (claimed[index] as bigint));
+  checkpoint(signal, 'queueing relays');
   const added = await queueRelays(
     deps.db,
     campaignId,
@@ -102,13 +112,15 @@ export async function activateCheck(deps: ChainDeps, campaignId: string): Promis
  * @returns idle when no relay is waiting; relayed with the status the store recorded and the cause in fixed words.
  * @throws StoreError only when the store cannot hand out or record a relay at all.
  */
-export async function relayNext(deps: ChainDeps): Promise<RelayOutcome> {
+export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<RelayOutcome> {
+  checkpoint(signal, 'taking a relay');
   const relay = await takeRelay(deps.db, deps.now(), RELAY_LEASE_SECONDS);
   if (relay === null) return { kind: 'idle' };
   const key = { campaignId: relay.campaignId, wallet: relay.wallet, version: relay.version };
   let tx: Hash | null = null;
   let gasUsed: bigint | null = null;
   const finish = async (status: RelayStatus, cause: string): Promise<RelayOutcome> => {
+    checkpoint(signal, 'recording a relay');
     const wait = status === 'pending' ? retryDelaySeconds(relay.attempts) : undefined;
     const stored = await markRelay(deps.db, key, { status, retryAfterSeconds: wait }, deps.now());
     const retryAfterSeconds = stored === 'pending' && wait !== undefined ? wait : null;
@@ -134,13 +146,17 @@ export async function relayNext(deps: ChainDeps): Promise<RelayOutcome> {
       if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet');
       return finish('pending', `the claim would revert with ${simulated.error}`);
     }
+    checkpoint(signal, 'sending a claim');
     tx = await deps.chain.sendClaim(vault, ticket);
+    checkpoint(signal, 'recording a sent claim');
     await markRelay(deps.db, key, { status: 'sent', tx: tx.toLowerCase() }, deps.now());
     const receipt = await deps.chain.confirmClaim(tx);
     gasUsed = receipt.gasUsed;
     if (!receipt.ok) return finish('pending', `claim ${tx} reverted on chain`);
     return finish('confirmed', `claimed ${ticket.cumulativeAmount} cumulative base units in ${tx} (gas ${receipt.gasUsed})`);
   } catch (error) {
+    // A stopped step writes nothing more: the relay stays leased and is taken again once its lease runs out (C41).
+    if (error instanceof StepStopped) throw error;
     return finish('pending', safeCause(error));
   }
 }

@@ -25,6 +25,7 @@ import {
 import { decideWallet, OutOfCredit, type DecideDeps, type DecisionRecord } from '../replay/decide.ts';
 import { inSingleScope, MAX_SERV_CALLS_PER_SCREEN, SCREEN_CAUSES, SCREEN_TIME_LIMIT_MS, servBudget } from '../screen/single.ts';
 import { askFactsOf, campaignFacts, campaignSettings, familyAddressesToCheck } from './facts.ts';
+import { checkpoint } from './vault.ts';
 
 /** How long one worker holds an ask: above SCREEN_TIME_LIMIT_MS, so a live screening never loses its ask midway. */
 export const ASK_LEASE_SECONDS = 300;
@@ -53,6 +54,13 @@ export function retryDelaySeconds(attempt: number): number {
  * with more is refused rather than counted short, so the screening is tried again and held at the last attempt (C41).
  */
 export const MAX_FAMILY_LOOKUPS = 1_000;
+/**
+ * Tries of one ask on which an answer the output checks refused counts as a failed try, given back with the usual wait,
+ * rather than stored as the code-written hold. Measured on the ROBO replay: 6 of 8 sampled stored holds of this kind did
+ * not come back when the same wallet was asked again, so a refusal is usually a one-off. From this try on the hold is
+ * stored. A retry takes the same ceiling and the same checks, so it can never approve what they would not (C11, C13).
+ */
+export const REFUSED_ANSWER_TRIES = 3;
 
 /** Every cause an undecided ask can carry. Fixed words, so nothing from the chain, SERV or the store reaches a log (C40). */
 export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
@@ -62,6 +70,7 @@ export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
   settings: 'the campaign settings are not valid',
   links: 'the campaign funder records could not be read',
   family: 'the linked family has more funders than one screening looks up',
+  refused: 'the answer was refused by the output checks',
   store: 'the decision could not be stored',
 });
 
@@ -152,7 +161,13 @@ async function decideOnce(wallet: Address, facts: Facts, settings: Settings, ser
   return record;
 }
 
-async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps): Promise<AskDecision> {
+/** A decision for decideAsk, and whether it is the code-written hold the output checks put in place of a refused answer. */
+interface Screened {
+  decision: AskDecision;
+  refused: boolean;
+}
+
+async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps): Promise<Screened> {
   const campaign = await getCampaign(deps.db, taken.campaignId);
   if (campaign === null) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.noCampaign);
   if (campaign.rulebook !== CURRENT_RULEBOOK) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.rulebook);
@@ -169,7 +184,7 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps):
     CAMPAIGN_SCREEN_CAUSES.links,
   );
   const record = await decideOnce(taken.wallet, facts, settings, serv);
-  return {
+  const decision: AskDecision = {
     campaignId: taken.campaignId,
     wallet: taken.wallet,
     action: record.action,
@@ -182,10 +197,13 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps):
     facts: askFactsOf(facts),
     servRequestId: record.requestId,
   };
+  // Not every answer the checks replace is refused: a burst wallet's partial and a start a shared funder alone cannot
+  // hold are the code's own outcomes. Only the hold written in place of a refused answer is.
+  return { decision, refused: !record.accepted && record.action === 'hold' && record.rule === 'A1' };
 }
 
 /** The whole screening of one ask, held to the single screening's call cap and time limit (C26, C41). */
-async function decisionInTime(taken: TakenAsk, deps: ScreenDeps): Promise<AskDecision> {
+async function decisionInTime(taken: TakenAsk, deps: ScreenDeps): Promise<Screened> {
   const budget = servBudget(deps.serv, MAX_SERV_CALLS_PER_SCREEN);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeUp = new Promise<never>((_, reject) => {
@@ -201,7 +219,8 @@ async function decisionInTime(taken: TakenAsk, deps: ScreenDeps): Promise<AskDec
   }
 }
 
-async function release(taken: TakenAsk, cause: string, deps: ScreenDeps): Promise<ScreenOutcome> {
+async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal: AbortSignal | undefined): Promise<ScreenOutcome> {
+  checkpoint(signal, 'giving an ask back');
   const wait = retryDelaySeconds(taken.attempts);
   const status = await releaseAsk(deps.db, taken.campaignId, taken.wallet, deps.now(), MAX_ASK_ATTEMPTS, wait);
   const after =
@@ -225,27 +244,33 @@ async function release(taken: TakenAsk, cause: string, deps: ScreenDeps): Promis
  * CURRENT_RULEBOOK, settings that are not valid, facts that cannot be read, no answer from SERV, SERV out of credit, the
  * call cap, the time limit, or a decision the store refuses all give the ask back with releaseAsk: queued again below
  * MAX_ASK_ATTEMPTS, not to be taken before retryDelaySeconds for its attempt has passed, and held for review with rule
- * A1 at it (C11, C41). An answer the checks refuse is itself a hold with rule
- * A1, and is stored as one. No path gives a slot to an ask whose screening failed.
+ * A1 at it (C11, C41). An answer the checks refuse is a hold with rule A1; on the first REFUSED_ANSWER_TRIES tries of
+ * the ask it is given back like a failed try, and from then on it is stored as the hold. No path gives a slot to an ask
+ * whose screening failed. The step's signal is checked before every store write, so a step stopped at its limit takes
+ * no ask and writes no decision (C41).
  *
  * @returns idle when no ask is waiting; decided with the slot given, if any; released with the fixed cause; dropped
  *   when another worker decided the ask first.
  * @throws StoreError only when the store cannot hand out or give back an ask at all.
  */
-export async function screenNextAsk(deps: ScreenDeps): Promise<ScreenOutcome> {
+export async function screenNextAsk(deps: ScreenDeps, signal?: AbortSignal): Promise<ScreenOutcome> {
+  checkpoint(signal, 'taking an ask');
   const taken = await takeAsk(deps.db, deps.now(), ASK_LEASE_SECONDS, MAX_ASK_ATTEMPTS);
   if (taken === null) return { kind: 'idle' };
-  let decision: AskDecision;
+  let screened: Screened;
   try {
-    decision = await decisionInTime(taken, deps);
+    screened = await decisionInTime(taken, deps);
   } catch (error) {
-    return release(taken, causeOf(error), deps);
+    return release(taken, causeOf(error), deps, signal);
   }
+  if (screened.refused && taken.attempts < REFUSED_ANSWER_TRIES) return release(taken, CAMPAIGN_SCREEN_CAUSES.refused, deps, signal);
+  const { decision } = screened;
+  checkpoint(signal, 'storing a decision');
   let placed: { slot: number | null } | null;
   try {
     placed = await decideAsk(deps.db, decision, deps.now());
   } catch {
-    return release(taken, CAMPAIGN_SCREEN_CAUSES.store, deps);
+    return release(taken, CAMPAIGN_SCREEN_CAUSES.store, deps, signal);
   }
   if (placed === null) {
     deps.log(`screen ${taken.campaignId} ${taken.wallet}: another worker decided this ask first`);

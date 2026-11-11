@@ -2,8 +2,9 @@
 // the real decision path with live SERV, each first funder classified from its own nonce and code on Ethereum, the
 // approved wallets take the campaign's three slots, the list goes to a vault made by the real factory, the fork's clock
 // moves past the root delay, and the worker submits each claim. Then, on a second campaign whose asks a stand-in
-// screens, the owner cancels a pending list and the worker is stopped between a post and its record, to show it picks
-// up where the vault stands.
+// screens: a post the worker sent but never recorded is cancelled by the owner and never sent again; a publish that
+// stalls and is aborted sends nothing after a newer list is posted; and the owner pauses the vault across a list's
+// activation, after which every listed wallet is paid exactly its amount.
 //
 //   npm run rehearse:campaign
 //
@@ -65,6 +66,7 @@ import {
 import { readFactoryRecord, scrubber } from '../src/campaign/config.ts';
 import { runOnce, type RunReport, type WorkerDeps } from '../src/campaign/loop.ts';
 import { CANCEL_MARGIN_SECONDS, CANCELLED_LIST, publishCheck } from '../src/campaign/publish.ts';
+import { PAUSED_VAULT } from '../src/campaign/relay.ts';
 import { activateCheck, relayNext, type RelayOutcome } from '../src/campaign/relay.ts';
 import { screenNextAsk } from '../src/campaign/screen.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
@@ -91,10 +93,10 @@ const DEPOSIT = REWARD * BigInt(SLOTS);
 const ROOT_DELAY = 3600;
 const CAMPAIGN_DAYS = 7;
 const CAMPAIGN_ID = 'fork-rehearsal';
-// The second campaign, for the restart and cancel proofs: two slots, so it can take one wallet, lose that list to the
-// owner's cancel, then take another and post a new one.
+// The second campaign, for the restart, cancel, stall and pause proofs: three slots, so it can take one wallet and lose
+// that list to the owner's cancel, take a second whose post stalls and is aborted, then a third, and pay all three.
 const CAMPAIGN_B = 'fork-rehearsal-restarts';
-const SLOTS_B = 2;
+const SLOTS_B = 3;
 const DEPOSIT_B = REWARD * BigInt(SLOTS_B);
 const SETTINGS = { groupMinSize: 2, funderFanoutMin: 2 };
 /** The live budget: one screening for each of the six asks, with none spare. */
@@ -583,62 +585,109 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
       return asker;
     };
     const reportFor = (run: RunReport) => (Array.isArray(run.campaigns) ? run.campaigns.find((one) => one.campaignId === CAMPAIGN_B) : undefined);
-    const statusesB = async () => (await listVersions(store, CAMPAIGN_B)).map((version) => version.status).join(', ');
+    const versionsOfB = () => listVersions(store, CAMPAIGN_B);
+    const statusesB = async () => (await versionsOfB()).map((version) => version.status).join(', ');
     const agentNonce = () => publicClient.getTransactionCount({ address: agent.account.address });
+    const ownerCalls = async (functionName: 'cancelRoot' | 'pause' | 'unpause') => {
+      const call = await publicClient.simulateContract({ address: second.vault, abi: VAULT_ABI, functionName, account: owner.account });
+      await confirm(publicClient, await owner.writeContract(call.request), owner.account.address);
+      say(`  the owner called ${functionName} on the vault of ${CAMPAIGN_B}`);
+    };
+    const moveClock = async (seconds: number, why: string) => {
+      await test.increaseTime({ seconds });
+      await test.mine({ blocks: 1 });
+      say(`  evm_increaseTime ${seconds} seconds and evm_mine, ${why}`);
+    };
 
+    say('\n  (i) a post sent but never recorded, then the owner cancels it');
     const firstB = await askB(askKeysB[0] as Hex);
-    const posting = reportFor(await runOnce(standIn));
-    check(posting?.publish.kind === 'posted', `${CAMPAIGN_B}: the first list is posted (${posting?.publish.kind ?? '?'})`);
-    const cancel = await publicClient.simulateContract({ address: second.vault, abi: VAULT_ABI, functionName: 'cancelRoot', account: owner.account });
-    await confirm(publicClient, await owner.writeContract(cancel.request), owner.account.address);
-    say(`  the owner cancelled the pending root of ${CAMPAIGN_B} with cancelRoot`);
-    // A read inside the margin after a post never proves a cancel, so the fork's clock moves past it.
-    await test.increaseTime({ seconds: CANCEL_MARGIN_SECONDS });
-    await test.mine({ blocks: 1 });
-    say(`  evm_increaseTime ${CANCEL_MARGIN_SECONDS} seconds and evm_mine, past the cancel margin`);
-    const beforeCancelRuns = await agentNonce();
-    const afterCancel = reportFor(await runOnce(standIn));
-    const laterRun = reportFor(await runOnce(standIn));
-    const cancelSeen = afterCancel?.reconcile.kind === 'reconciled' && afterCancel.reconcile.cancelled.join() === '1';
-    check(cancelSeen, `${CAMPAIGN_B}: the next run marked list version 1 cancelled (versions: ${await statusesB()})`);
-    const leftAlone = [afterCancel, laterRun].every((run) => run?.publish.kind === 'skipped' && run.publish.reason === CANCELLED_LIST);
-    check(leftAlone && (await agentNonce()) === beforeCancelRuns, `${CAMPAIGN_B}: that run and the next posted nothing: "${CANCELLED_LIST}"`);
-
-    const secondB = await askB(askKeysB[1] as Hex);
-    const stopping = {
+    const stopsAfterSending: WorkerDeps = {
       ...standIn,
       chain: {
         ...standIn.chain,
-        sendPostRoot: async (...args: Parameters<WorkerDeps['chain']['sendPostRoot']>) => {
-          await standIn.chain.sendPostRoot(...args);
-          throw new RehearsalError('the worker stopped after the post was mined and before it was recorded');
+        broadcast: async (signed) => {
+          await standIn.chain.broadcast(signed);
+          throw new RehearsalError('the worker stopped after sending the post and before recording it');
         },
       },
     };
-    let stoppedMidway = false;
+    let stoppedAfterSending = false;
     try {
-      await publishCheck(stopping, CAMPAIGN_B);
+      await publishCheck(stopsAfterSending, CAMPAIGN_B);
     } catch (error) {
-      stoppedMidway = error instanceof RehearsalError;
+      stoppedAfterSending = error instanceof RehearsalError;
     }
-    const statusesStopped = await statusesB();
-    check(stoppedMidway && statusesStopped === 'cancelled, built', `${CAMPAIGN_B}: stopped between post and record (versions: ${statusesStopped})`);
-    const restarted = { ...standIn, memory: emptyChainMemory() };
-    const recovered = reportFor(await runOnce(restarted));
-    const recordedPosted = recovered?.reconcile.kind === 'reconciled' && recovered.reconcile.posted.join() === '2';
-    check(recordedPosted, `${CAMPAIGN_B}: after the restart, reconcile recorded list version 2 as posted (versions: ${await statusesB()})`);
-    check(recovered?.publish.kind === 'skipped', `${CAMPAIGN_B}: and publish sent nothing (${recovered?.publish.kind === 'skipped' ? recovered.publish.reason : '?'})`);
-    await test.increaseTime({ seconds: ROOT_DELAY });
-    await test.mine({ blocks: 1 });
-    for (let run = 0; run < 4; run += 1) await runOnce(restarted);
-    const versionsB = await listVersions(store, CAMPAIGN_B);
+    const [unrecorded] = await versionsOfB();
+    check(stoppedAfterSending && unrecorded?.status === 'sending', `${CAMPAIGN_B}: stopped after the send, list version 1 is recorded as sending (${await statusesB()})`);
+    // The send returns before the fork mines it, and the owner cancels a root they can see pending.
+    await publicClient.waitForTransactionReceipt({ hash: unrecorded?.postTx as `0x${string}`, timeout: 60_000 });
+    await ownerCalls('cancelRoot');
+    await moveClock(CANCEL_MARGIN_SECONDS, 'past the cancel margin');
+    const restarted: WorkerDeps = { ...standIn, memory: emptyChainMemory() };
+    const beforeCancelRuns = await agentNonce();
+    const afterCancel = reportFor(await runOnce(restarted));
+    const laterRun = reportFor(await runOnce(restarted));
+    const settled = afterCancel?.reconcile.kind === 'reconciled' && afterCancel.reconcile.posted.join() === '1' && afterCancel.reconcile.cancelled.join() === '1';
+    check(settled, `${CAMPAIGN_B}: after a restart, reconcile settled version 1 from its receipt and recorded the owner's cancel (${await statusesB()})`);
+    const leftAlone = [afterCancel, laterRun].every((run) => run?.publish.kind === 'skipped' && run.publish.reason === CANCELLED_LIST);
+    check(leftAlone && (await agentNonce()) === beforeCancelRuns, `${CAMPAIGN_B}: neither run posted it again: "${CANCELLED_LIST}"`);
+
+    say('\n  (iii) a publish that stalls before signing is aborted, and a newer list is posted meanwhile');
+    const secondB = await askB(askKeysB[1] as Hex);
+    let openGate: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    let stalledSends = 0;
+    const stalls: WorkerDeps = {
+      ...restarted,
+      chain: {
+        ...restarted.chain,
+        signPostRoot: async (...args) => {
+          await gate;
+          return restarted.chain.signPostRoot(...args);
+        },
+        broadcast: async (signed) => {
+          stalledSends += 1;
+          return restarted.chain.broadcast(signed);
+        },
+      },
+      timeouts: { publish: 2_000 },
+    };
+    const stalled = reportFor(await runOnce(stalls));
+    check(stalled?.publish.kind === 'timed-out', `${CAMPAIGN_B}: the publish for 2 wallets stalled and was stopped at its limit (${stalled?.publish.kind ?? '?'})`);
+    const thirdB = await askB(askKeysB[2] as Hex);
+    const newer = reportFor(await runOnce(restarted));
+    check(newer?.publish.kind === 'posted', `${CAMPAIGN_B}: a newer list for 3 wallets was posted (${newer?.publish.kind ?? '?'})`);
+    const afterNewer = await agentNonce();
+    openGate();
+    await wait(3_000);
+    const versionsNow = await versionsOfB();
+    const stalledRoot = versionsNow.find((version) => version.version === 2)?.root ?? '';
+    const newerRoot = versionsNow.find((version) => version.version === 3)?.root ?? '';
+    const stateNow = await publicClient.readContract({ address: second.vault, abi: VAULT_ABI, functionName: 'state' });
+    check(
+      stalledSends === 0 && (await agentNonce()) === afterNewer && stateNow.pendingRoot.toLowerCase() === newerRoot,
+      `${CAMPAIGN_B}: once released, the stopped publish sent nothing; the vault still waits on list version 3 (${await statusesB()})`,
+    );
+
+    say('\n  (ii) the owner pauses the vault across the activation of list version 3');
+    await moveClock(ROOT_DELAY, 'past the root delay');
+    await ownerCalls('pause');
+    const whilePaused = reportFor(await runOnce(restarted));
+    check(
+      whilePaused?.activate.kind === 'skipped' && whilePaused.activate.reason === PAUSED_VAULT && (await statusesB()) === 'cancelled, cancelled, posted',
+      `${CAMPAIGN_B}: while paused, activate marked nothing and queued nothing ("${PAUSED_VAULT}")`,
+    );
+    await ownerCalls('unpause');
+    for (let run = 0; run < 2 + SLOTS_B; run += 1) await runOnce(restarted);
     const stateB = await publicClient.readContract({ address: second.vault, abi: VAULT_ABI, functionName: 'state' });
-    say(`  ${CAMPAIGN_B}: versions ${versionsB.map((version) => `${version.version} ${version.status}`).join(', ')}; totalPaid ${usdc(stateB.totalPaid)}`);
-    for (const asker of [firstB, secondB]) {
+    say(`  ${CAMPAIGN_B}: versions ${versionsNow.map((version) => version.version).join(', ')} now ${await statusesB()}; totalPaid ${usdc(stateB.totalPaid)}`);
+    for (const asker of [firstB, secondB, thirdB]) {
       const received = await balance(asker);
-      check(received === REWARD, `${CAMPAIGN_B}: ${asker} received exactly ${usdc(REWARD)} (got ${usdc(received)})`);
+      check(received === REWARD, `${CAMPAIGN_B}: ${asker} received exactly ${usdc(REWARD)} after the unpause (got ${usdc(received)})`);
     }
-    check(stateB.totalPaid === DEPOSIT_B && (await statusesB()) === 'cancelled, active', `${CAMPAIGN_B}: list version 2 is active and paid ${usdc(stateB.totalPaid)}`);
+    check(stateB.totalPaid === DEPOSIT_B && (await statusesB()) === 'cancelled, cancelled, active', `${CAMPAIGN_B}: list version 3 is active and paid ${usdc(stateB.totalPaid)}`);
 
     const latest = await publicClient.getBlockNumber({ cacheTime: 0 });
     const sent: string[] = [];
@@ -666,8 +715,10 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
     }
     const onlyPostAndClaim = sent.length > 0 && sent.every((line) => /^(postRoot|claim) to vault [AB]$/.test(line));
     check(onlyPostAndClaim, `the agent sent ${sent.length} transactions, each postRoot or claim to a campaign vault: ${sent.join(', ')}`);
-    const rootB2 = versionsB.find((version) => version.version === 2)?.root ?? '';
-    check(postsOfRoot.get(rootB2) === 1, `${CAMPAIGN_B}: list version 2's root was posted once in all, across the stop and the restart`);
+    const rootB1 = unrecorded?.root ?? '';
+    check(postsOfRoot.get(rootB1) === 1, `${CAMPAIGN_B}: list version 1's root was posted once in all, across the stop, the cancel and the restart`);
+    check(!postsOfRoot.has(stalledRoot), `${CAMPAIGN_B}: list version 2's root, from the stopped publish, was never posted`);
+    check(postsOfRoot.get(newerRoot) === 1, `${CAMPAIGN_B}: list version 3's root was posted once`);
     check([...postsOfRoot.values()].every((times) => times === 1), `every root was posted once (${postsOfRoot.size} roots)`);
     const secrets = [agentKey, ownerKey, ...askKeys, ...askKeysB].map((key) => key.slice(2).toLowerCase());
     const leaked = workerLines.some((line) => {

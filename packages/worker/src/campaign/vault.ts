@@ -1,4 +1,18 @@
-import { BaseError, ContractFunctionRevertedError, type Chain, type Hash, type PublicClient, type Transport } from 'viem';
+import {
+  BaseError,
+  ContractFunctionRevertedError,
+  encodeFunctionData,
+  keccak256,
+  parseEventLogs,
+  TransactionNotFoundError,
+  TransactionReceiptNotFoundError,
+  WaitForTransactionReceiptTimeoutError,
+  type Chain,
+  type Hash,
+  type Hex,
+  type PublicClient,
+  type Transport,
+} from 'viem';
 import { AddressError, ChainError, parseAddress, parseChain, type Address, type MerkleHash } from '@thuli/core';
 import { getCampaign, StoreError, type Campaign, type Db } from '@thuli/store';
 import { VAULT_ABI } from '../vault/abi.ts';
@@ -22,6 +36,22 @@ export interface VaultRoots {
 
 export type ClaimSimulation = { ok: true } | { ok: false; error: string };
 
+/** A postRoot transaction signed by the agent key and not yet sent, so its hash is known before any node has it. */
+export interface SignedPost {
+  hash: Hash;
+  serialized: Hex;
+}
+
+/**
+ * What the network knows of one postRoot transaction: mined, with the claimable time its own RootPosted log holds when
+ * it succeeded; pending, known to a node but not mined; or unknown, which no node has.
+ */
+export type PostReceipt =
+  | { state: 'mined'; ok: true; gasUsed: bigint; claimableAt: bigint }
+  | { state: 'mined'; ok: false; gasUsed: bigint }
+  | { state: 'pending' }
+  | { state: 'unknown' };
+
 /**
  * The campaign worker's view of a vault. Its only two writes are postRoot (sendPostRoot, from VaultPort) and claim
  * (sendClaim), both signed by the agent key, which the vault lets do nothing else (C30, C39). Everything else is a read.
@@ -29,10 +59,20 @@ export type ClaimSimulation = { ok: true } | { ok: false; error: string };
 export interface CampaignVault extends VaultPort {
   roots(vault: Address): Promise<VaultRoots>;
   /**
-   * claimable(account, cumulativeAmount) for each entry, every value read at `blockNumber`: the block roots() just
-   * reported, so what is owed is read against the same active root the caller checked.
+   * claimed(account) for each account, every value read at `blockNumber`: the block roots() just reported, so what is
+   * owed is read against the same root and the same paused flag the caller checked. claimable() is not used for this,
+   * because it answers 0 while the vault is paused, which would read as already paid.
    */
-  claimableOf(vault: Address, entries: readonly VaultEntry[], blockNumber: bigint): Promise<bigint[]>;
+  claimedOf(vault: Address, accounts: readonly Address[], blockNumber: bigint): Promise<bigint[]>;
+  /**
+   * Checks postRoot with a static call from the agent, then signs it and sends nothing, so the caller can record the
+   * hash before the network can know the transaction (C27).
+   */
+  signPostRoot(vault: Address, root: MerkleHash, declaredTotal: bigint): Promise<SignedPost>;
+  /** Sends a signed postRoot exactly as signed. */
+  broadcast(signed: SignedPost): Promise<void>;
+  /** The post's receipt, waiting up to waitMs for it to be mined; 0 looks once. */
+  postReceipt(vault: Address, root: MerkleHash, hash: Hash, waitMs: number): Promise<PostReceipt>;
   /** A static call of claim from the agent: ok, or the name of the custom error it reverted with. */
   simulateClaim(vault: Address, ticket: ClaimTicket): Promise<ClaimSimulation>;
   /** Signs and broadcasts claim(account, cumulativeAmount, proof) from the agent key, and returns its hash. */
@@ -67,22 +107,26 @@ export interface CampaignMemory {
   queued: Set<number>;
   /** The last reason each step gave for doing nothing, so the loop logs a reason once rather than every few seconds. */
   waiting: Map<string, string>;
+  /** When this process first found each sending version's transaction unknown to the network, in milliseconds. */
+  missingSince: Map<number, number>;
 }
 
 /** Kept for the life of one process only. A restart starts it empty, which costs reads and never changes an outcome. */
 export interface ChainMemory {
   campaigns: Map<string, CampaignMemory>;
+  /** The cause each step last failed with, by its log label, so a failure that repeats every run is logged once. */
+  failing: Map<string, string>;
 }
 
 export function emptyChainMemory(): ChainMemory {
-  return { campaigns: new Map() };
+  return { campaigns: new Map(), failing: new Map() };
 }
 
 /** The campaign's own memory, made empty the first time the campaign is seen. */
 export function campaignMemory(memory: ChainMemory, campaignId: string): CampaignMemory {
   let mine = memory.campaigns.get(campaignId);
   if (mine === undefined) {
-    mine = { record: null, queued: new Set(), waiting: new Map() };
+    mine = { record: null, queued: new Set(), waiting: new Map(), missingSince: new Map() };
     memory.campaigns.set(campaignId, mine);
   }
   return mine;
@@ -108,12 +152,26 @@ export async function campaignHere(
   return same ? { ok: true, campaign } : { ok: false, reason: 'the campaign vault is on another chain than this worker' };
 }
 
+/** A step that was told to stop, because it ran past its time limit. Its message is fixed words. */
+export class StepStopped extends Error {
+  override name = 'StepStopped';
+}
+
+/**
+ * Stops the step when its signal is aborted. Every step calls this before each store write and before each signature
+ * or send, so a step the loop gave up on performs nothing after its limit (C41).
+ */
+export function checkpoint(signal: AbortSignal | undefined, before: string): void {
+  if (signal?.aborted === true) throw new StepStopped(`the step ran past its time limit, so it stopped before ${before}`);
+}
+
 /**
  * An error in words safe for a log line. Thuli's own errors carry only public values; a library error can quote an RPC
  * URL, which may hold a key, so only its custom error name or its first short line is kept (C40).
  */
 export function safeCause(error: unknown): string {
   if (
+    error instanceof StepStopped ||
     error instanceof RootError ||
     error instanceof ClaimListError ||
     error instanceof StoreError ||
@@ -166,7 +224,7 @@ function revertedOnChain(error: unknown): boolean {
 }
 
 /**
- * The agent key's view of a campaign vault on `publicClient`'s chain. Reads use the latest block; claimableOf reads
+ * The agent key's view of a campaign vault on `publicClient`'s chain. Reads use the latest block; claimedOf reads
  * CLAIMED_BATCH wallets per multicall, one call at a time, so 100,000 wallets are 100 calls in a row (C41).
  */
 export function campaignVault(publicClient: PublicClient<Transport, Chain>, agent: Wallet): CampaignVault {
@@ -193,17 +251,17 @@ export function campaignVault(publicClient: PublicClient<Transport, Chain>, agen
         paused: state.paused,
       };
     },
-    async claimableOf(vault, entries, blockNumber) {
+    async claimedOf(vault, accounts, blockNumber) {
       const amounts: bigint[] = [];
-      for (let start = 0; start < entries.length; start += CLAIMED_BATCH) {
-        const batch = entries.slice(start, start + CLAIMED_BATCH);
+      for (let start = 0; start < accounts.length; start += CLAIMED_BATCH) {
+        const batch = accounts.slice(start, start + CLAIMED_BATCH);
         // batchSize 0 keeps viem from splitting the batch into calls it would send all at once.
         const results = await publicClient.multicall({
-          contracts: batch.map((entry) => ({
+          contracts: batch.map((account) => ({
             address: vault,
             abi: VAULT_ABI,
-            functionName: 'claimable' as const,
-            args: [parseAddress(entry.account), entry.cumulativeAmount] as const,
+            functionName: 'claimed' as const,
+            args: [parseAddress(account)] as const,
           })),
           allowFailure: false,
           batchSize: 0,
@@ -212,6 +270,42 @@ export function campaignVault(publicClient: PublicClient<Transport, Chain>, agen
         amounts.push(...(results as bigint[]));
       }
       return amounts;
+    },
+    async signPostRoot(vault, root, declaredTotal) {
+      // The same static call sendPostRoot makes first, so a post the vault would refuse is never signed.
+      await publicClient.simulateContract({ address: vault, abi: VAULT_ABI, functionName: 'postRoot', args: [root, declaredTotal], account: agent.account });
+      const request = await agent.prepareTransactionRequest({
+        to: vault,
+        data: encodeFunctionData({ abi: VAULT_ABI, functionName: 'postRoot', args: [root, declaredTotal] }),
+      });
+      const serialized = await agent.signTransaction(request);
+      return { hash: keccak256(serialized), serialized };
+    },
+    async broadcast(signed) {
+      const hash = await publicClient.sendRawTransaction({ serializedTransaction: signed.serialized });
+      if (hash.toLowerCase() !== signed.hash.toLowerCase()) throw new ChainCallError('the node answered with another hash than the one signed');
+    },
+    async postReceipt(vault, root, hash, waitMs) {
+      let receipt;
+      try {
+        receipt =
+          waitMs > 0 ? await publicClient.waitForTransactionReceipt({ hash, timeout: waitMs }) : await publicClient.getTransactionReceipt({ hash });
+      } catch (error) {
+        if (!(error instanceof TransactionReceiptNotFoundError || error instanceof WaitForTransactionReceiptTimeoutError)) throw error;
+        try {
+          await publicClient.getTransaction({ hash });
+          return { state: 'pending' };
+        } catch (missing) {
+          if (missing instanceof TransactionNotFoundError) return { state: 'unknown' };
+          throw missing;
+        }
+      }
+      if (receipt.status !== 'success') return { state: 'mined', ok: false, gasUsed: receipt.gasUsed };
+      const [posted] = parseEventLogs({ abi: VAULT_ABI, eventName: 'RootPosted', logs: receipt.logs }).filter(
+        (log) => parseAddress(log.address) === vault && log.args.root.toLowerCase() === root.toLowerCase(),
+      );
+      if (posted === undefined) throw new ChainCallError(`the post ${hash} succeeded with no RootPosted log for its root`);
+      return { state: 'mined', ok: true, gasUsed: receipt.gasUsed, claimableAt: BigInt(posted.args.claimableAt) };
     },
     async simulateClaim(vault, ticket) {
       try {

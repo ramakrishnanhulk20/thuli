@@ -2,17 +2,28 @@ import type { Hash } from 'viem';
 import { parseAddress, type MerkleHash } from '@thuli/core';
 import {
   addListVersion,
+  latestList,
   listText,
   listVersions,
   markListCancelled,
   markListPosted,
+  markListSending,
+  markListUnsent,
   slotHolders,
   type Campaign,
   type ListVersion,
 } from '@thuli/store';
 import { buildClaimList } from '../vault/claimList.ts';
-import { buildRoot, postRoot, publishList, readPublishedList, RootError, type CampaignRecord } from '../vault/root.ts';
-import { campaignHere, campaignMemory, NO_ROOT, NO_VAULT_BLOCK, vaultRecordFor, type ChainDeps } from './vault.ts';
+import { buildRoot, postRoot, publishList, readPublishedList, RootError, type CampaignRecord, type VaultPort } from '../vault/root.ts';
+import {
+  campaignHere,
+  campaignMemory,
+  checkpoint,
+  NO_ROOT,
+  NO_VAULT_BLOCK,
+  vaultRecordFor,
+  type ChainDeps,
+} from './vault.ts';
 
 export type PublishOutcome =
   | { kind: 'skipped'; reason: string }
@@ -29,7 +40,7 @@ export type PublishOutcome =
 
 export type ReconcileOutcome =
   | { kind: 'skipped'; reason: string }
-  | { kind: 'reconciled'; posted: number[]; cancelled: number[] };
+  | { kind: 'reconciled'; posted: number[]; cancelled: number[]; unsent: number[] };
 
 const skipped = (reason: string): PublishOutcome => ({ kind: 'skipped', reason });
 
@@ -47,6 +58,19 @@ export const UNSEEN_LIST =
  * before the delay would have ended.
  */
 export const CANCEL_MARGIN_SECONDS = 120;
+
+/** The reason publishCheck gives while a list's post is recorded as sent and not yet settled from the chain. */
+export const SENDING_LIST = 'a list is being sent to the vault; nothing more is posted until reconcile settles it from the chain';
+
+/**
+ * How long a sending version's transaction may be unknown to every node before its root is taken never to have reached
+ * the vault and the version is built again. Counted from when this process first found it missing, because a node
+ * that has not yet heard of a broadcast looks the same as one that never will.
+ */
+export const UNSENT_AFTER_SECONDS = 600;
+
+// How long publish waits for its own post to be mined before leaving the settling to reconcile.
+const RECEIPT_WAIT_MS = 180_000;
 
 // Statuses a version only reaches once its root was on the vault, so a version older than one of these may have been
 // replaced there rather than cancelled.
@@ -81,9 +105,61 @@ async function rootDelayOf(deps: ChainDeps, campaign: Campaign): Promise<bigint 
 }
 
 /**
+ * Settles a version recorded as sending from what the network knows of its transaction: mined and successful, posted
+ * with the claimable time the transaction's own RootPosted log holds, so the existing cancel rule applies to it after
+ * its margin and its root is never sent again; mined and reverted, built again; unknown to every node for
+ * UNSENT_AFTER_SECONDS, built again; still pending, left as it is. Returns false while it stays sending.
+ */
+async function settleSending(
+  deps: ChainDeps,
+  campaign: Campaign,
+  sending: ListVersion,
+  outcome: { posted: number[]; unsent: number[] },
+  signal: AbortSignal | undefined,
+): Promise<boolean> {
+  const id = campaign.id;
+  const missing = campaignMemory(deps.memory, id).missingSince;
+  if (sending.postTx === null) throw new RootError(`list version ${sending.version} is sending with no transaction on record`);
+  const hash = sending.postTx as `0x${string}`;
+  const receipt = await deps.chain.postReceipt(parseAddress(campaign.vault), sending.root as `0x${string}`, hash, 0);
+  if (receipt.state === 'pending') return false;
+  if (receipt.state === 'unknown') {
+    const now = deps.now().getTime();
+    const since = missing.get(sending.version) ?? now;
+    missing.set(sending.version, since);
+    if (now - since < UNSENT_AFTER_SECONDS * 1000) return false;
+    checkpoint(signal, 'recording a post as unsent');
+    if (await markListUnsent(deps.db, id, sending.version)) {
+      outcome.unsent.push(sending.version);
+      deps.log(`reconcile ${id}: no node knows the post ${hash} of list version ${sending.version} after ${UNSENT_AFTER_SECONDS} s, so it is built again`);
+    }
+    missing.delete(sending.version);
+    return true;
+  }
+  missing.delete(sending.version);
+  checkpoint(signal, 'recording what became of a post');
+  if (!receipt.ok) {
+    if (await markListUnsent(deps.db, id, sending.version)) {
+      outcome.unsent.push(sending.version);
+      deps.log(`reconcile ${id}: the post ${hash} of list version ${sending.version} reverted, so it is built again`);
+    }
+    return true;
+  }
+  const claimableAt = Number(receipt.claimableAt);
+  if (!(await markListPosted(deps.db, id, sending.version, { postTx: null, claimableAt }))) {
+    throw new RootError(`list version ${sending.version} could not be recorded as posted from its receipt`);
+  }
+  outcome.posted.push(sending.version);
+  deps.log(`reconcile ${id}: the post ${hash} of list version ${sending.version} is mined, so it is recorded as posted, claimable from unix ${claimableAt}`);
+  return true;
+}
+
+/**
  * Brings a campaign's list versions into line with what its vault shows at one block, so a worker stopped between any
  * two lines picks up exactly where the vault stands (C27, C32). It sends nothing, and every write checks the status it
- * expects first, so it can only move a version to a status the vault already shows:
+ * expects first, so it can only move a version to a status the vault already shows. A version recorded as sending is
+ * settled from its own transaction before anything else (settleSending), and while it cannot be, nothing else happens.
+ * Then:
  * 1. the newest version is built and its root is the vault's pending root: the post reached the chain and the worker
  *    stopped before recording it, so it is marked posted, with no transaction hash and the vault's own claimable time;
  * 2. a built version's root is the root the vault pays now: the same, found after the delay, so it is marked posted with
@@ -100,17 +176,23 @@ async function rootDelayOf(deps: ChainDeps, campaign: Campaign): Promise<bigint 
  * @returns reconciled with the versions marked posted and cancelled, or skipped with the reason.
  * @throws StoreError or a chain error when a read fails; nothing is written after a failed read.
  */
-export async function reconcileCheck(deps: ChainDeps, campaignId: string): Promise<ReconcileOutcome> {
+export async function reconcileCheck(deps: ChainDeps, campaignId: string, signal?: AbortSignal): Promise<ReconcileOutcome> {
   const here = await campaignHere(deps, campaignId);
   if (!here.ok) return { kind: 'skipped', reason: here.reason };
-  const roots = await deps.chain.roots(parseAddress(here.campaign.vault));
   const posted: number[] = [];
   const cancelled: number[] = [];
+  const unsent: number[] = [];
+  const sending = (await listVersions(deps.db, campaignId)).filter((version) => version.status === 'sending').at(-1);
+  if (sending !== undefined && !(await settleSending(deps, here.campaign, sending, { posted, unsent }, signal))) {
+    return { kind: 'reconciled', posted, cancelled, unsent };
+  }
+  const roots = await deps.chain.roots(parseAddress(here.campaign.vault));
 
   const versions = await listVersions(deps.db, campaignId);
   const newest = versions.at(-1);
   if (newest?.status === 'built' && roots.pendingRoot !== NO_ROOT && newest.root === roots.pendingRoot) {
     const claimableAt = Number(roots.pendingClaimableAt);
+    checkpoint(signal, 'recording a pending list as posted');
     if (await markListPosted(deps.db, campaignId, newest.version, { postTx: null, claimableAt })) {
       posted.push(newest.version);
       deps.log(`reconcile ${campaignId}: list version ${newest.version} is pending on the vault but was never recorded, so it is recorded as posted, claimable from unix ${claimableAt}`);
@@ -121,6 +203,7 @@ export async function reconcileCheck(deps: ChainDeps, campaignId: string): Promi
       ? undefined
       : versions.filter((version) => version.status === 'built' && version.root === roots.activeRoot).at(-1);
   if (paying !== undefined) {
+    checkpoint(signal, 'recording a paid list as posted');
     if (await markListPosted(deps.db, campaignId, paying.version, { postTx: null, claimableAt: Number(roots.timestamp) })) {
       posted.push(paying.version);
       deps.log(`reconcile ${campaignId}: list version ${paying.version} is the root the vault pays but was never recorded, so it is recorded as posted`);
@@ -130,12 +213,13 @@ export async function reconcileCheck(deps: ChainDeps, campaignId: string): Promi
   const lastPosted = newestPosted(await listVersions(deps.db, campaignId));
   const missing = lastPosted !== undefined && lastPosted.root !== roots.pendingRoot && lastPosted.root !== roots.activeRoot;
   if (missing && cancelProven(lastPosted, await rootDelayOf(deps, here.campaign), roots.timestamp)) {
+    checkpoint(signal, 'recording a cancel');
     if (await markListCancelled(deps.db, campaignId, lastPosted.version)) {
       cancelled.push(lastPosted.version);
       deps.log(`reconcile ${campaignId}: the owner cancelled list version ${lastPosted.version} on the vault, so it is recorded as cancelled`);
     }
   }
-  return { kind: 'reconciled', posted, cancelled };
+  return { kind: 'reconciled', posted, cancelled, unsent };
 }
 
 async function recordFor(deps: ChainDeps, campaign: Campaign): Promise<CampaignRecord> {
@@ -155,17 +239,81 @@ async function versionFor(
   campaignId: string,
   newest: ListVersion | undefined,
   list: { root: MerkleHash; text: string; declaredTotal: bigint },
+  signal: AbortSignal | undefined,
 ): Promise<number> {
   if (newest?.status === 'built') {
     if (newest.root === list.root) return newest.version;
+    checkpoint(signal, 'cancelling an out-of-date list');
     await markListCancelled(deps.db, campaignId, newest.version);
     deps.log(`publish ${campaignId}: list version ${newest.version} was never posted and is out of date, so it is cancelled`);
   }
+  checkpoint(signal, 'recording a new list');
   return addListVersion(
     deps.db,
     { campaignId, root: list.root, publishedList: list.text, declaredTotal: list.declaredTotal.toString() },
     deps.now(),
   );
+}
+
+interface RecordedPost {
+  claimableAt: number;
+  gasUsed: bigint;
+}
+
+/**
+ * The vault port postRoot is handed, whose one send records itself in the store before the network can know it (C27,
+ * C32). Right before signing it reads the vault and the store again and refuses when the vault has a pending root or
+ * this version is no longer the newest built one, so a step that stalled cannot post over a newer list. Then it signs,
+ * records the hash with markListSending, sends the signed bytes, waits for the receipt and records the version posted
+ * with the receipt's own claimable time, or built again when the post reverted. The step's signal is checked before
+ * every signature, store write and send; a step stopped after the send leaves the version sending, for reconcile.
+ */
+function recordedPort(
+  deps: ChainDeps,
+  campaign: Campaign,
+  version: number,
+  signal: AbortSignal | undefined,
+  result: { posted?: RecordedPost },
+): VaultPort {
+  const id = campaign.id;
+  const chain = deps.chain;
+  // Delegated one by one, not spread, so a port that keeps its methods on a prototype keeps them here too.
+  return {
+    signer: chain.signer,
+    chainId: () => chain.chainId(),
+    readSnapshot: (vault, accounts) => chain.readSnapshot(vault, accounts),
+    findVaultCreated: (factory, vault, block) => chain.findVaultCreated(factory, vault, block),
+    async sendPostRoot(vault, root, declaredTotal) {
+      checkpoint(signal, 'signing a post');
+      const roots = await deps.chain.roots(vault);
+      if (roots.pendingRoot !== NO_ROOT) throw new RootError('a root is pending on the vault, so nothing was signed');
+      const newest = await latestList(deps.db, id);
+      if (newest?.version !== version || newest.status !== 'built' || newest.root !== root) {
+        throw new RootError(`list version ${version} is no longer the newest built list, so nothing was signed`);
+      }
+      checkpoint(signal, 'signing a post');
+      const signed = await deps.chain.signPostRoot(vault, root, declaredTotal);
+      checkpoint(signal, 'recording a signed post');
+      if (!(await markListSending(deps.db, id, version, { postTx: signed.hash.toLowerCase() }, deps.now()))) {
+        throw new RootError(`list version ${version} could not be recorded as sending, so nothing was sent`);
+      }
+      checkpoint(signal, 'sending a post');
+      await deps.chain.broadcast(signed);
+      const receipt = await deps.chain.postReceipt(vault, root, signed.hash, RECEIPT_WAIT_MS);
+      if (receipt.state !== 'mined') throw new RootError(`the post ${signed.hash} is not mined yet; reconcile settles it`);
+      checkpoint(signal, 'recording a mined post');
+      if (!receipt.ok) {
+        await markListUnsent(deps.db, id, version);
+        throw new RootError(`the post ${signed.hash} reverted, so list version ${version} is built again`);
+      }
+      const claimableAt = Number(receipt.claimableAt);
+      if (!(await markListPosted(deps.db, id, version, { postTx: null, claimableAt }))) {
+        throw new RootError(`list version ${version} could not be recorded as posted`);
+      }
+      result.posted = { claimableAt, gasUsed: receipt.gasUsed };
+      return { hash: signed.hash, gasUsed: receipt.gasUsed };
+    },
+  };
 }
 
 /**
@@ -176,18 +324,19 @@ async function versionFor(
  * from the published list (C32). Every amount is cumulative and a slot is never taken back, so a wallet on two versions
  * has one entitlement, and the vault pays only what it has not paid yet (C27).
  *
- * Nothing is sent while the vault has a pending root, when the slot holders are exactly the newest posted or active
- * version, when they are exactly the newest version and the owner cancelled it (CANCELLED_LIST), or while the newest
- * posted version is missing from the read, which may be a node behind our own post (UNSEEN_LIST). postRoot then runs every check it has: the vault record matches the factory's VaultCreated log and the
- * campaign row (vaultRecordFor, verifyVault), the agent is this key, the vault is not paused and the root can activate
- * before the end, the active root rebuilds from its own published list, and the vault can pay everything both lists may
- * still owe. The version is marked posted with the transaction and the vault's own claimable time.
+ * Nothing is sent while a version is recorded as sending (SENDING_LIST), while the vault has a pending root, when the
+ * slot holders are exactly the newest posted or active version, when they are exactly the newest version and the owner
+ * cancelled it (CANCELLED_LIST), or while the newest posted version is missing from the read, which may be a node
+ * behind our own post (UNSEEN_LIST). postRoot then runs every check it has: the vault record matches the factory's
+ * VaultCreated log and the campaign row (vaultRecordFor, verifyVault), the agent is this key, the vault is not paused
+ * and the root can activate before the end, the active root rebuilds from its own published list, and the vault can
+ * pay everything both lists may still owe. The one send goes through recordedPort, which records it before sending.
  *
  * @returns posted with the transaction, or skipped with the reason nothing was sent.
  * @throws RootError, ClaimListError, StoreError or a chain error when a check refuses or a call fails. Nothing is posted
  *   after a refusal, and a version recorded before a failed post is resumed on the next call.
  */
-export async function publishCheck(deps: ChainDeps, campaignId: string): Promise<PublishOutcome> {
+export async function publishCheck(deps: ChainDeps, campaignId: string, signal?: AbortSignal): Promise<PublishOutcome> {
   const here = await campaignHere(deps, campaignId);
   if (!here.ok) return skipped(here.reason);
   const { campaign } = here;
@@ -196,6 +345,7 @@ export async function publishCheck(deps: ChainDeps, campaignId: string): Promise
 
   const holders = await slotHolders(deps.db, campaignId);
   if (holders.length === 0) return skipped('no wallet holds a slot yet');
+  if ((await listVersions(deps.db, campaignId)).some((version) => version.status === 'sending')) return skipped(SENDING_LIST);
   const roots = await deps.chain.roots(vault);
   if (roots.pendingRoot !== NO_ROOT) return skipped('a root is pending on the vault');
 
@@ -233,7 +383,7 @@ export async function publishCheck(deps: ChainDeps, campaignId: string): Promise
     activePublished = paid;
   }
 
-  const version = await versionFor(deps, campaignId, versions.at(-1), { root, text, declaredTotal: list.declaredTotal });
+  const version = await versionFor(deps, campaignId, versions.at(-1), { root, text, declaredTotal: list.declaredTotal }, signal);
   const stored = await listText(deps.db, campaignId, version);
   if (stored === null) throw new RootError(`list version ${version} has no published text; nothing was posted`);
   const entries = readPublishedList(stored);
@@ -242,11 +392,10 @@ export async function publishCheck(deps: ChainDeps, campaignId: string): Promise
   }
 
   const record = await recordFor(deps, campaign);
-  const posted = await postRoot(deps.chain, record, entries, { activePublished, expectedRoot: root });
-  const after = await deps.chain.roots(vault);
-  if (after.pendingRoot !== root) throw new RootError('the vault does not show the posted root as pending');
-  const claimableAt = Number(after.pendingClaimableAt);
-  await markListPosted(deps.db, campaignId, version, { postTx: posted.hash.toLowerCase(), claimableAt });
+  const sent: { posted?: RecordedPost } = {};
+  const posted = await postRoot(recordedPort(deps, campaign, version, signal, sent), record, entries, { activePublished, expectedRoot: root });
+  if (sent.posted === undefined) throw new RootError(`list version ${version} was not recorded as posted`);
+  const { claimableAt } = sent.posted;
   deps.log(
     `publish ${campaignId}: list version ${version} with ${entries.length} wallet${entries.length === 1 ? '' : 's'}, ${posted.declaredTotal} base units, root ${root}, ` +
       `posted in ${posted.hash} (gas ${posted.gasUsed}), claimable from unix ${claimableAt}`,
