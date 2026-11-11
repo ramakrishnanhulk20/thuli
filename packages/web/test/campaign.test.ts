@@ -113,6 +113,7 @@ describe('the fixtures', () => {
     expect(CampaignSchema.safeParse(fx.campaign()).success).toBe(true);
     expect(CampaignSchema.safeParse(fx.campaign({ status: 'closed', lists: fx.lists('none') })).success).toBe(true);
     expect(CampaignSchema.safeParse(fx.campaign({ lists: fx.lists('two') })).success).toBe(true);
+    expect(CampaignSchema.safeParse(fx.campaign({ lists: fx.lists('sending') })).success).toBe(true);
     const kinds: AskKind[] = ['queued', 'screening', 'full', 'partial', 'fullNoSlot', 'hold', 'exclude', 'failed'];
     for (const kind of kinds) {
       const result = AskSchema.safeParse(fx.ask(kind, signer.address, 3));
@@ -140,9 +141,12 @@ describe('the fixtures', () => {
     expect(isAskJson(fx.ask('hold', signer.address))).toBe(true);
     expect(isAskView(fx.askView(fx.ask('full', signer.address, 1), fx.ticket()))).toBe(true);
     expect(isBoardPage(fx.board(3))).toBe(true);
+    expect(isCampaignView(fx.campaign({ lists: fx.lists('sending') }))).toBe(true);
     expect(isCampaignView({ ...fx.campaign(), maxSlots: '20' })).toBe(false);
     expect(isCampaignView({ ...fx.campaign(), counts: { asked: 1 } })).toBe(false);
     expect(isCampaignView({ ...fx.campaign(), lists: [{ version: 1, root: 'nope', status: 'active', postTx: null, claimableAt: null }] })).toBe(false);
+    const sending = fx.lists('sending').at(-1) as Record<string, unknown>;
+    expect(isCampaignView({ ...fx.campaign(), lists: [{ ...sending, status: 'frozen' }] })).toBe(false);
     expect(isAskJson({ ...fx.ask('hold', signer.address), status: 'paid' })).toBe(false);
     expect(isAskJson({ ...fx.ask('hold', signer.address), action: 'approve' })).toBe(false);
     expect(isBoardPage({ asks: [{}] })).toBe(false);
@@ -289,7 +293,14 @@ describe('payoutFor', () => {
 
 describe('what the page says', () => {
   it('writes the list statuses in plain words', () => {
-    expect(LIST_STATUS_WORDS).toEqual({ built: 'built', posted: 'posted, waiting', active: 'paying', superseded: 'replaced', cancelled: 'cancelled' });
+    expect(LIST_STATUS_WORDS).toEqual({
+      built: 'built',
+      sending: 'sent, waiting for the network',
+      posted: 'posted, waiting',
+      active: 'paying',
+      superseded: 'replaced',
+      cancelled: 'cancelled',
+    });
   });
 
   it('puts lists newest first and board rows newest decision first, once per wallet', () => {
@@ -472,5 +483,14 @@ describe('the plain line for a held wallet that has no history', () => {
 
   it('does not show when the answer carries no facts', () => {
     expect(showsWhatToDo({ ...held(), facts: null })).toBe(false);
+  });
+});
+
+describe('a list that is being sent', () => {
+  it('has its transaction and no time it can be claimed from', () => {
+    const sending = fx.lists('sending').at(-1) as { status: string; postTx: string | null; claimableAt: number | null };
+    expect(sending.status).toBe('sending');
+    expect(sending.postTx).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(sending.claimableAt).toBeNull();
   });
 });

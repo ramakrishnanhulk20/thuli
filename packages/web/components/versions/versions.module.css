@@ -254,6 +254,58 @@
   color: var(--color-ink-3);
 }
 
+/* Asked again */
+.repeatFigures {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  margin-top: 40px;
+}
+
+.repeatFigure {
+  min-width: 0;
+}
+
+.repeatLabel {
+  margin-top: 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.repeatNote {
+  margin-top: 8px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-ink-3);
+}
+
+.repeatFlaw {
+  margin-top: 40px;
+}
+
+.repeatClosing {
+  max-width: 70ch;
+  margin-top: 32px;
+}
+
+@media (min-width: 1024px) {
+  .repeatFigures {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 32px;
+  }
+
+  /* Room for two lines, so the notes under the three figures start on the same line. */
+  .repeatLabel {
+    min-height: 3em;
+  }
+}
+
 /* Not covered */
 .notCovered {
   max-width: 70ch;

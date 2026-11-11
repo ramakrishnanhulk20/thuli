@@ -30,7 +30,9 @@ export function Lists({ campaignId, campaign }: { campaignId: string; campaign: 
                     <span className={styles.txText}>{shortHash(list.postTx)}</span>
                   </a>
                 )}
-                {list.claimableAt === null ? null : <span className={styles.listDim}>{`claimable ${formatUtcMinute(list.claimableAt * 1000)}`}</span>}
+                {list.claimableAt === null || list.status === 'sending' ? null : (
+                  <span className={styles.listDim}>{`claimable ${formatUtcMinute(list.claimableAt * 1000)}`}</span>
+                )}
                 <a className={styles.tx} href={`/api/campaigns/${encodeURIComponent(campaignId)}/lists/${list.version}`} target="_blank" rel="noopener noreferrer">
                   <span className={styles.txText}>the list</span>
                 </a>

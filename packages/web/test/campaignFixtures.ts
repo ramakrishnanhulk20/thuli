@@ -59,10 +59,15 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
   const opensAt = isoAt(midnight - 10 * DAY);
   const closesAt = isoAt(midnight + 5 * DAY - 60_000);
 
-  const lists = (kind: 'none' | 'one' | 'two') =>
+  const lists = (kind: 'none' | 'one' | 'two' | 'sending') =>
     kind === 'none'
       ? []
-      : kind === 'one'
+      : kind === 'sending'
+        ? [
+            { version: 1, root: ROOT_1, status: 'superseded', postTx: POST_TX, claimableAt: Math.floor(now / 1000) - 7200 },
+            { version: 2, root: ROOT_2, status: 'sending', postTx: HASH_B, claimableAt: null },
+          ]
+        : kind === 'one'
         ? [{ version: 1, root: ROOT_1, status: 'active', postTx: POST_TX, claimableAt: Math.floor(now / 1000) - 3600 }]
         : [
             { version: 1, root: ROOT_1, status: 'superseded', postTx: POST_TX, claimableAt: Math.floor(now / 1000) - 7200 },
@@ -82,7 +87,7 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
     status: 'open',
     opensAt,
     closesAt,
-    counts: { asked: 14, queued: 2, decided: 12, held: 5, slotsTaken: 7, slotsLeft: 13 },
+    counts: { asked: 14, queued: 2, decided: 12, held: 5, slotsTaken: 7, slotsLeft: 13, asksLeft: 186 },
     lists: lists('one'),
     ...overrides,
   });

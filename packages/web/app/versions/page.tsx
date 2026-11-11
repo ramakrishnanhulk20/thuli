@@ -5,6 +5,7 @@ import { SiteNav } from '@/components/site/SiteNav';
 import { Blocked } from '@/components/versions/Blocked';
 import { Control } from '@/components/versions/Control';
 import { NotCovered } from '@/components/versions/NotCovered';
+import { Repeatability } from '@/components/versions/Repeatability';
 import { Scorecard } from '@/components/versions/Scorecard';
 import styles from '@/components/versions/versions.module.css';
 import { loadHop, loadScorecard, loadVersions } from '@/lib/replay/load';
@@ -58,6 +59,7 @@ export default function VersionsPage() {
 
           <Blocked verdicts={versions.verdicts} routes={versions.routes} total={routesTotal} />
           <Control hop={hop} />
+          <Repeatability />
           <NotCovered noReply={versions.noReply} testWalletAppeals={versions.testWalletAppeals} />
 
           <div className={styles.footLink}>

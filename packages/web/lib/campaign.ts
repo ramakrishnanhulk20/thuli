@@ -8,7 +8,7 @@ import { formatInt } from './format';
 
 export type Action = 'full' | 'partial' | 'hold' | 'exclude';
 export type AskStatus = 'queued' | 'screening' | 'decided' | 'failed';
-export type ListStatus = 'built' | 'posted' | 'active' | 'superseded' | 'cancelled';
+export type ListStatus = 'built' | 'sending' | 'posted' | 'active' | 'superseded' | 'cancelled';
 
 export interface ListVersion {
   version: number;
@@ -76,7 +76,7 @@ export interface AskView {
 
 const ACTIONS: readonly string[] = ['full', 'partial', 'hold', 'exclude'];
 const ASK_STATUSES: readonly string[] = ['queued', 'screening', 'decided', 'failed'];
-const LIST_STATUSES: readonly string[] = ['built', 'posted', 'active', 'superseded', 'cancelled'];
+const LIST_STATUSES: readonly string[] = ['built', 'sending', 'posted', 'active', 'superseded', 'cancelled'];
 const AMOUNT = /^[0-9]+$/;
 const HASH = /^0x[0-9a-f]{64}$/;
 
@@ -296,6 +296,7 @@ export function chainName(chain: number): string {
 
 export const LIST_STATUS_WORDS: Record<ListStatus, string> = {
   built: 'built',
+  sending: 'sent, waiting for the network',
   posted: 'posted, waiting',
   active: 'paying',
   superseded: 'replaced',

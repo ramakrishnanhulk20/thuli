@@ -171,3 +171,31 @@ export interface HopFile {
   eliminated: HopBucket;
   clusters: { total: number; touched: number; fullyHeld: number; uncounted: number };
 }
+
+export interface ConsistencyRate {
+  count: number;
+  total: number;
+  rate: number;
+  low: number;
+  high: number;
+}
+
+/** One sampled wallet: the stratum it was drawn from and its action on each fresh run, in order. */
+export interface ConsistencySample {
+  wallet: string;
+  stratum: string;
+  actions: string[];
+}
+
+/** consistency.json: sampled wallets screened again from scratch. Only the fields the versions page reads are typed. */
+export interface ConsistencyFile {
+  schema: number;
+  runDate: string;
+  runsPerWallet: number;
+  totalRuns: number;
+  servCalls: number;
+  ceilingViolations: number;
+  overall: { wallets: number; allSame: ConsistencyRate; matchMode: ConsistencyRate };
+  strata: { modelHold: { wallets: number } };
+  samples: ConsistencySample[];
+}
