@@ -7,7 +7,7 @@ The threat model came before the code. On 27 October 2026 an independent review 
 
 ## What the contract tests hold
 
-On 11 November 2026 `forge test` reported 79 tests passed and none failed. Their parts, counted from the files in `packages/contracts/test` and the settings in `packages/contracts/foundry.toml`:
+On 11 November 2026 `forge test` reported 77 tests passed, none failed and 2 skipped with no Base RPC set, and 79 passed with `BASE_RPC_URL` set. The 79 are, counted from the files in `packages/contracts/test` and the settings in `packages/contracts/foundry.toml`:
 
 - 64 unit tests of each vault function and each way it can fail.
 - 1 demo test: a list of 30 farm wallets cannot take more than 20 USDC from the demo vault, and no wallet gets more than 1 USDC.
@@ -16,7 +16,7 @@ On 11 November 2026 `forge test` reported 79 tests passed and none failed. Their
 - 1 fork test: a full campaign on real USDC.
 - 1 invariant suite holding 7 invariants. The setting runs 256 random call sequences, up to 64 calls deep, and fails the run on any revert the test did not expect.
 
-The demo test and the fork test run on a local copy of Base mainnet at block 55,661,700 with real USDC. They skip when no Base RPC address is set, and the 79 includes them. `npm run contracts:test` repeats the run. A mutation pass was also run on the vault, but the repository holds no output from it, so this page gives no count for it. The TypeScript packages have their own tests in `packages/*/test`.
+The demo test and the fork test run on a local copy of Base mainnet at block 55,661,700 with real USDC. They skip when no Base RPC address is set, so the 79 counts them only when `BASE_RPC_URL` is set. `npm run contracts:test` repeats the run. A mutation pass was also run on the vault, but the repository holds no output from it, so this page gives no count for it. The TypeScript packages have their own tests in `packages/*/test`.
 
 ## Attack it yourself
 

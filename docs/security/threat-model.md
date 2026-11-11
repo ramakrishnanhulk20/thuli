@@ -261,8 +261,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   flow: the facilitator settles the signed payment before the screening runs, so a result never goes out on an unsettled
   authorization, and a second copy of one `PAYMENT-SIGNATURE` fails at settlement because its nonce is spent. The
   payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
-  price (the exact scheme needs strict equality), inside its validity window. Production runs on Base mainnet; Base
-  Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
+  price (the exact scheme needs strict equality), inside its validity window. The route settles on the network the
+  configuration names: it is proved on Base Sepolia, and Base mainnet is supported by configuration and has not been
+  run. Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
   (hold, with the cause), so a settled payment always buys a result. Shown by: one payment header replayed in 10 parallel
   requests yields one result, and a Base Sepolia payment to a mainnet route is refused. When settlement is pending, the
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer
