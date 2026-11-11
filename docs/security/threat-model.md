@@ -147,7 +147,7 @@ proofs and amounts claimants submit to the vault; DNS for configured hostnames.
 ## C) Defensive-programming standards (the definition of done)
 
 The implementation is complete only when every invariant below is upheld and demonstrated. "Shown by" names the test
-or attack that demonstrates it. A work order that carries an invariant also carries its test.
+or attack that demonstrates it. A change that touches an invariant also carries its test.
 
 ### C.1 Invariants
 
@@ -251,8 +251,12 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   by: killing the worker between paying and storing the receipt, then restarting; exactly one payment.
 - **C24. Unauthenticated endpoints cannot run up the bill.** `/api/check` never buys data. All model spend reachable
   without sign-in or payment has a per-client and a global daily ceiling; at the ceiling the endpoint says it is busy
-  and returns no decision. Results are cached by canonical address, chain and rule version. Shown by: all spellings of
-  one address cost one model run between them, and a client past its ceiling is refused.
+  and returns no decision. Results are cached by canonical address, chain and rule version. On `/api/check` a caller may
+  start 5 new checks an hour and run 1 at a time, the service runs 2 at a time and starts at most 300 a UTC day, and
+  one wallet is screened by one request at a time. A cached answer costs nothing and counts toward none of these. A hold
+  from a failed screening is cached 5 minutes, so an outage cannot be hammered. A store that cannot be reached refuses
+  before any screening starts. With a database configured these ceilings are shared by every server copy. Shown by: all
+  spellings of one address, sent to two copies, cost one model run between them, and a client past its ceiling is refused.
 - **C25. No paid result goes out without a settled payment for that exact request.** The route uses x402's upfront
   flow: the facilitator settles the signed payment before the screening runs, so a result never goes out on an unsettled
   authorization, and a second copy of one `PAYMENT-SIGNATURE` fails at settlement because its nonce is spent. The
@@ -266,10 +270,17 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   payer can cancel or spend it elsewhere. A timeout or error returns retry with the claim kept, so a header never pays
   twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
   route's timeout plus 30 seconds is refused, and a used claim is remembered until its validBefore, so no copy of a header
-  can outlive its claim. Non-goal: claims live in memory, so after a restart a copy sent inside its window
-  could still be answered from a facilitator's pending cache, until Postgres holds the claims.
+  can outlive its claim. With a database configured the claims live in Postgres, shared by every server copy and kept
+  across a restart. Once a settlement is confirmed the buyer gets the result whatever the store does: a claim the store
+  could not mark used stays held, so no copy is served. Before that, a store that cannot be reached refuses, and nothing
+  is settled on a claim the store could not record. Shown by: one header sent 10 times at once to two copies over one
+  database is settled and served once.
+  Non-goal, only when no database is configured: claims then live in each server's memory, so after a restart a copy sent
+  inside its window could still be answered from a facilitator's pending cache.
   Non-goal: a facilitator that fails after broadcasting leaves a landed payment unserved until the buyer retries the same
   header and its settlement resolves.
+  Non-goal: when a settlement's outcome is unknown and recording the claim as unsure fails as well, the claim stays held
+  by a request that is gone, so the same header cannot retry before its validBefore. That takes two failures at once.
 - **C26. The paid path cannot cost more than it earns.** The worst-case cost of one paid screening is a stated number
   below the price, enforced by a per-request spend cap. Shown by: the cap holds for a wallet that triggers all four hops.
 
@@ -348,8 +359,11 @@ or attack that demonstrates it. A work order that carries an invariant also carr
   a million transfers and one still passing money on at the hop cap both end in hold within the timeout.
 - **C42. Public endpoints are rate limited on an identity the client cannot forge**, using the platform's trusted client
   address, never a client-sent `X-Forwarded-For`. The paid route also caps each client's running screenings, request rate
-  and failed settlement attempts, so unfunded signed payments cannot fill it. One open appeal per campaign and address. Shown by: a burst with
-  rotating `X-Forwarded-For` values is still limited.
+  and failed settlement attempts, so unfunded signed payments cannot fill it. With a database configured these limits are
+  shared by every server copy, so reaching another copy gives a caller no fresh allowance. The free check counts its own
+  request rate apart from the paid route's, so neither can use up the other. One open appeal per campaign and address.
+  Shown by: a burst with rotating `X-Forwarded-For` values is still limited, on both routes, and one caller alternating
+  between two copies meets the same limits.
 - **C43. Input never changes the shape of a query.** Shown by: injection fixtures (`'; drop table`, `%00`, oversized
   unicode) are stored and read back unchanged.
 
