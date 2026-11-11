@@ -124,9 +124,15 @@ describe('checkAsk', () => {
     const input = await signed();
     expect(await checkAsk(input, context())).toEqual(accepted);
     const askText = askMessage({ campaignId: CAMPAIGN, wallet: asker.address, signedAt: NOW });
-    for (const text of [APPEAL_TEXT, askText]) {
+    // The ask message has four lines, so as an appeal text it stops at the one-line rule; flattened, it reaches the signature.
+    const cases = [
+      [APPEAL_TEXT, APPEAL_SIGNATURE_CAUSE],
+      [askText, 'the appeal text must be one line'],
+      [askText.replaceAll('\n', ' '), APPEAL_SIGNATURE_CAUSE],
+    ] as const;
+    for (const [text, cause] of cases) {
       const appeal = { campaignId: CAMPAIGN, wallet: asker.address, text, signedAt: NOW, signature: input.signature };
-      expect(await checkAppeal(appeal, appealContext)).toEqual(refusedWith(APPEAL_SIGNATURE_CAUSE));
+      expect(await checkAppeal(appeal, appealContext)).toEqual(refusedWith(cause));
     }
   });
 

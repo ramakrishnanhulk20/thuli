@@ -24,7 +24,13 @@ const MAX_REQUEST_ID_CHARS = 128;
 // One plain-text rule for model reasons and appeal text, so the two can never drift apart.
 const FORBIDDEN_IN_TEXT = FORBIDDEN_IN_REASON;
 
+// Every control character (Unicode's Cc, the tab and both line ends among them, U+0085 too) and the two Unicode
+// separators, which some terminals and editors also break the line at.
+const BREAKS_THE_LINE = /[\p{Cc}\u2028\u2029]/u;
+const BREAKS_THE_LINE_ALL = /[\p{Cc}\u2028\u2029]/gu;
+
 const SIGNATURE_CAUSE = 'the signature does not match this appeal';
+const ONE_LINE_CAUSE = 'the appeal text must be one line';
 
 export class AppealError extends Error {
   override name = 'AppealError';
@@ -52,6 +58,17 @@ const refuse = (cause: string): AppealCheck => ({ ok: false, cause });
 export function isPlainText(text: string): boolean {
   const lowered = text.toLowerCase();
   return !FORBIDDEN_IN_TEXT.some((token) => lowered.includes(token)) && !NON_PLAIN_CHARACTERS.test(text) && text.isWellFormed();
+}
+
+/**
+ * True when text is one line: no control character of any kind (a line break, a carriage return, a tab, U+0085) and
+ * neither U+2028 nor U+2029. Text from an outsider that is printed for someone else, on a page or a terminal, must not
+ * be able to start a line of its own that reads as ours (C34, C40).
+ *
+ * Covers only what breaks a line. Links, markup and invisible format characters are isPlainText's to refuse.
+ */
+export function isOneLine(text: string): boolean {
+  return !BREAKS_THE_LINE.test(text);
 }
 
 /**
@@ -87,9 +104,10 @@ export function appealMessage(a: { campaignId: string; wallet: string; textHash:
  * and counts as a wallet, so isContract must reflect accountType 'contract' only (C20). Anything that throws is a refusal,
  * and so is any isContract answer but true or false.
  *
- * The first failed check in this order gives the cause, always a fixed text: address, text length, text content, campaign,
- * signing time, signature, contract wallet. The signature is checked before the account type because it costs nothing,
- * so a request nobody signed can never make the server read the chain.
+ * The first failed check in this order gives the cause, always a fixed text: address, text length, text content, one
+ * line, campaign, signing time, signature, contract wallet. A character that breaks the line is the one-line check's to
+ * refuse, whatever else the plain-text rule says of it, so it always gets that check's cause. The signature is checked
+ * before the account type because it costs nothing, so a request nobody signed can never make the server read the chain.
  *
  * @param opts.now The current time in unix seconds, from the server's clock.
  * @param opts.isContract Reads the wallet's account type. Runs only after every free check, the signature included, has passed.
@@ -109,7 +127,10 @@ export async function checkAppeal(
   const { text } = input;
   if (typeof text !== 'string' || text.trim() === '') return refuse('the appeal text is empty');
   if (text.length > MAX_APPEAL_CHARS) return refuse(`the appeal text is longer than ${MAX_APPEAL_CHARS} characters`);
-  if (!isPlainText(text)) return refuse('the appeal text contained a link, markup or control characters');
+  // Line breakers read as spaces here, so they reach the one-line check below and get its cause. The two checks together
+  // let through exactly the texts both rules allow; only which cause a line breaker gets has moved.
+  if (!isPlainText(text.replace(BREAKS_THE_LINE_ALL, ' '))) return refuse('the appeal text contained a link, markup or control characters');
+  if (!isOneLine(text)) return refuse(ONE_LINE_CAUSE);
 
   if (input.campaignId !== opts.expectedCampaignId) return refuse('this appeal is for a different campaign');
 

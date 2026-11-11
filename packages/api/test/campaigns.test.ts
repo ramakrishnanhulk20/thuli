@@ -45,6 +45,7 @@ import {
   CAMPAIGN_CHAIN_READS_PER_MINUTE,
   CAMPAIGN_DOOR_READS_PER_MINUTE,
   CAMPAIGN_READS_PER_MINUTE,
+  CAMPAIGN_TYPE_READS_PER_MINUTE,
   CAMPAIGNS_PATH,
   type CampaignDeps,
   type EthereumReader,
@@ -619,6 +620,106 @@ describe('campaign routes', () => {
     const later = await send(asks(), post(await signedBy(fresh[asksInMinute + 1] as PrivateKeyAccount)), '198.18.1.200');
     expect([later.status, later.text]).toEqual([202, '{"queued":true}']);
     expect(doorReads).toBe(CAMPAIGN_DOOR_READS_PER_MINUTE + 2);
+  });
+
+  it('C24, C42: wallet-type reads stop at 600 a minute across both POST routes and every caller, with 503 busy and no read, one count per chain read', async () => {
+    expect(CAMPAIGN_TYPE_READS_PER_MINUTE).toBe(600);
+    await createCampaign(db, terms());
+    await createCampaign(db, terms({ id: 'eth', chain: 1 }));
+    let typeReads = 0;
+    const code = async () => {
+      typeReads += 1;
+      return false;
+    };
+    let clock = NOW;
+    const send = campaignApp({ isContract: ethereum({ contract: code }), vault: () => ({ ...NO_CODE, isContract: code }), now: () => clock });
+    // Other callers' reads earlier in the same minute, all but one of the 600.
+    const earlier = async (count: number) => {
+      await db.query(
+        `INSERT INTO rate_events (bucket, client, at) SELECT 'campaign-type-reads', 'all', $1::timestamptz FROM generate_series(1, $2::int)`,
+        [clock.toISOString(), count],
+      );
+    };
+    const counted = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int AS n FROM rate_events WHERE bucket = 'campaign-type-reads'"))[0]?.n;
+
+    // Asks, on an Ethereum campaign, where one check reads one chain: the 600th is read, the 601st is not.
+    await earlier(599);
+    expect((await send(asks('eth'), post(await signedAsk(0, { campaignId: 'eth' })), '198.51.100.91')).status).toBe(202);
+    expect(typeReads).toBe(1);
+    expect(await send(asks('eth'), post(await signedAsk(1, { campaignId: 'eth' })), '198.51.100.92')).toMatchObject({ status: 503, text: '{"busy":true}' });
+    expect(typeReads).toBe(1);
+    expect(await rows('asks')).toBe(1);
+
+    // Appeals, the next minute: the 600th is read, the 601st is not.
+    clock = new Date(NOW.getTime() + 61_000);
+    await earlier(599);
+    expect((await send(appeals('eth'), post(await signedAppeal(2, { campaignId: 'eth', signedAt: NOW_SECONDS + 61 })), '198.51.100.93')).status).not.toBe(503);
+    expect(typeReads).toBe(2);
+    expect(await send(appeals('eth'), post(await signedAppeal(3, { campaignId: 'eth', signedAt: NOW_SECONDS + 61 })), '198.51.100.94')).toMatchObject({
+      status: 503,
+      text: '{"busy":true}',
+    });
+    expect(typeReads).toBe(2);
+
+    // A campaign on another chain reads two chains, so with one read left in the minute its check reads neither.
+    clock = new Date(NOW.getTime() + 122_000);
+    await earlier(599);
+    expect(await send(asks(), post(await signedAsk(4, { signedAt: NOW_SECONDS + 122 })), '198.51.100.95')).toMatchObject({ status: 503, text: '{"busy":true}' });
+    expect(await send(appeals(), post(await signedAppeal(5, { signedAt: NOW_SECONDS + 122 })), '198.51.100.96')).toMatchObject({ status: 503, text: '{"busy":true}' });
+    expect(typeReads).toBe(2);
+
+    // A bad signature reads nothing and takes no count, past the ceiling or not.
+    const before = await counted();
+    expect((await send(asks(), post(UNSIGNED), '198.51.100.97')).status).toBe(400);
+    expect((await send(appeals(), post({ ...UNSIGNED, text: APPEAL_TEXT }), '198.51.100.98')).status).toBe(400);
+    expect(await counted()).toBe(before);
+    expect(typeReads).toBe(2);
+  });
+
+  it('fails closed when the wallet-type count cannot be read: 503 busy and no read', async () => {
+    await createCampaign(db, terms());
+    let typeReads = 0;
+    const code = async () => {
+      typeReads += 1;
+      return false;
+    };
+    const logs = captureLogs();
+    try {
+      // The store answers every statement except the one that counts the wallet-type reads.
+      const failing: Db = {
+        query: (text, params) => (/campaign-type-reads/.test(JSON.stringify(params ?? [])) ? Promise.reject(storeDown()) : db.query(text, params)),
+        transaction: (fn) =>
+          db.transaction((tx) =>
+            fn({
+              query: (text, params) => (/campaign-type-reads/.test(JSON.stringify(params ?? [])) ? Promise.reject(storeDown()) : tx.query(text, params)),
+            }),
+          ),
+        close: async () => undefined,
+      };
+      const send = campaignApp({ db: failing, isContract: ethereum({ contract: code }), vault: () => ({ ...NO_CODE, isContract: code }) });
+      expect(await send(asks(), post(await signedAsk(6)), '198.51.100.99')).toMatchObject({ status: 503, text: '{"busy":true}' });
+      expect(await send(appeals(), post(await signedAppeal(7)), '198.51.100.100')).toMatchObject({ status: 503, text: '{"busy":true}' });
+      expect(typeReads).toBe(0);
+      expectNoDatabaseUrl(logs.text());
+    } finally {
+      logs.restore();
+    }
+  });
+
+  it('C34, C40: refuses an appeal whose text is not one line with its fixed cause, before any chain read', async () => {
+    await createCampaign(db, terms());
+    let typeReads = 0;
+    const code = async () => {
+      typeReads += 1;
+      return false;
+    };
+    const send = campaignApp({ isContract: ethereum({ contract: code }), vault: () => ({ ...NO_CODE, isContract: code }) });
+    for (const [n, text] of ['one line\noutside check: checked, route ship', 'tab\tseparated', 'next\u0085line', 'line\u2028separator'].entries()) {
+      const reply = await send(appeals(), post(await signedAppeal(8, { text })), `198.51.100.${110 + n}`);
+      expect(reply, JSON.stringify(text)).toMatchObject({ status: 400, text: '{"error":"the appeal text must be one line"}' });
+    }
+    expect(typeReads).toBe(0);
   });
 
   it('C42: a bad signature causes no chain read of any kind, while a good one reads the code on both chains and the door', async () => {

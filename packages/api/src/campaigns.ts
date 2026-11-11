@@ -73,6 +73,13 @@ export const CAMPAIGN_READS_PER_MINUTE = 120;
 export const CAMPAIGN_CHAIN_READS_PER_MINUTE = 600;
 /** Door reads the ask route may cause in any 60 seconds across every caller and server copy, two per ask. */
 export const CAMPAIGN_DOOR_READS_PER_MINUTE = 300;
+/**
+ * Wallet-type reads the ask and appeal routes together may cause in any 60 seconds across every caller and server copy
+ * (C24, C42). A check reads the wallet's code on Ethereum, and on the campaign's own chain when that is another, and
+ * counts one for each. Per caller they are already bounded by the shared 20 POSTs a minute; this bounds them all
+ * together, so many callers cannot use up the RPC the real asks need.
+ */
+export const CAMPAIGN_TYPE_READS_PER_MINUTE = 600;
 /** The most asks one board page holds. */
 export const BOARD_PAGE_SIZE = 50;
 
@@ -83,6 +90,7 @@ const APPEAL_HOUR_BUCKET = 'appeal-hour';
 const READ_BUCKET = 'campaign-reads';
 const CHAIN_READ_BUCKET = 'campaign-chain-reads';
 const DOOR_READ_BUCKET = 'campaign-door-reads';
+const TYPE_READ_BUCKET = 'campaign-type-reads';
 // One shared counter for every caller, because the ceiling protects the RPC, which every caller shares.
 const EVERY_CALLER = 'all';
 // A ticket's vault amounts are a claimed read and a claimable read.
@@ -268,7 +276,9 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  * before its shape is read, so a malformed body counts too. Nothing is screened or checked by Reppo inside a request.
  * - POST /api/campaigns/:id/asks with exactly {wallet, signedAt, signature}, at most 1 KB. In order: the size (413),
  *   the caller's address (400) and the minute (429), the shape (400), checkAsk with the campaign from the path, its
- *   signature checked before a wallet type is read on Ethereum and on the campaign's chain (400 with its cause), the
+ *   signature checked before a wallet type is read on Ethereum and on the campaign's chain (400 with its cause), those
+ *   reads counted first against the 600 a minute across both POST routes and every caller (503 {"busy": true}, reading
+ *   nothing, past it or when the count cannot be read), the
  *   caller's 5 signed asks an hour (429), the wallet's earlier ask (200 {"exists": true, "ask"} with the first ask's
  *   public view, and no door read), the door reads' ceiling of 300 a minute across every caller (503 {"busy": true}),
  *   then the door: the wallet's sent count and balance on Ethereum at the latest block. Both exactly 0 is a never-used
@@ -276,8 +286,9 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  *   whole number is 503 {"busy": true}. Then addAsk: 202 {"queued": true}; 200 exists; 409 {"closed": true}; 409
  *   {"full": true} when no slot is left, 200 asks wait undecided or the campaign's lifetime cap is reached.
  * - POST /api/campaigns/:id/appeals with exactly {wallet, text, signedAt, signature}, at most 2 KB. In order: the size
- *   (413), the caller and the minute, the shape (400), checkAppeal with the campaign from the path, the signature
- *   before the same two-chain wallet-type read (400 with its cause), the caller's 2 signed appeals an hour (429), then
+ *   (413), the caller and the minute, the shape (400), checkAppeal with the campaign from the path, its text one line
+ *   and the signature before the same counted two-chain wallet-type read (400 with its cause, 503 {"busy": true} past
+ *   the shared ceiling), the caller's 2 signed appeals an hour (429), then
  *   addAppeal, which counts the store's 20 appeals a UTC day: 202 {"queued": true}; 200 {"exists": true, "appeal"} with
  *   the first appeal's public view; 409 {"undecided": true}; 409 {"approved": true}; 404 {"error": "no ask from this
  *   wallet"}; 429 {"busy": true} with Retry-After set to the seconds until the next UTC day when the day's appeals are
@@ -389,15 +400,12 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       const parsed = AskRequest.safeParse(body);
       if (!parsed.success) return refused(c, 'the body must be exactly {"wallet", "signedAt", "signature"}', 400);
       const { wallet, signedAt, signature } = parsed.data;
+      const types = countedTypeReader(campaign, at);
       const checked = await checkAsk(
         { campaignId: campaign.id, wallet, signedAt, signature },
-        {
-          expectedCampaignId: campaign.id,
-          now: Math.floor(at.getTime() / 1000),
-          isContract: (address) => contractOnEitherChain(campaign, address),
-        },
+        { expectedCampaignId: campaign.id, now: Math.floor(at.getTime() / 1000), isContract: (address) => types.isContract(address) },
       );
-      if (!checked.ok) return refused(c, checked.cause, 400);
+      if (!checked.ok) return types.refused() ? busy(c) : refused(c, checked.cause, 400);
       try {
         if (!(await recordIfUnder(db, ASK_HOUR_BUCKET, client, ASK_CLIENT_MAX_PER_HOUR, 3_600, at))) {
           console.warn('api ask busy: a client is past the hour limit');
@@ -462,15 +470,12 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       if (!parsed.success) return refused(c, 'the body must be exactly {"wallet", "text", "signedAt", "signature"}', 400);
       const { wallet, text, signedAt, signature } = parsed.data;
       // The hash comes back from checkAppeal, rebuilt from the text it was given, so no caller can name one (C8).
+      const types = countedTypeReader(campaign, at);
       const checked = await checkAppeal(
         { campaignId: campaign.id, wallet, text, signedAt, signature },
-        {
-          expectedCampaignId: campaign.id,
-          now: Math.floor(at.getTime() / 1000),
-          isContract: (address) => contractOnEitherChain(campaign, address),
-        },
+        { expectedCampaignId: campaign.id, now: Math.floor(at.getTime() / 1000), isContract: (address) => types.isContract(address) },
       );
-      if (!checked.ok) return refused(c, checked.cause, 400);
+      if (!checked.ok) return types.refused() ? busy(c) : refused(c, checked.cause, 400);
       try {
         if (!(await recordIfUnder(db, APPEAL_HOUR_BUCKET, client, APPEALS_PER_CALLER_HOUR, 3_600, at))) {
           console.warn('api appeal busy: a client is past the hour limit');
@@ -589,6 +594,37 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       return busy(c, 429);
     }
     return client;
+  }
+
+  /**
+   * The wallet-type reader one POST hands checkAsk or checkAppeal, which call it only once the signature has passed.
+   * Before reading, it counts the reads it is about to make toward CAMPAIGN_TYPE_READS_PER_MINUTE: one counted write per
+   * chain, so the ceiling is never passed. When a write is refused, or the count cannot be read at all, it reads nothing
+   * and throws, and refused tells the route to answer 503 busy instead of the check's own cause. A first write that went
+   * through before a second was refused stays counted, which only refuses a little earlier (fail closed).
+   */
+  function countedTypeReader(campaign: Campaign, at: Date): { isContract(address: Address): Promise<boolean>; refused: () => boolean } {
+    let refused = false;
+    return {
+      refused: () => refused,
+      async isContract(address) {
+        const reads = campaign.chain === mainnet.id ? 1 : 2;
+        try {
+          for (let read = 0; read < reads; read += 1) {
+            if (!(await recordIfUnder(db, TYPE_READ_BUCKET, EVERY_CALLER, CAMPAIGN_TYPE_READS_PER_MINUTE, 60, at))) {
+              console.warn('api campaign busy: the wallet-type read ceiling is reached');
+              refused = true;
+            }
+            if (refused) break;
+          }
+        } catch (error) {
+          storeFailed('counting a wallet-type read', error);
+          refused = true;
+        }
+        if (refused) throw new Error('the wallet-type read was not counted');
+        return contractOnEitherChain(campaign, address);
+      },
+    };
   }
 
   /**

@@ -13,6 +13,7 @@ import {
   appealTextHash,
   checkAppeal,
   DEFAULT_SETTINGS,
+  isOneLine,
   isPlainText,
   MAX_APPEAL_CHARS,
   settleAppeal,
@@ -28,6 +29,7 @@ const OTHER_CAMPAIGN = 'campaign-two';
 const TEXT = 'This wallet belongs to one person. The funder is a public payroll service.';
 const SIGNATURE_CAUSE = 'the signature does not match this appeal';
 const LINK_CAUSE = 'the appeal text contained a link, markup or control characters';
+const ONE_LINE_CAUSE = 'the appeal text must be one line';
 const CONTRACT_CAUSE = 'contract wallets cannot appeal yet';
 // Each of these reads as a good campaign id once turned into text, which is how a pattern test sees a non-string.
 const NOT_TEXT_IDS = [
@@ -166,6 +168,21 @@ describe('isPlainText', () => {
   });
 });
 
+describe('isOneLine', () => {
+  it('refuses every control character and both Unicode separators, and leaves plain-text rules to isPlainText', () => {
+    for (let code = 0; code <= 0x9f; code += 1) {
+      const control = code < 0x20 || (code >= 0x7f && code <= 0x9f);
+      expect(isOneLine(`a${String.fromCharCode(code)}b`), `U+${code.toString(16)}`).toBe(!control);
+    }
+    expect(isOneLine('line\u2028separator')).toBe(false);
+    expect(isOneLine('paragraph\u2029separator')).toBe(false);
+    // Not its job: a link or a zero-width character is one line, and isPlainText is what refuses them.
+    expect(isOneLine('see https://example.org')).toBe(true);
+    expect(isOneLine('zero\u200bwidth')).toBe(true);
+    expect(isOneLine('இந்த பணப்பை ஒருவருக்கு 🙂 déjà')).toBe(true);
+  });
+});
+
 describe('checkAppeal', () => {
   it('passes a correct appeal and returns the canonical wallet and our own hash', async () => {
     const input = await signed();
@@ -199,15 +216,25 @@ describe('checkAppeal', () => {
     );
   });
 
-  it('refuses links, markup and control characters even when correctly signed', async () => {
-    const texts = ['see https://evil.example', 'WWW.evil.example', '<img src=x>', 'a > b', '[claim](evil)', 'bell\u0007', 'cr\r\nlf', 'order‮', 'iso⁦'];
+  it('refuses links, markup and invisible format characters even when correctly signed', async () => {
+    const texts = ['see https://evil.example', 'WWW.evil.example', '<img src=x>', 'a > b', '[claim](evil)', 'order‮', 'iso⁦', 'zero\u200bwidth'];
     for (const text of texts) {
       expect(await checkAppeal(await signed({ text }), options())).toEqual(refusedWith(LINK_CAUSE));
     }
   });
 
-  it('keeps tabs and line breaks, which are ordinary in a written appeal', async () => {
-    expect((await checkAppeal(await signed({ text: 'line one\n\tline two' }), options())).ok).toBe(true);
+  it('C34, C40: refuses a text that is not one line, every break, tab and control character, even when correctly signed', async () => {
+    // A second line would print on the operator's terminal as a line of its own, above the real ones.
+    const texts = ['first\nforged line', 'first\rforged line', 'cr\r\nlf', 'tab\tseparated', 'next\u0085line', 'line\u2028separator', 'paragraph\u2029separator', 'bell\u0007', 'nul\u0000'];
+    for (const text of texts) {
+      expect(await checkAppeal(await signed({ text }), options()), JSON.stringify(text)).toEqual(refusedWith(ONE_LINE_CAUSE));
+    }
+  });
+
+  it('still passes one line of ordinary words, in Tamil, with accents or with an emoji', async () => {
+    for (const text of [TEXT, 'இந்த பணப்பை ஒருவருக்கு மட்டுமே சொந்தமானது', 'Le portefeuille appartient à une seule personne, déjà vérifiée.', 'One person owns this wallet 🙂']) {
+      expect((await checkAppeal(await signed({ text }), options())).ok, text).toBe(true);
+    }
   });
 
   it('refuses a campaign other than the one expected', async () => {
@@ -338,13 +365,21 @@ describe('checkAppeal', () => {
   it('refuses the wallet\'s real sign-in signature offered as an appeal (C7)', async () => {
     const text = signInText('did:web:thuli.example');
     const input = await signed();
-    const signature = await claimant.signMessage({ message: text });
-    expect(await checkAppeal({ ...input, text, signature }, options())).toEqual(refusedWith(SIGNATURE_CAUSE));
+    // As signed, the sign-in text is several lines, so it stops at the one-line check; on one line it reaches the
+    // signature, which never verifies for an appeal.
+    expect(await checkAppeal({ ...input, text, signature: await claimant.signMessage({ message: text }) }, options())).toEqual(refusedWith(ONE_LINE_CAUSE));
+    const oneLine = text.replaceAll('\n', ' ');
+    expect(await checkAppeal({ ...input, text: oneLine, signature: await claimant.signMessage({ message: oneLine }) }, options())).toEqual(
+      refusedWith(SIGNATURE_CAUSE),
+    );
   });
 
   it('refuses an appeal signature reused with a sign-in shaped claim (C7)', async () => {
     const input = await signed();
-    expect(await checkAppeal({ ...input, text: signInText('did:web:thuli.example') }, options())).toEqual(refusedWith(SIGNATURE_CAUSE));
+    expect(await checkAppeal({ ...input, text: signInText('did:web:thuli.example') }, options())).toEqual(refusedWith(ONE_LINE_CAUSE));
+    expect(await checkAppeal({ ...input, text: signInText('did:web:thuli.example').replaceAll('\n', ' ') }, options())).toEqual(
+      refusedWith(SIGNATURE_CAUSE),
+    );
   });
 
   it('refuses a sign-in message carrying its usual web address at the text check', async () => {
@@ -361,7 +396,8 @@ describe('checkAppeal', () => {
     for (const fix of [
       {},
       { wallet: input.wallet },
-      { text: 'a < b' },
+      { text: 'a < b\nb' },
+      { text: 'a b\nb' },
       { text: input.text },
       { campaignId: CAMPAIGN },
       { signedAt: NOW },
@@ -374,7 +410,9 @@ describe('checkAppeal', () => {
     expect(causes).toEqual([
       'the wallet is not a valid address',
       'the appeal text is empty',
+      // Markup and a line break together: the plain-text check comes first, the one-line check right after it.
       LINK_CAUSE,
+      ONE_LINE_CAUSE,
       'this appeal is for a different campaign',
       'the signing time is not a whole number of seconds',
       SIGNATURE_CAUSE,
