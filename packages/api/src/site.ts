@@ -4,7 +4,7 @@ import path from 'node:path';
 import { connectPostgres, migrate, openMemoryDb, type Db } from '@thuli/store';
 import { EnvError, loadEnv } from '@thuli/worker/src/env.ts';
 import { createApp } from './app.ts';
-import { accountTypeReader, vaultReaders } from './campaigns.ts';
+import { accountReader, BASE_PUBLIC_RPC, vaultReaders } from './campaigns.ts';
 import { ConfigError, loadApiConfig } from './config.ts';
 import { liveScreen } from './live.ts';
 import { failureCode, postgresStores } from './stores.ts';
@@ -42,7 +42,8 @@ function causeOf(error: unknown): string {
 
 const present = (value: string | undefined) => value !== undefined && value.trim() !== '';
 
-// Only Base campaigns need it, so it may be left out; a value that is set must still be an https URL.
+// Base campaigns' vaults need it, and the ask door falls back to Base's public RPC without it, so it may be left out; a
+// value that is set must still be an https URL.
 function baseRpcUrl(env: Record<string, string | undefined>): string | null {
   const value = env.BASE_RPC_URL?.trim();
   if (value === undefined || value === '') return null;
@@ -76,7 +77,9 @@ async function migrateFrom(db: Db, migrations: Readonly<Record<string, string>>)
  * Production is env.NODE_ENV as the server runs, not as the site was built.
  * - The campaign routes share that database. They read wallet types on ETH_RPC_URL and on the campaign's own chain,
  *   and vaults on that chain: Base Sepolia's public RPC, or for a Base campaign BASE_RPC_URL. A Base campaign with
- *   BASE_RPC_URL unset gets tickets without vault amounts and refuses every ask, because its chain cannot be read.
+ *   BASE_RPC_URL unset gets tickets without vault amounts and refuses every ask, because its chain cannot be read. The
+ *   ask door reads a wallet's sent count and balance on ETH_RPC_URL and then, for a wallet empty there, on Base
+ *   mainnet: BASE_RPC_URL when set, else Base's public RPC.
  *
  * A setting that is missing, malformed or forbidden, a private key in env included (C39), means no API at all: every
  * request answers 503 {busy: true} and the cause is logged once, by variable name, never with a value (C40). The site
@@ -87,7 +90,8 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
   const now = () => new Date();
   let config: ReturnType<typeof loadApiConfig>;
   let screen: ReturnType<typeof liveScreen>;
-  let isContract: ReturnType<typeof accountTypeReader>;
+  let isContract: ReturnType<typeof accountReader>;
+  let baseAccounts: ReturnType<typeof accountReader>;
   let vault: ReturnType<typeof vaultReaders>;
   try {
     const production = env.NODE_ENV === 'production';
@@ -100,8 +104,10 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
       throw new MountRefused('DATABASE_URL is not set: a production server keeps no payments or limits in its own memory.');
     }
     screen = liveScreen(env, files.rulebook);
-    isContract = accountTypeReader(loadEnv(env).ETH_RPC_URL);
-    vault = vaultReaders(baseRpcUrl(env));
+    isContract = accountReader(loadEnv(env).ETH_RPC_URL, 'ethereum');
+    const baseUrl = baseRpcUrl(env);
+    baseAccounts = accountReader(baseUrl ?? BASE_PUBLIC_RPC, 'base');
+    vault = vaultReaders(baseUrl);
   } catch (error) {
     console.error(`api not mounted: ${causeOf(error)}`);
     return { fetch: async () => answer(503, { busy: true }) };
@@ -122,7 +128,7 @@ export function siteApi(env: Record<string, string | undefined>, files: SiteFile
       await db.close().catch(() => undefined);
       throw error;
     }
-    const app = createApp(config, { screen, stores: postgresStores(db, now), now, campaigns: { db, isContract, vault, now } });
+    const app = createApp(config, { screen, stores: postgresStores(db, now), now, campaigns: { db, isContract, baseAccounts, vault, now } });
     return (request) => app.fetch(request);
   }
 

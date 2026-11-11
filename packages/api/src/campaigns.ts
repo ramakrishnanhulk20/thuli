@@ -14,6 +14,7 @@ import {
   type Address,
   type LeafTree,
   type MerkleHash,
+  type ScreenedChain,
 } from '@thuli/core';
 import {
   activeList,
@@ -71,7 +72,10 @@ export const APPEALS_PER_CALLER_HOUR = 2;
 export const CAMPAIGN_READS_PER_MINUTE = 120;
 /** Chain reads the read routes may cause in any 60 seconds across every caller and server copy, two per ticket. */
 export const CAMPAIGN_CHAIN_READS_PER_MINUTE = 600;
-/** Door reads the ask route may cause in any 60 seconds across every caller and server copy, two per ask. */
+/**
+ * Door reads the ask route may cause in any 60 seconds across every caller and server copy: two on Ethereum for every
+ * ask that reaches the door, and two more on Base for one empty on Ethereum, each pair counted before it is read.
+ */
 export const CAMPAIGN_DOOR_READS_PER_MINUTE = 300;
 /**
  * Wallet-type reads the ask and appeal routes together may cause in any 60 seconds across every caller and server copy
@@ -95,7 +99,7 @@ const TYPE_READ_BUCKET = 'campaign-type-reads';
 const EVERY_CALLER = 'all';
 // A ticket's vault amounts are a claimed read and a claimable read.
 const READS_PER_TICKET = 2;
-// An ask's door reads are the wallet's sent count and its balance.
+// The door reads a wallet's sent count and its balance on each chain it reads.
 const READS_PER_DOOR = 2;
 // A version's text never changes once stored, so a parsed list needs no age, only a bound on how many are kept.
 const LIST_CACHE_SIZE = 8;
@@ -123,22 +127,26 @@ export interface VaultReader {
 }
 
 /**
- * Reads one address on Ethereum at the latest block. Called as a function, true only for account type contract: a
- * delegated EOA keeps its own key and counts as a wallet (C20). Any read may reject when the chain cannot be read.
+ * Reads one address on one chain. Called as a function, true only for account type contract: a delegated EOA keeps its
+ * own key and counts as a wallet (C20). The sent count and the balance are read at the finalized block, the block the
+ * worker screens at, so the door counts exactly the history a screening would. Any read may reject when the chain
+ * cannot be read.
  */
-export interface EthereumReader {
+export interface AccountReader {
   (address: Address): Promise<boolean>;
-  /** How many transactions the address has sent: its nonce at the latest block. */
+  /** How many transactions the address has sent: its nonce at the finalized block. */
   sentCount(address: Address): Promise<number>;
-  /** The address's balance in wei at the latest block. */
+  /** The address's balance in wei at the finalized block. */
   balance(address: Address): Promise<bigint>;
 }
 
 export interface CampaignDeps {
   /** The database the campaign tables live in, the one the other stores use. */
   db: Db;
-  /** The Ethereum reader: the wallet type for checkAsk and checkAppeal, and the two reads that find a never-used wallet. */
-  isContract: EthereumReader;
+  /** The Ethereum reader: the wallet type for checkAsk and checkAppeal, and the door's first sent count and balance. */
+  isContract: AccountReader;
+  /** The Base mainnet reader: the door's second sent count and balance, read only for a wallet empty on Ethereum. */
+  baseAccounts: AccountReader;
   /**
    * The reader for a campaign's chain, or null when Thuli has none for it. Left out, or null, a claim ticket goes out
    * without claimed and claimable, and every ask to a campaign off Ethereum is refused, because its chain cannot be read.
@@ -281,9 +289,11 @@ function campaignView(campaign: Campaign, tally: CampaignView['counts'], lists: 
  *   nothing, past it or when the count cannot be read), the
  *   caller's 5 signed asks an hour (429), the wallet's earlier ask (200 {"exists": true, "ask"} with the first ask's
  *   public view, and no door read), the door reads' ceiling of 300 a minute across every caller (503 {"busy": true}),
- *   then the door: the wallet's sent count and balance on Ethereum at the latest block. Both exactly 0 is a never-used
- *   wallet, 200 {"neverUsed": true} with nothing stored, queued or counted; a read that fails, times out or is not a
- *   whole number is 503 {"busy": true}. Then addAsk: 202 {"queued": true}; 200 exists; 409 {"closed": true}; 409
+ *   then the door: the wallet's sent count and balance at the finalized block, the worker's block, on Ethereum and, for
+ *   a wallet with nothing there, on Base mainnet, whose two reads are counted against the same ceiling first. Empty on
+ *   both chains is a never-used wallet, 200 {"neverUsed": true} with nothing stored or queued; a read that fails, times
+ *   out or is not a whole number on a chain that had to be read is 503 {"busy": true}, as is the ceiling reached before
+ *   the Base reads. Then addAsk: 202 {"queued": true}; 200 exists; 409 {"closed": true}; 409
  *   {"full": true} when no slot is left, 200 asks wait undecided or the campaign's lifetime cap is reached.
  * - POST /api/campaigns/:id/appeals with exactly {wallet, text, signedAt, signature}, at most 2 KB. In order: the size
  *   (413), the caller and the minute, the shape (400), checkAppeal with the campaign from the path, its text one line
@@ -414,9 +424,10 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
         // A wallet that asked before gets its first ask back whatever the chain says of it now, and causes no door read.
         const earlier = await getAsk(db, campaign.id, checked.wallet);
         if (earlier !== null) return answer(c, ExistsBody, { exists: true, ask: askJson(earlier) }, 200);
-        // The door reads' global ceiling: 300 a minute, 150 asks, across every caller and server copy. Per caller they
-        // are bounded before this: each pair follows a signed ask that spent one of the caller's 5 an hour, so one
-        // caller causes at most 5 times 2, 10 door reads an hour.
+        // The door reads' global ceiling: 300 a minute, counted as pairs, across every caller and server copy. This
+        // pair is Ethereum's; neverUsedOnBothChains counts Base's before it reads it. Per caller they are bounded
+        // before this: every pair follows a signed ask that spent one of the caller's 5 an hour, so one caller causes
+        // at most 5 times 4, 20 door reads an hour.
         if (!(await recordIfUnder(db, DOOR_READ_BUCKET, EVERY_CALLER, CAMPAIGN_DOOR_READS_PER_MINUTE / READS_PER_DOOR, 60, at))) {
           console.warn('api ask busy: the door-read ceiling is reached');
           return busy(c);
@@ -425,7 +436,7 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
         storeFailed('checking an ask', error);
         return busy(c);
       }
-      const neverUsed = await neverUsedOnEthereum(checked.wallet);
+      const neverUsed = await neverUsedOnBothChains(checked.wallet);
       if (neverUsed === null) return busy(c);
       // A wallet that cost nothing to make is not an ask: nothing is stored or queued, and no slot or cap is taken (C24).
       if (neverUsed) return answer(c, NeverUsedBody, { neverUsed: true }, 200);
@@ -434,10 +445,10 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
         if (result === 'queued') return answer(c, QueuedBody, { queued: true }, 202);
         if (result === 'closed') return answer(c, ClosedBody, { closed: true }, 409);
         // full covers the lifetime cap, askLifetimeCap(max_slots) = max(1,000, 100 times max_slots) asks that never
-        // expire. Only a wallet that has sent a transaction or holds a balance on Ethereum is stored, so locking a
-        // campaign this way now costs an attacker the cap times one funded wallet: at least 1,000 wallets, each with its
-        // own key and each given a balance or a sent transaction on Ethereum. What stays free stores nothing: a
-        // never-used wallet costs only its door reads, which the ceiling above caps.
+        // expire. Only a wallet that has sent a transaction or holds a balance on Ethereum or Base is stored, so locking
+        // a campaign this way now costs an attacker the cap times one funded wallet: at least 1,000 wallets, each with
+        // its own key and each given a balance or a sent transaction on one of the two. What stays free stores nothing:
+        // a never-used wallet costs only its door reads, which the ceiling caps.
         if (result === 'full') return answer(c, FullBody, { full: true }, 409);
         if (result === 'unknown') return answer(c, ErrorBody, NO_CAMPAIGN, 404);
         // The wallet's first ask landed after the lookup above, so this one reads that one.
@@ -642,15 +653,14 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
   }
 
   /**
-   * Whether wallet has never been used on Ethereum: exactly 0 transactions sent and a balance of exactly 0, both read
-   * at the latest block by the same reader as the wallet type. null when either read fails, times out, is missing or
-   * answers anything but a whole number, so a read that did not happen is never taken as never used, nor as used (C11).
+   * Whether wallet is empty on one chain: exactly 0 transactions sent and a balance of exactly 0 at the finalized block.
+   * null when either read fails, times out, is missing or answers anything but a whole number of 0 or more.
    */
-  async function neverUsedOnEthereum(wallet: Address): Promise<boolean | null> {
+  async function emptyOn(reader: AccountReader, wallet: Address): Promise<boolean | null> {
     let sent: bigint | null;
     let balance: bigint | null;
     try {
-      const [count, wei] = await Promise.all([deps.isContract.sentCount(wallet), deps.isContract.balance(wallet)]);
+      const [count, wei] = await Promise.all([reader.sentCount(wallet), reader.balance(wallet)]);
       sent = wholeNumber(count);
       balance = wholeNumber(wei);
     } catch (error) {
@@ -662,6 +672,28 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       return null;
     }
     return sent === 0n && balance === 0n;
+  }
+
+  /**
+   * Whether wallet has never been used on Ethereum nor on Base mainnet. Ethereum is read first, and a wallet used there
+   * is used, with Base never read. Only a wallet empty on Ethereum is read on Base, and its two reads are counted
+   * against the door ceiling before they are made (C49). null, which the route answers as busy, when a read on a chain
+   * that had to be read fails or answers anything but a whole number, or when the second count is refused or cannot
+   * be read: a read that did not happen never decides the answer (C11).
+   */
+  async function neverUsedOnBothChains(wallet: Address): Promise<boolean | null> {
+    const onEthereum = await emptyOn(deps.isContract, wallet);
+    if (onEthereum !== true) return onEthereum;
+    try {
+      if (!(await recordIfUnder(db, DOOR_READ_BUCKET, EVERY_CALLER, CAMPAIGN_DOOR_READS_PER_MINUTE / READS_PER_DOOR, 60, now()))) {
+        console.warn('api ask busy: the door-read ceiling is reached before the Base reads');
+        return null;
+      }
+    } catch (error) {
+      storeFailed('counting the Base door reads', error);
+      return null;
+    }
+    return emptyOn(deps.baseAccounts, wallet);
   }
 
   /** A parsed list kept under key, made the most recently used, or undefined. */
@@ -761,19 +793,25 @@ function isContractCode(code: string | undefined): boolean {
 }
 
 /**
- * The Ethereum mainnet reader: whether an address is a contract from its code, by the facts' rule (isContractCode),
- * and its sent count and balance at the latest block. Offchain lookups are off (C38), and each read gives up after 10
- * seconds.
+ * Base mainnet's public RPC: the door's Base reader reads it unless BASE_RPC_URL names another, the way Base Sepolia's
+ * public RPC is the vault reader's.
  */
-export function accountTypeReader(rpcUrl: string): EthereumReader {
+export const BASE_PUBLIC_RPC = 'https://mainnet.base.org';
+
+/**
+ * The account reader for Ethereum mainnet or Base mainnet: whether an address is a contract from its code, by the
+ * facts' rule (isContractCode), and its sent count and balance at the finalized block. Offchain lookups are off (C38),
+ * and each read gives up after 10 seconds.
+ */
+export function accountReader(rpcUrl: string, chain: ScreenedChain): AccountReader {
   const client = createPublicClient({
-    chain: mainnet,
+    chain: chain === 'ethereum' ? mainnet : base,
     transport: http(rpcUrl, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1 }),
     ccipRead: false,
   });
   return Object.assign(async (address: Address) => isContractCode(await client.getCode({ address })), {
-    sentCount: (address: Address) => client.getTransactionCount({ address, blockTag: 'latest' }),
-    balance: (address: Address) => client.getBalance({ address, blockTag: 'latest' }),
+    sentCount: (address: Address) => client.getTransactionCount({ address, blockTag: 'finalized' }),
+    balance: (address: Address) => client.getBalance({ address, blockTag: 'finalized' }),
   });
 }
 
