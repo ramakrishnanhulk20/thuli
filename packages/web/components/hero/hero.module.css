@@ -1,0 +1,705 @@
+.hero {
+  --pad: clamp(20px, 3vw, 48px);
+  --catch: 0;
+  --hero-scroll: 0;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-height: 100svh;
+  overflow: clip;
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+/* Layers: 0 glow, 1 canvas, 2 scrims, 3 caption and tooltip, 4 text. */
+.glow {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 70% 55% at 78% 8%, rgba(127, 178, 255, 0.1), transparent 60%),
+    linear-gradient(to top, rgba(255, 176, 31, 0.06), transparent 28%);
+}
+
+.violet {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at var(--moon-x) var(--moon-y),
+    rgba(167, 139, 250, 0.12),
+    transparent calc(var(--moon-r) * 1.9)
+  );
+  opacity: var(--catch);
+}
+
+.canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    linear-gradient(to top, rgba(5, 7, 11, 0.94) 0%, rgba(5, 7, 11, 0.6) 30%, transparent 60%),
+    linear-gradient(to right, rgba(5, 7, 11, 0.7), transparent 52%);
+}
+
+.topScrim {
+  display: none;
+}
+
+/* Meta row */
+.meta {
+  position: absolute;
+  top: 96px;
+  left: var(--pad);
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+  white-space: nowrap;
+  animation: fade 500ms ease-out 100ms both;
+}
+
+.metaMark {
+  color: var(--color-accent);
+}
+
+.metaItem {
+  white-space: nowrap;
+}
+
+/* Copy block */
+.copy {
+  z-index: 4;
+  max-width: 62vw;
+  margin: auto 0 40px var(--pad);
+}
+
+.heading {
+  display: block;
+}
+
+.lead {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 500;
+  font-weight: 500;
+  font-size: clamp(1.5rem, 2.6vw, 2.75rem);
+  line-height: 1.1;
+  color: var(--color-ink);
+  animation: rise 700ms var(--ease-out-expo) 150ms backwards;
+}
+
+.leadShare {
+  color: var(--color-accent);
+}
+
+.title {
+  display: block;
+  margin-left: -0.04em;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 125, 'wght' 800;
+  font-weight: 800;
+  font-size: min(21vw, 21rem, 34svh);
+  line-height: 0.82;
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--color-ink);
+  transform-origin: left bottom;
+  animation: widen 1400ms var(--ease-in-out-quart) 250ms both;
+}
+
+.letter {
+  display: inline-block;
+  animation: letterRise 900ms var(--ease-out-expo) both;
+}
+
+.letter:nth-child(1) {
+  animation-delay: 250ms;
+}
+
+.letter:nth-child(2) {
+  animation-delay: 310ms;
+}
+
+.letter:nth-child(3) {
+  animation-delay: 370ms;
+}
+
+.letter:nth-child(4) {
+  animation-delay: 430ms;
+}
+
+.letter:nth-child(5) {
+  animation-delay: 490ms;
+}
+
+.tail {
+  display: block;
+  max-width: 36ch;
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: clamp(1.125rem, 1.5vw, 1.375rem);
+  line-height: 1.4;
+  color: var(--color-ink-2);
+  animation: rise 600ms var(--ease-out-expo) 700ms backwards;
+}
+
+.cta {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 28px;
+  animation: rise 600ms var(--ease-out-expo) 850ms backwards;
+}
+
+.primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 52px;
+  padding: 0 22px;
+  border-radius: 8px;
+  background: var(--color-accent);
+  color: var(--color-night);
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 16px;
+  white-space: nowrap;
+  transition:
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.primary:hover {
+  background: #ffc24d;
+}
+
+.primary:active {
+  transform: scale(0.98);
+}
+
+.play {
+  flex: none;
+  transition: transform 200ms var(--ease-out-expo);
+}
+
+.primary:hover .play {
+  transform: translateX(3px);
+}
+
+.check {
+  position: relative;
+  width: 340px;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  height: 52px;
+  padding: 0 84px 0 16px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: rgba(239, 234, 224, 0.06);
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  transition: border-color 160ms ease;
+}
+
+.input::placeholder {
+  color: var(--color-ink-3);
+}
+
+.input:hover {
+  border-color: var(--color-ink-3);
+}
+
+.input:focus {
+  border-color: var(--color-accent);
+}
+
+.submit {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.submitLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.submitLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.submit:hover .submitLabel::after {
+  transform: scaleX(1);
+}
+
+.error {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-exclude);
+}
+
+.credits {
+  max-width: 900px;
+  margin-top: 28px;
+  animation: fade 800ms ease-out 1100ms backwards;
+}
+
+/* Counter block */
+.counter {
+  position: absolute;
+  right: var(--pad);
+  bottom: 40px;
+  z-index: 3;
+  width: 360px;
+  text-align: right;
+  animation: fade 600ms ease-out 1000ms backwards;
+}
+
+.counterLabel {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.counterLabelLine {
+  display: block;
+  white-space: nowrap;
+}
+
+.counterValue {
+  position: relative;
+}
+
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.counterNumber {
+  margin: 8px 0 10px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75, 'wght' 700;
+  font-weight: 700;
+  font-size: clamp(3rem, 5.4vw, 5.5rem);
+  line-height: 1;
+  color: var(--color-accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.counterStats {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-ink-2);
+}
+
+.counterStat {
+  display: block;
+}
+
+.statMark {
+  display: none;
+  color: var(--color-accent);
+}
+
+.counterNote {
+  margin-top: 10px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--color-ink-3);
+}
+
+/* Cluster caption, set on an arc that hugs the moon, and the tooltip */
+.captionArc {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.captionText {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  fill: var(--color-ink-3);
+  opacity: 0;
+  transition: opacity 600ms ease;
+}
+
+.tooltip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  pointer-events: none;
+  padding: 10px 12px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+  background: var(--color-night-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+  color: var(--color-ink-2);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.tooltipFirst {
+  display: block;
+  color: var(--color-ink);
+}
+
+.tooltipLine {
+  display: block;
+}
+
+/* Scroll. The entrance animations on the faded blocks use "backwards" fill so this rule takes over once they finish. */
+@media (prefers-reduced-motion: no-preference) {
+  .canvas {
+    transform: translateY(calc(var(--hero-scroll) * 18svh));
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) and (min-width: 768px) {
+  .title {
+    transform: translateY(calc(var(--hero-scroll) * -6svh)) scale(calc(1 + var(--hero-scroll) * 0.06));
+  }
+
+  .lead,
+  .tail,
+  .cta,
+  .credits,
+  .counter {
+    opacity: calc(1 - var(--hero-scroll) * 1.6);
+  }
+}
+
+/* Small laptop, 1024 to 1279 */
+@media (max-width: 1279px) {
+  .copy {
+    max-width: 56vw;
+  }
+
+  .title {
+    font-size: min(19vw, 34svh);
+  }
+
+  .counter {
+    width: 300px;
+  }
+
+  .credits {
+    max-width: 600px;
+  }
+}
+
+/* Tablet, 768 to 1023 */
+@media (max-width: 1023px) {
+  .copy {
+    max-width: 80vw;
+  }
+
+  .title {
+    font-size: min(22vw, 30svh);
+  }
+
+  .counter {
+    position: static;
+    width: auto;
+    margin-bottom: 22px;
+    text-align: left;
+  }
+
+  .counterStat {
+    display: inline;
+  }
+
+  .statMark {
+    display: inline-block;
+    margin: 0 10px;
+    vertical-align: middle;
+  }
+
+  .counterNote {
+    display: none;
+  }
+
+  .captionArc {
+    display: none;
+  }
+
+  .meta {
+    display: block;
+  }
+
+  .metaItem {
+    display: block;
+  }
+
+  .metaMark,
+  .metaMiddle {
+    display: none;
+  }
+
+  .topScrim {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2;
+    display: block;
+    height: 110px;
+    pointer-events: none;
+    background: linear-gradient(to bottom, rgba(5, 7, 11, 0.78), transparent);
+  }
+}
+
+/* Mobile, below 768 */
+@media (max-width: 767px) {
+  .meta {
+    top: 60px;
+    font-size: 10px;
+  }
+
+  .copy {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-self: stretch;
+    max-width: none;
+    margin: 250px 0 0;
+    padding: 0 var(--pad) 24px;
+  }
+
+  .copy::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    top: -60px;
+    z-index: -1;
+    pointer-events: none;
+    background: linear-gradient(to bottom, transparent, rgba(5, 7, 11, 0.9) 110px);
+  }
+
+  .counter {
+    display: contents;
+    animation: none;
+  }
+
+  .counterLabel,
+  .counterNumber,
+  .counterStats,
+  .counterNote {
+    animation: fade 600ms ease-out 1000ms backwards;
+  }
+
+  .counterLabel {
+    order: 0;
+    font-size: 10px;
+  }
+
+  .counterValue {
+    order: 1;
+  }
+
+  .counterNumber {
+    font-size: 44px;
+  }
+
+  .heading {
+    order: 2;
+  }
+
+  .cta {
+    order: 3;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    margin-top: 0;
+  }
+
+  .counterStats {
+    order: 4;
+    margin-top: 18px;
+    font-size: 12px;
+    line-height: 1.6;
+    text-align: left;
+  }
+
+  .counterStat {
+    display: block;
+  }
+
+  .statMark {
+    display: none;
+  }
+
+  .counterNote {
+    order: 5;
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    text-align: left;
+  }
+
+  .credits {
+    order: 6;
+    margin-top: 18px;
+  }
+
+  .lead {
+    margin-top: 14px;
+    margin-bottom: 0;
+    font-size: 22px;
+    line-height: 1.15;
+  }
+
+  .title {
+    font-size: 25vw;
+    line-height: 0.84;
+  }
+
+  .tail {
+    margin-top: 10px;
+    font-size: 16px;
+  }
+
+  .primary {
+    justify-content: center;
+    width: 100%;
+    margin-top: 20px;
+  }
+
+  .check {
+    width: 100%;
+    margin-top: 10px;
+  }
+
+  .submit {
+    top: 4px;
+    right: 4px;
+    height: 44px;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes letterRise {
+  from {
+    opacity: 0;
+    transform: translateY(40%);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes widen {
+  from {
+    font-variation-settings: 'wdth' 75, 'wght' 800;
+  }
+
+  to {
+    font-variation-settings: 'wdth' 125, 'wght' 800;
+  }
+}
+
+/* Reduced motion: no rises, the title rests at full width, everything is visible at first paint. */
+@media (prefers-reduced-motion: reduce) {
+  .meta,
+  .lead,
+  .title,
+  .letter,
+  .tail,
+  .cta,
+  .counter,
+  .counterLabel,
+  .counterNumber,
+  .counterStats,
+  .counterNote,
+  .credits {
+    animation: none;
+  }
+}

@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@theme static {
+  --color-night: #05070b;
+  --color-night-2: #0b0f16;
+  --color-line: #1c2430;
+  --color-ink: #efeae0;
+  --color-ink-2: #a9b0ba;
+  --color-ink-3: #7c8693;
+  --color-accent: #ffb01f;
+  --color-full: #5fe3b3;
+  --color-partial: #7fb2ff;
+  --color-hold: #a78bfa;
+  --color-exclude: #ff5d8f;
+
+  --font-display: var(--ff-display), "Arial Narrow", sans-serif;
+  --font-body: var(--ff-body), system-ui, sans-serif;
+  --font-mono: var(--ff-mono), ui-monospace, monospace;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-quart: cubic-bezier(0.76, 0, 0.24, 1);
+
+  --radius-button: 8px;
+}
+
+html {
+  background: var(--color-night);
+  color: var(--color-ink);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.55;
+  min-height: 100svh;
+  overflow-x: clip;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--color-night);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

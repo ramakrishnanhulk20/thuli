@@ -1,0 +1,84 @@
+.notes {
+  --pad: clamp(20px, 3vw, 48px);
+
+  padding: 96px var(--pad);
+  border-top: 1px solid var(--color-line);
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-2);
+}
+
+.mark {
+  color: var(--color-accent);
+}
+
+.rowHeading {
+  margin: 48px 0 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  text-transform: uppercase;
+  color: var(--color-ink-3);
+}
+
+.tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.swatch {
+  width: 72px;
+  height: 72px;
+  border: 1px solid var(--color-line);
+  border-radius: 8px;
+}
+
+.tokenName,
+.tokenHex {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tokenName {
+  margin-top: 8px;
+  color: var(--color-ink);
+}
+
+.tokenHex {
+  color: var(--color-ink-3);
+}
+
+.display {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 64px;
+  line-height: 1.15;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.sentence {
+  margin-top: 24px;
+  font-family: var(--font-body);
+  font-size: 18px;
+  color: var(--color-ink);
+}
+
+.address {
+  margin-top: 16px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}

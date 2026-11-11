@@ -1,0 +1,431 @@
+/* Nav */
+.nav {
+  --pad: clamp(20px, 3vw, 48px);
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.overlay {
+  position: absolute;
+  top: 0;
+  left: var(--pad);
+  right: var(--pad);
+  /* One above the copy block, so the open mobile sheet inside it covers the copy. */
+  z-index: 5;
+  height: 72px;
+  animation: fade 500ms ease-out 100ms both;
+}
+
+.bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  height: 64px;
+  padding: 0 var(--pad);
+  border-bottom: 1px solid var(--color-line);
+}
+
+/* The blur sits on its own layer: a backdrop-filter on the bar itself would trap the fixed menu sheet inside the bar. */
+.bar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: rgba(5, 7, 11, 0.82);
+  backdrop-filter: blur(10px);
+}
+
+.spacer {
+  height: 64px;
+}
+
+/* Hidden until the visitor scrolls up past the hero. The shown state uses "none", not translateY(0), for the same trap reason. */
+.bar[data-shown] {
+  visibility: hidden;
+  transform: translateY(-100%);
+  transition:
+    transform 300ms var(--ease-out-expo),
+    visibility 0s linear 300ms;
+}
+
+.bar[data-shown='true'] {
+  visibility: visible;
+  transform: none;
+  transition:
+    transform 300ms var(--ease-out-expo),
+    visibility 0s;
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 44px;
+}
+
+.wordmarkMark {
+  color: var(--color-accent);
+}
+
+.wordmarkName {
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 700;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  color: var(--color-ink);
+}
+
+.wordmarkTamil {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--color-ink-3);
+}
+
+.wordmark:hover .wordmarkMark {
+  animation: markDrop 400ms ease-in-out;
+}
+
+.links {
+  display: flex;
+  gap: 32px;
+}
+
+.link {
+  position: relative;
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-ink-2);
+  transition: color 180ms ease;
+}
+
+.link:hover {
+  color: var(--color-ink);
+}
+
+.menuButton {
+  display: none;
+  position: relative;
+  z-index: 41;
+  align-items: center;
+  height: 44px;
+  padding: 0 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--color-ink);
+  cursor: pointer;
+}
+
+.menuLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgba(5, 7, 11, 0.96);
+  backdrop-filter: blur(8px);
+}
+
+.sheetNav {
+  position: absolute;
+  top: 120px;
+  left: var(--pad);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.sheetLink {
+  position: relative;
+  display: inline-block;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 700;
+  font-weight: 700;
+  font-size: 40px;
+  line-height: 1.25;
+  color: var(--color-ink);
+  animation: sheetLinkIn 350ms var(--ease-out-expo) both;
+  animation-delay: calc(var(--i) * 50ms);
+}
+
+/* One underline draw for every link in the nav and the footer. */
+.link::after,
+.sheetLink::after,
+.menuLabel::after,
+.footLinkLabel::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--color-ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 220ms var(--ease-out-expo);
+}
+
+.link:hover::after,
+.sheetLink:hover::after,
+.menuButton:hover .menuLabel::after,
+.footLink:hover .footLinkLabel::after {
+  transform: scaleX(1);
+}
+
+/* Footer */
+.footer {
+  --pad: clamp(20px, 3vw, 48px);
+
+  padding: 96px var(--pad) 40px;
+  border-top: 1px solid var(--color-line);
+  background: var(--color-night);
+  color: var(--color-ink);
+}
+
+.footerLine {
+  max-width: 22ch;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 100, 'wght' 500;
+  font-weight: 500;
+  font-size: clamp(1.75rem, 3.2vw, 3rem);
+  line-height: 1.1;
+  color: var(--color-ink);
+}
+
+.footerMeaning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  font-family: var(--font-body);
+  font-size: 16px;
+  color: var(--color-ink-2);
+}
+
+.footerMark {
+  color: var(--color-accent);
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 48px;
+  margin-top: 56px;
+}
+
+.columnLabel {
+  margin-bottom: 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--color-ink-3);
+}
+
+.footLinks {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 2;
+}
+
+.footLink {
+  display: inline-block;
+  color: var(--color-ink-2);
+  transition: color 180ms ease;
+}
+
+.footLink:hover {
+  color: var(--color-ink);
+}
+
+.footLinkLabel {
+  position: relative;
+  display: inline-block;
+}
+
+.footAddress {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-ink-3);
+}
+
+.footerCredits {
+  margin-top: 64px;
+}
+
+.footerBase {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 24px;
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-line);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--color-ink-3);
+}
+
+/* Film credits, shared by the hero and the footer. */
+.credits {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 22px;
+  row-gap: 4px;
+  font-family: var(--font-display);
+  font-variation-settings: 'wdth' 75;
+  text-transform: uppercase;
+}
+
+.creditRole {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  color: var(--color-ink-3);
+}
+
+.creditName {
+  margin-left: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-2);
+}
+
+/* Small laptop, 1024 to 1279 */
+@media (max-width: 1279px) {
+  .links {
+    gap: 22px;
+  }
+}
+
+/* Tablet, 768 to 1023 */
+@media (max-width: 1023px) {
+  .links {
+    display: none;
+  }
+
+  .menuButton {
+    display: inline-flex;
+  }
+}
+
+/* Mobile, below 768 */
+@media (max-width: 767px) {
+  .overlay {
+    height: 56px;
+  }
+
+  .bar {
+    height: 56px;
+  }
+
+  .spacer {
+    height: 56px;
+  }
+
+  .wordmarkName {
+    font-size: 16px;
+  }
+
+  .wordmarkTamil {
+    font-size: 14px;
+  }
+
+  .footer {
+    padding-top: 64px;
+  }
+
+  .columns {
+    grid-template-columns: 1fr;
+    gap: 32px;
+  }
+
+  .footerBase {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .credits {
+    column-gap: 14px;
+  }
+
+  .creditRole {
+    font-size: 9px;
+  }
+
+  .creditName {
+    font-size: 12px;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes sheetLinkIn {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes markDrop {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(2px);
+  }
+}
+
+/* Reduced motion: the bar shows and hides at once, and nothing slides or fades in. */
+@media (prefers-reduced-motion: reduce) {
+  .overlay,
+  .sheetLink {
+    animation: none;
+  }
+
+  .bar[data-shown],
+  .bar[data-shown='true'] {
+    transition: none;
+  }
+
+  /* Motion writes inline styles for the fade, so only an important rule can hold the line still. */
+  .footerLine {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
