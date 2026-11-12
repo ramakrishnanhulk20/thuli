@@ -552,7 +552,7 @@ describe('the outside check of an appeal', () => {
   });
 });
 
-describe('paying the outside check at most once (C23)', () => {
+describe('paying the outside check at most MAX_UNCLEAR_SUBMITS times (C23, C56)', () => {
   const MAYBE_PAID = 'the outside check may already have been paid for';
   const key = (wallet: string) => ({ campaignId: CAMPAIGN, wallet });
 
@@ -576,7 +576,7 @@ describe('paying the outside check at most once (C23)', () => {
     }
   }
 
-  it('pays once when the write keeping the evaluation id fails, ends the appeal unchecked, and logs the id for a look-up by hand (cut A)', async () => {
+  it('pays at most MAX_UNCLEAR_SUBMITS times when the write keeping the evaluation id fails: with the limit at 1, once, then ends the appeal unchecked and logs the id for a look-up by hand (cut A)', async () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
@@ -586,7 +586,7 @@ describe('paying the outside check at most once (C23)', () => {
       failNext = false;
       throw new Error('connection reset');
     });
-    const deps = { ...appealDeps(reppo), db: flaky };
+    const deps = { ...appealDeps(reppo), db: flaky, maxUnclearSubmits: 1 };
     await appealNext(deps);
     expect(lines.some((line) => line.includes('eval_1') && line.includes('by hand'))).toBe(true);
     later(APPEAL_LEASE_SECONDS + 1);
@@ -596,7 +596,7 @@ describe('paying the outside check at most once (C23)', () => {
     expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: MAYBE_PAID, reppoEvalId: null });
   });
 
-  it('pays once when the process stops after the submit returns, before the id is kept (cut B)', async () => {
+  it('pays at most MAX_UNCLEAR_SUBMITS times when the process stops after the submit returns, before the id is kept: with the limit at 1, once (cut B)', async () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
@@ -604,7 +604,7 @@ describe('paying the outside check at most once (C23)', () => {
     expect(await markAppealSubmitting(db, key(wallet), clock)).toBe(true);
     await reppo.submit('the decision, sent by the worker that then stopped');
     later(APPEAL_LEASE_SECONDS + 1);
-    const deps = appealDeps(reppo);
+    const deps = { ...appealDeps(reppo), maxUnclearSubmits: 1 };
     expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
     await tenMoreRuns(deps);
     expect(reppo.posts).toBe(1);
@@ -612,7 +612,6 @@ describe('paying the outside check at most once (C23)', () => {
   });
 
   it.each([1, 2])('counts each unclear submit and, with the limit at %i, ends the check as maybe paid for after exactly that many POSTs (C56)', async (limit) => {
-    expect(MAX_UNCLEAR_SUBMITS).toBe(1);
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
@@ -647,12 +646,71 @@ describe('paying the outside check at most once (C23)', () => {
     expect(await appealNext(deps)).toEqual({ kind: 'idle' });
   });
 
+  it('gives an appeal one more submit after an unclear one by default: MAX_UNCLEAR_SUBMITS is 2 (C56)', () => {
+    expect(MAX_UNCLEAR_SUBMITS).toBe(2);
+  });
+
+  it('on the default limit, follows one unclear submit with one that answers: two POSTs, the id kept, the verdict recorded, the count 1 (C56)', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    reppo.submitAnswers.push(new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null));
+    reppo.answers.push(completed('review'));
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
+    later(retryDelaySeconds(1));
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', route: 'review', evalId: 'eval_1' });
+    expect(reppo.posts).toBe(2);
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checked', reppoEvalId: 'eval_1', reppoRoute: 'review', reppoScore: 78, unclearSubmits: 1 });
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(2);
+  });
+
+  it('on the default limit, ends the check as maybe paid for after two unclear submits, and never sends a third over ten more runs (C56)', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    reppo.submitFails = new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
+    later(retryDelaySeconds(1));
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
+    expect(reppo.posts).toBe(2);
+    later(retryDelaySeconds(2));
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: APPEAL_MAYBE_PAID });
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'unchecked', checkNote: APPEAL_MAYBE_PAID, unclearSubmits: 2, submitStartedAt: null });
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(2);
+  });
+
+  it('on the default limit, counts a submit cut off before its id was kept, sends once more, and keeps and follows the second evaluation (cut B, C56)', async () => {
+    const { wallet } = await decided();
+    await appealed(wallet);
+    const reppo = new StandInReppo();
+    expect(await takeAppeal(db, clock, APPEAL_LEASE_SECONDS, APPEAL_MAX_ATTEMPTS)).toMatchObject({ submitStarted: false });
+    expect(await markAppealSubmitting(db, key(wallet), clock)).toBe(true);
+    await reppo.submit('the decision, sent by the worker that then stopped');
+    later(APPEAL_LEASE_SECONDS + 1);
+    reppo.answers.push({ status: 'UNFINISHED', creditsCharged: 0, verdict: null }, completed('ship'));
+    const deps = appealDeps(reppo);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', cause: APPEAL_CAUSES.unfinished, status: 'queued' });
+    expect(reppo.posts).toBe(2);
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', reppoEvalId: 'eval_2', unclearSubmits: 1 });
+    later(APPEAL_LOOKUP_WAIT_SECONDS);
+    expect(await appealNext(deps)).toMatchObject({ kind: 'checked', route: 'ship', evalId: 'eval_2' });
+    expect(reppo.lookedUp).toEqual(['eval_2', 'eval_2']);
+    await tenMoreRuns(deps);
+    expect(reppo.posts).toBe(2);
+    expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checked', reppoEvalId: 'eval_2', unclearSubmits: 1 });
+  });
+
   it('ends a check whose count reached the limit with no mark left, as a stop right after the count leaves it, and sends nothing more (fail closed)', async () => {
     const { wallet } = await decided();
     await appealed(wallet);
     const reppo = new StandInReppo();
     reppo.submitFails = new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
-    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'released', status: 'queued' });
+    const deps = { ...appealDeps(reppo), maxUnclearSubmits: 1 };
+    expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
     later(retryDelaySeconds(1));
     const stop = new AbortController();
     const cutting = hooked(/SET unclear_submits = appeals\.unclear_submits \+ 1/, async (run) => {
@@ -660,10 +718,10 @@ describe('paying the outside check at most once (C23)', () => {
       stop.abort();
       return counted;
     });
-    await expect(appealNext({ ...appealDeps(reppo), db: cutting }, stop.signal)).rejects.toThrow('ran past its time limit');
+    await expect(appealNext({ ...deps, db: cutting }, stop.signal)).rejects.toThrow('ran past its time limit');
     expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'checking', unclearSubmits: 1, submitStartedAt: null });
     later(APPEAL_LEASE_SECONDS + 1);
-    expect(await appealNext(appealDeps(reppo))).toMatchObject({ kind: 'unchecked', cause: APPEAL_MAYBE_PAID });
+    expect(await appealNext(deps)).toMatchObject({ kind: 'unchecked', cause: APPEAL_MAYBE_PAID });
     expect(reppo.posts).toBe(1);
   });
 
@@ -715,8 +773,8 @@ describe('paying the outside check at most once (C23)', () => {
     expect(lines).toEqual([`appeal ${CAMPAIGN} ${wallet}: unchecked, ${APPEAL_CAUSES.unsendable}`]);
   });
 
-  it('pays once with two workers on one appeal after a lease ran out, whichever of them stalls', async () => {
-    // A stalls with its POST out; B takes the appeal once the lease has run out.
+  it('pays at most MAX_UNCLEAR_SUBMITS times with two workers on one appeal after a lease ran out, whichever of them stalls: with the limit at 1, once', async () => {
+    // A stalls with its POST out; B takes the appeal once the lease has run out, and at a limit of 1 ends it unsent.
     const first = await decided();
     await appealed(first.wallet);
     const slowA = new StandInReppo();
@@ -724,11 +782,11 @@ describe('paying the outside check at most once (C23)', () => {
     slowA.answerGate = new Promise<void>((resolve) => {
       answer = resolve;
     });
-    const a = appealNext(appealDeps(slowA));
+    const a = appealNext({ ...appealDeps(slowA), maxUnclearSubmits: 1 });
     await until(() => slowA.posts === 1);
     later(APPEAL_LEASE_SECONDS + 1);
     const b = new StandInReppo();
-    expect(await appealNext(appealDeps(b))).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
+    expect(await appealNext({ ...appealDeps(b), maxUnclearSubmits: 1 })).toMatchObject({ kind: 'unchecked', cause: MAYBE_PAID });
     answer();
     await a;
     expect(slowA.posts + b.posts).toBe(1);
@@ -776,7 +834,7 @@ describe('paying the outside check at most once (C23)', () => {
     expect(reppo.submitted).toHaveLength(2);
   });
 
-  it('keeps the mark after no answer, a 408, a 500 or a reply out of shape, and never sends a second POST for any of them (fail closed)', async () => {
+  it('keeps the mark after no answer, a 408, a 500 or a reply out of shape, and with the limit at 1 never sends a second POST for any of them (fail closed)', async () => {
     const wallets = [await decided(), await decided(), await decided(), await decided()];
     for (const { wallet } of wallets) await appealed(wallet);
     const reppo = new StandInReppo();
@@ -786,7 +844,7 @@ describe('paying the outside check at most once (C23)', () => {
       new ReppoError('Reppo answered with status 500', 500),
       new ReppoError('Reppo gave an evaluation id that is not safe to use, so it may have been charged', null),
     );
-    const deps = appealDeps(reppo);
+    const deps = { ...appealDeps(reppo), maxUnclearSubmits: 1 };
     for (const { wallet } of wallets) {
       expect(await appealNext(deps)).toMatchObject({ kind: 'released', wallet, status: 'queued' });
       expect((await appealRow(wallet))?.submitStartedAt).not.toBeNull();
@@ -878,11 +936,11 @@ describe('paying the outside check at most once (C23)', () => {
     ['a cause code not in the list', () => new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) })],
     ['a 408', () => reply(408)],
     ['a 500', () => reply(500)],
-  ])('reads %s as unclear: the try counted, the mark kept, and the next take counts it and ends the check (fail closed)', async (_name, answer) => {
+  ])('reads %s as unclear: the try counted, the mark kept, and with the limit at 1 the next take counts it and ends the check (fail closed)', async (_name, answer) => {
     const { wallet } = await decided();
     await appealed(wallet);
     const { reppo, posts } = realReppo(answer);
-    const deps = appealDeps(reppo);
+    const deps = { ...appealDeps(reppo), maxUnclearSubmits: 1 };
     expect(await appealNext(deps)).toMatchObject({ kind: 'released', status: 'queued' });
     expect(await appealRow(wallet)).toMatchObject({ checkStatus: 'queued', attempts: 1, unclearSubmits: 0 });
     expect((await appealRow(wallet))?.submitStartedAt).not.toBeNull();
@@ -1065,8 +1123,8 @@ describe('the operator\'s appeal commands', () => {
     const checked = await decided();
     const fresh = await decided();
     const reppo = new StandInReppo();
-    const deps = appealDeps(reppo);
-    // An unclear submit, then the next take counts it and ends the check.
+    const deps = { ...appealDeps(reppo), maxUnclearSubmits: 1 };
+    // An unclear submit, then the next take counts it and, with the limit at 1, ends the check.
     await appealed(ended.wallet);
     reppo.submitAnswers.push(new ReppoError('Reppo answered with status 500', 500));
     expect(await appealNext(deps)).toMatchObject({ kind: 'released', wallet: ended.wallet });

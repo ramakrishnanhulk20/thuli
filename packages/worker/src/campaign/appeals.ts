@@ -61,16 +61,18 @@ import { checkpoint, StepStopped, waitNoted, type ChainMemory } from './vault.ts
  * How long one worker holds an appeal. The submit always ends inside it: the take, the text and the mark take
  * milliseconds, and the one POST then ends by APPEAL_SUBMIT_DEADLINE_MS, 30 seconds, at the latest, or sooner at the
  * step's own 240 second limit, leaving over 260 seconds of the lease. A second worker can take the appeal only once the
- * lease has run out, when the submit mark already stands, so it never sends (C23, C41).
+ * lease has run out, when the submit mark already stands, so it counts that submit as unclear and sends again only while
+ * the count is below MAX_UNCLEAR_SUBMITS (C23, C41, C56).
  */
 export const APPEAL_LEASE_SECONDS = 300;
 /** Tries one appeal's outside check gets before it ends unchecked (C41). */
 export const APPEAL_MAX_ATTEMPTS = 6;
 /**
  * How many submits of one appeal may end unclear, each perhaps charged with no evaluation id to show, before its check
- * is given up as "may have been paid for" (APPEAL_MAYBE_PAID). 1 means the first unclear submit ends it (C56).
+ * is given up as "may have been paid for" (APPEAL_MAYBE_PAID). At 2, one unclear submit is tried once more, so a single
+ * dropped connection does not cost an appeal its check, and one check is paid for at most twice (C56).
  */
-export const MAX_UNCLEAR_SUBMITS = 1;
+export const MAX_UNCLEAR_SUBMITS = 2;
 /** How long one look-up waits for Reppo, which answers in 30 to 90 seconds; past this the try is given back unfinished. */
 export const APPEAL_REPPO_WAIT_MS = 150_000;
 /** The deadline of the one POST that submits an appeal; with no retry, it is the whole submit. */
