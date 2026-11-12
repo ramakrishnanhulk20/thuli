@@ -77,7 +77,8 @@ export interface ApiConfig {
   payTo: Address;
   /**
    * The public https origin the paid route lives at, used for the 402 resource URL and the Bazaar listing, so a client's
-   * Host header never shapes them. Null only on Base Sepolia, where the request's own origin is used instead.
+   * Host header never shapes them. PUBLIC_ORIGIN, or else the production host Vercel names. Null only on Base Sepolia
+   * with neither set, where the request's own origin is used instead.
    */
   publicOrigin: string | null;
   /**
@@ -171,16 +172,25 @@ function settlementRpcUrl(env: Env, network: NetworkName): string {
   return value;
 }
 
+// Vercel sets this on every deployment, at build and at run time, to the project's production host with no scheme. The
+// platform writes it and no caller can, so it is as safe a source as PUBLIC_ORIGIN, which still wins when both are set.
+const VERCEL_PRODUCTION_HOST = 'VERCEL_PROJECT_PRODUCTION_URL';
+
 function publicOrigin(env: Env, isRequired: boolean): string | null {
-  const value = read(env, 'PUBLIC_ORIGIN');
-  if (value === undefined) {
+  const own = read(env, 'PUBLIC_ORIGIN');
+  const host = read(env, VERCEL_PRODUCTION_HOST);
+  if (own === undefined && host === undefined) {
     if (isRequired) throw new ConfigError('PUBLIC_ORIGIN is missing. Base mainnet needs the https origin the API is served at.');
     return null;
   }
-  const refusal = new ConfigError('PUBLIC_ORIGIN must be an https origin such as https://api.example.com, with no path.');
+  // A PUBLIC_ORIGIN that is set and bad is refused, never swapped for the host, and both go through the one parser below.
+  const refusal =
+    own !== undefined
+      ? new ConfigError('PUBLIC_ORIGIN must be an https origin such as https://api.example.com, with no path.')
+      : new ConfigError(`${VERCEL_PRODUCTION_HOST} must be a bare host name such as thuli.vercel.app. Set PUBLIC_ORIGIN to name the origin yourself.`);
   let url: URL;
   try {
-    url = new URL(value);
+    url = new URL(own ?? `https://${host}`);
   } catch {
     throw refusal;
   }
@@ -220,18 +230,22 @@ function port(env: Env): number {
 
 /**
  * Reads and checks the paid API's settings. X402_NETWORK has no default, so testnet payments are off unless chosen.
- * Base needs PAYTO_ADDRESS, the CDP keys, PUBLIC_ORIGIN and BASE_RPC_URL; Base Sepolia needs PAYTO_ADDRESS_TESTNET,
- * may name a FACILITATOR_URL and a PUBLIC_ORIGIN, and reads its receipts from the public Sepolia RPC.
+ * Base needs PAYTO_ADDRESS, the CDP keys, BASE_RPC_URL and its own origin (PUBLIC_ORIGIN, or on Vercel the production
+ * host the platform names); Base Sepolia needs PAYTO_ADDRESS_TESTNET, may name a FACILITATOR_URL and a PUBLIC_ORIGIN,
+ * and reads its receipts from the public Sepolia RPC.
  * TRUSTED_CLIENT_HEADER and DATABASE_URL are optional on both; DATABASE_URL_UNPOOLED, when set, is used instead of
  * DATABASE_URL.
  *
  * Refuses to start while any variable named like a private key is set, because a key held by an internet-facing server
  * is a key an attacker can reach (C39). This runs first, before any other setting is read.
  *
+ * A process that serves nobody but itself, such as the proof script, has no public origin to name, so it may pass
+ * publicOrigin 'optional'. One that is set is still checked. Every server leaves the option out.
+ *
  * @throws ConfigError naming the first missing or bad variable, or every private key variable that is set. The message
  * never holds a value (C40).
  */
-export function loadApiConfig(env: Env): ApiConfig {
+export function loadApiConfig(env: Env, options: { publicOrigin?: 'optional' } = {}): ApiConfig {
   refusePrivateKeys(env);
   const network = read(env, 'X402_NETWORK');
   if (network !== 'base' && network !== 'base-sepolia') {
@@ -260,7 +274,7 @@ export function loadApiConfig(env: Env): ApiConfig {
     usdc: parseAddress(chain.usdc),
     explorer: chain.explorer,
     payTo,
-    publicOrigin: publicOrigin(env, network === 'base'),
+    publicOrigin: publicOrigin(env, network === 'base' && options.publicOrigin !== 'optional'),
     facilitator,
     port: port(env),
     trustedClientHeader: trustedClientHeader(env),

@@ -109,6 +109,12 @@ export interface ApiDeps {
   stores?: Stores;
   /** The campaign routes' database and chain readers. Left out, no /api/campaigns route exists. */
   campaigns?: CampaignDeps;
+  /**
+   * True leaves the catalogue listing off the paid route's terms. For a server only this machine can reach, such as a
+   * proof run in its own process: a settled payment asks the facilitator to list the route, and a public catalogue must
+   * not be handed an address nobody else can open.
+   */
+  unlisted?: boolean;
 }
 
 interface AppEnv {
@@ -250,7 +256,7 @@ function exampleOutput(config: ApiConfig): PaidScreenResponse {
   });
 }
 
-function screenRoutes(config: ApiConfig): RoutesConfig {
+function screenRoutes(config: ApiConfig, listed: boolean): RoutesConfig {
   return {
     [`POST ${SCREEN_PATH}`]: {
       accepts: [
@@ -267,8 +273,8 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
       ...(config.publicOrigin !== null && { resource: `${config.publicOrigin}${SCREEN_PATH}` }),
       description: DESCRIPTION,
       mimeType: 'application/json',
-      extensions: {
-        ...declareDiscoveryExtension({
+      ...(listed && {
+        extensions: declareDiscoveryExtension({
           bodyType: 'json',
           input: { wallet: EXAMPLE_WALLET },
           inputSchema: {
@@ -280,7 +286,7 @@ function screenRoutes(config: ApiConfig): RoutesConfig {
           },
           output: { example: exampleOutput(config), schema: OUTPUT_SCHEMA as Record<string, unknown> },
         }),
-      },
+      }),
     },
   };
 }
@@ -866,7 +872,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => c.json({ error: 'the body is too large' }, 413) }),
     readRequest,
     holdPlace,
-    paymentMiddleware(screenRoutes(config), resourceServer),
+    paymentMiddleware(screenRoutes(config, deps.unlisted !== true), resourceServer),
     async (c) => {
       const request = paidRequests.getStore();
       // The upfront flow only reaches here after a settle this app recorded. Anything else is a broken invariant.

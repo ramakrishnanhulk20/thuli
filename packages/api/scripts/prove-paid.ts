@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
 import { serve } from '@hono/node-server';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
-import { decodePaymentResponseHeader, decodePaymentSignatureHeader } from '@x402/core/http';
+import { decodePaymentRequiredHeader, decodePaymentResponseHeader, decodePaymentSignatureHeader } from '@x402/core/http';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { wrapFetchWithPayment } from '@x402/fetch';
 import { createPublicClient, erc20Abi, http } from 'viem';
@@ -18,7 +18,8 @@ import { PaidScreenResponse, SettledRetryBody } from '../src/schema.ts';
 import { PayerKeyError, takePayerAccount } from './payer-key.ts';
 
 const ROBO_FARM_WALLET = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
-const USAGE = 'Usage: npm run prove:paid -- [--wallet <address>] [--url <http origin of a running site>] [--save <file for the 200 body>]';
+const USAGE =
+  'Usage: npm run prove:paid -- [--wallet <address>] [--url <http origin of a running site>] [--save <file for the 200 body>] [--save-terms <file for the 402 terms>]';
 const FETCHES = 10;
 // A settled payment whose screening ran out of time is asked for again with the same header, at most this often.
 const REDEEM_TRIES = 2;
@@ -37,13 +38,15 @@ interface Options {
   origin: string | null;
   /** Where to write the 200 body, exactly as received. */
   save: string | null;
+  /** Where to write the payment terms the 402 carried, decoded from its header and otherwise as received. */
+  saveTerms: string | null;
 }
 
 function readOptions(): Options {
-  let values: { wallet?: string | undefined; url?: string | undefined; save?: string | undefined };
+  let values: { wallet?: string | undefined; url?: string | undefined; save?: string | undefined; 'save-terms'?: string | undefined };
   try {
     values = parseArgs({
-      options: { wallet: { type: 'string' }, url: { type: 'string' }, save: { type: 'string' } },
+      options: { wallet: { type: 'string' }, url: { type: 'string' }, save: { type: 'string' }, 'save-terms': { type: 'string' } },
       strict: true,
       allowPositionals: false,
     }).values;
@@ -66,7 +69,7 @@ function readOptions(): Options {
     }
     origin = parsed.origin;
   }
-  return { wallet, origin, save: values.save ?? null };
+  return { wallet, origin, save: values.save ?? null, saveTerms: values['save-terms'] ?? null };
 }
 
 function usdc(units: bigint): string {
@@ -114,7 +117,8 @@ function payingClient(config: ApiConfig, account: ReturnType<typeof privateKeyTo
 }
 
 async function listen(config: ApiConfig): Promise<{ origin: string; close(): void }> {
-  const app = createApp(config, { screen: liveScreen(process.env) });
+  // Only this script can reach this server, so its paid route is kept out of the facilitator's public catalogue.
+  const app = createApp(config, { screen: liveScreen(process.env), unlisted: true });
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: app.fetch, port: 0, hostname: '127.0.0.1' }, (info: AddressInfo) => {
       resolve({ origin: `http://127.0.0.1:${info.port}`, close: () => server.close() });
@@ -144,10 +148,11 @@ async function waitForChange(read: () => Promise<bigint>, before: bigint): Promi
 }
 
 async function main(): Promise<number> {
-  const { wallet, origin, save } = readOptions();
+  const { wallet, origin, save, saveTerms } = readOptions();
   // The API runs in this process, so the payer key leaves the environment before the API reads it (C39).
   const account = takePayerAccount(process.env);
-  const config = loadApiConfig(process.env);
+  // This script serves no one else: it pays the API in this process, or a site that names its own origin.
+  const config = loadApiConfig(process.env, { publicOrigin: 'optional' });
   const payer = parseAddress(account.address);
   const readBalance = await balanceReader(config, payer);
   const before = await readBalance();
@@ -166,10 +171,13 @@ async function main(): Promise<number> {
   console.log(`paid route at:    ${server.origin}${SCREEN_PATH}`);
   try {
     let sentSignature: string | null = null;
+    let termsHeader: string | null = null;
     const recordingFetch: typeof fetch = async (input, init) => {
       const request = new Request(input, init);
       sentSignature = request.headers.get('payment-signature') ?? sentSignature;
-      return fetch(request, { redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      const reply = await fetch(request, { redirect: 'error', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (reply.status === 402) termsHeader = reply.headers.get('payment-required') ?? termsHeader;
+      return reply;
     };
     const client = payingClient(config, account);
     const pay = wrapFetchWithPayment(recordingFetch, client);
@@ -211,6 +219,9 @@ async function main(): Promise<number> {
     const result = PaidScreenResponse.parse(outcome.body);
     // The body as it arrived, once it has passed the reply's own schema; nothing is added or reordered.
     if (save !== null) fs.writeFileSync(save, `${JSON.stringify(outcome.body, null, 2)}\n`);
+    if (saveTerms !== null && termsHeader !== null) {
+      fs.writeFileSync(saveTerms, `${JSON.stringify(decodePaymentRequiredHeader(termsHeader), null, 2)}\n`);
+    }
     const { decision, payment } = result;
     console.log(`decision:         ${decision.action}, rule ${decision.rule}, share ${decision.shareBps} bps`);
     console.log(`reason:           ${decision.reason}`);

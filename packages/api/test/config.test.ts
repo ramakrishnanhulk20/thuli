@@ -202,6 +202,28 @@ describe('loadApiConfig', () => {
     expect(loadApiConfig(testnet({ PUBLIC_ORIGIN: 'https://test.thuli.example' })).publicOrigin).toBe('https://test.thuli.example');
   });
 
+  it('falls back to the production host Vercel names when PUBLIC_ORIGIN is unset, held to the same shape', () => {
+    const onVercel = { PUBLIC_ORIGIN: undefined, VERCEL_PROJECT_PRODUCTION_URL: 'thuli.vercel.app' };
+    expect(loadApiConfig(mainnet(onVercel)).publicOrigin).toBe('https://thuli.vercel.app');
+    expect(loadApiConfig(testnet(onVercel)).publicOrigin).toBe('https://thuli.vercel.app');
+    expect(loadApiConfig(mainnet({ VERCEL_PROJECT_PRODUCTION_URL: 'thuli.vercel.app' })).publicOrigin).toBe('https://api.thuli.example');
+    for (const bad of ['thuli.vercel.app/pay', 'user@thuli.vercel.app', 'https://thuli.vercel.app', 'two words', 'thuli.vercel.app?x=1']) {
+      const error = configError(mainnet({ PUBLIC_ORIGIN: undefined, VERCEL_PROJECT_PRODUCTION_URL: bad }));
+      expect(error.message).toContain('VERCEL_PROJECT_PRODUCTION_URL');
+      expect(error.message).not.toContain(bad);
+    }
+    const unsafe = configError(mainnet({ PUBLIC_ORIGIN: 'http://api.thuli.example', VERCEL_PROJECT_PRODUCTION_URL: 'thuli.vercel.app' }));
+    expect(unsafe.message).toContain('PUBLIC_ORIGIN must be');
+    expect(configError(mainnet({ PUBLIC_ORIGIN: undefined, VERCEL_PROJECT_PRODUCTION_URL: '  ' })).message).toContain('PUBLIC_ORIGIN is missing');
+  });
+
+  it('lets a process that serves nobody else leave PUBLIC_ORIGIN out on mainnet, and still checks one that is set', () => {
+    const selfOnly = { publicOrigin: 'optional' } as const;
+    expect(loadApiConfig(mainnet({ PUBLIC_ORIGIN: undefined }), selfOnly).publicOrigin).toBeNull();
+    expect(loadApiConfig(mainnet(), selfOnly).publicOrigin).toBe('https://api.thuli.example');
+    expect(() => loadApiConfig(mainnet({ PUBLIC_ORIGIN: 'http://api.thuli.example' }), selfOnly)).toThrow(ConfigError);
+  });
+
   it('reads pending settlements from BASE_RPC_URL on mainnet, which is required and https, and from the public RPC on Sepolia', () => {
     expect(loadApiConfig(mainnet()).settlementRpcUrl).toBe('https://mainnet.base.org');
     expect(configError(mainnet({ BASE_RPC_URL: undefined })).message).toContain('BASE_RPC_URL');

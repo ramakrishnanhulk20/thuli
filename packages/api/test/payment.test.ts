@@ -147,6 +147,7 @@ interface SetupOptions {
   readReceipt?: ReadReceipt;
   /** Fresh stores on the current backend unless given. Two apps handed stores over one database are two copies. */
   stores?: Stores;
+  unlisted?: boolean;
 }
 
 async function setup(options: SetupOptions = {}) {
@@ -159,6 +160,7 @@ async function setup(options: SetupOptions = {}) {
     readReceipt: options.readReceipt ?? noChain,
     now,
     stores,
+    ...(options.unlisted !== undefined && { unlisted: options.unlisted }),
   });
   const sentSignatures: string[] = [];
   const fetchAs =
@@ -211,6 +213,22 @@ describe.each(BACKENDS)('POST /api/x402/screen without payment, on $name', (back
     expect(required.resource.mimeType).toBe('application/json');
     expect(screen).not.toHaveBeenCalled();
     expect(facilitator.settled).toHaveLength(0);
+  });
+
+  it('sends the catalogue listing with a settled payment, and sends none from an unlisted server', async () => {
+    const listed = await setup();
+    expect((await listed.pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(200);
+    expect(listed.facilitator.settled).toHaveLength(1);
+    expect(listed.facilitator.settled[0]?.extensions?.bazaar).toBeDefined();
+
+    const unlisted = await setup({ unlisted: true });
+    const unpaid = await unlisted.appFetch(url(SCREEN_PATH), post({ wallet: WALLET }));
+    const required = decodePaymentRequiredHeader(unpaid.headers.get('payment-required') as string);
+    expect(required.extensions?.bazaar).toBeUndefined();
+    expect(required.accepts[0]).toMatchObject({ scheme: 'exact', network: 'eip155:84532', amount: PRICE_UNITS, payTo: PAY_TO });
+    expect((await unlisted.pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(200);
+    expect(unlisted.facilitator.settled).toHaveLength(1);
+    expect(unlisted.facilitator.settled[0]?.extensions?.bazaar).toBeUndefined();
   });
 });
 
