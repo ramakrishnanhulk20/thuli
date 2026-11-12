@@ -39,6 +39,7 @@
     "vault:create": "node --env-file-if-exists=.env --env-file-if-exists=.env.payer --import tsx packages/worker/scripts/create-vault.ts",
     "campaign:create": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/create-campaign.ts",
     "campaign:requeue": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/requeue-ask.ts",
+    "campaign:screen": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/screen-wallets.ts",
     "appeal:list": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/appeal-list.ts",
     "appeal:settle": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/appeal-settle.ts",
     "appeal:export": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/appeal-export.ts",
