@@ -16,15 +16,20 @@ Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Repp
 
 ## Deployments
 
-Base Sepolia is Base's public test network, chain id `84532`. The factory is also deployed on Base mainnet, chain id `8453`. No vault has been created on Base mainnet and no real payment has been made yet. The public campaign and every other address in this file stay on Base Sepolia with test money. The deploy script deploys to Base only when it is given both `--network base` and `--real-money`.
+Base Sepolia is Base's public test network, chain id `84532`. On Base mainnet, chain id `8453`, the factory is deployed and one small vault was run from start to end with real USDC as a proof, described below the table. The public campaign and every other address in this file stay on Base Sepolia with test money. The deploy script deploys to Base only when it is given both `--network base` and `--real-money`.
 
 | Network | Contract | Address | Verified source |
 | --- | --- | --- | --- |
-| Base mainnet | ThuliVaultFactory | [`0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De`](https://basescan.org/address/0x1d9b8cd9a5af33287bb96862d9bb0f563dc402de) | pending |
+| Base mainnet | ThuliVaultFactory | [`0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De`](https://basescan.org/address/0x1d9b8cd9a5af33287bb96862d9bb0f563dc402de) | [Basescan](https://basescan.org/address/0x1d9b8cd9a5af33287bb96862d9bb0f563dc402de#code) |
+| Base mainnet | ThuliVault, the mainnet proof vault | [`0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C`](https://basescan.org/address/0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C) | [Basescan](https://basescan.org/address/0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C#code) |
 | Base Sepolia | ThuliVaultFactory | [`0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56`](https://sepolia.basescan.org/address/0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56) | [Blockscout](https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56), [Basescan](https://sepolia.basescan.org/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56#code) |
 | Base Sepolia | ThuliVault, the proof vault | [`0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034) | [Basescan](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034#code) |
 
-The Base mainnet factory was deployed in transaction [`0x2f00...bff3`](https://basescan.org/tx/0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3) in block `56121245`, and its record is `base.json` in `packages/contracts/deployments`. Its runtime code is byte for byte the Base Sepolia factory's, the same 9,415 bytes when read from both chains. Source verification on Basescan is pending. The Base Sepolia factory was deployed in block `57247894` (record: [`base-sepolia.json`](packages/contracts/deployments/base-sepolia.json)). It made the proof vault in block `57248098`, and the run that used it is recorded in [`base-sepolia-proof.json`](packages/contracts/deployments/base-sepolia-proof.json). The proof vault pays Base Sepolia test USDC (`0x036CbD53842c5426634e7929541eC2318f3dCF7e`), caps each wallet at 1 USDC, holds 2 USDC and delays every list by one hour. The Base Sepolia factory's source is verified on Blockscout and Basescan, and the proof vault's on Basescan. The vault's source is also in the repository: [`ThuliVault.sol`](packages/contracts/src/ThuliVault.sol). Basescan shows a bot check to scripts, so those links are for a browser. `npm run vault:verify` verifies contracts on Basescan and needs an explorer API key, and `npm run vault:verify -- --network base` does the same for the mainnet factory (see the commands table). You can check the proof record against the chain yourself: step 3 of the judge path below.
+The Base mainnet factory was deployed in transaction [`0x2f00...bff3`](https://basescan.org/tx/0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3) in block `56121245`, and its record is [`base.json`](packages/contracts/deployments/base.json). Its runtime code is byte for byte the Base Sepolia factory's, the same 9,415 bytes when read from both chains, and its source is verified on Basescan.
+
+Realised, with real USDC on Base mainnet: on 12 November 2026 that factory made one vault with a cap of 1 USDC, a deposit of 2 USDC and a one-hour delay. Thuli's worker key posted a list of one wallet. When the hour was over the worker submitted the claim and the vault paid that wallet exactly 1 USDC ([the claim](https://basescan.org/tx/0x6cbeb31cbeddd5ba6b2c98463d2a1d3dfa679fef0774a3f3683faf5dc4bb3d31)), with the worker paying the gas. A static call of the claim for a wallet that is not on the list, with the paid wallet's proof, reverts with `InvalidProof`. After the vault ended, the owner took back the 1 USDC that was left ([the withdrawal](https://basescan.org/tx/0x0f8c55a0ab1c74efa7d5462feeb9423208d85e45c04538553c7cc1e648422ba6)). The run is recorded in [`base-proof.json`](packages/contracts/deployments/base-proof.json), and `npm run prove:vault -- verify --network base --real-money` checks that record against Base in 17 checks. It reads the factory's logs, so it needs a Base RPC that serves log queries; Base's own public endpoint refuses them. What this proof does not show: a campaign on mainnet. It is one vault, one list and one wallet.
+
+The Base Sepolia factory was deployed in block `57247894` (record: [`base-sepolia.json`](packages/contracts/deployments/base-sepolia.json)). It made the proof vault in block `57248098`, and the run that used it is recorded in [`base-sepolia-proof.json`](packages/contracts/deployments/base-sepolia-proof.json). The proof vault pays Base Sepolia test USDC (`0x036CbD53842c5426634e7929541eC2318f3dCF7e`), caps each wallet at 1 USDC, holds 2 USDC and delays every list by one hour. The Base Sepolia factory's source is verified on Blockscout and Basescan, and the proof vault's on Basescan. The vault's source is also in the repository: [`ThuliVault.sol`](packages/contracts/src/ThuliVault.sol). Basescan shows a bot check to scripts, so those links are for a browser. `npm run vault:verify` verifies contracts on Basescan and needs an explorer API key, and `npm run vault:verify -- --network base` does the same for the mainnet factory (see the commands table). You can check the proof record against the chain yourself: step 3 of the judge path below.
 
 ## What Thuli does
 
@@ -88,7 +93,8 @@ For a wallet:
 
 - A free check. Paste any Ethereum address at `/check`, or call `POST /api/check`. No sign-in and no payment, up to 5 new checks an hour for each visitor.
 - A reason. Every decision shows the outcome, the rule, a plain-text reason, the transactions it cites and the list of facts the screening did not measure.
-- A live campaign with no gas. A wallet signs a four-line text message, which costs nothing and moves nothing. Thuli screens it in public. If it is approved it takes a slot, and after the vault's delay the worker submits the claim from its own key and pays the gas. On Base Sepolia with test USDC. A wallet that has never been used on Ethereum is told so at the door, and nothing is stored.
+- A live campaign with no gas. A wallet signs a four-line text message, which costs nothing and moves nothing. Thuli screens it in public. If it is approved it takes a slot, and after the vault's delay the worker submits the claim from its own key and pays the gas. On Base Sepolia with test USDC. A wallet that has never been used on Ethereum or on Base is told so at the door, and nothing is stored.
+- Screened on the chain where the wallet is older. A campaign ask is read on Ethereum or on Base mainnet, whichever the wallet was active on first, and the decision says which. A wallet used only on Base is screened on its Base history. This needs the worker's two RPC endpoints to serve old state and traces, which it checks at start; without that it reads Ethereum only and says so in its log. `npm run campaign:screen -- --wallets <address>` shows the chain and the decision for any wallet without storing anything.
 - An appeal. A wallet that was held, excluded, cut to a partial reward or whose screening could not finish can file one appeal per campaign: one line of text, signed with the wallet like the ask, with no gas. Thuli's own decision for that wallet, with the parts that identify it removed, goes to Reppo for an outside check. The wallet's own words go to no model and appear on no public page. The route Reppo gives (ship, review, block or unreadable) and a short note are shown beside the decision. The check is advice. This is built and covered by tests, and no Reppo evaluation has been run for an appeal yet (see [What is not built yet](#what-is-not-built-yet)).
 
 For another agent or a developer:
@@ -100,6 +106,10 @@ For another agent or a developer:
 ### A local run of the live campaign
 
 On 11 November 2026 the site and the worker ran on one machine against Base Sepolia with test USDC. A wallet with some history asked through the site, was approved in full and took slot 1. The worker posted list 1 in [this transaction](https://sepolia.basescan.org/tx/0x9ab3fc2af5e2eb1597cb781d5eb8d4da265b14977234e18b2aa66adb6c27e915) to the campaign's vault, [`0x866eDed69E7800d19c8D73f7Edf5c54081f8BA65`](https://sepolia.basescan.org/address/0x866eDed69E7800d19c8D73f7Edf5c54081f8BA65). When the vault's hour was over, the worker submitted [the claim](https://sepolia.basescan.org/tx/0x27f1dee59482b1c12daa7937f5a56098efb39c0a48fcb9c7f1b8bbd0f4ca98f7), which paid that wallet 0.5 test USDC. A wallet that had never been used was held. A paid call through the built site was charged once and its stored result fetched again ([transaction](https://sepolia.basescan.org/tx/0x4dd9f6a26f42f72e562203ea9a9ac4cbcb27753ca580a4778ca7fa225a3574a1)). This was a local run against a public test network, not a hosted deployment and not a public campaign, and the vault is not in the Deployments table.
+
+On 12 November 2026 the two-chain read was run live with `npm run campaign:screen` on three wallets, one model screening each. A wallet with history only on Base was read on Base and approved in full (45 days old, 40 transactions sent). A wallet with history only on Ethereum was read on Ethereum and cut to a partial reward (329 days old, 4 sent). A wallet with both was read on Base, where it is older (939 days against 895 on Ethereum), and approved in full.
+
+The reader behind that works with plain RPC calls and no explorer. It was checked on Ethereum against the explorer with `npm run history:compare`: on the 29 of 31 wallets whose whole history the explorer could serve, both gave the same age, sent count, account type, first funder and funding transaction. For the other 2 the explorer's own internal-transfer list failed, and the reader matched the explorer's shorter read. What this does not show: on Base there is no second source here to compare against, and no false-hold rate has been measured on Base history.
 
 ## How it fits together
 
@@ -340,11 +350,11 @@ This needs no key and no wallet. You need git and Node 26 or newer. The output b
    Expect:
 
    ```text
-    Test Files  71 passed (71)
-         Tests  1847 passed | 84 skipped (1931)
+    Test Files  74 passed (74)
+         Tests  1994 passed | 97 skipped (2091)
    ```
 
-   It takes about 75 seconds. The 84 skipped tests need things a fresh clone does not have: a real Postgres for 77 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
+   It takes about 75 seconds. The 97 skipped tests need things a fresh clone does not have: a real Postgres for 90 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
 
 3. Check the vault proof against Base Sepolia.
 
@@ -426,7 +436,7 @@ Commands, all from the root `package.json`:
 | Command | What it does |
 | --- | --- |
 | `npm test` | Runs `vitest run`: every test under `packages/*/test`. |
-| `npm run test:db` | Runs the store and API tests one file at a time on an in-memory Postgres. Set `STORE_TEST_URL` to the address of a Postgres and the same tests also run there, which empties the tables they test, so give it an empty scratch database. Without it, 77 of 376 tests skip. |
+| `npm run test:db` | Runs the store and API tests one file at a time on an in-memory Postgres. Set `STORE_TEST_URL` to the address of a Postgres and the same tests also run there, which empties the tables they test, so give it an empty scratch database. Without it, 90 of 416 tests skip. |
 | `npm run typecheck` | Runs the TypeScript compiler over core, worker, API, store and web. Writes no files. |
 | `npm run contracts:test` | Runs `forge test --root packages/contracts`. Needs Foundry. Without a Base RPC, 77 pass and 2 skip. With `BASE_RPC_URL` set, 79 pass. |
 | `npm run contracts:lint` | Runs solhint over the Solidity. Needs `npm install --prefix packages/contracts`. |
@@ -434,12 +444,14 @@ Commands, all from the root `package.json`:
 | `npm run web:build` | Builds the site for production. |
 | `npm run api:dev` | Starts the standalone paid and free API on port 8787, or on `PORT`. Needs `.env.api`. |
 | `npm run prove:vault -- verify` | Checks the committed vault proof against Base Sepolia, 14 checks, no key. The other Base Sepolia phases (`setup`, `claim`, `record`) need two test keys and are not for strangers. |
-| `npm run prove:vault -- <phase> --network base --real-money` | The Base mainnet proof: one small run fixed in code (a 1 USDC cap and a 2 USDC deposit) in six phases, `create`, `post`, `claim`, `withdraw`, `record` and `verify`. Each phase signs nothing unless you add `--send`, and it needs `BASE_RPC_URL`. The commands exist and were rehearsed against a local fork of Base mainnet with `--fork`. The proof has not been run on Base mainnet. |
+| `npm run prove:vault -- <phase> --network base --real-money` | The Base mainnet proof: one small run fixed in code (a 1 USDC cap and a 2 USDC deposit) in six phases, `create`, `post`, `claim`, `withdraw`, `record` and `verify`. Each phase signs nothing unless you add `--send`, and it needs `BASE_RPC_URL`. It was run on Base mainnet on 12 November 2026, and `verify` checks the committed record `base-proof.json` in 17 checks. `verify` needs a Base RPC that serves log queries. `--fork` runs every phase against a local fork instead. |
 | `npm run prove:paid` | Pays for one screening of one wallet, fetches the stored result 10 more times with the same payment header and checks that each copy is identical, checks that a fresh header that never settled buys no result, and checks that exactly 5 cents left the wallet. Needs a funded test key and the SERV values. |
 | `npm run vault:deploy` | Deploys the factory to Base Sepolia and records it. Needs the worker key and an explorer key. With `--network base --real-money` it targets Base mainnet instead: without `--send` it simulates and signs nothing, and with `--send` it deploys and writes `base.json`. The mainnet path needs `BASE_RPC_URL` and the owner key. |
 | `npm run vault:verify` | Verifies the factory and the proof vault on Basescan through the Etherscan API, plus any vault made by a `createVault` transaction you name with `--vault-tx`. `-- --network base` does the Base mainnet factory. Sends no transaction. Needs Foundry and an explorer API key (`EXPLORER_API_KEY`); it refuses without one, with exit code 1. |
 | `npm run vault:create` | Makes and funds one campaign vault from the committed factory. Without `--send` it prints the plan and signs nothing. |
 | `npm run campaign:create` | Registers a campaign from its vault's creation transaction. It needs `--agent`, the key the vault names as its agent, and it refuses a vault that holds less than the reward times the slots. Without `--write` it stores nothing. It signs nothing. |
+| `npm run campaign:screen -- --wallets <address>` | Screens up to 6 wallets the way a campaign ask is screened, in a throwaway campaign in memory: prints the chain each was read on, the decision, the reason and the facts. Stores nothing, signs nothing, sends nothing. One model screening per wallet. Needs the SERV values and the two RPC endpoints. |
+| `npm run history:compare -- --wallets <file or list>` | Read-only check of the RPC history reader against the explorer's whole history on Ethereum: the facts each gives for every wallet, side by side, and every difference. Exits 1 on any difference or unread wallet. |
 | `npm run campaign:requeue` | Puts one failed ask back in the queue after an outage, so the worker screens it again from the start. Without `--write` it only says what it would do. Any ask that has not failed is refused, and so is an ask that has an appeal. |
 | `npm run worker` | Runs the campaign worker: screens asks, posts lists to the vault, submits claims, and sends appeals to the outside check when `REPPO_API_KEY` is set. `-- --once` runs one pass and exits. Runs as one process, on Base Sepolia. |
 | `npm run rehearse:campaign` | Runs the worker end to end on a local fork of Base Sepolia, with failure cases. Needs `anvil` and live SERV. |
@@ -605,8 +617,8 @@ Tests, run on a fresh clone on 11 November 2026.
 
 ```text
 $ npx vitest run
- Test Files  71 passed (71)
-      Tests  1847 passed | 84 skipped (1931)
+ Test Files  74 passed (74)
+      Tests  1994 passed | 97 skipped (2091)
 
 $ npm run typecheck
 > tsc -p tsconfig.typecheck.json --noEmit
@@ -616,7 +628,7 @@ $ npm run contracts:test
 Ran 6 test suites in 21.65s (57.70s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
 ```
 
-The 84 skipped TypeScript tests are explained in step 2 of the judge path: 77 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 1848 passed and 83 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
+The 97 skipped TypeScript tests are explained in step 2 of the judge path: 90 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 1995 passed and 96 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
 
 The 79 Foundry tests are 64 unit tests, 1 demo test (30 farm wallets cannot take more than 20 USDC, and none gets more than 1 USDC), 1 fixture test that pins one list and its proofs, 11 fuzz tests at 10,000 random cases each, 1 fork test of a full campaign on real USDC, and 1 invariant suite with 7 invariants run as 256 random call sequences, up to 64 calls deep. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens, and the fork tests do not cover Circle freezing or pausing USDC or gas prices on Base. None of this replaces an outside audit.
 
@@ -674,13 +686,13 @@ Versions are from the `package.json` files and match the lockfiles.
 
 ## Security
 
-The threat model was written on 27 October 2026, before any code, by an independent pass that saw only a plain description of the system. It lists the attacks to expect and 59 numbered rules (C1 to C59), twelve of them added on 11 November 2026 during the build of the live campaign and appeals; each rule names the test or attack that shows it, and a change that touches a rule has to carry its test. The worker's key can post a list to a vault and, like anyone, submit a claim, which pays only the wallet named in the list. It cannot withdraw, cancel, pause, extend the end, replace itself or rescue a token. Every list waits a delay the owner can use to cancel it, each wallet is capped, and the total paid cannot pass the deposit. If the worker's key were stolen and nobody cancelled in time, the stated loss is whatever the deposit has not yet paid out, at most the cap per wallet, and no watcher exists yet to warn the owner. The vault protects claimants from a hacked Thuli server and from early withdrawal, and does not protect them from the project that funds it. The named limits are on the [limits page](packages/web/content/docs/limits.mdx) and under the non-goals in the [threat model](docs/security/threat-model.md) (section C.2, standard 5). No outside firm has audited Thuli. It is self-audited, with the threat model, rounds of internal checking and the tests, and every vault holds only test USDC.
+The threat model was written on 27 October 2026, before any code, by an independent pass that saw only a plain description of the system. It lists the attacks to expect and 60 numbered rules (C1 to C60), thirteen of them added on 11 and 12 November 2026 during the build of the live campaign, appeals and the two-chain history read; each rule names the test or attack that shows it, and a change that touches a rule has to carry its test. The worker's key can post a list to a vault and, like anyone, submit a claim, which pays only the wallet named in the list. It cannot withdraw, cancel, pause, extend the end, replace itself or rescue a token. Every list waits a delay the owner can use to cancel it, each wallet is capped, and the total paid cannot pass the deposit. If the worker's key were stolen and nobody cancelled in time, the stated loss is whatever the deposit has not yet paid out, at most the cap per wallet, and no watcher exists yet to warn the owner. The vault protects claimants from a hacked Thuli server and from early withdrawal, and does not protect them from the project that funds it. The named limits are on the [limits page](packages/web/content/docs/limits.mdx) and under the non-goals in the [threat model](docs/security/threat-model.md) (section C.2, standard 5). No outside firm has audited Thuli. It is self-audited, with the threat model, rounds of internal checking and the tests. Every campaign vault holds only test USDC, and the one mainnet vault was the 2 USDC proof and is empty.
 
 ## What is not built yet
 
 This is the state of the code on 11 November 2026. The [limits page](packages/web/content/docs/limits.mdx) and section 4.8 of [ARCHITECTURE.md](ARCHITECTURE.md) list the same items.
 
-- Anything on Base mainnet beyond the factory. The factory is deployed there and its source verification is pending. No vault has been made, no real payment has been made, and the paid route has been proved only on Base Sepolia. The mainnet proof commands exist and have not been run.
+- A campaign on Base mainnet. The factory is deployed and verified there, and one proof vault paid 1 real USDC, but the public campaign runs on Base Sepolia and the paid route has been proved only on Base Sepolia.
 - Self-serve campaigns: owner sign-in, an owner dashboard and a way to upload a project's own claim list. Today a project registers a campaign with `npm run vault:create` and `npm run campaign:create`.
 - Owner sign-in for appeals. Wallets file appeals through the site and the worker sends them to the outside check, but the owner's settle is an operator's command, `npm run appeal:settle`. Contract wallets cannot appeal.
 - A Reppo evaluation of an appeal. None has been run yet, because the account needs credit.
@@ -694,7 +706,9 @@ This is the state of the code on 11 November 2026. The [limits page](packages/we
 
 Named limits of what is built, in plain words:
 
-- Screening reads Ethereum history only. A wallet used mostly on other chains looks new.
+- A campaign ask is screened on one chain's history, Ethereum or Base, whichever the wallet was active on first. A wallet used mostly on a third chain looks new, and only native ETH counts, so a wallet that has only ever held tokens reads as never used. The free check, the paid API and the replay read Ethereum only.
+- Every threshold, and the measured false-hold rate, come from Ethereum history. No rate has been measured on Base history.
+- The two-chain read cannot date some wallets, and holds them for a person: one whose first money arrived with no transaction (a staking payout), one that delegated its code before its first own transaction, and one paid in more than 24 separate blocks before it first sent anything.
 - A campaign screens each ask as it arrives, so it sees a group of linked wallets only as the group grows, and it links wallets through their direct first funder only. The replay, which screens a whole list at once, has neither gap.
 - One worker process is the design. Two copies for a few seconds never pay anyone twice, but they can post the same list twice, which restarts that list's wait.
 - Because owner sign-in is not built, an operator's command settles appeals. The outside check on an appeal is advice and decides nothing.
