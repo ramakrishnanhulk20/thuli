@@ -3,7 +3,7 @@
 Thuli is Tamil for "a drop": every drop of an airdrop lands in a real hand.
 
 Picked 27 Oct 2026: a screening service with an immutable reward vault on Base. The numbered
-rules (C1 to C59) are in docs/security/threat-model.md. This file grows the interface section (addresses, ABI, the
+rules (C1 to C60) are in docs/security/threat-model.md. This file grows the interface section (addresses, ABI, the
 exact reads and writes the UI makes) as the backend lands.
 
 ## 1. System overview
@@ -251,9 +251,12 @@ code disagree, the code is right and this section needs an update.
 
 Everything runs on Base Sepolia, Base's public testnet, with test money. There is one factory there, and one vault made
 from it by the vault proof run. The vault factory was also deployed on Base mainnet on 11 Nov 2026, at 16:31 UTC. Its
-runtime code is identical to the Base Sepolia factory. Source verification on Basescan is still pending. No vault has
-been created on Base mainnet and no real payment has been made yet. The public campaign and every other address below
-stay on Base Sepolia with test money. The deploy script deploys to Base only with both `--network base` and
+runtime code is identical to the Base Sepolia factory, and its source is verified on Basescan. On 12 Nov 2026 it made
+one proof vault, 0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C, which ran once with real USDC: 2 USDC deposited, a cap of
+1 USDC, a one-hour delay, one listed wallet paid exactly 1 USDC by a claim the worker submitted, and the remaining
+1 USDC withdrawn by the owner after the end. Its record is packages/contracts/deployments/base-proof.json, and
+`npm run prove:vault -- verify --network base --real-money` checks it against Base in 17 checks. The public campaign and
+every other address below stay on Base Sepolia with test money. The deploy script deploys to Base only with both `--network base` and
 `--real-money`.
 
 | What | Value |
@@ -822,8 +825,8 @@ refused appeal costs no count. Past a day count the route answers 429 with `Retr
 next UTC midnight.
 
 The outside check. The worker's appeal step (`appealNext` in `packages/worker/src/campaign/appeals.ts`) takes the oldest
-ready appeal, held by a 300 second lease, and gives it at most 6 tries (`APPEAL_MAX_ATTEMPTS`), with the same waits as an
-ask (10, 30, 90 and 270 seconds, then 600). It runs once a run, after the relay step, and is skipped, with one logged
+ready appeal, held by a 300 second lease. A check with no evaluation id gets at most 6 counted tries
+(`APPEAL_MAX_ATTEMPTS`), with the same waits as an ask (10, 30, 90 and 270 seconds, then 600). It runs once a run, after the relay step, and is skipped, with one logged
 reason, when no `REPPO_API_KEY` is set; appeals then wait in the queue.
 
 - What is sent. Only the decision: `reppoInput(record, appealedAction, reason)` in `packages/core/src/reppo.ts` builds
@@ -833,13 +836,21 @@ reason, when no `REPPO_API_KEY` is set; appeals then wait in the queue.
   amount, a date or a time, or a number of seven digits or more. If it finds any, nothing is sent and the
   check ends unchecked. The step is never handed the appellant's text, so it cannot be sent. A decision that kept no
   record also ends unchecked.
-- Sent once. The check charges for every submit and cannot tell that a text was sent twice, so the worker marks the
-  appeal in the store before it sends (`markAppealSubmitting`), then makes one POST with no retry and a 30 second
-  deadline (`submitEvaluationOnce`), and stores the evaluation id at once, before any wait. A later try looks that id up
-  and never submits again. A refusal that cannot have charged (402, 400, 401 or 404) takes the mark back so a later try may
-  send. Any other outcome (no reply, the deadline, a 5xx, a 409, a reply out of shape) keeps the mark, and the appeal
-  ends unchecked at its next take with nothing sent again. A look-up waits up to 150 seconds.
-- Out of credit. A 402 hands the try back and waits 600 seconds, said once in the log.
+- Sent with a bound. The check charges for every submit and cannot tell that a text was sent twice, so the worker marks
+  the appeal in the store before it sends (`markAppealSubmitting`), then makes one POST with no retry inside it and a 30
+  second deadline (`submitEvaluationOnce`), and stores the evaluation id at once, before any wait. A later try looks
+  that id up and never submits again. A look-up waits up to 150 seconds.
+- After a failed submit, `afterFailedSubmit` decides by whose fault it was, from the error's class. Out of credit (402),
+  the service busy (409, 429), the key refused (401, 403) or a request that never left the machine: nothing was charged,
+  the mark is taken back, the try is handed back and the appeal waits (180 seconds when busy, 600 otherwise, the
+  longest wait when out of credit), for as long as it takes. A refusal of the appeal's own request (400, 404): the try
+  counts. An input that can never be sent: the check ends at once. Anything else (no reply, the deadline, 408, a 5xx, a
+  reply out of shape) is unclear: the mark stays, and the next take counts it in the store (`countUnclearSubmit`). At
+  `MAX_UNCLEAR_SUBMITS`, 2, the check ends with "the outside check may already have been paid for"; below it the
+  worker submits once more. So one check is paid for at most twice.
+- A paid check is followed. Once an evaluation id is stored, no count of tries ends the check: an unfinished look-up
+  waits 300 seconds with its try handed back, the store ends it a day after its submit, and an evaluation the outside
+  check reports as failed ends it at once.
 - What is stored. The route (`ship`, `review` or `block`; none when Reppo named one Thuli does not know, and the check
   still counts as checked because it was charged), a note cut to 280 characters and kept only if it is plain text, the
   evaluation id and the credits charged. Reppo's score (0 to 100), its decision word and its confidence are kept too, for
@@ -850,7 +861,8 @@ reason, when no `REPPO_API_KEY` is set; appeals then wait in the queue.
   decision word, the confidence or the check's cause.
 
 Bound to the decision. An appeal is about the action and rule it was filed against. If the ask no longer has them, the
-check ends unchecked with the cause "the decision changed after the appeal". A failed ask that has an appeal is never
+check ends unchecked with the cause "the decision changed after the appeal", unless the change is the owner's own
+reversal or the check already holds an evaluation id: those are still checked. A failed ask that has an appeal is never
 put back in the queue by `campaign:requeue`, so the appeal and the check always judge the decision that was appealed.
 
 The owner's call. The operator runs `npm run appeal:settle -- --id CAMPAIGN --wallet ADDRESS --outcome reversed|upheld
@@ -926,8 +938,8 @@ searching the code.
 - Dolphin summaries. There is no Dolphin client.
 - A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
   one machine.
-- Base mainnet vaults and real payments. The factory is deployed on Base mainnet and nothing else is (4.1); no vault has
-  been created there and no real payment has been made.
+- A campaign on Base mainnet. The factory is deployed there and one proof vault paid 1 real USDC (4.1). That is one
+  vault, one list and one wallet; the campaign and the paid route's proofs are on Base Sepolia.
 - Owner sign-in for appeals. Appeals are filed through the public route, checked by the outside check and settled by an
   operator's command (4.6). No owner can sign in to settle one, the scorecard does not score appeals, and no Reppo
   evaluation has been run for one yet.
@@ -1006,9 +1018,9 @@ One ask, as `ask` in the answers above and as each entry of the board:
 | `appeal` | the wallet's appeal in its public view below, or null when it filed none |
 
 A failed ask is one whose screening could not finish after its attempts: it reads action `hold`, rule `A1` and the
-reason "Held for review: the screening could not finish." A wallet that had never been used on Ethereum when the worker
-looked at it is held by code under `A1`, with the reason "A1: This wallet has never been used on Ethereum, so there is
-nothing to screen." and no model call. Held and excluded wallets never take a slot, and slots go in the order asks are
+reason "Held for review: the screening could not finish." A wallet that had never been used on Ethereum or Base when the
+worker looked at it is held by code under `A1`, with the reason "A1: This wallet has never been used on Ethereum or
+Base, so there is nothing to screen." and no model call (a worker reading Ethereum only says "on Ethereum"). Held and excluded wallets never take a slot, and slots go in the order asks are
 decided. A reversed appeal can give an ask a slot later (4.6).
 
 One appeal, as `appeal` on an ask and in the appeals answers:
@@ -1065,7 +1077,7 @@ checks for them:
 | 429 | `{"busy": true}` | more than 5 asks that passed the check from this caller in an hour |
 | 200 | `{"exists": true, "ask": ...}` | this wallet already asked, in any spelling; the first ask stands unchanged, and no door read is made |
 | 503 | `{"busy": true}` | the door reads of every caller have reached 300 a minute (150 asks), or a door read failed, timed out or did not answer a whole number |
-| 200 | `{"neverUsed": true}` | the wallet has sent no transaction and holds no balance on Ethereum. Nothing was stored, queued or counted |
+| 200 | `{"neverUsed": true}` | the wallet has sent no transaction and holds no balance on Ethereum, and none on Base mainnet. Nothing was stored, queued or counted |
 | 202 | `{"queued": true}` | the ask is stored and waits for screening |
 | 409 | `{"closed": true}` | the campaign is closed, or now is outside `opensAt` to `closesAt` |
 | 409 | `{"full": true}` | the campaign cannot seat another wallet: every slot is taken, 200 asks already wait undecided, or its asks have reached the lifetime cap |
@@ -1078,10 +1090,13 @@ ahead), "the signature does not match this ask", "contract wallets cannot ask ye
 campaign's own chain), "the wallet type could not be checked". A signature made over an appeal, or over another
 campaign's ask, fails the signature check. The wallet type is read last, so a request nobody signed makes no chain read.
 
-The door rule. A wallet that has never been used on Ethereum cost its sender nothing to make, so it is not an ask. After
-the check and the earlier-ask lookup, the route reads the wallet's sent-transaction count and its balance on Ethereum at
-the latest block. Both exactly zero is answered `{"neverUsed": true}` with nothing stored, queued or counted: no slot, no
-cap and no screening are spent on it. A read that fails, times out or is not a whole number answers busy, never "used"
+The door rule. A wallet that has never been used on Ethereum or on Base cost its sender nothing to make, so it is not an
+ask. After the check and the earlier-ask lookup, the route reads the wallet's sent-transaction count and its balance on
+Ethereum at the latest finalized block, the block the worker screens at. A wallet with either above zero goes on, and
+Base is not read. A wallet empty on Ethereum is read the same way on Base mainnet (`neverUsedOnBothChains`), on
+BASE_RPC_URL or else Base's public endpoint, and those two reads are counted against the same ceiling before they are
+made. Empty on both is answered `{"neverUsed": true}` with nothing stored, queued or counted: no slot, no cap and no
+screening are spent on it. A read that fails, times out or is not a whole number answers busy, never "used"
 and never "never used". The door reads have a ceiling of their own, 300 a minute across every caller and server copy,
 and each pair follows a signed ask that spent one of its caller's 5 an hour.
 
@@ -1200,9 +1215,20 @@ way on every run is logged once, again only when its cause changes, and a line s
 
 1. The campaign is looked up. A missing campaign, a campaign on a rulebook other than the current one, or settings that
    are not valid stop the screening, and the ask goes back to the queue (see "What happens on failure").
-2. The wallet's own facts are read on Ethereum at the latest finalized block: its age, its transactions sent, its
+2. The wallet's own facts are read on one chain at its latest finalized block: its age, its transactions sent, its
    account type and its first funder, the address that sent it its first real money. They are taken into single-wallet
-   scope, as in the paid route (4.5).
+   scope, as in the paid route (4.5). Which chain: when both RPC endpoints passed the start probe (`screenChains` in
+   `packages/worker/src/campaign/chain.ts`: old state, `trace_filter` and `trace_transaction`), `pickChain` reads the
+   wallet's first activity on Ethereum and on Base mainnet, by core's `firstActivityTime`, and `olderChain` names the
+   chain where it is older (one chain only: that one; a tie: Ethereum). The facts are then read on that chain at the
+   block the picker read it at, with plain RPC calls and no explorer (`rpcHistory` in
+   `packages/worker/src/facts/rpcHistory.ts`): a halving search for the first block where the sent count or the
+   balance is above zero, every block that paid the wallet until its first own transaction that succeeded, and those
+   blocks' transfers from their traces. The funder's kind is read on the same chain. The chain is stored in the ask's
+   public facts as `chain` (`ethereum` or `base`). If either chain cannot be read, the try fails with "the wallet's
+   history could not be read on both chains" and is taken again. When the probe failed, one log line says which
+   endpoint lacks what, and every ask is read on Ethereum through the explorer reader, as before. About 200 RPC calls
+   an ask; `npm run campaign:screen` runs this path for any wallet and stores nothing.
 3. The first funder's kind is read from the chain. The facts reader leaves it unknown, so the worker reads the funder's
    code and its count of transactions sent at a finalized block, when the ask is screened, and applies core's
    `funderKind`: contract code makes it a `contract`, a plain address with 10,000 or more transactions sent
@@ -1213,7 +1239,8 @@ way on every run is logged once, again only when its cause changes, and a line s
    and the campaign's settings (checks A1 to A9).
 5. A wallet that was never used is decided by code. If its own facts show no transaction sent, a plain account, no first
    funder in a history that was read, and an age that is known, and its start and ceiling are both a hold under `A1`, the
-   decision is that hold with the reason "A1: This wallet has never been used on Ethereum, so there is nothing to screen."
+   decision is that hold with the reason "A1: This wallet has never been used on Ethereum or Base, so there is nothing to
+   screen." (or "on Ethereum" when only Ethereum is read)
    and no model call, on its first try. The model could only have written the reason. A read that failed leaves a fact
    unknown, so a failed read is never taken for an empty wallet.
 6. Every other screening first takes one count of the day's budget: 2,000 model screenings a UTC day across every
@@ -1412,8 +1439,8 @@ the worker.
 A one-time Base mainnet proof has commands: `npm run vault:deploy` and `npm run prove:vault` take `--network base`, and
 they work on Base only with `--real-money` as well, and they sign nothing there without `--send`. They have a rehearsal mode,
 `--fork`, which runs against a local fork of Base mainnet and writes only outside the committed records. The factory
-deployment has been done (4.1). The proof itself, a vault, a root and a claim with real USDC, has not been run: no vault
-exists on Base mainnet and no real payment has been made.
+deployment has been done (4.1), and the proof itself was run on 12 Nov 2026: a vault, a root, a claim that paid 1 real
+USDC and a withdrawal of the rest, recorded in base-proof.json. `verify` needs a Base RPC that serves log queries.
 
 #### Limits
 
@@ -1440,6 +1467,8 @@ docs. In short:
   that each hold a balance or have sent a transaction, and one set of funded wallets can fill every campaign's cap.
   An attacker with many addresses and aged wallets can use up a day's 2,000 model screenings, and the real asks then wait
   until after midnight.
-- Screening reads a wallet's Ethereum history only. A wallet used mostly on other chains looks new.
+- A campaign ask is screened on one chain's history, Ethereum or Base, whichever the wallet was active on first. A wallet
+  used mostly on a third chain looks new, and only native ETH counts. The free check, the paid API and the replay read
+  Ethereum only. Every threshold and the false-hold rate were measured on Ethereum history; nothing was measured on Base.
 - Owner sign-in is not built, so an operator's command settles appeals. The scorecard does not score appeals, and no
   Reppo evaluation has been run for an appeal yet.
