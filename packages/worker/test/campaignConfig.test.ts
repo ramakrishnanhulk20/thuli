@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { GRAPH_G1, parseAddress } from '@thuli/core';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
-import { BASE_PUBLIC_RPC_URL, BLOCKSCOUT_BASE_API_DEFAULT, EnvError, loadEnv } from '../src/env.ts';
+import { BASE_PUBLIC_RPC_URL, EnvError, loadEnv } from '../src/env.ts';
 
 const KEY = `0x${'5a'.repeat(32)}`;
 const GOOD = {
@@ -78,7 +78,6 @@ describe('loadWorkerConfig without campaign settings', () => {
         'baseRpcUrl',
         'blockscoutApi',
         'blockscoutApiKey',
-        'blockscoutBaseApi',
         'chainRpcUrl',
         'databaseUrl',
         'ethRpcUrl',
@@ -93,37 +92,26 @@ describe('loadWorkerConfig without campaign settings', () => {
   });
 });
 
-describe('loadWorkerConfig and Base history', () => {
+describe('loadWorkerConfig, BASE_RPC_URL and the Blockscout key', () => {
   const SCOUT_KEY = 'proapi_not-a-real-key-0123456789';
 
-  it("leaves Base history off with no key, and takes Base's public endpoint and Blockscout's API on Base when the URLs are unset", () => {
-    for (const unset of [{}, { BASE_RPC_URL: ' ', BLOCKSCOUT_BASE_API: '', BLOCKSCOUT_API_KEY: '  ' }]) {
-      expect(loadWorkerConfig({ ...GOOD, ...unset })).toMatchObject({
-        baseRpcUrl: BASE_PUBLIC_RPC_URL,
-        blockscoutBaseApi: BLOCKSCOUT_BASE_API_DEFAULT,
-        blockscoutApiKey: null,
-      });
+  it("takes Base's public endpoint and no key when both are unset, and no longer reads a Base explorer setting", () => {
+    for (const unset of [{}, { BASE_RPC_URL: ' ', BLOCKSCOUT_API_KEY: '  ' }]) {
+      expect(loadWorkerConfig({ ...GOOD, ...unset })).toMatchObject({ baseRpcUrl: BASE_PUBLIC_RPC_URL, blockscoutApiKey: null });
     }
     expect(BASE_PUBLIC_RPC_URL).toBe('https://mainnet.base.org');
-    expect(BLOCKSCOUT_BASE_API_DEFAULT).toBe('https://api.blockscout.com/8453/api/v2');
+    const stale = { ...GOOD, BLOCKSCOUT_BASE_API: 'ftp://scout.example.com' };
+    expect(Object.keys(loadWorkerConfig(stale))).not.toContain('blockscoutBaseApi');
+    expect(Object.keys(loadEnv({ ...stale, SERV_API_KEY: 'k' }))).not.toContain('BLOCKSCOUT_BASE_API');
   });
 
-  it('reads the key and the two URLs when set, trimming a trailing slash', () => {
-    const config = loadWorkerConfig({
-      ...GOOD,
-      BASE_RPC_URL: 'https://base.example.com/rpc/',
-      BLOCKSCOUT_BASE_API: 'https://scout.example.com/8453/api/v2/',
-      BLOCKSCOUT_API_KEY: ` ${SCOUT_KEY} `,
-    });
-    expect(config).toMatchObject({
-      baseRpcUrl: 'https://base.example.com/rpc',
-      blockscoutBaseApi: 'https://scout.example.com/8453/api/v2',
-      blockscoutApiKey: SCOUT_KEY,
-    });
+  it('reads the key and the Base URL when set, trimming a trailing slash', () => {
+    const config = loadWorkerConfig({ ...GOOD, BASE_RPC_URL: 'https://base.example.com/rpc/', BLOCKSCOUT_API_KEY: ` ${SCOUT_KEY} ` });
+    expect(config).toMatchObject({ baseRpcUrl: 'https://base.example.com/rpc', blockscoutApiKey: SCOUT_KEY });
   });
 
   it('refuses a URL that is not https and a key with a space or under 8 characters, in both validators, never repeating a value', () => {
-    const bad = { BASE_RPC_URL: 'http://mainnet.base.org', BLOCKSCOUT_BASE_API: 'ftp://scout.example.com', BLOCKSCOUT_API_KEY: `${SCOUT_KEY} x` };
+    const bad = { BASE_RPC_URL: 'http://mainnet.base.org', BLOCKSCOUT_API_KEY: `${SCOUT_KEY} x` };
     let message = '';
     try {
       loadWorkerConfig({ ...GOOD, ...bad });
@@ -138,7 +126,7 @@ describe('loadWorkerConfig and Base history', () => {
 
     const env = { SERV_API_KEY: 'k', SERV_BASE_URL: GOOD.SERV_BASE_URL, ETH_RPC_URL: GOOD.ETH_RPC_URL, BLOCKSCOUT_ETH_API: GOOD.BLOCKSCOUT_ETH_API };
     const defaults = loadEnv(env);
-    expect(defaults).toMatchObject({ BASE_RPC_URL: BASE_PUBLIC_RPC_URL, BLOCKSCOUT_BASE_API: BLOCKSCOUT_BASE_API_DEFAULT });
+    expect(defaults).toMatchObject({ BASE_RPC_URL: BASE_PUBLIC_RPC_URL });
     expect(defaults.BLOCKSCOUT_API_KEY).toBeUndefined();
     for (const [name, value] of Object.entries({ ...bad, BLOCKSCOUT_API_KEY: 'short' })) {
       let envMessage = '';

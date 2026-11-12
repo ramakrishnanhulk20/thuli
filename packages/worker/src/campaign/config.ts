@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { z } from 'zod';
 import { graphVersion, parseAddress, type Address } from '@thuli/core';
-import { BASE_PUBLIC_RPC_URL, BLOCKSCOUT_BASE_API_DEFAULT, BLOCKSCOUT_KEY } from '../env.ts';
+import { BASE_PUBLIC_RPC_URL, BLOCKSCOUT_KEY } from '../env.ts';
 
 export class WorkerConfigError extends Error {
   override name = 'WorkerConfigError';
@@ -14,13 +14,19 @@ export interface WorkerConfig {
   servApiKey: string;
   servBaseUrl: string;
   servGraphId: string;
+  /** Ethereum mainnet's RPC. Campaign asks are read on both chains only when it and baseRpcUrl serve old state and traces. */
   ethRpcUrl: string;
+  /** Ethereum's Blockscout API, the explorer reader's source. */
   blockscoutApi: string;
-  /** Base mainnet's RPC for screening on Base history: BASE_RPC_URL, or Base's public endpoint when it is not set. */
+  /**
+   * Base mainnet's RPC for the campaign's RPC history: BASE_RPC_URL, or Base's public endpoint when it is not set, which
+   * serves no traces, so history is then off.
+   */
   baseRpcUrl: string;
-  /** Base mainnet's Blockscout API: BLOCKSCOUT_BASE_API, or Blockscout's keyed API for chain 8453 when it is not set. */
-  blockscoutBaseApi: string;
-  /** The Blockscout API key, sent only to Base's Blockscout. null when BLOCKSCOUT_API_KEY is not set: Base history is off. */
+  /**
+   * The Blockscout API key, sent by the Ethereum explorer reader only when blockscoutApi's host is api.blockscout.com.
+   * null when BLOCKSCOUT_API_KEY is not set: that reader then reads without one.
+   */
   blockscoutApiKey: string | null;
   /** The campaign chain's RPC: Base Sepolia, where every campaign vault lives today. */
   chainRpcUrl: string;
@@ -71,20 +77,14 @@ const RULES: readonly { name: string; valid(value: string): boolean; needs: stri
 // Read only when REPPO_API_KEY is set: https only, because the key travels as a bearer header.
 const REPPO_BASE_URL = { name: 'REPPO_BASE_URL', valid: isHttps, needs: 'an https URL, since REPPO_API_KEY is set' };
 
-// Names that may be left unset, each then taking its default. env.ts checks the same three names by the same rules, so a
-// value one of them refuses the other refuses too. https only: the Blockscout key travels as a bearer header.
+// Names that may be left unset, each then taking its default. env.ts checks the same two names by the same rules, so a
+// value one of them refuses the other refuses too. https only: the RPC URLs can carry a token in their path.
 const DEFAULTED: readonly { name: string; valid(value: string): boolean; needs: string; fallback: string }[] = [
   { name: 'BASE_RPC_URL', valid: isHttps, needs: "an https URL, or unset for Base's public endpoint", fallback: BASE_PUBLIC_RPC_URL },
   {
-    name: 'BLOCKSCOUT_BASE_API',
-    valid: isHttps,
-    needs: "an https URL, or unset for Blockscout's API on Base",
-    fallback: BLOCKSCOUT_BASE_API_DEFAULT,
-  },
-  {
     name: 'BLOCKSCOUT_API_KEY',
     valid: (value) => BLOCKSCOUT_KEY.test(value),
-    needs: '8 to 512 visible characters with no spaces, or unset to screen on Ethereum only',
+    needs: "8 to 512 visible characters with no spaces, or unset to read Ethereum's Blockscout without a key",
     fallback: '',
   },
 ];
@@ -92,8 +92,9 @@ const DEFAULTED: readonly { name: string; valid(value: string): boolean; needs: 
 /**
  * Reads and checks every variable the worker needs before anything connects, so a missing one stops it at start rather
  * than at its first screening. Base URLs lose any trailing slash, as env.ts does. REPPO_API_KEY is optional: without it
- * the appeal step is skipped; with it, REPPO_BASE_URL must be an https URL. BASE_RPC_URL and BLOCKSCOUT_BASE_API are
- * optional, each with its default, and BLOCKSCOUT_API_KEY is optional: without it Base history is off.
+ * the appeal step is skipped; with it, REPPO_BASE_URL must be an https URL. BASE_RPC_URL is optional, with Base's
+ * public endpoint as its default, and BLOCKSCOUT_API_KEY is optional. Whether asks are read on both chains is not a
+ * setting: screenChains probes the two RPC endpoints at start.
  *
  * @throws WorkerConfigError naming each missing or invalid variable on its own line, with what it must be. No value is
  *   ever part of the message (C40).
@@ -128,7 +129,6 @@ export function loadWorkerConfig(source: Record<string, string | undefined>): Wo
     ethRpcUrl: url('ETH_RPC_URL'),
     blockscoutApi: url('BLOCKSCOUT_ETH_API'),
     baseRpcUrl: urlOr('BASE_RPC_URL', BASE_PUBLIC_RPC_URL),
-    blockscoutBaseApi: urlOr('BLOCKSCOUT_BASE_API', BLOCKSCOUT_BASE_API_DEFAULT),
     blockscoutApiKey: blockscoutKey === '' ? null : blockscoutKey,
     chainRpcUrl: url('BASE_SEPOLIA_RPC_URL'),
     reppo: reppoKey === '' ? null : { apiKey: reppoKey, baseUrl: url('REPPO_BASE_URL') },
@@ -172,7 +172,7 @@ export function scrubber(secrets: readonly string[]): (line: string) => string {
  */
 export function secretsOf(config: WorkerConfig): string[] {
   const secrets = [config.workerKey, config.workerKey.slice(2), config.servApiKey, config.databaseUrl];
-  secrets.push(config.ethRpcUrl, config.blockscoutApi, config.baseRpcUrl, config.blockscoutBaseApi, config.chainRpcUrl);
+  secrets.push(config.ethRpcUrl, config.blockscoutApi, config.baseRpcUrl, config.chainRpcUrl);
   if (config.reppo !== null) secrets.push(config.reppo.apiKey);
   if (config.blockscoutApiKey !== null) secrets.push(config.blockscoutApiKey);
   try {

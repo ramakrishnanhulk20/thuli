@@ -27,6 +27,7 @@
     "export:replay": "node --import tsx packages/worker/scripts/export-replay.ts",
     "appeal:demo": "node --env-file=.env --import tsx packages/worker/scripts/appeal-demo.ts",
     "consistency": "node --env-file-if-exists=.env --import tsx packages/worker/scripts/consistency.ts",
+    "history:compare": "node --env-file=.env --import tsx packages/worker/scripts/compare-history.ts",
     "api:dev": "npm --prefix packages/api run dev",
     "web:dev": "npm --prefix packages/web run dev",
     "web:build": "npm --prefix packages/web run build",

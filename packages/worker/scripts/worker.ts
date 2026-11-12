@@ -9,9 +9,10 @@
 // and BASE_SEPOLIA_RPC_URL from .env, and the factory from packages/contracts/deployments/base-sepolia.json. It serves
 // every open campaign in the store, so starting a campaign needs no change here. The database must be migrated first
 // (npm run db:migrate). REPPO_API_KEY and REPPO_BASE_URL are optional: with them, each appeal gets Reppo's outside
-// check; without them, appeals wait in the queue. BLOCKSCOUT_API_KEY is optional: with it, each ask is screened on
-// Ethereum or Base history, whichever is older, reading BASE_RPC_URL and BLOCKSCOUT_BASE_API, both with defaults;
-// without it, on Ethereum only, as one line at start says.
+// check; without them, appeals wait in the queue. When ETH_RPC_URL and BASE_RPC_URL (default: Base's public endpoint)
+// both serve old state and traces, which a probe checks at start, each ask is screened on Ethereum or Base history,
+// whichever is older, read over those RPCs; otherwise on Ethereum only, as one line at start says. BLOCKSCOUT_API_KEY is
+// optional, sent only when BLOCKSCOUT_ETH_API is Blockscout's keyed host.
 import fs from 'node:fs';
 import path from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
@@ -38,7 +39,7 @@ async function main(): Promise<number> {
   const { values } = parseArgs({ options: { once: { type: 'boolean', default: false } } });
   const config = loadWorkerConfig(process.env);
   clean = scrubber(secretsOf(config));
-  const chains = screenChains(config, log);
+  const chains = await screenChains(config, log);
   const rulebook = fs.readFileSync(RULEBOOK_FILE, 'utf8');
   if (rulebook.trim() === '') throw new WorkerConfigError('The rulebook is empty, so no screening could follow it.');
   const factory = readFactoryRecord(DEPLOYMENT_FILE).address;
@@ -65,7 +66,10 @@ async function main(): Promise<number> {
     const runs = await runLoop(
       {
         db,
-        facts: factsAtFinalizedBlock({ rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi }, 'ethereum'),
+        facts: factsAtFinalizedBlock(
+          { rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi, ...(config.blockscoutApiKey === null ? {} : { apiKey: config.blockscoutApiKey }) },
+          'ethereum',
+        ),
         accountState: accountStateAtFinalizedBlock({ rpcUrl: config.ethRpcUrl }, 'ethereum'),
         ...(chains === undefined ? {} : { chains }),
         serv: {

@@ -1,10 +1,28 @@
-import { firstActivityTime, olderChain, type AccountState, type Address, type Facts, type ScreenedChain, type Transfer } from '@thuli/core';
-import { chainClient, collectBasicFacts, MAX_FUNDING_PAGES, readTransferPages, type FactSources } from '../facts/basic.ts';
+import {
+  firstActivityTime,
+  olderChain,
+  SCREENED_CHAIN_NAME,
+  SCREENED_CHAINS,
+  type AccountState,
+  type Address,
+  type Facts,
+  type ScreenedChain,
+} from '@thuli/core';
+import { chainClient, collectBasicFacts, type FactSources } from '../facts/basic.ts';
+import {
+  finalizedBlock,
+  firstUsedBlock,
+  HistoryError,
+  historyClientOf,
+  historyProbe,
+  rpcHistory,
+  transfersInBlock,
+  type HistoryClient,
+  type HistoryLack,
+} from '../facts/rpcHistory.ts';
 import { accountStateAtFinalizedBlock } from '../screen/single.ts';
 import type { WorkerConfig } from './config.ts';
 
-/** Transaction pages the picker reads per chain, oldest first, looking for the first activity (C41). */
-export const PICK_TRANSACTION_PAGES = 3;
 /**
  * How long the picker waits for both chains. It leaves 80 of SCREEN_TIME_LIMIT_MS's 120 seconds for the full facts read
  * on the chosen chain and the model (C41).
@@ -19,9 +37,9 @@ export type FirstActivity = { time: number | null; block: number } | 'unknown';
 
 /** What a campaign screening reads on one chain. */
 export interface ChainReader {
-  /** The wallet's first activity at the chain's latest finalized block, firstActivityOn in production. Never throws. */
+  /** The wallet's first activity at the chain's latest finalized block, rpcFirstActivity in production. Never throws. */
   firstActivity(wallet: Address, signal?: AbortSignal): Promise<FirstActivity>;
-  /** The wallet's free facts at this block of the chain, collectBasicFacts in production. */
+  /** The wallet's free facts at this block of the chain, collectBasicFacts on rpcHistory in production. */
   facts(wallet: Address, block: number): Promise<Facts>;
   /** An address's nonce and code at the chain's latest finalized block, accountStateAtFinalizedBlock in production. */
   accountState(address: Address): Promise<AccountState>;
@@ -35,47 +53,36 @@ export interface PickedChain {
   blocks: Readonly<Record<ScreenedChain, number>>;
 }
 
+// The picker's signal stops a search between steps: each read already sent still ends by its own 15 second timeout.
+function stoppedBy(client: HistoryClient, signal: AbortSignal): HistoryClient {
+  return {
+    request: (method, params) => (signal.aborted ? Promise.reject(new HistoryError('the read was stopped')) : client.request(method, params)),
+  };
+}
+
 /**
- * The wallet's first activity on one chain at that chain's latest finalized block: core's firstActivityTime over the
- * transaction rows and internal rows read, the very rule wallet age uses, so the pick and the age mean one thing (C20).
- * Transactions are read oldest first, page by page, until the rows read date the wallet, the list ends, or
- * PICK_TRANSACTION_PAGES pages are read. Internal transfers cannot be sorted, so they are read to the end, at most
- * MAX_FUNDING_PAGES pages. Only rows at or before the finalized block count, by the rule the full facts read uses.
+ * The wallet's first activity on one chain at that chain's latest finalized block, read with plain RPC calls:
+ * firstUsedBlock finds the first block where its sent count or balance is above zero, and transfersInBlock reads that
+ * block's transfers. The time is core's firstActivityTime over those rows, the very rule wallet age uses over the same
+ * rows in rpcHistory, so the pick and the age mean one thing (C20).
  *
- * @returns the time, or null when every row was read and none dates the wallet, with the block; 'unknown' when
- *   transaction pages are left past the cap with nothing found, internal pages are left past theirs, or any read fails,
- *   times out, is out of shape or is stopped by the signal. Doubt is never read as no history (C11). Never throws, and
- *   nothing it read reaches a log (C40).
+ * @returns the time with the block, null for a wallet never used there; 'unknown' when the first block holds no
+ *   qualifying transfer (money that came with no transaction, such as a staking withdrawal or a block reward, or only a
+ *   failed one), or when any read fails, is out of shape, meets a trace kind it does not read, or is stopped by the
+ *   signal. Doubt is never read as no history (C11). Never throws, and nothing it read reaches a log (C40).
  */
-export async function firstActivityOn(chain: ScreenedChain, wallet: Address, sources: FactSources, signal?: AbortSignal): Promise<FirstActivity> {
-  // One failed list stops the other, so a chain that cannot be settled costs no more pages.
-  const stop = new AbortController();
-  const onAbort = () => stop.abort();
-  signal?.addEventListener('abort', onAbort, { once: true });
+export async function rpcFirstActivity(client: HistoryClient, wallet: Address, signal?: AbortSignal): Promise<FirstActivity> {
   try {
     if (signal?.aborted === true) return 'unknown';
-    const head = await chainClient(chain, sources.rpcUrl).getBlock({ blockTag: 'finalized' });
-    const block = Number(head.number);
-    if (!Number.isSafeInteger(block) || block < 0) return 'unknown';
-    const dated = (transfers: readonly Transfer[]) => firstActivityTime(wallet, { external: { transfers: [...transfers], complete: false } }) !== null;
-    const read = (list: 'transactions' | 'internal-transactions', options: { maxPages: number; oldestFirst?: boolean; enough?: typeof dated }) =>
-      readTransferPages(wallet, list, block, sources, { ...options, signal: stop.signal }).catch((error: unknown) => {
-        stop.abort();
-        throw error;
-      });
-    const [external, internal] = await Promise.all([
-      read('transactions', { maxPages: PICK_TRANSACTION_PAGES, oldestFirst: true, enough: dated }),
-      read('internal-transactions', { maxPages: MAX_FUNDING_PAGES }),
-    ]);
-    if (!internal.complete) return 'unknown';
-    // Read oldest first, so once a transaction row dates the wallet no later page can hold an earlier one.
-    if (!external.complete && firstActivityTime(wallet, { external }) === null) return 'unknown';
-    return { time: firstActivityTime(wallet, { external, internal }), block };
+    const reads = signal === undefined ? client : stoppedBy(client, signal);
+    const block = await finalizedBlock(reads);
+    const used = await firstUsedBlock(reads, wallet, block);
+    if (used === null) return { time: null, block };
+    const rows = await transfersInBlock(reads, wallet, used);
+    const time = firstActivityTime(wallet, { external: { transfers: rows.external, complete: false }, internal: { transfers: rows.internal, complete: false } });
+    return time === null ? 'unknown' : { time, block };
   } catch {
     return 'unknown';
-  } finally {
-    stop.abort();
-    signal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -135,34 +142,48 @@ export async function pickChain(
   }
 }
 
-/** The production reader for one chain on its sources: firstActivityOn, collectBasicFacts and accountStateAtFinalizedBlock. */
-export function chainReader(chain: ScreenedChain, sources: FactSources): ChainReader {
+/**
+ * The production reader for one chain on its RPC alone: rpcFirstActivity for the pick, collectBasicFacts on rpcHistory
+ * for the facts, and accountStateAtFinalizedBlock, every call with the fact reads' 15 second timeout and one retry (C41).
+ */
+export function chainReader(chain: ScreenedChain, sources: Pick<FactSources, 'rpcUrl'>): ChainReader {
+  const client = historyClientOf(chainClient(chain, sources.rpcUrl));
   return {
-    firstActivity: (wallet, signal) => firstActivityOn(chain, wallet, sources, signal),
-    facts: (wallet, block) => collectBasicFacts(wallet, { chain, block }, sources),
+    firstActivity: (wallet, signal) => rpcFirstActivity(client, wallet, signal),
+    facts: (wallet, block) => collectBasicFacts(wallet, { chain, block }, { rpcUrl: sources.rpcUrl, history: (address, at) => rpcHistory(client, address, at) }),
     accountState: accountStateAtFinalizedBlock(sources, chain),
   };
 }
 
-/** Said once at start when Base history is off. It names the setting and no value (C40). */
-export const BASE_HISTORY_OFF = 'screen: Base history is off because BLOCKSCOUT_API_KEY is not set, so every ask is screened on Ethereum only';
+const RPC_SETTING: Readonly<Record<ScreenedChain, string>> = { ethereum: 'ETH_RPC_URL', base: 'BASE_RPC_URL' };
+const LACK_WORDS: Readonly<Record<HistoryLack, string>> = { 'old state': 'serves no old state', traces: 'serves no traces', 'no answer': 'gave no answer' };
 
 /**
- * The campaign screening's reader per chain, from the worker's settings: Ethereum on ETH_RPC_URL and BLOCKSCOUT_ETH_API,
- * Base on BASE_RPC_URL and BLOCKSCOUT_BASE_API. The Blockscout key goes to Base's Blockscout only: Ethereum's source is
- * read without one, exactly as before. With no key Base history is off: nothing is returned, every ask is screened on
- * Ethereum as before, and BASE_HISTORY_OFF is logged. The worker calls this once, at start.
+ * The one line said at start when RPC history is off: each chain whose endpoint failed the probe, by name and setting,
+ * and what it lacks. Fixed words only, never an address or a value (C40).
  */
-export function screenChains(
-  config: Pick<WorkerConfig, 'ethRpcUrl' | 'blockscoutApi' | 'baseRpcUrl' | 'blockscoutBaseApi' | 'blockscoutApiKey'>,
-  log: (line: string) => void,
-): ChainReaders | undefined {
-  if (config.blockscoutApiKey === null) {
-    log(BASE_HISTORY_OFF);
+export function historyOffLine(lacks: Readonly<Partial<Record<ScreenedChain, HistoryLack>>>): string {
+  const reasons = SCREENED_CHAINS.flatMap((chain) => {
+    const lack = lacks[chain];
+    return lack === undefined ? [] : [`${SCREENED_CHAIN_NAME[chain]}'s endpoint (${RPC_SETTING[chain]}) ${LACK_WORDS[lack]}`];
+  });
+  return `screen: RPC history is off because ${reasons.join(' and ')}, so every ask is screened on Ethereum only`;
+}
+
+/**
+ * The campaign screening's reader per chain, Ethereum on ETH_RPC_URL and Base on BASE_RPC_URL, read with plain RPC calls.
+ * Both endpoints are probed at once with historyProbe: old state and traces. RPC history is on only when both pass;
+ * otherwise nothing is returned, every ask is screened on Ethereum through the explorer reader as before, and
+ * historyOffLine is logged once. The worker calls this once, at start. Never throws.
+ */
+export async function screenChains(config: Pick<WorkerConfig, 'ethRpcUrl' | 'baseRpcUrl'>, log: (line: string) => void): Promise<ChainReaders | undefined> {
+  const urls: Readonly<Record<ScreenedChain, string>> = { ethereum: config.ethRpcUrl, base: config.baseRpcUrl };
+  const probes = await Promise.all(SCREENED_CHAINS.map(async (chain) => [chain, await historyProbe(historyClientOf(chainClient(chain, urls[chain])))] as const));
+  const lacks: Partial<Record<ScreenedChain, HistoryLack>> = {};
+  for (const [chain, probe] of probes) if (!probe.ok) lacks[chain] = probe.lacks;
+  if (Object.keys(lacks).length > 0) {
+    log(historyOffLine(lacks));
     return undefined;
   }
-  return {
-    ethereum: chainReader('ethereum', { rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi }),
-    base: chainReader('base', { rpcUrl: config.baseRpcUrl, blockscoutApi: config.blockscoutBaseApi, apiKey: config.blockscoutApiKey }),
-  };
+  return { ethereum: chainReader('ethereum', { rpcUrl: urls.ethereum }), base: chainReader('base', { rpcUrl: urls.base }) };
 }

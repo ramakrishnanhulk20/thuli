@@ -35,7 +35,12 @@ export function liveScreen(
   const text = rulebook ?? readRulebook();
   if (text.trim() === '') throw new ConfigError('The rulebook is empty, so no screening could follow it.');
   const connection = { baseUrl: workerEnv.SERV_BASE_URL, apiKey: workerEnv.SERV_API_KEY };
-  const facts = factsAtFinalizedBlock({ rpcUrl: workerEnv.ETH_RPC_URL, blockscoutApi: workerEnv.BLOCKSCOUT_ETH_API });
+  // The key is sent only when BLOCKSCOUT_ETH_API is Blockscout's keyed host; the reader's own predicate decides (C40).
+  const facts = factsAtFinalizedBlock({
+    rpcUrl: workerEnv.ETH_RPC_URL,
+    blockscoutApi: workerEnv.BLOCKSCOUT_ETH_API,
+    ...(workerEnv.BLOCKSCOUT_API_KEY === undefined ? {} : { apiKey: workerEnv.BLOCKSCOUT_API_KEY }),
+  });
   const decide = {
     viaGraph: (record: Parameters<typeof decideViaGraph>[0]) => decideViaGraph(record, { ...connection, graphId }),
     viaV2: (record: Parameters<typeof decideViaV2>[0]) => decideViaV2(record, text, connection),

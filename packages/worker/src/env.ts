@@ -11,10 +11,11 @@ const BaseUrl = z
 
 const blankAsMissing = (value: unknown) => (typeof value === 'string' && value.trim() === '' ? undefined : value);
 
-/** Base mainnet's public RPC, read when BASE_RPC_URL is not set. */
+/**
+ * Base mainnet's public RPC, read when BASE_RPC_URL is not set. It serves no traces, so with it the campaign's RPC
+ * history stays off.
+ */
 export const BASE_PUBLIC_RPC_URL = 'https://mainnet.base.org';
-/** Blockscout's keyed API for Base mainnet (chain 8453), read when BLOCKSCOUT_BASE_API is not set. */
-export const BLOCKSCOUT_BASE_API_DEFAULT = 'https://api.blockscout.com/8453/api/v2';
 /**
  * What a Blockscout API key may be: 8 to 512 visible ASCII characters, no spaces. It travels as a header value, where a
  * line break would be refused, and a value under 8 characters would be too short for the log scrubber to blank (C40).
@@ -28,7 +29,6 @@ const EnvSchema = z.object({
   ETH_RPC_URL: BaseUrl,
   BLOCKSCOUT_ETH_API: BaseUrl,
   BASE_RPC_URL: z.preprocess(blankAsMissing, BaseUrl.default(BASE_PUBLIC_RPC_URL)),
-  BLOCKSCOUT_BASE_API: z.preprocess(blankAsMissing, BaseUrl.default(BLOCKSCOUT_BASE_API_DEFAULT)),
   BLOCKSCOUT_API_KEY: z.preprocess(blankAsMissing, z.string().trim().regex(BLOCKSCOUT_KEY).optional()),
   EXPLORER_API_URL: z.preprocess(blankAsMissing, BaseUrl.default('https://api.etherscan.io/v2/api')),
   EXPLORER_API_KEY: z.preprocess(blankAsMissing, z.string().trim().min(1).optional()),

@@ -18,6 +18,7 @@ import {
 } from '@thuli/core';
 import { loadEnv } from '../env.ts';
 import { fetchJsonCapped } from '../http.ts';
+import { HistoryError, historyClientOf, rpcHistory } from './rpcHistory.ts';
 
 export const REQUEST_TIMEOUT_MS = 15_000;
 /** Pages read per list, external and internal each. Blockscout lists newest first, so the oldest is on the last page. */
@@ -29,23 +30,38 @@ export interface FactSources {
   rpcUrl: string;
   blockscoutApi: string;
   /**
-   * The Blockscout API key. When given, every Blockscout request sends it in the authorization header as a bearer token,
-   * and only there: never in a URL, an error or a stored value (C40). The RPC never receives it.
+   * The Blockscout API key. When given, a Blockscout request whose URL keyedBlockscoutHost accepts sends it in the
+   * authorization header as a bearer token, and only there: never in a URL, an error or a stored value, never to any
+   * other host (C40). The RPC never receives it.
    */
   apiKey?: string;
   /** Told which fact could not be read and why, in fixed words with no URLs or secrets. */
   onProblem?: (fact: FactName, cause: string) => void;
 }
 
-function sourcesFromEnv(): FactSources {
-  const env = loadEnv();
-  return { rpcUrl: env.ETH_RPC_URL, blockscoutApi: env.BLOCKSCOUT_ETH_API };
+/** A wallet's history at or before a block, in the shape core's facts functions take. readHistory is Blockscout's. */
+export type HistoryReader = (wallet: Address, snapshotBlock: number) => Promise<AddressData>;
+
+/** Sources whose history comes from a reader of their own, rpcHistory for one, rather than from Blockscout. */
+export interface HistorySources {
+  rpcUrl: string;
+  history: HistoryReader;
+  onProblem?: FactSources['onProblem'];
 }
 
-function baseSourcesFromEnv(): FactSources {
+const hasHistoryReader = (sources: FactSources | HistorySources): sources is HistorySources => 'history' in sources;
+
+function sourcesFromEnv(): FactSources {
   const env = loadEnv();
   const key = env.BLOCKSCOUT_API_KEY;
-  return { rpcUrl: env.BASE_RPC_URL, blockscoutApi: env.BLOCKSCOUT_BASE_API, ...(key === undefined ? {} : { apiKey: key }) };
+  return { rpcUrl: env.ETH_RPC_URL, blockscoutApi: env.BLOCKSCOUT_ETH_API, ...(key === undefined ? {} : { apiKey: key }) };
+}
+
+// Base has no explorer reader, so its history is read over its own RPC, as the campaign path reads it there.
+function baseSourcesFromEnv(): HistorySources {
+  const rpcUrl = loadEnv().BASE_RPC_URL;
+  const client = historyClientOf(chainClient('base', rpcUrl));
+  return { rpcUrl, history: (wallet, block) => rpcHistory(client, wallet, block) };
 }
 
 const VIEM_CHAINS: Readonly<Record<ScreenedChain, Chain>> = { ethereum: mainnet, base };
@@ -93,10 +109,29 @@ class FactError extends Error {
 /** The two Blockscout address lists the facts are read from. */
 export type BlockscoutList = 'transactions' | 'internal-transactions';
 
-// Blockscout v12 drops a sorted list back to its default order unless sort and order come again on every page.
-const OLDEST_FIRST: Readonly<Record<string, string>> = { sort: 'block_number', order: 'asc' };
 
 const keyOf = (sources: Pick<FactSources, 'apiKey'>) => (sources.apiKey === undefined || sources.apiKey === '' ? undefined : sources.apiKey);
+
+/** The one host the Blockscout key is ever sent to: Blockscout's keyed API, which serves every chain it indexes. */
+export const KEYED_BLOCKSCOUT_HOST = 'api.blockscout.com';
+
+/**
+ * True only for an https URL whose host is exactly KEYED_BLOCKSCOUT_HOST, on the default port, with no user name or
+ * password: the only requests that may carry the Blockscout key (C40). It is asked of the very URL about to be sent,
+ * parsed by the same WHATWG URL parser fetch uses, so a look-alike host (api.blockscout.com.evil.example,
+ * xapi.blockscout.com), the host written into a path, a query or a user name, a trailing dot or another port all fail.
+ * Anything that does not parse is false. Not covered: who answers at that host, and redirects, which fetchJsonCapped
+ * refuses.
+ */
+export function keyedBlockscoutHost(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === 'https:' && parsed.hostname === KEYED_BLOCKSCOUT_HOST && parsed.port === '' && parsed.username === '' && parsed.password === '';
+}
 
 function blockscoutHeaders(apiKey: string | undefined): Record<string, string> {
   return apiKey === undefined ? { accept: 'application/json' } : { accept: 'application/json', authorization: `Bearer ${apiKey}` };
@@ -128,22 +163,15 @@ function listUrl(apiBase: string, wallet: Address, list: BlockscoutList, query: 
 export interface PageOptions {
   /** Pages read at most. A list with more pages left past them comes back with complete false. */
   maxPages: number;
-  /** Asks for the oldest items first, sort and order sent on every page; refused for the internal list, which cannot sort. */
-  oldestFirst?: boolean;
-  /** Reads no further page once this is true of the transfers read so far, which it gets in no particular order. */
-  enough?: (transfers: readonly Transfer[]) => boolean;
-  /** Reads no further page once aborted. A page already asked for still ends by its own 15 second timeout. */
-  signal?: AbortSignal;
 }
 
 /**
  * One Blockscout address list, page by page, as oldest-first transfers at or before snapshotBlock: pending items and
- * anything after the snapshot block are left out, the rule the whole-history read uses. A list asked for oldest first
- * must come back with its blocks in rising order across every page, or the read fails, so a list in another order can
- * never pass for the oldest items. complete is true only when Blockscout said no page follows.
+ * anything after the snapshot block are left out, the rule the whole-history read uses. complete is true only when
+ * Blockscout said no page follows.
  *
- * @throws FactError on any failed or oversized reply, a page out of shape, a list out of order, an aborted signal, or a
- *   URL that would hold the key. Its message holds no URL, key or cursor (C40).
+ * @throws FactError on any failed or oversized reply, a page out of shape, or a URL that would hold the key. Its
+ *   message holds no URL, key or cursor (C40).
  */
 export async function readTransferPages(
   wallet: Address,
@@ -152,29 +180,22 @@ export async function readTransferPages(
   sources: Pick<FactSources, 'blockscoutApi' | 'apiKey'>,
   options: PageOptions,
 ): Promise<TransferPage> {
-  if (options.oldestFirst === true && list !== 'transactions') throw new Error('only the transactions list can be read oldest first');
   const internal = list === 'internal-transactions';
   const Page = z.object({ items: z.array(internal ? BlockscoutInternalTx : BlockscoutTx).max(100), next_page_params: NextPage });
   const apiKey = keyOf(sources);
   const transfers: (Transfer | null)[] = [];
-  let lastBlock = -1;
   let cursor: Record<string, string> = {};
   for (let page = 0; page < options.maxPages; page += 1) {
-    if (options.signal?.aborted === true) throw new FactError('the read was stopped');
-    const query = options.oldestFirst === true ? { ...cursor, ...OLDEST_FIRST } : cursor;
+    const url = listUrl(sources.blockscoutApi, wallet, list, cursor, apiKey);
     const reply = await fetchJsonCapped(
-      listUrl(sources.blockscoutApi, wallet, list, query, apiKey),
-      { headers: blockscoutHeaders(apiKey) },
+      url,
+      { headers: blockscoutHeaders(keyedBlockscoutHost(url) ? apiKey : undefined) },
       { timeoutMs: REQUEST_TIMEOUT_MS, maxBytes: MAX_PAGE_BYTES },
     );
     if (!reply.ok) throw new FactError(`Blockscout answered with status ${reply.status}`);
     const parsed = Page.safeParse(reply.json);
     if (!parsed.success) throw new FactError('Blockscout page did not match the expected shape');
     for (const item of parsed.data.items) {
-      if (options.oldestFirst === true && item.block_number !== null) {
-        if (item.block_number < lastBlock) throw new FactError('Blockscout did not list the transactions oldest first');
-        lastBlock = item.block_number;
-      }
       transfers.push(
         internal
           ? internalTransfer(item as z.infer<typeof BlockscoutInternalTx>, snapshotBlock)
@@ -182,11 +203,10 @@ export async function readTransferPages(
       );
     }
     const next = parsed.data.next_page_params;
-    if (next === null) return { transfers: oldestFirst(transfers, options.oldestFirst === true), complete: true };
-    if (options.enough?.(transfers.filter((transfer): transfer is Transfer => transfer !== null)) === true) break;
+    if (next === null) return { transfers: oldestFirst(transfers), complete: true };
     cursor = cursorFrom(next, apiKey);
   }
-  return { transfers: oldestFirst(transfers, options.oldestFirst === true), complete: false };
+  return { transfers: oldestFirst(transfers), complete: false };
 }
 
 /** Every transfer of one list up to MAX_FUNDING_PAGES pages. Throws past them, so a history is never read short. */
@@ -205,13 +225,11 @@ function seconds(timestamp: string | null): number {
 const lowerAddress = (hash: string) => parseAddress(hash).toLowerCase();
 
 /**
- * Turns Blockscout's items, newest first unless they were asked for oldest first, into the oldest-first transfers the
- * facts engine reads, the same shape the replay gets from its explorer. Pending items and anything after the snapshot
- * block are left out.
+ * Turns Blockscout's newest-first items into the oldest-first transfers the facts engine reads, the same shape the
+ * replay gets from its explorer. Pending items and anything after the snapshot block are left out.
  */
-function oldestFirst(items: (Transfer | null)[], ascending: boolean): Transfer[] {
-  const kept = items.filter((transfer): transfer is Transfer => transfer !== null);
-  return (ascending ? kept : kept.reverse()).sort((a, b) => a.block - b.block);
+function oldestFirst(items: (Transfer | null)[]): Transfer[] {
+  return items.filter((transfer): transfer is Transfer => transfer !== null).reverse().sort((a, b) => a.block - b.block);
 }
 
 function externalTransfer(tx: z.infer<typeof BlockscoutTx>, snapshotBlock: number): Transfer | null {
@@ -257,14 +275,15 @@ async function readHistory(wallet: Address, snapshotBlock: number, sources: Fact
 
 function errorKind(reason: unknown): string {
   // Library messages can contain the RPC URL, and some RPC URLs carry a key, so only our own messages pass (C40).
-  if (reason instanceof FactError) return reason.message;
+  if (reason instanceof FactError || reason instanceof HistoryError) return reason.message;
   return reason instanceof Error ? reason.name : 'unknown error';
 }
 
 /**
  * Computes the free facts for one wallet as of a past block of one screened chain, Ethereum or Base, from that chain's
- * RPC and Blockscout. First funding and wallet age come from core's fundingTransfer and walletAgeDays, the same
- * definitions the replay uses (C20). Left out, the sources are the chain's own from the environment.
+ * RPC and its history: Blockscout through readHistory, or the reader the sources carry in `history`. First funding and
+ * wallet age come from core's fundingTransfer and walletAgeDays over that history, the same definitions the replay uses
+ * (C20). Left out, the sources are the chain's own from the environment.
  *
  * Group, shared deposit address and claim-paid-elsewhere are not computed in this version and are always listed in
  * missing. Any fact that cannot be read is set to null or "unknown" and named in missing, so the ceiling holds the
@@ -277,7 +296,7 @@ function errorKind(reason: unknown): string {
 export async function collectBasicFacts(
   wallet: Address,
   at: { chain: ScreenedChain; block: number },
-  sources: FactSources = at.chain === 'base' ? baseSourcesFromEnv() : sourcesFromEnv(),
+  sources: FactSources | HistorySources = at.chain === 'base' ? baseSourcesFromEnv() : sourcesFromEnv(),
 ): Promise<Facts> {
   const address = parseAddress(wallet);
   if (!isScreenedChain(at.chain)) throw new Error('basic facts are only available on ethereum and base');
@@ -295,7 +314,8 @@ export async function collectBasicFacts(
     client.getBlock({ blockNumber }),
     client.getTransactionCount({ address, blockNumber }),
     client.getCode({ address, blockNumber }),
-    readHistory(address, at.block, sources),
+    // Called inside an async function, so a reader that throws at once still lands in allSettled as a failed read.
+    (async () => (hasHistoryReader(sources) ? sources.history(address, at.block) : readHistory(address, at.block, sources)))(),
   ]);
 
   let txCountAtSnapshot: number | null = null;

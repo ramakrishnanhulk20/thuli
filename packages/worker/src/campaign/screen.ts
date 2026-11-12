@@ -109,9 +109,10 @@ export interface ScreenDeps {
    */
   accountState(address: Address): Promise<AccountState>;
   /**
-   * A reader per screened chain, given only while Base history is on (screenChains, with BLOCKSCOUT_API_KEY set). With
-   * it, each ask is screened on the chain pickChain names, its funder's kind read on that same chain, and facts and
-   * accountState above are never called. Left out, every ask is screened on Ethereum through them, as before.
+   * A reader per screened chain, given only while Base history is on (screenChains, when both chains' RPC endpoints
+   * pass its probe). With it, each ask is screened on the chain pickChain names, its funder's kind read on that same
+   * chain, and facts and accountState above are never called. Left out, every ask is screened on Ethereum through
+   * them, as before.
    */
   chains?: ChainReaders;
   /** SERV's two routes and the wait between retries, as decideWallet takes them. */
