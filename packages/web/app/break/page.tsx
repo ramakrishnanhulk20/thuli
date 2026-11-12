@@ -1,10 +1,9 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Metadata } from 'next';
 import { BreakPage } from '@/components/break/BreakPage';
 import styles from '@/components/break/break.module.css';
 import { SiteNav } from '@/components/site/SiteNav';
-import { settlementUrl, type ProofFacts } from '@/lib/attacks';
+import type { ProofFacts } from '@/lib/attacks';
+import { loadPaidExample } from '@/lib/paidExample';
 import { loadVaultProof } from '@/lib/vaultProof';
 import { SHARE_IMAGE } from '@/lib/siteUrl';
 
@@ -15,13 +14,6 @@ export const metadata: Metadata = {
   description: DESCRIPTION,
   openGraph: { title: 'Try to break it', description: DESCRIPTION, images: [SHARE_IMAGE] },
 };
-
-/** The settlement of the paid example, read at build from the API's captured answer. */
-function paidExampleTransaction(): unknown {
-  const file = path.join(process.cwd(), '..', 'api', 'examples', 'paid-screen-response.json');
-  const example = JSON.parse(fs.readFileSync(file, 'utf8')) as { payment?: { transaction?: unknown } };
-  return example.payment?.transaction;
-}
 
 export default function BreakRoute() {
   const record = loadVaultProof();
@@ -44,7 +36,7 @@ export default function BreakRoute() {
       <SiteNav mode="bar" />
       <main id="break" className={styles.page}>
         <div className={styles.column}>
-          <BreakPage facts={facts} settlementHref={settlementUrl(record.explorer, paidExampleTransaction())} />
+          <BreakPage facts={facts} settlementHref={loadPaidExample().settlementUrl} />
         </div>
       </main>
     </>

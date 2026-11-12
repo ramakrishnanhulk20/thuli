@@ -1,6 +1,5 @@
 import { createPublicClient, encodeAbiParameters, http, isAddress, keccak256, parseAbi, type Address, type Hex } from 'viem';
 import { baseSepolia } from 'viem/chains';
-import { BASE_SEPOLIA_CHAIN, BASE_SEPOLIA_EXPLORER, explorerTxUrl } from './explorer';
 import { VAULT_ABI } from './vaultAbi';
 
 /** The public endpoint packages/api/src/config.ts names as BASE_SEPOLIA_RPC. */
@@ -352,18 +351,4 @@ export function judgeRenderedReason(paragraph: { childElementCount: number } | n
 /** First 10 and last 6 characters, for the root and for transaction hashes. */
 export function shortHash(value: string): string {
   return `${value.slice(0, 10)}…${value.slice(-6)}`;
-}
-
-const TX_HASH = /^0x[0-9a-f]{64}$/;
-
-/**
- * The BaseScan page of a settlement, built from a hash that passed the check. The hash and the explorer come from a record
- * the site does not control, so a hash that is not exactly 0x and 64 lowercase hex characters is refused rather than
- * tidied, and so is an explorer that is not the one lib/explorer.ts names.
- * @throws RangeError for either.
- */
-export function settlementUrl(explorer: string, hash: unknown): string {
-  if (typeof hash !== 'string' || !TX_HASH.test(hash)) throw new RangeError('the settlement transaction is not a 64 digit hash');
-  if (explorer !== BASE_SEPOLIA_EXPLORER) throw new RangeError('the record names an explorer the site does not use');
-  return explorerTxUrl(BASE_SEPOLIA_CHAIN, hash);
 }

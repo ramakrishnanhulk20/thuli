@@ -22,7 +22,6 @@ import {
   rootLineText,
   rootMatches,
   runApiAttack,
-  settlementUrl,
   shortHash,
   STATE_SIGNATURE,
   runVaultCall,
@@ -357,19 +356,7 @@ describe('the markup row', () => {
   });
 });
 
-describe('the settlement link', () => {
-  const example = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'api', 'examples', 'paid-screen-response.json'), 'utf8')) as { payment: { transaction: string } };
-
-  it('is built from the example transaction on the proof explorer', () => {
-    expect(settlementUrl(record.explorer, example.payment.transaction)).toBe(`https://sepolia.basescan.org/tx/${example.payment.transaction}`);
-  });
-
-  it('refuses a hash that is not a hash', () => {
-    expect(() => settlementUrl(record.explorer, '0xabc')).toThrow(RangeError);
-    expect(() => settlementUrl(record.explorer, undefined)).toThrow(RangeError);
-    expect(() => settlementUrl(record.explorer, example.payment.transaction.toUpperCase())).toThrow(RangeError);
-  });
-
+describe('shortHash', () => {
   it('shortens the root to its first 10 and last 6 characters', () => {
     expect(shortHash(record.root)).toBe(`${record.root.slice(0, 10)}…${record.root.slice(-6)}`);
   });
