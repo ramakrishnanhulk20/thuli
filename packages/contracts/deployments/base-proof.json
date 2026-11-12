@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "network": "base",
+  "chainId": 8453,
+  "explorer": "https://basescan.org",
+  "factory": "0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De",
+  "vault": "0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C",
+  "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "owner": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
+  "agent": "0xBedcF312f0070295c73bff4De974F372aa03Dee6",
+  "perWalletCap": "1000000",
+  "rootDelaySeconds": 3600,
+  "root": "0x34671779c85c8ec5742ebe23210d45d87b76cacf9e6d29ec1394ae36e3999928",
+  "claimableAt": 1794465781,
+  "paid": {
+    "account": "0x96E854aBDdc5C618ca843956d1303017b586aB75",
+    "amount": "1000000"
+  },
+  "refused": {
+    "account": "0x8bBd641B8355EC3b856560256Dd6Cf0150FE3253",
+    "error": "InvalidProof"
+  },
+  "withdrawn": {
+    "to": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
+    "amount": "1000000"
+  },
+  "deposited": "2000000",
+  "totalPaid": "1000000",
+  "transactions": [
+    {
+      "label": "createVault",
+      "hash": "0x06c4123beea2cc0eae0dee7832b44beda1f5def2b3ee308560703f15de33c7bd",
+      "block": 56358527,
+      "gasUsed": 1686371,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "approve",
+      "hash": "0xb8bb444eb3e8f7a480e25f25dbec33150ae0d36ac8728c4857900d39c0c62697",
+      "block": 56358543,
+      "gasUsed": 55437,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "deposit",
+      "hash": "0x0e40c135b57075738f6e8a696a6afd0154548182afc250bbf11e2c911732dde6",
+      "block": 56358557,
+      "gasUsed": 100114,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    },
+    {
+      "label": "postRoot",
+      "hash": "0xed563a909b47cf666464f3b4383c09cca208726cc560c85a7b9efbac823e83a8",
+      "block": 56359030,
+      "gasUsed": 75112,
+      "from": "0xBedcF312f0070295c73bff4De974F372aa03Dee6"
+    },
+    {
+      "label": "claim",
+      "hash": "0x6cbeb31cbeddd5ba6b2c98463d2a1d3dfa679fef0774a3f3683faf5dc4bb3d31",
+      "block": 56377250,
+      "gasUsed": 128807,
+      "from": "0xBedcF312f0070295c73bff4De974F372aa03Dee6"
+    },
+    {
+      "label": "withdraw",
+      "hash": "0x0f8c55a0ab1c74efa7d5462feeb9423208d85e45c04538553c7cc1e648422ba6",
+      "block": 56511881,
+      "gasUsed": 55413,
+      "from": "0x86D40838B9805FF63343B8F060EF3fC336f59E78"
+    }
+  ],
+  "recordedAt": "2026-11-12T14:12:46.416Z"
+}

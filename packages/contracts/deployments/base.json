@@ -5,7 +5,8 @@
   "deployer": "0x86d40838b9805ff63343b8f060ef3fc336f59e78",
   "txHash": "0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3",
   "block": 56121245,
-  "verifiedOn": "none",
+  "verifiedOn": "basescan",
   "explorer": "https://basescan.org/address/0x1d9b8cd9a5af33287bb96862d9bb0f563dc402de",
+  "basescanSource": "https://basescan.org/address/0x1d9b8cd9a5af33287bb96862d9bb0f563dc402de#code",
   "recordedAt": "2026-11-11T16:31:02.667Z"
 }
