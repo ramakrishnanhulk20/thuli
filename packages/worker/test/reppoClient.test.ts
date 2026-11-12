@@ -1,5 +1,6 @@
 // Not covered here: a live Reppo call (every reply is a stub and no request leaves the machine), and whether a real
-// timed-out or lost evaluation is charged, which only Reppo's own ledger can show.
+// timed-out or lost evaluation is charged, which only Reppo's own ledger can show. The never-left tests build fetch's
+// TypeError and its cause code by hand, so they do not show which code a real DNS failure or connect timeout raises.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EnvError } from '../src/env.ts';
 import {
@@ -9,8 +10,13 @@ import {
   reppoConnectionFromEnv,
   NO_EVALUATION_CREATED,
   ReppoNotSent,
+  ReppoRefused,
+  ReppoStoppedFirst,
+  ReppoUnreachable,
+  ReppoUnsendable,
   SUBMIT_MAY_HAVE_LANDED,
   submitCannotHaveCharged,
+  submitEvaluation,
   submitEvaluationOnce,
 } from '../src/reppo/client.ts';
 
@@ -167,6 +173,16 @@ describe('evaluate', () => {
     expect(waits()).toEqual([2_000]);
   });
 
+  it.each([400, 402, 404, 429])('throws a plain ReppoError on a %i after a submit try that got no reply, since that try may have landed (C23)', async (status) => {
+    const fetchMock = replies(new TypeError('fetch failed'), json({}, status));
+    const error = (await submitEvaluation('the text', opts).catch((caught: unknown) => caught)) as ReppoError;
+    expect(error).toBeInstanceOf(ReppoError);
+    expect(error).not.toBeInstanceOf(ReppoRefused);
+    expect(error).toMatchObject({ status, message: SUBMIT_MAY_HAVE_LANDED });
+    expect(submitCannotHaveCharged(error)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ['a path', '../../admin'],
     ['a query', 'abc?x=1'],
@@ -266,6 +282,13 @@ describe('submitEvaluationOnce', () => {
       expect(notSent).toBeInstanceOf(ReppoNotSent);
       expect(submitCannotHaveCharged(notSent)).toBe(true);
     }
+    // An input that can never be sent is told apart from a submit stopped before its call.
+    for (const never of [empty, tooLong]) {
+      expect(never).toBeInstanceOf(ReppoUnsendable);
+      expect(never).not.toBeInstanceOf(ReppoStoppedFirst);
+    }
+    expect(before).toBeInstanceOf(ReppoStoppedFirst);
+    expect(before).not.toBeInstanceOf(ReppoUnsendable);
 
     const hanging = vi.fn(async (_url: string, _init?: RequestInit) => new Promise<Response>(() => undefined));
     vi.stubGlobal('fetch', hanging);
@@ -276,6 +299,43 @@ describe('submitEvaluationOnce', () => {
     expect(cut).toBeInstanceOf(ReppoError);
     expect(submitCannotHaveCharged(cut)).toBe(false);
     expect(hanging).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'])(
+    'answers a fetch that failed with cause code %s, before anything left, with ReppoUnreachable in fixed words (C40)',
+    async (code) => {
+      const cause = Object.assign(new Error(`connect ${code} eval.example.org:443 Bearer ${KEY}`), { code });
+      const fetchMock = replies(new TypeError(`fetch failed for ${BASE}/agents/evals`, { cause }));
+      const error = await submitEvaluationOnce('the text', once).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ReppoUnreachable);
+      expect(error).toBeInstanceOf(ReppoNotSent);
+      expect(submitCannotHaveCharged(error)).toBe(true);
+      const seen = `${(error as Error).message} ${String((error as Error).stack)} ${JSON.stringify(error)}`;
+      expect(seen).not.toContain(KEY);
+      expect(seen).not.toContain('example.org');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('leaves every other failure unclear: no cause code, a code not in the list, a cause of another shape, a failure that is not a TypeError, a 408 and a 500 (fail closed)', async () => {
+    const failures: (Response | Error)[] = [
+      new TypeError('fetch failed'),
+      new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) }),
+      new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) }),
+      new TypeError('fetch failed', { cause: 'ECONNREFUSED' }),
+      new TypeError('fetch failed', { cause: { code: 7 } }),
+      new Error('connect ECONNREFUSED', { cause: { code: 'ECONNREFUSED' } }),
+      json({}, 408),
+      json({}, 500),
+    ];
+    for (const failure of failures) {
+      const fetchMock = replies(failure);
+      const error = await submitEvaluationOnce('the text', once).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ReppoError);
+      expect(error).not.toBeInstanceOf(ReppoNotSent);
+      expect(submitCannotHaveCharged(error)).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    }
   });
 });
 

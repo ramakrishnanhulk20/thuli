@@ -16,7 +16,9 @@ import {
   type GraphRecord,
 } from '@thuli/core';
 import {
+  APPEAL_MAYBE_PAID,
   clearAppealSubmitting,
+  countUnclearSubmit,
   getAsk,
   markAppealSubmitting,
   markAppealUnchecked,
@@ -44,7 +46,9 @@ import {
   ReppoError,
   ReppoOutOfCredit,
   ReppoRefused,
-  submitCannotHaveCharged,
+  ReppoStoppedFirst,
+  ReppoUnreachable,
+  ReppoUnsendable,
   submitEvaluationOnce,
   type ReppoConnection,
   type ReppoEval,
@@ -62,12 +66,19 @@ import { checkpoint, StepStopped, waitNoted, type ChainMemory } from './vault.ts
 export const APPEAL_LEASE_SECONDS = 300;
 /** Tries one appeal's outside check gets before it ends unchecked (C41). */
 export const APPEAL_MAX_ATTEMPTS = 6;
+/**
+ * How many submits of one appeal may end unclear, each perhaps charged with no evaluation id to show, before its check
+ * is given up as "may have been paid for" (APPEAL_MAYBE_PAID). 1 means the first unclear submit ends it (C56).
+ */
+export const MAX_UNCLEAR_SUBMITS = 1;
 /** How long one look-up waits for Reppo, which answers in 30 to 90 seconds; past this the try is given back unfinished. */
 export const APPEAL_REPPO_WAIT_MS = 150_000;
 /** The deadline of the one POST that submits an appeal; with no retry, it is the whole submit. */
 export const APPEAL_SUBMIT_DEADLINE_MS = 30_000;
 /** How long an appeal waits after Reppo answered its submit busy (409 or 429), having created nothing. */
 export const APPEAL_BUSY_WAIT_SECONDS = 180;
+/** How long an appeal waits, its try handed back, when Reppo could not be reached or refused our key (401 or 403). */
+export const APPEAL_SERVICE_WAIT_SECONDS = 600;
 /** How long a paid check waits between look-ups while Reppo still has its evaluation queued or running. */
 export const APPEAL_LOOKUP_WAIT_SECONDS = 300;
 const APPEAL_POLL_MS = 5_000;
@@ -84,14 +95,14 @@ export const APPEAL_CAUSES = Object.freeze({
   unfinished: 'the outside check had not finished',
   failed: 'the outside check could not finish',
   lost: 'the appeal was no longer being checked by this worker',
-  maybePaid: 'the outside check may already have been paid for',
   busy: 'the outside check was busy and created nothing',
   keptRefusing: 'the outside check kept refusing the submit',
   evaluationFailed: 'the outside check failed',
+  unreachable: 'the outside check could not be reached, so nothing was sent',
+  keyRefused: 'the outside check refused the key in REPPO_API_KEY',
+  stopped: 'the step was stopped before the submit, so nothing was sent',
+  unsendable: 'the decision could not be sent to the outside check',
 });
-
-// The refusals that mean Reppo is busy for now, not that this appeal is wrong: both are in NO_EVALUATION_CREATED.
-const BUSY_REFUSALS: readonly number[] = [409, 429];
 
 const APPEAL_LABEL = 'appeal';
 const ROUTES: readonly ReppoRoute[] = ['ship', 'review', 'block'];
@@ -116,6 +127,8 @@ export interface AppealDeps {
   memory: ChainMemory;
   reppo: AppealReppo;
   spend: AppealSpend;
+  /** The unclear submits one appeal may have before its check ends; MAX_UNCLEAR_SUBMITS when left out. */
+  maxUnclearSubmits?: number;
 }
 
 type Where = { campaignId: string; wallet: Address };
@@ -196,9 +209,14 @@ function causeOf(error: unknown): string {
  *   unchecked and nothing is sent (C35).
  * - An evaluation id already on the appeal, from a try cut short after its submit: that evaluation is looked up and
  *   nothing is submitted again (C23). A submit begun with no id kept (submitStarted) may have been paid for, so the
- *   appeal ends unchecked with APPEAL_CAUSES.maybePaid and is never sent. Otherwise markAppealSubmitting goes first, and
- *   only a worker whose mark landed sends, with one POST and no retry (submitOnce), so Reppo is paid at most once for any
- *   appeal under any cut and with any number of workers.
+ *   store counts it (countUnclearSubmit); once the count reaches the limit, deps.maxUnclearSubmits or else
+ *   MAX_UNCLEAR_SUBMITS, the appeal ends unchecked with the store's APPEAL_MAYBE_PAID and is never sent again, and below
+ *   it the same run submits again. Every submit goes through markAppealSubmitting first, and only a worker whose mark
+ *   landed sends, with one POST and no retry (submitOnce), so a check is submitted with a possible charge and no id to
+ *   show at most the limit's number of times, under any cut and with any number of workers (C56).
+ * - A failed submit is handled by whose fault it is (afterFailedSubmit): our credit or key, or the outside check busy or
+ *   out of reach, waits with its try handed back and ends no appeal; this appeal's own refused request counts its tries;
+ *   an input that can never be sent ends at once; anything unclear keeps its mark for the next take to count.
  * - COMPLETED: recordAppealCheck with the route, noteFrom of Reppo's reason, the id, the credits charged and the
  *   verdict's score, decision and confidence, each null when the store would refuse it. A paid check always ends checked,
  *   with route null when Reppo named none Thuli knows or its verdict was out of shape (C23).
@@ -208,12 +226,19 @@ function causeOf(error: unknown): string {
  * - Out of credit: given back with LONGEST_RETRY_SECONDS and its try handed back, said once (C24). A check with no
  *   evaluation id that runs out of tries ends unchecked (C41).
  * Log lines hold ids, routes, counts and fixed words; never the appeal's text, which this step never receives, Reppo's
- * note or a key (C40). The signal is checked before every store write and before the submit (C41).
+ * note or a key (C40). The signal is checked before every store write and before the submit (C41), except the writes
+ * that undo a submit which sent nothing: the mark taken back, and for a submit stopped before its call, the try handed
+ * back too.
  *
  * @returns idle when no appeal is ready; checked, unchecked, released or dropped (another worker or a settle moved it).
- * @throws StepStopped when the signal is aborted; StoreError only when the store cannot hand out an appeal at all.
+ * @throws StepStopped when the signal is aborted, unless the stop came before the submit's call, which hands the try
+ *   back and returns released; StoreError only when the store cannot hand out an appeal at all; RangeError, before any
+ *   take, when deps.maxUnclearSubmits is not a whole number from 1.
  */
 export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promise<AppealOutcome> {
+  const unclearLimit = deps.maxUnclearSubmits ?? MAX_UNCLEAR_SUBMITS;
+  // A limit that is not a whole number, NaN among them, would never be reached, so it is refused before any take (C56).
+  if (!Number.isInteger(unclearLimit) || unclearLimit < 1) throw new RangeError('maxUnclearSubmits must be a whole number from 1');
   checkpoint(signal, 'taking an appeal');
   const taken = await takeAppeal(deps.db, deps.now(), APPEAL_LEASE_SECONDS, APPEAL_MAX_ATTEMPTS);
   if (taken === null) return { kind: 'idle' };
@@ -222,21 +247,18 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
   try {
     let evalId = taken.reppoEvalId;
     if (evalId === null) {
+      // A mark with no id is a submit that may have been charged, and Reppo cannot recognise a text sent twice. The
+      // store counts it and takes the mark back; once the count reaches the limit the appeal is never sent again, and
+      // ends unchecked but can still be settled. A count already at the limit with no mark, as a stop right after the
+      // count leaves it, ends the same way (C23, C56, fail closed).
+      let unclear = taken.unclearSubmits;
       if (taken.submitStarted) {
-        // A submit was begun and no id was kept, so it may have been paid for, and Reppo cannot recognise a text sent
-        // twice: this appeal is never sent again. It ends unchecked and can still be settled (C23).
-        checkpoint(signal, 'ending an appeal check');
-        await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.maybePaid);
-        deps.log(`${label}: unchecked, ${APPEAL_CAUSES.maybePaid}`);
-        return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.maybePaid };
+        checkpoint(signal, 'counting an unclear submit');
+        unclear = (await countUnclearSubmit(deps.db, where, deps.now())).unclearSubmits;
       }
+      if (unclear >= unclearLimit) return await endCheck(deps, taken, APPEAL_MAYBE_PAID, signal, `, after ${plural(unclear, 'unclear submit')}`);
       const built = outsideInput(taken);
-      if (!built.ok) {
-        checkpoint(signal, 'ending an appeal check');
-        await markAppealUnchecked(deps.db, where, deps.now(), built.cause);
-        deps.log(`${label}: unchecked, ${built.cause}${built.kind === undefined ? '' : ` (${built.kind})`}`);
-        return { kind: 'unchecked', ...where, cause: built.cause };
-      }
+      if (!built.ok) return await endCheck(deps, taken, built.cause, signal, built.kind === undefined ? '' : ` (${built.kind})`);
       checkpoint(signal, 'marking an appeal as being sent');
       // The durable mark goes first: of two workers holding this appeal after a lease ran out, only the one whose mark
       // lands may send, and a cut at any later point leaves the mark for the next take to see (C23).
@@ -251,27 +273,53 @@ export async function appealNext(deps: AppealDeps, signal?: AbortSignal): Promis
     checkpoint(signal, 'waiting for the outside check');
     const result = await deps.reppo.lookUp(evalId, signal);
     if (result.status === 'COMPLETED') return await recordCheck(deps, taken, evalId, result, signal);
-    if (result.status === 'FAILED') return await endFailed(deps, taken, evalId, signal);
+    if (result.status === 'FAILED') return await endFailed(deps, taken, evalId, result, signal);
     return await followLater(deps, taken, evalId, signal);
   } catch (error) {
     if (error instanceof StepStopped) throw error;
-    if (error instanceof ReppoOutOfCredit) return outOfCredit(deps, taken, signal);
+    if (error instanceof ReppoOutOfCredit) return waitFor(deps, taken, APPEAL_CAUSES.outOfCredit, LONGEST_RETRY_SECONDS, signal);
     return giveBack(deps, taken, causeOf(error), signal);
   }
 }
 
 /**
+ * What the step does after its one POST failed, decided by whose fault the failure is:
+ * - wait: our balance (402), the service busy (409, 429), our key (401, 403) or a call that never left
+ *   (ReppoUnreachable). None is this appeal's fault, so its try is handed back and it waits `seconds`, for good if need
+ *   be (C24);
+ * - stopped: the worker's own time limit stopped the submit before its call (ReppoStoppedFirst). The try is handed back;
+ * - refused: Reppo refused this appeal's own request (400, 404). The try counts, and APPEAL_MAX_ATTEMPTS of them end it;
+ * - unsendable: the input can never be sent (ReppoUnsendable). The check ends at once;
+ * - unclear: anything else, a submit that may have been charged. The mark stays, and the next take counts it.
+ * Every kind but unclear proves nothing was charged. Read by the error's class and, for a refusal, its status; anything
+ * not named here, a refusal with another status or a kind of ReppoNotSent added later among them, is unclear, never
+ * "not charged" (fail closed). Pure.
+ */
+type FailedSubmit = { kind: 'wait'; cause: string; seconds: number } | { kind: 'stopped' | 'refused' | 'unsendable' | 'unclear'; cause: string };
+
+function afterFailedSubmit(error: unknown): FailedSubmit {
+  if (error instanceof ReppoOutOfCredit) return { kind: 'wait', cause: APPEAL_CAUSES.outOfCredit, seconds: LONGEST_RETRY_SECONDS };
+  if (error instanceof ReppoUnreachable) return { kind: 'wait', cause: APPEAL_CAUSES.unreachable, seconds: APPEAL_SERVICE_WAIT_SECONDS };
+  if (error instanceof ReppoStoppedFirst) return { kind: 'stopped', cause: APPEAL_CAUSES.stopped };
+  if (error instanceof ReppoUnsendable) return { kind: 'unsendable', cause: APPEAL_CAUSES.unsendable };
+  if (error instanceof ReppoRefused) {
+    if (error.status === 409 || error.status === 429) return { kind: 'wait', cause: APPEAL_CAUSES.busy, seconds: APPEAL_BUSY_WAIT_SECONDS };
+    if (error.status === 401 || error.status === 403) return { kind: 'wait', cause: APPEAL_CAUSES.keyRefused, seconds: APPEAL_SERVICE_WAIT_SECONDS };
+    if (error.status === 400 || error.status === 404) return { kind: 'refused', cause: causeOf(error) };
+  }
+  return { kind: 'unclear', cause: causeOf(error) };
+}
+
+/**
  * The one POST of a marked appeal, and what it leaves in the store for each way it can end (C23, C56):
  * - an evaluation id: kept at once with noteAppealEval, before any wait, with no stop allowed between the two;
- * - an outcome that cannot have charged (submitCannotHaveCharged: a 402, a status in NO_EVALUATION_CREATED, or a submit
- *   that never left): the mark is taken back with clearAppealSubmitting, with no stop before it either, so an appeal
- *   that sent nothing is never ended as paid for. Then a 402 waits the longest wait with its try handed back; a busy 409
- *   or 429 waits APPEAL_BUSY_WAIT_SECONDS with its try counted (busyBack); the rest wait the usual wait;
- * - anything else, no reply, the deadline, the signal mid-call, 408, a 5xx or a reply out of shape: the submit may have
- *   been charged, so the mark stays and the appeal is given back; its next take ends it unchecked and nothing is sent
- *   again (fail closed).
- * When noteAppealEval fails after an id came back, the mark stays too and the appeal ends the same way: one check is paid
- * for and its verdict lost, the lesser harm than paying twice. That line names the id, so the operator can look it up.
+ * - a failure afterFailedSubmit reads as anything but unclear: nothing was charged, so the mark is taken back with
+ *   clearAppealSubmitting, with no stop before it either, and the appeal waits, is given back or ends as that kind says;
+ * - an unclear failure: the submit may have been charged, so the mark stays and the appeal is given back with its try
+ *   counted. Its next take counts the submit, and ends the check once MAX_UNCLEAR_SUBMITS are counted (fail closed).
+ * When noteAppealEval fails after an id came back, the mark stays too and the next take counts it the same way: one
+ * check is paid for and its verdict lost, the lesser harm than paying past the limit. That line names the id, so the
+ * operator can look it up.
  */
 async function submitOnce(
   deps: AppealDeps,
@@ -285,16 +333,18 @@ async function submitOnce(
   try {
     evalId = await deps.reppo.submit(input, signal);
   } catch (error) {
-    if (!submitCannotHaveCharged(error)) {
-      return { kind: 'ended', outcome: await giveBack(deps, taken, `${causeOf(error)}, so it is never sent again`, signal) };
+    const failed = afterFailedSubmit(error);
+    if (failed.kind === 'unclear') {
+      return { kind: 'ended', outcome: await giveBack(deps, taken, `${failed.cause}; the next try counts it as an unclear submit`, signal) };
     }
-    // No checkpoint before this write: it records that this send charged nothing, and left undone it would end an
-    // appeal that paid nothing as "may already have been paid for".
+    // No checkpoint before this write: it records that this send charged nothing, and left undone the next take would
+    // count a submit that paid nothing as perhaps paid for.
     await clearAppealSubmitting(deps.db, where, deps.now());
     let outcome: AppealOutcome;
-    if (error instanceof ReppoOutOfCredit) outcome = await outOfCredit(deps, taken, signal);
-    else if (error instanceof ReppoRefused && error.status !== null && BUSY_REFUSALS.includes(error.status)) outcome = await busyBack(deps, taken, signal);
-    else outcome = await giveBack(deps, taken, causeOf(error), signal);
+    if (failed.kind === 'wait') outcome = await waitFor(deps, taken, failed.cause, failed.seconds, signal);
+    else if (failed.kind === 'stopped') outcome = await stoppedFirst(deps, taken, failed.cause);
+    else if (failed.kind === 'refused') outcome = await refusedBack(deps, taken, failed.cause, signal);
+    else outcome = await endCheck(deps, taken, failed.cause, signal);
     return { kind: 'ended', outcome };
   }
   // No checkpoint between the submit and this record: the evaluation may be paid for already, so its id is kept, abort
@@ -363,6 +413,16 @@ function decisionFrom(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 && value.length <= MAX_REPPO_DECISION_CHARS && isPlainText(value) ? value : null;
 }
 
+// Ends the check unchecked for good with a cause in fixed words, kept for the owner's view only (C40). detail is more
+// fixed words or numbers for the log line alone.
+async function endCheck(deps: AppealDeps, taken: TakenAppeal, cause: string, signal: AbortSignal | undefined, detail = ''): Promise<AppealOutcome> {
+  checkpoint(signal, 'ending an appeal check');
+  const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
+  await markAppealUnchecked(deps.db, where, deps.now(), cause);
+  deps.log(`appeal ${taken.campaignId} ${taken.wallet}: unchecked, ${cause}${detail}`);
+  return { kind: 'unchecked', ...where, cause };
+}
+
 async function giveBack(deps: AppealDeps, taken: TakenAppeal, cause: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
   checkpoint(signal, 'giving an appeal back');
   const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
@@ -374,20 +434,22 @@ async function giveBack(deps: AppealDeps, taken: TakenAppeal, cause: string, sig
   return { kind: 'released', ...where, cause, status };
 }
 
-// Reppo was busy and created nothing. The try counts, so an outside check that keeps refusing ends after
-// APPEAL_MAX_ATTEMPTS tries with a cause that says so, never as paid for, because nothing was.
-async function busyBack(deps: AppealDeps, taken: TakenAppeal, signal: AbortSignal | undefined): Promise<AppealOutcome> {
-  checkpoint(signal, 'giving an appeal back');
+// Reppo refused this appeal's own request (400 or 404), and this submit created nothing. The try counts, so a request
+// it keeps refusing ends after APPEAL_MAX_ATTEMPTS tries with a cause that says so.
+async function refusedBack(deps: AppealDeps, taken: TakenAppeal, cause: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+  if (taken.attempts >= APPEAL_MAX_ATTEMPTS) return endCheck(deps, taken, APPEAL_CAUSES.keptRefusing, signal);
+  return giveBack(deps, taken, cause, signal);
+}
+
+// The worker's own time limit stopped the submit before its call, so nothing was sent and the appeal is not to blame.
+// No checkpoint before this write, though the signal is aborted: it is the one write that leaves the appeal as if this
+// try was never made, and left undone the lease would run out with the try counted.
+async function stoppedFirst(deps: AppealDeps, taken: TakenAppeal, cause: string): Promise<AppealOutcome> {
   const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
-  const label = `appeal ${taken.campaignId} ${taken.wallet}`;
-  if (taken.attempts >= APPEAL_MAX_ATTEMPTS) {
-    await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.keptRefusing);
-    deps.log(`${label}: unchecked, ${APPEAL_CAUSES.keptRefusing}`);
-    return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.keptRefusing };
-  }
-  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, APPEAL_BUSY_WAIT_SECONDS);
-  deps.log(`${label}: not checked, ${APPEAL_CAUSES.busy}; queued again, next try in ${APPEAL_BUSY_WAIT_SECONDS} s`);
-  return { kind: 'released', ...where, cause: APPEAL_CAUSES.busy, status };
+  const wait = retryDelaySeconds(taken.attempts);
+  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, wait, { refundTry: true });
+  deps.log(`appeal ${taken.campaignId} ${taken.wallet}: not checked, ${cause}; queued again, next try in ${wait} s`);
+  return { kind: 'released', ...where, cause, status };
 }
 
 // Paid for and still queued or running at Reppo: looked up again after APPEAL_LOOKUP_WAIT_SECONDS with the try handed
@@ -402,24 +464,37 @@ async function followLater(deps: AppealDeps, taken: TakenAppeal, evalId: string,
   return { kind: 'released', ...where, cause: APPEAL_CAUSES.unfinished, status };
 }
 
-// Reppo ended the evaluation FAILED: it charges nothing and no verdict will come, so the check ends now, with no
-// further look-up.
-async function endFailed(deps: AppealDeps, taken: TakenAppeal, evalId: string, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+// Reppo ended the evaluation FAILED: no verdict will come, so the check ends now, with no further look-up. Reppo's docs
+// say a FAILED evaluation charges nothing; any credits it reports anyway go into the spend total and the log line, so
+// such a charge would be seen.
+async function endFailed(
+  deps: AppealDeps,
+  taken: TakenAppeal,
+  evalId: string,
+  result: ReppoEval,
+  signal: AbortSignal | undefined,
+): Promise<AppealOutcome> {
   checkpoint(signal, 'ending an appeal check');
   const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
   await markAppealUnchecked(deps.db, where, deps.now(), APPEAL_CAUSES.evaluationFailed);
-  deps.log(`appeal ${taken.campaignId} ${taken.wallet}: unchecked, ${APPEAL_CAUSES.evaluationFailed}, evaluation ${evalId}`);
+  let charged = '';
+  if (result.creditsCharged > 0) {
+    deps.spend.credits += result.creditsCharged;
+    charged = `, ${result.creditsCharged} credits charged though it failed, ${deps.spend.credits} credits since start`;
+  }
+  deps.log(`appeal ${taken.campaignId} ${taken.wallet}: unchecked, ${APPEAL_CAUSES.evaluationFailed}, evaluation ${evalId}${charged}`);
   return { kind: 'unchecked', ...where, cause: APPEAL_CAUSES.evaluationFailed };
 }
 
-// No credit is no fault of the appeal: its try is handed back and it waits the longest wait, so a long outage of credit
-// neither ends appeals nor spins (C24). Said once until a check is recorded again.
-async function outOfCredit(deps: AppealDeps, taken: TakenAppeal, signal: AbortSignal | undefined): Promise<AppealOutcome> {
+// A wait that is no fault of the appeal: our credit, our key, or the outside check busy or out of reach. Its try is
+// handed back and it waits `seconds`, so however long the cause lasts it neither ends appeals nor spins (C24, C41).
+// Said once, then again only when the cause changes or after a check is recorded.
+async function waitFor(deps: AppealDeps, taken: TakenAppeal, cause: string, seconds: number, signal: AbortSignal | undefined): Promise<AppealOutcome> {
   checkpoint(signal, 'giving an appeal back');
   const where: Where = { campaignId: taken.campaignId, wallet: taken.wallet };
-  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, LONGEST_RETRY_SECONDS, { refundTry: true });
-  if (waitNoted(deps.memory.waiting, APPEAL_LABEL, APPEAL_CAUSES.outOfCredit)) deps.log(`appeal: waiting, ${APPEAL_CAUSES.outOfCredit}`);
-  return { kind: 'released', ...where, cause: APPEAL_CAUSES.outOfCredit, status };
+  const status = await releaseAppeal(deps.db, where, deps.now(), APPEAL_MAX_ATTEMPTS, seconds, { refundTry: true });
+  if (waitNoted(deps.memory.waiting, APPEAL_LABEL, cause)) deps.log(`appeal: waiting, ${cause}`);
+  return { kind: 'released', ...where, cause, status };
 }
 
 // Every character that can still break, end or turn a line once JSON.stringify has escaped quotes, backslashes and the
@@ -456,8 +531,11 @@ function appealLines(appeal: OwnerAppeal, ask: PublicAsk | null, place: number, 
     `  text: ${quoted(appeal.text)}`,
     `  outside check: ${check}`,
     ...(appeal.checkNote === null ? [] : [`  check note: ${quoted(appeal.checkNote)}`]),
-    // A mark with no evaluation id means a submit may have been charged with nothing to show for it.
-    `  submit mark: ${appeal.submitStartedAt === null ? 'none' : `set at ${appeal.submitStartedAt.toISOString()}`}`,
+    ...(appeal.unclearSubmits > 0 ? [`  unclear submits: ${appeal.unclearSubmits}`] : []),
+    // A mark beside an evaluation id is a submit that shows what it paid for, so only a mark with none is worth a warning.
+    ...(appeal.submitStartedAt !== null && appeal.reppoEvalId === null
+      ? [`  warning: a submit may have been paid for, marked at ${appeal.submitStartedAt.toISOString()} with no evaluation id`]
+      : []),
     `  note: ${appeal.reppoNote === null ? 'none' : quoted(appeal.reppoNote)}`,
     `  outcome: ${outcome}`,
     ...(appeal.ownerNote === null ? [] : [`  owner note: ${quoted(appeal.ownerNote)}`]),

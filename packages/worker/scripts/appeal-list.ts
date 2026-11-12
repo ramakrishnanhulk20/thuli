@@ -6,8 +6,8 @@
 // This is the only place an appeal's text is shown, and it goes to this terminal only; no page or log carries it (C40).
 // The text, the owner's note, Reppo's words and the check's stored cause are each printed by one quoting function as a
 // JSON string after a fixed label, with every character that can break or turn a line escaped, so none of them can pass
-// for a line of this command's own (C34, C58). The check note and the submit mark show an appeal whose outside check
-// may already have been paid for.
+// for a line of this command's own (C34, C58). The check note, the count of unclear submits and a warning line for a
+// submit mark with no evaluation id show an appeal whose outside check may already have been paid for.
 // Reads DATABASE_URL and nothing else, changes nothing, and loads no private key.
 import { parseArgs } from 'node:util';
 import { CAMPAIGN_ID } from '@thuli/core';

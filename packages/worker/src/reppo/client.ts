@@ -84,8 +84,8 @@ export function reppoConnectionFromEnv(source: Record<string, string | undefined
 
 /**
  * One HTTP call, retried on a 5xx or a failed call. unanswered is true when an earlier try got no usable reply: for a
- * submit, Reppo may have taken that try without our seeing it. Reppo has no way to ask whether a lost submit landed, but
- * one that did makes the retry answer 409 until it finishes, which is how submit tells.
+ * submit, Reppo may have taken that try without our seeing it. Reppo has no way to ask whether a lost submit landed, so
+ * submit reads every refusal after such a try as one that may have been charged.
  */
 async function call(
   url: string,
@@ -123,8 +123,42 @@ const BUSY_STATUS = 409;
 /** Reppo refused a submit with a status in NO_EVALUATION_CREATED: no evaluation was created, so nothing was charged. */
 export class ReppoRefused extends ReppoError {}
 
-/** A submit that stopped before any request left: its input was refused, or its signal was already aborted. */
-export class ReppoNotSent extends ReppoError {}
+/**
+ * A submit that stopped before any request left, so it cannot have charged. Abstract, so every one names its kind: an
+ * input that can never be sent (ReppoUnsendable), a submit stopped before its call (ReppoStoppedFirst), or a call that
+ * never left this machine (ReppoUnreachable).
+ */
+export abstract class ReppoNotSent extends ReppoError {}
+
+/** The input is empty or over the byte limit, so it can never be sent as it is, however often it is tried. */
+export class ReppoUnsendable extends ReppoNotSent {}
+
+/** The caller's signal was already aborted, so the submit stopped before its call. */
+export class ReppoStoppedFirst extends ReppoNotSent {}
+
+/**
+ * The call failed before any request left this machine: the host name did not resolve or no connection was made. Its
+ * words are fixed and hold nothing of fetch's own text, which can quote the URL (C40).
+ */
+export class ReppoUnreachable extends ReppoNotSent {}
+
+// The cause codes with which fetch fails before a byte of the request is sent: no address for the host (ENOTFOUND, and
+// EAI_AGAIN for a lookup that failed for now), or no connection (ECONNREFUSED, UND_ERR_CONNECT_TIMEOUT for a connect
+// that did not finish in time). Every other failure, a reset or a socket closed mid-call among them, may have sent the
+// request, so it is left unclear (fail closed).
+const NEVER_LEFT: readonly string[] = ['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'];
+
+/**
+ * True only for fetch's own TypeError whose cause carries one of the NEVER_LEFT codes. Read from the cause's code,
+ * never from any message text. Not covered: a wrapper that hides the cause, which then reads as unclear. Pure.
+ */
+function neverLeft(error: unknown): boolean {
+  if (!(error instanceof TypeError)) return false;
+  const cause: unknown = error.cause;
+  if (typeof cause !== 'object' || cause === null || !('code' in cause)) return false;
+  const code: unknown = cause.code;
+  return typeof code === 'string' && NEVER_LEFT.includes(code);
+}
 
 function refuse(reply: JsonReply): never {
   if (reply.status === 402) throw new ReppoOutOfCredit('Reppo answered 402, so the credit balance has run out');
@@ -134,8 +168,15 @@ function refuse(reply: JsonReply): never {
 
 /** The message names no evaluation id: there is none we saw, and a guessed one could point a person at someone else's. */
 export const SUBMIT_MAY_HAVE_LANDED =
-  'a Reppo submit got no reply and Reppo then said an evaluation was running, so a charge may have been made; this text was not sent again';
+  'a Reppo submit got no reply and a later try was refused, so a charge may have been made; this text was not sent again';
 
+/**
+ * The retrying submit behind evaluate and submitEvaluation. A 409 is waited out and sent again, at most
+ * MAX_BUSY_RESUBMITS times, while every try so far was answered. Once a try got no reply (mayHaveLanded), that try may
+ * have landed and been charged, so every later reply that is not OK, whatever its status, throws a plain ReppoError
+ * with SUBMIT_MAY_HAVE_LANDED and the status, and the text is not sent again. It is never ReppoRefused or
+ * ReppoOutOfCredit, which would say nothing was charged (C23).
+ */
 async function submit(input: string, conn: Required<ReppoOptions>, headers: Record<string, string>): Promise<string> {
   const init = { method: 'POST', headers, body: JSON.stringify({ taskType: 'response', input }) };
   let mayHaveLanded = false;
@@ -147,12 +188,10 @@ async function submit(input: string, conn: Required<ReppoOptions>, headers: Reco
       if (!submitted.success) throw new ReppoError('Reppo gave an evaluation id that is not safe to use', null);
       return submitted.data.id;
     }
+    // A refusal speaks only for the try it answers. After a try we never heard back from, a 409 most likely means that
+    // try is the evaluation running, and any other refusal says nothing about it either way.
+    if (mayHaveLanded) throw new ReppoError(SUBMIT_MAY_HAVE_LANDED, reply.status);
     if (reply.status !== BUSY_STATUS) refuse(reply);
-    // A busy answer is one of NO_EVALUATION_CREATED: this try created nothing, so it is waited out and sent again. But an
-    // account runs one evaluation at a time, so after a submit we never heard back from, the evaluation running is most
-    // likely that submit: it may have been charged, and sending again would start a second paid evaluation once it ends.
-    // So that error is a plain ReppoError, never ReppoRefused (C23).
-    if (mayHaveLanded) throw new ReppoError(SUBMIT_MAY_HAVE_LANDED, BUSY_STATUS);
     if (busy === MAX_BUSY_RESUBMITS) throw new ReppoRefused('Reppo still had another evaluation running', BUSY_STATUS);
     await conn.sleep(BUSY_WAIT_MS);
   }
@@ -217,7 +256,7 @@ function withDefaults(opts: ReppoOptions): Required<ReppoOptions> {
 
 function checkInput(input: string): void {
   if (input === '' || Buffer.byteLength(input) > MAX_INPUT_BYTES) {
-    throw new ReppoNotSent(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
+    throw new ReppoUnsendable(`the input is empty or over the ${MAX_INPUT_BYTES} byte limit`, null);
   }
 }
 
@@ -229,15 +268,15 @@ function checkInput(input: string): void {
  * Every call has a 30 second timeout and a 1 MB reply cap (C41). An evaluation Reppo finished with a result out of shape
  * returns with verdict null, since it was still charged.
  *
- * Nothing that may already be paid for is sent twice (C23). A 409 after a submit try that got no reply or a 5xx means
- * that try most likely landed, so the text is not sent again and this throws SUBMIT_MAY_HAVE_LANDED. When the wait runs
- * out, the evaluation is still running and Reppo charges it when it finishes, so it returns as UNFINISHED with its id
- * and verdict null instead of being sent again.
+ * Nothing that may already be paid for is sent twice (C23). After a submit try that got no reply or a 5xx, that try may
+ * have landed, so any refusal that follows, a 409 or any other status, ends the submit with SUBMIT_MAY_HAVE_LANDED and
+ * the text is not sent again. When the wait runs out, the evaluation is still running and Reppo charges it when it
+ * finishes, so it returns as UNFINISHED with its id and verdict null instead of being sent again.
  *
- * @throws ReppoOutOfCredit on a 402.
- * @throws ReppoError on a 400, 401 or 404 at once, on a 409 after a submit with no reply, when the retries run out, and
- * on a reply out of shape, including an id that is not a short url-safe string, which is refused before it goes in a
- * URL. No error holds the key or the URL (C40).
+ * @throws ReppoOutOfCredit on a 402 to a poll, or to a submit whose tries were all answered.
+ * @throws ReppoError on a 400, 401 or 404 at once, on any refusal after a submit try with no reply, when the retries run
+ * out, and on a reply out of shape, including an id that is not a short url-safe string, which is refused before it
+ * goes in a URL. No error holds the key or the URL (C40).
  * @throws RangeError when pollMs or timeoutMs is not above 0, before any call.
  */
 export async function evaluate(input: string, opts: ReppoOptions): Promise<ReppoEval> {
@@ -252,7 +291,8 @@ export async function evaluate(input: string, opts: ReppoOptions): Promise<Reppo
  * caller can keep the id before any wait and every later try looks it up instead of paying again (C23). The input, 409,
  * retry and id rules are evaluate's.
  *
- * @throws ReppoOutOfCredit on a 402; ReppoError as evaluate throws it before its wait; RangeError as evaluate does.
+ * @throws ReppoOutOfCredit on a 402 to a submit whose tries were all answered; ReppoError as evaluate throws it before
+ *   its wait, ReppoUnsendable among them for an input refused before any call; RangeError as evaluate does.
  */
 export async function submitEvaluation(input: string, opts: ReppoOptions): Promise<string> {
   const conn = withDefaults(opts);
@@ -293,21 +333,24 @@ function untilAborted<T>(work: Promise<T>, signal: AbortSignal | undefined): Pro
  * NO_EVALUATION_CREATED says, the same as in the retrying submit.
  *
  * @returns the evaluation id Reppo answered with.
- * @throws ReppoOutOfCredit on a 402; ReppoRefused on a status in NO_EVALUATION_CREATED; ReppoNotSent for an input
- *   that is empty or too large, or a signal aborted before the call, when nothing left: none of these can have charged
- *   (submitCannotHaveCharged). Any other outcome, no answer, the deadline, the signal mid-call, 408, a 5xx, another
- *   status or a reply out of shape, throws a plain ReppoError: the submit may have been charged (fail closed).
+ * @throws ReppoOutOfCredit on a 402; ReppoRefused on a status in NO_EVALUATION_CREATED; a ReppoNotSent when nothing
+ *   left: ReppoUnsendable for an input that is empty or too large, ReppoStoppedFirst for a signal aborted before the
+ *   call, ReppoUnreachable for a fetch that failed with one of the NEVER_LEFT cause codes. None of these can have
+ *   charged (submitCannotHaveCharged). Any other outcome, no answer, the deadline, the signal mid-call, any other fetch
+ *   failure, 408, a 5xx, another status or a reply out of shape, throws a plain ReppoError: the submit may have been
+ *   charged (fail closed). No error holds the key or the URL (C40).
  */
 export async function submitEvaluationOnce(input: string, opts: ReppoConnection & { timeoutMs: number; signal?: AbortSignal }): Promise<string> {
   checkInput(input);
   if (!(opts.timeoutMs > 0)) throw new RangeError('timeoutMs must be above 0');
-  if (opts.signal?.aborted === true) throw new ReppoNotSent('the Reppo submit was not sent, because the step was told to stop first', null);
+  if (opts.signal?.aborted === true) throw new ReppoStoppedFirst('the Reppo submit was not sent, because the step was told to stop first', null);
   const init = { method: 'POST', headers: headersFor(opts), body: JSON.stringify({ taskType: 'response', input }) };
   let reply: JsonReply;
   try {
     reply = await untilAborted(fetchJsonCapped(`${opts.baseUrl}/agents/evals`, init, { ...LIMITS, timeoutMs: opts.timeoutMs }), opts.signal);
-  } catch {
-    // fetch's own failure text can quote the URL, so nothing of it is copied (C40).
+  } catch (error) {
+    // fetch's own failure text can quote the URL, so nothing of it is copied, and only its cause's code is read (C40).
+    if (neverLeft(error)) throw new ReppoUnreachable('the Reppo submit could not reach Reppo, so nothing was sent', null);
     throw new ReppoError(SUBMIT_OUTCOME_UNKNOWN, null);
   }
   if (!reply.ok) refuse(reply);
