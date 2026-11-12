@@ -3,7 +3,7 @@ title: Contracts and addresses
 description: The deployed factory and proof vault on Base Sepolia, the factory on Base mainnet, the five proof transactions, how to check them, and the commands that deploy, verify, make a vault and register a campaign.
 ---
 
-Every vault, the proof and the campaign are on Base Sepolia, Base's public test network, chain id `84532`. The vaults pay test USDC, which has no value. The one thing on Base mainnet is the factory contract, described in the section after the proof tables. No vault has been made from it.
+Every vault, the proof and the campaign are on Base Sepolia, Base's public test network, chain id `84532`. The vaults pay test USDC, which has no value. On Base mainnet there is the factory contract and one small proof vault that was run once with real USDC, both described in the section after the proof tables.
 
 | What | Value |
 | --- | --- |
@@ -28,7 +28,13 @@ The factory contract was deployed on Base mainnet, chain id `8453`, on 11 Novemb
 | Factory | [`0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De`](https://basescan.org/address/0x1d9b8CD9A5aF33287Bb96862d9BB0f563DC402De) |
 | Factory deploy | [0x2f008850...e9bff3](https://basescan.org/tx/0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3), block 56121245 |
 
-Its runtime code is identical to the Base Sepolia factory's. Source verification on Basescan is still pending: `npm run vault:verify -- --network base` does it. No vault has been created on Base mainnet and no real payment has been made yet. Every campaign, the proof vault and every other address on this page stay on Base Sepolia with test money.
+Its runtime code is identical to the Base Sepolia factory's, and its source is verified on Basescan (`npm run vault:verify -- --network base` checks it).
+
+Realised, with real USDC: on 12 November 2026 that factory made one vault, [`0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C`](https://basescan.org/address/0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C), with a cap of 1 USDC, a deposit of 2 USDC and a one-hour delay. Thuli's worker key posted a list of one wallet. When the hour was over the worker submitted the claim and the vault paid that wallet exactly 1 USDC, in [this transaction](https://basescan.org/tx/0x6cbeb31cbeddd5ba6b2c98463d2a1d3dfa679fef0774a3f3683faf5dc4bb3d31), with the worker paying the gas. A static call of the claim for a wallet that is not on the list, with the paid wallet's proof, reverts with `InvalidProof`. After the vault ended, the owner took back the 1 USDC that was left, in [this transaction](https://basescan.org/tx/0x0f8c55a0ab1c74efa7d5462feeb9423208d85e45c04538553c7cc1e648422ba6). The vault's source is verified on Basescan too.
+
+The run is recorded in `packages/contracts/deployments/base-proof.json`. `npm run prove:vault -- verify --network base --real-money` checks that record against Base in 17 checks: the six transactions and who sent them, the factory's and the vault's events, the USDC transfer, the vault's terms, what was paid and to whom, and that the vault is empty. It reads the factory's logs, so it needs `BASE_RPC_URL` to be an endpoint that serves log queries. Base's own public endpoint refuses them.
+
+What this proof does not show: a campaign on mainnet. It is one vault, one list and one wallet. Every campaign and every other address on this page stay on Base Sepolia with test money.
 
 ## The five proof transactions
 
@@ -172,4 +178,4 @@ The worker then serves the campaign. `npm run worker` handles every open campaig
 
 On Base mainnet the proof is fixed in code: a cap of 1 USDC, 2 USDC deposited, the contract's minimum delay of one hour, and an end three hours after creation. It pays the address in `PAYTO_ADDRESS` and reads Base mainnet through `BASE_RPC_URL`. Each phase loads only the key it signs with: the owner key `PAYER_PRIVATE_KEY` for create and withdraw, and the agent key `WORKER_PRIVATE_KEY` for post and claim.
 
-Both mainnet paths also take `--fork`. With `--fork --rpc-url http://127.0.0.1:PORT` they run against a local copy of Base mainnet made with anvil, and never reach a public RPC. `vault:deploy` then needs `--out FILE` outside `packages/contracts/deployments`. `prove:vault` needs `--state FILE` and `--deployment FILE`, and `--record FILE` for the record phase, all outside the public records, so a rehearsal never writes them. The mainnet commands exist and were rehearsed against a fork of Base mainnet. The mainnet proof has not been run: it has no record, and no mainnet vault exists.
+Both mainnet paths also take `--fork`. With `--fork --rpc-url http://127.0.0.1:PORT` they run against a local copy of Base mainnet made with anvil, and never reach a public RPC. `vault:deploy` then needs `--out FILE` outside `packages/contracts/deployments`. `prove:vault` needs `--state FILE` and `--deployment FILE`, and `--record FILE` for the record phase, all outside the public records, so a rehearsal never writes them. The mainnet proof was run for real on 12 November 2026, after a rehearsal against a fork. Its record is `base-proof.json`.

@@ -24,7 +24,7 @@ The [campaign page](/campaign) shows the campaign the site is set up with. If th
 
 What to expect:
 
-- A wallet that has never been used is turned away at the door. If it has sent no transaction and holds no balance on Ethereum, the page says "This wallet has never been used" and stores nothing. It still counts toward the visitor's 5 signed asks an hour.
+- A wallet that has never been used is turned away at the door. If it has sent no transaction and holds no balance on Ethereum or on Base, the page says "This wallet has never been used" and stores nothing. It still counts toward the visitor's 5 signed asks an hour.
 - A wallet whose history shows no incoming transfer of value has no first funder to read. A fact that cannot be read means hold, under rule A1, and the board shows the rule and the reason.
 - A wallet with some history that is young or quiet gets a partial reward, not a hold. By default that is under 30 days old or fewer than 5 transactions sent, under rule A8.
 - A wallet used only on other chains looks new, because only Ethereum mainnet is read.
@@ -63,7 +63,7 @@ The site serves the pages, these docs, the free check and the paid route. Copy `
 - `X402_NETWORK`: `base` for real USDC or `base-sepolia` for test USDC. It has no default, so testnet is a choice.
 - The address that receives payments: `PAYTO_ADDRESS_TESTNET` on Base Sepolia, `PAYTO_ADDRESS` on Base. It is an address, never a key.
 - `SERV_API_KEY`, `SERV_BASE_URL` and `SERV_GRAPH_ID`, from the SERV console. Every screening calls SERV with them.
-- `ETH_RPC_URL` and `BLOCKSCOUT_ETH_API`, where a screening reads the wallet's history.
+- `ETH_RPC_URL` and `BLOCKSCOUT_ETH_API`, where a screening reads the wallet's history. For a campaign ask the worker also reads `BASE_RPC_URL`, and when both RPC endpoints serve old state and traces it reads the history from them alone, on Ethereum or on Base.
 - On Base only: `CDP_API_KEY_ID`, `CDP_API_KEY_SECRET`, `PUBLIC_ORIGIN` and `BASE_RPC_URL`. On Base Sepolia, `PUBLIC_ORIGIN` is optional, and `FACILITATOR_URL` left empty means `https://x402.org/facilitator`.
 - `DATABASE_URL` and `TRUSTED_CLIENT_HEADER`, which a production server must have. Locally, leave `DATABASE_URL` empty and the site runs an in-process database whose contents are lost on restart.
 
@@ -87,4 +87,4 @@ The stored replay data is the ROBO and Hop replay rows, the stored SERV answers,
 
 You can check the vault proof without any keys or stored data. Run `npm run prove:vault -- verify`, or read the record in `packages/contracts/deployments/base-sepolia-proof.json` and look the transactions up on the Base Sepolia explorer.
 
-`prove:vault` takes four phases on Base Sepolia: `setup`, `claim`, `record` and `verify`. With `--network base --real-money` it has six phases for a small Base mainnet proof that has not been run, listed on [Contracts and addresses](/docs/contracts). Only `verify` is for strangers. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.
+`prove:vault` takes four phases on Base Sepolia: `setup`, `claim`, `record` and `verify`. With `--network base --real-money` it has six phases for the small Base mainnet proof, which was run on 12 November 2026 and is described on [Contracts and addresses](/docs/contracts). Only `verify` is for strangers. To run `setup` yourself you need two different test keys, set as `PAYER_PRIVATE_KEY` and `WORKER_PRIVATE_KEY` in `.env`: an owner with at least 2 Base Sepolia USDC and some test ETH for gas, and an agent with test ETH. Free test USDC comes from the Circle faucet. The root waits one hour on chain, so `claim` only works an hour after `setup`.

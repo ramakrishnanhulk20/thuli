@@ -19,11 +19,11 @@ Your words go to the campaign's owner only. They are shown on no public page and
 
 ## Why was my new wallet held?
 
-Because Thuli found nothing to read about it. It reads a wallet's history on Ethereum mainnet. A wallet with no incoming transfer of value there has no first funder, and a fact that cannot be read means hold, under rule A1, so a person can look. A wallet that has some history but is young or quiet is not held for that. By default one that is under 30 days old or has sent fewer than 5 transactions gets a partial reward, under rule A8. A wallet used mostly on other chains looks new, because only Ethereum mainnet is read. The board shows the rule and the reason for every decision. More on [Live campaign](/docs/campaigns).
+Because Thuli found nothing to read about it. A campaign reads a wallet's history on Ethereum or on Base, whichever the wallet was active on first. A wallet with no incoming transfer of value has no first funder, and a fact that cannot be read means hold, under rule A1, so a person can look. A wallet that has some history but is young or quiet is not held for that. By default one that is under 30 days old or has sent fewer than 5 transactions gets a partial reward, under rule A8. A wallet used mostly on a third chain looks new, because only Ethereum and Base are read, and only native ETH counts. The board shows the rule and the reason for every decision. More on [Live campaign](/docs/campaigns).
 
 ## Why is a brand-new wallet turned away at the door?
 
-A wallet that has sent no transaction and holds no balance on Ethereum gets the answer `{"neverUsed": true}` when it asks. Nothing is stored or queued: it takes no slot, no place in the queue and no part of the campaign's cap on asks. It costs nothing to make a wallet like that, so Thuli will not spend a screening on it, and a free supply of new keys cannot fill a campaign's queue or run up the model bill. Signing the ask cost nothing, and the attempt only counts toward the visitor's 5 signed asks an hour. Ask with a wallet you have used for a while. The worker keeps the same rule as a second check: a wallet that reaches it with nothing to read is held by code under rule A1 with the reason "A1: This wallet has never been used on Ethereum, so there is nothing to screen.", and no model is called.
+A wallet that has sent no transaction and holds no balance on Ethereum, and none on Base either, gets the answer `{"neverUsed": true}` when it asks. Nothing is stored or queued: it takes no slot, no place in the queue and no part of the campaign's cap on asks. It costs nothing to make a wallet like that, so Thuli will not spend a screening on it, and a free supply of new keys cannot fill a campaign's queue or run up the model bill. Signing the ask cost nothing, and the attempt only counts toward the visitor's 5 signed asks an hour. Ask with a wallet you have used for a while. The worker keeps the same rule as a second check: a wallet that reaches it with nothing to read is held by code under rule A1 with the reason "A1: This wallet has never been used on Ethereum or Base, so there is nothing to screen.", and no model is called.
 
 ## What if two of my wallets share a funder?
 
@@ -43,7 +43,7 @@ Doubt means hold. A paid request always gets a decision: if SERV gives no answer
 
 ## Who holds the reward money?
 
-The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. Every vault so far is on Base Sepolia with test USDC. The factory that makes vaults is also deployed on Base mainnet, and no vault has been made from it.
+The vault contract holds it, not Thuli. The project deposits into its own vault, Thuli's agent key can only post a list that waits a delay and can be cancelled, and the owner takes back leftovers only after the end. Every vault so far is on Base Sepolia with test USDC. The factory that makes vaults is also deployed on Base mainnet, where one small proof vault paid 1 real USDC and was then emptied by its owner.
 
 ## Can Thuli take the money in a vault?
 
@@ -63,7 +63,7 @@ Yes, at [/check](/check), or with the box on the home page. Paste an Ethereum ad
 
 ## Which chains does it use?
 
-Screening reads Ethereum mainnet only. The paid route takes USDC on Base or on Base Sepolia, the test network. Every vault is on Base Sepolia. The vault factory is also deployed on Base mainnet, with no vault made from it yet. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
+A campaign reads a wallet's history on Ethereum or on Base mainnet, whichever it was active on first. The free check, the paid API and the replay read Ethereum only. The paid route takes USDC on Base or on Base Sepolia, the test network. Every campaign vault is on Base Sepolia. The vault factory is also deployed on Base mainnet, where one proof vault paid 1 real USDC. Thuli's code knows three chains: Ethereum (1), Base (8453) and Base Sepolia (84532).
 
 ## Is the rulebook public, and does that help farmers?
 
