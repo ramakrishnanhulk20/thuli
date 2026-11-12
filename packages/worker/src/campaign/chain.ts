@@ -170,11 +170,14 @@ export function historyOffLine(lacks: Readonly<Partial<Record<ScreenedChain, His
   return `screen: RPC history is off because ${reasons.join(' and ')}, so every ask is screened on Ethereum only`;
 }
 
+/** Said once at start when both endpoints passed the probe. */
+export const HISTORY_ON = 'screen: RPC history is on, so every ask is screened on Ethereum or Base, whichever the wallet was active on first';
+
 /**
  * The campaign screening's reader per chain, Ethereum on ETH_RPC_URL and Base on BASE_RPC_URL, read with plain RPC calls.
  * Both endpoints are probed at once with historyProbe: old state and traces. RPC history is on only when both pass;
- * otherwise nothing is returned, every ask is screened on Ethereum through the explorer reader as before, and
- * historyOffLine is logged once. The worker calls this once, at start. Never throws.
+ * then HISTORY_ON is logged. Otherwise nothing is returned, every ask is screened on Ethereum through the explorer
+ * reader as before, and historyOffLine is logged. The worker calls this once, at start. Never throws.
  */
 export async function screenChains(config: Pick<WorkerConfig, 'ethRpcUrl' | 'baseRpcUrl'>, log: (line: string) => void): Promise<ChainReaders | undefined> {
   const urls: Readonly<Record<ScreenedChain, string>> = { ethereum: config.ethRpcUrl, base: config.baseRpcUrl };
@@ -185,5 +188,6 @@ export async function screenChains(config: Pick<WorkerConfig, 'ethRpcUrl' | 'bas
     log(historyOffLine(lacks));
     return undefined;
   }
+  log(HISTORY_ON);
   return { ethereum: chainReader('ethereum', { rpcUrl: urls.ethereum }), base: chainReader('base', { rpcUrl: urls.base }) };
 }

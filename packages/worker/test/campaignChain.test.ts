@@ -18,7 +18,7 @@ import {
   type GraphRecord,
 } from '@thuli/core';
 import { addAsk, createCampaign, getAsk, migrate, openMemoryDb, type CampaignInput, type Db } from '@thuli/store';
-import { historyOffLine, PICK_TIME_LIMIT_MS, pickChain, screenChains, type ChainReader, type ChainReaders, type FirstActivity } from '../src/campaign/chain.ts';
+import { HISTORY_ON, historyOffLine, PICK_TIME_LIMIT_MS, pickChain, screenChains, type ChainReader, type ChainReaders, type FirstActivity } from '../src/campaign/chain.ts';
 import { loadWorkerConfig } from '../src/campaign/config.ts';
 import {
   CAMPAIGN_SCREEN_CAUSES,
@@ -279,12 +279,12 @@ describe('screenChains', () => {
     said = [];
   });
 
-  it('gives an RPC reader for each chain, and logs nothing, when both endpoints serve old state and traces', async () => {
+  it('gives an RPC reader for each chain, and says in one line that RPC history is on, when both endpoints serve old state and traces', async () => {
     const both = nodes();
     serve([both.ethereum, both.base]);
     const chains = await screenChains(config, log);
     expect(Object.keys(chains ?? {}).sort()).toEqual(['base', 'ethereum']);
-    expect(said).toEqual([]);
+    expect(said).toEqual([HISTORY_ON]);
     for (const node of [both.ethereum, both.base]) {
       expect(node.calls.map((call) => call.method)).toEqual(['eth_getBlockByNumber', 'eth_getBalance', 'trace_filter', 'trace_transaction']);
     }
@@ -487,6 +487,8 @@ async function rpcChains() {
   serve([both.ethereum, both.base]);
   const chains = await screenChains(loadWorkerConfig(ENV), (line) => lines.push(line));
   if (chains === undefined) throw new Error('RPC history did not turn on');
+  // The start line is checked on its own; the screening tests read only what a screening logs.
+  lines = lines.filter((line) => line !== HISTORY_ON);
   return { ...both, chains };
 }
 
