@@ -39,15 +39,14 @@ Live on a testnet:
 
 - The reward vault on Base Sepolia, with a live proof. Realised, with test USDC that has no real value: one approved wallet claimed 1 USDC from the vault, and a wallet left off the list was refused with the error `InvalidProof`. Anyone with the repository can check that record against the chain with `npm run prove:vault -- verify`. See [The vault](/docs/vault) and [Contracts and addresses](/docs/contracts).
 - The paid route, with one real payment. Realised, with real USDC: one screening was bought for 5 cents on Base mainnet and settled in [this transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4). Ten more requests with the same payment returned the stored result and were not charged. Before that, the same proof ran on Base Sepolia with test USDC through a local build of the site ([transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1)). See [Check a wallet and the paid API](/docs/paid-api).
-- The live campaign, built end to end for Base Sepolia with test USDC: any wallet signs an ask, is screened in public, and an approved wallet takes a slot and is paid from the campaign's vault after the vault's delay. The ask and board routes, the screening worker and the [campaign page](/campaign) exist. A project starts a campaign with two commands, described on [Contracts and addresses](/docs/contracts). See [Live campaign](/docs/campaigns).
+- The live campaign on Base Sepolia with test USDC: any wallet signs an ask, is screened in public, and an approved wallet takes a slot and is paid from the campaign's vault after the vault's delay. The campaign on this site is "Thuli demo drop": 24 slots of 0.5 test USDC, paid from [this vault](https://sepolia.basescan.org/address/0x863342D22557De5E7f093F9351797291b18329CA). The site and a worker process on its own host share one hosted Postgres database. A project starts a campaign with two commands, described on [Contracts and addresses](/docs/contracts). See [Live campaign](/docs/campaigns).
 
 Not built yet:
 
 - A campaign on Base mainnet. The vault factory is deployed on Base mainnet and one proof vault there paid 1 real USDC (see [Contracts and addresses](/docs/contracts)), but the campaign runs on Base Sepolia with test money.
-- A hosted database. The paid and free routes use Postgres when a database is configured, and the store was tested against an in-process one. No database is hosted for Thuli yet.
 - Self-serve campaigns for a project: owner sign-in, an owner dashboard and a route to upload its own claim list. Today a project registers a campaign with two commands, described on [Contracts and addresses](/docs/contracts).
 - Owner sign-in for appeals. A campaign takes a signed appeal and sends Thuli's own decision to Reppo for a check. One appeal has been checked that way against the real service, with the route `review`, and the owner upheld the decision. The owner's call is made by an operator's command, because owner sign-in is not built. See [Live campaign](/docs/campaigns).
-- A hosted worker. The worker that screens asks, posts each list's root to the vault and submits claims is built, and it runs as a script on one machine. There is no container or host configuration for it yet.
+- Worker hosting as code. The worker runs as one process on a host, set up by hand in the host's settings. The repository holds no container file or host configuration for it.
 - Paid data lookups. Nothing calls a paid data provider today.
 
 ## Start here

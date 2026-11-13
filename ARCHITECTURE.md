@@ -19,7 +19,7 @@ flowchart TB
     WAL["Wallet"]
   end
 
-  subgraph Web["Web app on Next.js, holds no private key"]
+  subgraph Web["Web app on Next.js, hosted on Vercel, holds no private key"]
     PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
     FILES["Static replay files"]
     ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
@@ -27,21 +27,21 @@ flowchart TB
 
   API["API package: free check, paid screen, campaign routes"]
   FAC["x402 facilitator"]
-  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
+  DB[("Postgres at Neon: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
 
-  subgraph Worker["Worker, run as scripts"]
+  subgraph Worker["Worker: one process on Railway, and operator scripts"]
     LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims, check an appeal"]
     SCRIPTS["Replay, scoring, export and operator scripts"]
   end
 
   subgraph Screening["Screening code"]
-    FACTS["Facts from public Ethereum reads"]
+    FACTS["Facts from public chain reads"]
     LIMITS["Start and ceiling set in code"]
     ASK["Ask SERV with the rules graph or the rulebook"]
     CHECKS["Output checks in code"]
   end
 
-  ETH["Ethereum RPC and Blockscout"]
+  ETH["Ethereum and Base RPC, Blockscout"]
   SERV["SERV Reasoning"]
   REPPO["Reppo evaluation API"]
 
@@ -55,8 +55,7 @@ flowchart TB
     P2["Planned: Dolphin summaries"]
     P3["Planned: owner sign-in and campaign upload"]
     P4["Planned: owner settles appeals in the site"]
-    P5["Planned: hosted worker and database"]
-    P6["Planned: Base mainnet vaults and real payments"]
+    P6["Planned: campaigns on Base mainnet"]
   end
 
   VIS --> PAGES
@@ -90,17 +89,16 @@ flowchart TB
   FACTS -.-> P2
   API -.-> P3
   API -.-> P4
-  LOOP -.-> P5
   VAULT -.-> P6
 
   classDef planned stroke-dasharray: 5 5
-  class P1,P2,P3,P4,P5,P6 planned
+  class P1,P2,P3,P4,P6 planned
 ```
 
 ## 2. Main sequence: one wallet through an open campaign
 
 One wallet from its signed ask to its payout, as the API, the store and the worker do it today. Every step here is in
-the code; the worker runs as a script on one machine, and hosting it is planned (section 1).
+the code; the worker runs as one process on a host (4.10).
 
 ```mermaid
 sequenceDiagram
@@ -109,7 +107,7 @@ sequenceDiagram
   participant API as Campaign routes
   participant DB as Postgres store
   participant K as Worker
-  participant ETH as Ethereum RPC and Blockscout
+  participant ETH as Ethereum and Base RPC
   participant SV as SERV Reasoning
   participant V as Vault on Base Sepolia
   participant R as Reppo evaluation API
@@ -119,11 +117,11 @@ sequenceDiagram
   W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
   API->>API: checkAsk: a valid address, signed in the last 600 seconds, the signature matches the rebuilt ask text
   API->>ETH: Only then read the wallet's code, a contract cannot ask yet
-  API->>ETH: Read its sent count and balance, a wallet with neither is answered neverUsed and nothing is stored
+  API->>ETH: Read its sent count and balance on Ethereum, then on Base, a wallet with neither on both is answered neverUsed and nothing is stored
   API->>DB: Store the ask as queued while slots and room are left, the first ask per wallet stands
   API-->>W: 202 queued
   K->>DB: Take the oldest queued ask, leased for 300 seconds
-  K->>ETH: Read the wallet's facts at the latest finalized block, and its first funder's code and sent count
+  K->>ETH: Read the wallet's facts on the chain it was active on first, at that chain's latest finalized block, and its first funder's code and sent count
   K->>DB: Read the first funders of the campaign's other asks
   K->>K: Link asks that share a funder, set start and ceiling in code
   K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
@@ -940,8 +938,8 @@ searching the code.
   paid route screens inside the request, and the replays run as scripts.
 - Paid data through Kite Passport, and the Nansen and Allium lookups behind it. No code calls Kite, Nansen or Allium.
 - Dolphin summaries. There is no Dolphin client.
-- A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
-  one machine.
+- Worker hosting as code. The worker runs as one process on Railway, set up by hand in the host's own settings (start
+  command, restart policy, variables). The repository holds no container file and no host configuration.
 - A campaign on Base mainnet. The factory is deployed there and one proof vault paid 1 real USDC (4.1). That is one
   vault, one list and one wallet; the campaign is on Base Sepolia. The paid route has settled one real payment on
   Base mainnet (0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4, 13 Nov 2026), in a run on one machine.
@@ -1163,9 +1161,13 @@ Campaigns are created with `createCampaign`, which refuses different terms for a
 The campaign worker does the work no web request does. It screens each ask, posts the list of approved wallets to the
 campaign's vault, submits each wallet's claim from its own key once the vault's delay is over, so the wallet is paid
 without paying gas, and sends each appealed decision to the outside check. It is a script, `npm run worker`
-(`packages/worker/scripts/worker.ts`), and its code is in `packages/worker/src/campaign/`. Today it runs from this
-repository on one machine, against Base Sepolia with test money. Nothing hosts it (4.8). It shares Postgres with the
-routes in 4.9: the routes put asks and appeals in, and the worker takes them out.
+(`packages/worker/scripts/worker.ts`), and its code is in `packages/worker/src/campaign/`. It runs as one process on a
+host, Railway, against Base Sepolia with test money. The host starts it with `node --import tsx
+packages/worker/scripts/worker.ts`, node itself and not npm, so the host's stop signal reaches the worker and it finishes
+the step under way; the restart policy is always, and one copy is the design. It shares Postgres, hosted at Neon, with
+the routes in 4.9: the routes put asks and appeals in, and the worker takes them out. The site answers anonymous
+traffic, so it reads chains through public RPC addresses only; the worker alone holds the keyed RPC endpoints the
+two-chain read needs.
 
 A lease, used below, is a note on a row saying one worker holds it until a set time. If that worker stops, the row is
 free again when the time passes.

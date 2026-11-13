@@ -467,7 +467,7 @@ Found on 10 November.
 
 ## Non-goals of the campaign worker
 
-The worker screens each ask as it arrives and runs as one script on one machine, and appeals are settled by an operator's command. These are the limits that follow from that, each with what it would take to fix. They were checked against the code on 11 November 2026.
+The worker screens each ask as it arrives and runs as one process on one host, and appeals are settled by an operator's command. These are the limits that follow from that, each with what it would take to fix. They were checked against the code on 11 November 2026.
 
 - A campaign that pays as asks arrive sees a family only as it grows. Until the family reaches the campaign's group size (`groupMinSize`, 5 unless the campaign changes it), each of its wallets looks alone and can be approved, and an ask once decided is not screened again. Screening a whole claim list at once, as the replay does, has no such gap.
 - A campaign ask is linked through the wallet's direct first funder only. Funding passed through in-between wallets is not traced for it, where the offline replay follows a funding back through up to 6 single-use pass-through wallets. To fix it, run the same trace on each ask, which costs more chain reads for every ask against the same ceilings (C49).

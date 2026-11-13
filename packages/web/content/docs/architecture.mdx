@@ -17,7 +17,7 @@ flowchart TB
     WAL["Wallet"]
   end
 
-  subgraph Web["Web app on Next.js, holds no private key"]
+  subgraph Web["Web app on Next.js, hosted on Vercel, holds no private key"]
     PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
     FILES["Static replay files"]
     ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
@@ -25,21 +25,21 @@ flowchart TB
 
   API["API package: free check, paid screen, campaign routes"]
   FAC["x402 facilitator"]
-  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
+  DB[("Postgres at Neon: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
 
-  subgraph Worker["Worker, run as scripts"]
+  subgraph Worker["Worker: one process on Railway, and operator scripts"]
     LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims, check an appeal"]
     SCRIPTS["Replay, scoring, export and operator scripts"]
   end
 
   subgraph Screening["Screening code"]
-    FACTS["Facts from public Ethereum reads"]
+    FACTS["Facts from public chain reads"]
     LIMITS["Start and ceiling set in code"]
     ASK["Ask SERV with the rules graph or the rulebook"]
     CHECKS["Output checks in code"]
   end
 
-  ETH["Ethereum RPC and Blockscout"]
+  ETH["Ethereum and Base RPC, Blockscout"]
   SERV["SERV Reasoning"]
   REPPO["Reppo evaluation API"]
 
@@ -53,8 +53,7 @@ flowchart TB
     P2["Planned: Dolphin summaries"]
     P3["Planned: owner sign-in and campaign upload"]
     P4["Planned: owner settles appeals in the site"]
-    P5["Planned: hosted worker and database"]
-    P6["Planned: Base mainnet vaults and real payments"]
+    P6["Planned: campaigns on Base mainnet"]
   end
 
   VIS --> PAGES
@@ -88,11 +87,10 @@ flowchart TB
   FACTS -.-> P2
   API -.-> P3
   API -.-> P4
-  LOOP -.-> P5
   VAULT -.-> P6
 
   classDef planned stroke-dasharray: 5 5
-  class P1,P2,P3,P4,P5,P6 planned
+  class P1,P2,P3,P4,P6 planned
 ```
 
 The free check and the paid route run the same screening inside the request. A paid request answers within 240 seconds, and a paid result is stored so the same payment header fetches it again. The paid route is described in [Check a wallet and the paid API](/docs/paid-api). The vault factory is also deployed on Base mainnet, and its runtime code is identical to the Base Sepolia factory. Its source is verified on Basescan, and on 12 November 2026 it made one proof vault that paid 1 real USDC to a listed wallet and returned the rest to its owner (see [Contracts and addresses](/docs/contracts)). The public campaign and every other address stay on Base Sepolia with test money.
@@ -108,7 +106,7 @@ sequenceDiagram
   participant API as Campaign routes
   participant DB as Postgres store
   participant K as Worker
-  participant ETH as Ethereum RPC and Blockscout
+  participant ETH as Ethereum and Base RPC
   participant SV as SERV Reasoning
   participant V as Vault on Base Sepolia
   participant R as Reppo evaluation API
@@ -118,11 +116,11 @@ sequenceDiagram
   W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
   API->>API: checkAsk: a valid address, signed in the last 600 seconds, the signature matches the rebuilt ask text
   API->>ETH: Only then read the wallet's code, a contract cannot ask yet
-  API->>ETH: Read its sent count and balance, a wallet with neither is answered neverUsed and nothing is stored
+  API->>ETH: Read its sent count and balance on Ethereum, then on Base, a wallet with neither on both is answered neverUsed and nothing is stored
   API->>DB: Store the ask as queued while slots and room are left, the first ask per wallet stands
   API-->>W: 202 queued
   K->>DB: Take the oldest queued ask, leased for 300 seconds
-  K->>ETH: Read the wallet's facts at the latest finalized block, and its first funder's code and sent count
+  K->>ETH: Read the wallet's facts on the chain it was active on first, at that chain's latest finalized block, and its first funder's code and sent count
   K->>DB: Read the first funders of the campaign's other asks
   K->>K: Link asks that share a funder, set start and ceiling in code
   K->>SV: Facts, start and ceiling, through the rules graph or the rulebook

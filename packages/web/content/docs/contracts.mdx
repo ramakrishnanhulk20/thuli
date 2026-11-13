@@ -19,6 +19,21 @@ Every vault, the proof and the campaign are on Base Sepolia, Base's public test 
 
 The deploy record writes the factory address in lowercase and the proof record in checksum case. They are the same address.
 
+## The demo campaign's vault
+
+The campaign on this site pays from its own vault, made by the same factory on 13 November 2026.
+
+| What | Value |
+| --- | --- |
+| Vault | [`0x863342D22557De5E7f093F9351797291b18329CA`](https://sepolia.basescan.org/address/0x863342D22557De5E7f093F9351797291b18329CA), source verified on Basescan |
+| Created in | [0xe3b41a48...71bc6c](https://sepolia.basescan.org/tx/0xe3b41a48f991704a1707ed2c3696f8cbfd16bda41203a245eb661a04f271bc6c), block 58116678 |
+| Campaign | `thuli-demo`, "Thuli demo drop", 24 slots of 0.5 test USDC |
+| Owner | `0x86D40838B9805FF63343B8F060EF3fC336f59E78`, Thuli's own test wallet |
+| Agent | `0xBedcF312f0070295c73bff4De974F372aa03Dee6`, the worker's key |
+| Terms | cap of 0.5 USDC per wallet (`500000` base units), root delay 3,600 seconds, 12 test USDC deposited, ends 28 Dec 2026, 04:46:41 UTC |
+
+Its lists and payouts are on the [campaign page](/campaign) as they happen.
+
 ## The factory on Base mainnet
 
 The factory contract was deployed on Base mainnet, chain id `8453`, on 11 November 2026. The record is `packages/contracts/deployments/base.json`.

@@ -24,6 +24,7 @@ Base Sepolia is Base's public test network, chain id `84532`. On Base mainnet, c
 | Base mainnet | ThuliVault, the mainnet proof vault | [`0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C`](https://basescan.org/address/0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C) | [Basescan](https://basescan.org/address/0x52e9F0D7b48a7bbAf5700433810c41C96CfBC40C#code) |
 | Base Sepolia | ThuliVaultFactory | [`0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56`](https://sepolia.basescan.org/address/0xbD2c20D2A068fe6D5052efcA910D1Cba44638B56) | [Blockscout](https://base-sepolia.blockscout.com/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56), [Basescan](https://sepolia.basescan.org/address/0xbd2c20d2a068fe6d5052efca910d1cba44638b56#code) |
 | Base Sepolia | ThuliVault, the proof vault | [`0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034`](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034) | [Basescan](https://sepolia.basescan.org/address/0xAdb8aD5A8BC359fF17D81DBe41833bB6b26B2034#code) |
+| Base Sepolia | ThuliVault, the demo campaign's vault | [`0x863342D22557De5E7f093F9351797291b18329CA`](https://sepolia.basescan.org/address/0x863342D22557De5E7f093F9351797291b18329CA) | [Basescan](https://sepolia.basescan.org/address/0x863342D22557De5E7f093F9351797291b18329CA#code) |
 
 The Base mainnet factory was deployed in transaction [`0x2f00...bff3`](https://basescan.org/tx/0x2f0088506ef05f2a9c435b9fc141ad60c399380126d4c6670f5bcaf1dfe9bff3) in block `56121245`, and its record is [`base.json`](packages/contracts/deployments/base.json). Its runtime code is byte for byte the Base Sepolia factory's, the same 9,415 bytes when read from both chains, and its source is verified on Basescan.
 
@@ -109,6 +110,8 @@ On 11 November 2026 the site and the worker ran on one machine against Base Sepo
 
 On 13 November 2026 one appeal ran end to end on the same local setup. A test wallet one day old on Base asked, was cut to a partial reward under rule A8 and took a slot. It filed a signed appeal, and the worker sent Thuli's decision to Reppo once, as evaluation `cmwegxukf000508l98c92l3va`. The check finished 86 seconds later with the route `review`: Reppo's note says its judges disagreed, one scoring the decision 60 and one 100. Realised: 440 Reppo credits, 22 cents, charged once. The owner upheld the decision with `npm run appeal:settle`. What this does not show: a `ship` or `block` route, a reversal, or any of the failure paths, which have run only in tests.
 
+The public demo campaign is "Thuli demo drop", id `thuli-demo`: 24 slots of 0.5 test USDC, paid from the demo vault in the Deployments table. It runs on a hosted Postgres database and a worker process on its own host. On 13 November 2026 the hosted parts were checked together before the site went up. Thuli's own test wallet, which is also the demo campaign's owner, signed an ask and sent it through a production build of the site on one machine, set up exactly as the hosted site is. The ask was stored in the hosted database. The worker on its host read the wallet's history on Base, cut it to a partial reward under rule A8 (one day old, six transactions sent) and gave it slot 1, twelve seconds after the ask was stored. One second later it posted list 1 to the demo vault in [this transaction](https://sepolia.basescan.org/tx/0x708517c831f4335ac375963e10f1f7a8fa0ba826d92063981173b9ede0091f2d). What this does not show: an ask sent through the hosted site itself.
+
 On 12 November 2026 the two-chain read was run live with `npm run campaign:screen` on three wallets, one model screening each. A wallet with history only on Base was read on Base and approved in full (45 days old, 40 transactions sent). A wallet with history only on Ethereum was read on Ethereum and cut to a partial reward (329 days old, 4 sent). A wallet with both was read on Base, where it is older (939 days against 895 on Ethereum), and approved in full.
 
 The reader behind that works with plain RPC calls and no explorer. It was checked on Ethereum against the explorer with `npm run history:compare`: on the 29 of 31 wallets whose whole history the explorer could serve, both gave the same age, sent count, account type, first funder and funding transaction. For the other 2 the explorer's own internal-transfer list failed, and the reader matched the explorer's shorter read. What this does not show: on Base there is no second source here to compare against, and no false-hold rate has been measured on Base history.
@@ -125,7 +128,7 @@ flowchart TB
     WAL["Wallet"]
   end
 
-  subgraph Web["Web app on Next.js, holds no private key"]
+  subgraph Web["Web app on Next.js, hosted on Vercel, holds no private key"]
     PAGES["Pages: home, replay, check, versions, break, docs, campaign"]
     FILES["Static replay files"]
     ROUTES["Routes: /api/check, /api/x402/*, /api/campaigns/*, /api/search"]
@@ -133,21 +136,21 @@ flowchart TB
 
   API["API package: free check, paid screen, campaign routes"]
   FAC["x402 facilitator"]
-  DB[("Postgres store: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays")]
+  DB[("Postgres at Neon: payment claims, leases, rate events, day counts, check cache, campaigns, asks, list versions, claim relays, appeals")]
 
-  subgraph Worker["Worker, run as scripts"]
-    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims"]
-    SCRIPTS["Replay, scoring and export scripts"]
+  subgraph Worker["Worker: one process on Railway, and operator scripts"]
+    LOOP["Campaign loop: screen an ask, publish the list, post the root, relay claims, check an appeal"]
+    SCRIPTS["Replay, scoring, export and operator scripts"]
   end
 
   subgraph Screening["Screening code"]
-    FACTS["Facts from public Ethereum reads"]
+    FACTS["Facts from public chain reads"]
     LIMITS["Start and ceiling set in code"]
     ASK["Ask SERV with the rules graph or the rulebook"]
     CHECKS["Output checks in code"]
   end
 
-  ETH["Ethereum RPC and Blockscout"]
+  ETH["Ethereum and Base RPC, Blockscout"]
   SERV["SERV Reasoning"]
   REPPO["Reppo evaluation API"]
 
@@ -160,14 +163,13 @@ flowchart TB
     P1["Planned: paid data through Kite Passport, Nansen and Allium"]
     P2["Planned: Dolphin summaries"]
     P3["Planned: owner sign-in and campaign upload"]
-    P4["Planned: public appeal routes"]
-    P5["Planned: hosted worker and database"]
-    P6["Planned: Base mainnet"]
+    P4["Planned: owner settles appeals in the site"]
+    P6["Planned: campaigns on Base mainnet"]
   end
 
   VIS --> PAGES
   AGT -->|"pays 0.05 USDC over x402"| ROUTES
-  WAL -->|"signed ask, ticket"| ROUTES
+  WAL -->|"signed ask, signed appeal, ticket"| ROUTES
   PAGES -->|"reads"| FILES
   PAGES -->|"free check"| ROUTES
   ROUTES -->|"all but /api/search"| API
@@ -175,11 +177,12 @@ flowchart TB
   API --> DB
   API -->|"screens one wallet"| FACTS
   API -->|"claimed, claimable"| VAULT
-  DB <-->|"asks, decisions, lists, relays"| LOOP
-  DB ~~~ SCRIPTS
+  DB <-->|"asks, decisions, lists, relays, appeals"| LOOP
+  SCRIPTS -->|"registers campaigns, settles appeals"| DB
   LOOP -->|"screens each ask"| FACTS
   LOOP -->|"VaultCreated log"| FACTORY
   LOOP -->|"postRoot, claim"| VAULT
+  LOOP -->|"sends each appealed decision"| REPPO
   FACTORY -->|"creates"| VAULT
   VAULT -->|"pays"| WAL
   SCRIPTS -->|"replays a claim list"| FACTS
@@ -195,14 +198,13 @@ flowchart TB
   FACTS -.-> P2
   API -.-> P3
   API -.-> P4
-  LOOP -.-> P5
   VAULT -.-> P6
 
   classDef planned stroke-dasharray: 5 5
-  class P1,P2,P3,P4,P5,P6 planned
+  class P1,P2,P3,P4,P6 planned
 ```
 
-One wallet from its signed ask to its payout, as the API, the store and the worker do it. Every step is in the code, and the worker runs as a script on one machine.
+One wallet from its signed ask to its payout, as the API, the store and the worker do it. Every step is in the code, and the worker runs as one process on a host.
 
 ```mermaid
 sequenceDiagram
@@ -211,19 +213,21 @@ sequenceDiagram
   participant API as Campaign routes
   participant DB as Postgres store
   participant K as Worker
-  participant ETH as Ethereum RPC and Blockscout
+  participant ETH as Ethereum and Base RPC
   participant SV as SERV Reasoning
   participant V as Vault on Base Sepolia
+  participant R as Reppo evaluation API
+  participant O as Operator command
 
   W->>W: Sign the ask text as a personal message
   W->>API: POST /api/campaigns/:id/asks with wallet, signedAt, signature
-  API->>API: checkAsk: a valid address, signed in the last 600 seconds
-  API->>ETH: Read the wallet's code, a contract cannot ask yet
-  API->>API: The signature must match the rebuilt ask text
-  API->>DB: Store the ask as queued, the first ask per wallet stands
+  API->>API: checkAsk: a valid address, signed in the last 600 seconds, the signature matches the rebuilt ask text
+  API->>ETH: Only then read the wallet's code, a contract cannot ask yet
+  API->>ETH: Read its sent count and balance on Ethereum, then on Base, a wallet with neither on both is answered neverUsed and nothing is stored
+  API->>DB: Store the ask as queued while slots and room are left, the first ask per wallet stands
   API-->>W: 202 queued
   K->>DB: Take the oldest queued ask, leased for 300 seconds
-  K->>ETH: Read the wallet's facts at the latest finalized block
+  K->>ETH: Read the wallet's facts on the chain it was active on first, at that chain's latest finalized block, and its first funder's code and sent count
   K->>DB: Read the first funders of the campaign's other asks
   K->>K: Link asks that share a funder, set start and ceiling in code
   K->>SV: Facts, start and ceiling, through the rules graph or the rulebook
@@ -232,10 +236,12 @@ sequenceDiagram
   K->>DB: Store the decision, an approved wallet takes the next free slot
   K->>DB: Build the list from the slot holders, store it as a new list version
   K->>K: Read the stored text back and rebuild the root from it
-  K->>V: Check the vault against the factory log, then postRoot
-  K->>DB: Mark the version posted with its transaction
+  K->>V: Check the vault against the factory log, simulate and sign postRoot
+  K->>DB: Record the hash and nonce, the version is sending
+  K->>V: Send the signed post and wait for its receipt
+  K->>DB: Mark the version posted with the claimable time the receipt holds
   V->>V: The root waits out its delay, and the owner can cancel it
-  K->>V: Read state, and claimable for every listed wallet
+  K->>V: Read state, and claimed for every listed wallet
   K->>DB: Mark the version active, queue a relay for each wallet still owed
   K->>DB: Take the oldest waiting relay
   K->>V: Simulate, then send claim(account, cumulativeAmount, proof) from the agent key
@@ -243,6 +249,12 @@ sequenceDiagram
   K->>DB: Mark the relay confirmed
   W->>API: GET /api/campaigns/:id/asks/:wallet
   API-->>W: The decision, and a claim ticket once the list is active
+  W->>API: POST /api/campaigns/:id/appeals with wallet, one line of text, signedAt, signature (not approved in full)
+  API->>DB: Store the appeal, bound to the decision it disputes
+  K->>R: Send Thuli's decision with identifiers removed, never the appellant's text
+  R-->>K: Route ship, review or block, and a note
+  K->>DB: Store the route and note, the ask is unchanged
+  O->>DB: Settle it: reversed to an approval, which takes the next free slot, or upheld
 ```
 
 The packages and their main modules. An arrow points from a module to one it imports. The one dashed line is not an import: core's leaf and the vault hash a claim the same way, so a list built in TypeScript proves on chain.
@@ -263,7 +275,7 @@ flowchart TB
   end
 
   subgraph worker["packages/worker"]
-    CAMPW["campaign: loop, screen, facts, publish, relay, vault"]
+    CAMPW["campaign: loop, screen, facts, publish, relay, vault, appeals"]
     SINGLE["screen/single"]
     REPLAY["replay: decide, runner, scoring, export"]
     REPPO["reppo: client, feedback"]
@@ -273,7 +285,7 @@ flowchart TB
   end
 
   subgraph store["packages/store"]
-    SCAMP["campaigns"]
+    SCAMP["campaigns, appeals"]
     SROWS["paymentClaims, limits, checkCache, sweep"]
     SDB["db, migrate"]
   end
@@ -306,6 +318,7 @@ flowchart TB
   CAMPW --> SINGLE
   CAMPW --> REPLAY
   CAMPW --> VAULTW
+  CAMPW --> REPPO
   CAMPW --> SCAMP
   SINGLE --> READ
   SINGLE --> REPLAY
@@ -693,14 +706,14 @@ The threat model was written on 27 October 2026, before any code, by an independ
 
 ## What is not built yet
 
-This is the state of the code on 11 November 2026. The [limits page](packages/web/content/docs/limits.mdx) and section 4.8 of [ARCHITECTURE.md](ARCHITECTURE.md) list the same items.
+This is the state of the code on 13 November 2026. The [limits page](packages/web/content/docs/limits.mdx) and section 4.8 of [ARCHITECTURE.md](ARCHITECTURE.md) list the same items.
 
 - A campaign on Base mainnet. The factory is deployed and verified there, and one proof vault paid 1 real USDC, but the public campaign runs on Base Sepolia with test money.
 - Self-serve campaigns: owner sign-in, an owner dashboard and a way to upload a project's own claim list. Today a project registers a campaign with `npm run vault:create` and `npm run campaign:create`.
 - Owner sign-in for appeals. Wallets file appeals through the site and the worker sends them to the outside check, but the owner's settle is an operator's command, `npm run appeal:settle`. Contract wallets cannot appeal.
-- A Reppo evaluation of an appeal. None has been run yet, because the account needs credit.
+- More live appeals. One appeal has been checked by Reppo live (route `review`, upheld by the owner). The routes `ship` and `block` and a reversal have run only in tests.
 - Appeals in the scorecard. The scorecard does not score appeals yet.
-- A hosted worker and a hosted database. The worker runs as a script on one machine, and no database is hosted for Thuli.
+- Worker hosting as code. The worker runs as one process on a host, set up by hand; the repository holds no container file or host configuration.
 - A general job queue. Only campaign asks, claim submissions and appeal checks are queued.
 - Paid data lookups through Kite Passport, Nansen or Allium, and Dolphin summaries. No code calls them.
 - A watcher that rebuilds each posted list and alerts the owner inside the vault's delay.

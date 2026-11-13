@@ -17,7 +17,7 @@ flowchart TD
   G -->|worker posts the root and submits claims| H[Vault on Base Sepolia]
 ```
 
-Every arrow runs today for a campaign on Base Sepolia, from one script on one machine. The free check, the paid check and the replay stop at the decision.
+Every arrow runs today for a campaign on Base Sepolia, from one worker process on a host. The free check, the paid check and the replay stop at the decision.
 
 ## Step 1. Code reads the chain and works out facts
 
@@ -58,4 +58,4 @@ Doubt means hold. A failed check becomes a hold on rule A1 with the cause in pla
 
 Wallets with a full or partial decision go onto a claim list, a full wallet at the campaign's reward and a partial wallet at its share rounded down. Held and excluded wallets get nothing. The list becomes one short fingerprint, a Merkle root, on the project's own vault, and Thuli's key can post that fingerprint and nothing else. Every new fingerprint waits out a delay the project sets, from 1 hour to 30 days, so the project can cancel it before it pays. An approved wallet then claims with a proof and is paid to the address on the list. See [The vault](/docs/vault).
 
-A script, the campaign worker, does this today for a campaign. It builds the list from the approved wallets that hold a slot, posts the root, and once the delay is over submits each wallet's claim so the wallet pays no gas. Anyone may submit a claim, and the money still goes only to the address on the list. The first approved wallets take the campaign's slots. Once the slots are gone, the campaign takes no new ask, and an ask that was already waiting is still decided but is not listed. The worker runs with `npm run worker` on one machine, on Base Sepolia with test USDC, and nothing hosts it yet. Its limits are on [Limits and non-goals](/docs/limits).
+A script, the campaign worker, does this today for a campaign. It builds the list from the approved wallets that hold a slot, posts the root, and once the delay is over submits each wallet's claim so the wallet pays no gas. Anyone may submit a claim, and the money still goes only to the address on the list. The first approved wallets take the campaign's slots. Once the slots are gone, the campaign takes no new ask, and an ask that was already waiting is still decided but is not listed. The worker runs as one process on a host, on Base Sepolia with test USDC. Its limits are on [Limits and non-goals](/docs/limits).

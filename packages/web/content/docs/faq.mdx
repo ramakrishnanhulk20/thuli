@@ -71,7 +71,7 @@ It is public, and you can read it on [the rulebook page](/docs/rulebook). It is 
 
 ## What is not built yet?
 
-As of 11 November 2026: owner sign-in, a general job queue (only campaign asks, claim submissions and appeal checks are queued), paid data lookups, a deployed worker host, and any vault or payment on Base mainnet. The vault factory is deployed there, and nothing has been made from it. The campaign routes, the appeal route, the screening worker that posts each list to the vault and submits claims, and the campaign page are built, and the worker runs as a script on one machine. They are described on [Live campaign](/docs/campaigns). The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
+As of 13 November 2026: owner sign-in, a general job queue (only campaign asks, claim submissions and appeal checks are queued), paid data lookups, and a campaign on Base mainnet. On Base mainnet the vault factory is deployed, one proof vault paid 1 real USDC and the paid route took one real 5 cent payment, but the campaign runs on Base Sepolia with test money. The campaign routes, the appeal route, the screening worker that posts each list to the vault and submits claims, and the campaign page are built. The worker runs as one process on a host and shares a hosted Postgres database with the site. They are described on [Live campaign](/docs/campaigns). The check page at [/check](/check) and the paid route are built and served by the site. The full list is on [limits](/docs/limits).
 
 ## Is it audited?
 

@@ -9,6 +9,8 @@ A live campaign is one reward campaign that anyone can enter. Any wallet may ask
 
 Today a campaign runs on Base Sepolia, Base's public test network, and pays test USDC that has no value. The [campaign page](/campaign) shows the slots taken, the wallets that asked, every decision as it is made, and the lists posted to the vault.
 
+The campaign on this site is "Thuli demo drop", id `thuli-demo`: 24 slots of 0.5 test USDC each, open until 28 December 2026. Its vault is [`0x863342D22557De5E7f093F9351797291b18329CA`](https://sepolia.basescan.org/address/0x863342D22557De5E7f093F9351797291b18329CA), made by the factory in [this transaction](https://sepolia.basescan.org/tx/0xe3b41a48f991704a1707ed2c3696f8cbfd16bda41203a245eb661a04f271bc6c) with 12 test USDC, a cap of 0.5 USDC a wallet and a one-hour delay, and its source is verified on Basescan. Its owner is Thuli's own test wallet. The site, a worker process on its own host and one hosted Postgres database run it.
+
 The project that runs a campaign sets the reward per wallet, the number of slots, and when asks open and close. A wallet approved for a partial reward gets half of the full reward unless the project sets another share. The default is 5,000 of 10,000 basis points, where a basis point is one hundredth of a percent. A campaign stops taking asks at least one vault delay plus one hour before the vault ends, so a list posted at the last moment can still be paid.
 
 ## What happens when you ask
@@ -165,6 +167,8 @@ An ask gets 10 tries. The worker waits 10, 30, 90 and 270 seconds between the fi
 ### A run against Base Sepolia
 
 On 11 November 2026 the whole path was run once with test money, from a local copy of the site and a worker on one machine, against the public test network. A wallet with history asked and was approved. The worker posted list 1 in [this transaction](https://sepolia.basescan.org/tx/0x9ab3fc2af5e2eb1597cb781d5eb8d4da265b14977234e18b2aa66adb6c27e915) to the vault at [0x866eDed69E7800d19c8D73f7Edf5c54081f8BA65](https://sepolia.basescan.org/address/0x866eDed69E7800d19c8D73f7Edf5c54081f8BA65). An hour later, when the vault's delay was over, the worker submitted the claim in [this one](https://sepolia.basescan.org/tx/0x27f1dee59482b1c12daa7937f5a56098efb39c0a48fcb9c7f1b8bbd0f4ca98f7), and the vault paid the wallet 0.5 test USDC. This was not a hosted campaign, and nothing in it was public beyond the chain.
+
+On 13 November 2026 the hosted parts were checked together before the site went up. Thuli's own test wallet, which is also the demo campaign's owner, signed an ask and sent it through a production build of the site on one machine, set up exactly as the hosted site is. The ask was stored in the hosted database. The worker on its host read the wallet's history on Base, cut it to a partial reward under rule A8 (one day old, six transactions sent) and gave it slot 1, twelve seconds after the ask was stored. One second later it posted list 1 to the demo vault in [this transaction](https://sepolia.basescan.org/tx/0x708517c831f4335ac375963e10f1f7a8fa0ba826d92063981173b9ede0091f2d). What this does not show: an ask sent through the hosted site itself.
 
 ## What each outcome means
 
