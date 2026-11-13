@@ -70,8 +70,8 @@ export function formatUtc(iso: string): string {
  * Checks the 402 terms and the paid answer, and returns what the section prints.
  *
  * @throws PaidExampleError when the terms are not x402 version 2 with exactly one "exact" entry whose amount is whole
- * digits on Base Sepolia or Base, or when the answer is missing a field the section shows, or its settlement
- * transaction is not 0x and 64 lowercase hex characters.
+ * digits on Base Sepolia or Base, or when the answer is missing a field the section shows, its settlement transaction
+ * is not 0x and 64 lowercase hex characters, or it was settled on another network than the terms name.
  */
 export function checkPaidExample(terms: unknown, answer: unknown): PaidExample {
   if (!isObject(terms)) return fail('the payment terms are not a JSON object');
@@ -102,6 +102,9 @@ export function checkPaidExample(terms: unknown, answer: unknown): PaidExample {
   const payment = objectAt(answer, 'payment', 'answer');
   const transaction = textAt(payment, 'transaction', 'payment');
   if (!TX_HASH.test(transaction)) return fail('the settlement transaction is not 0x and 64 lowercase hex characters');
+  // The settlement link opens on the terms' network, so an answer settled on another one would link a hash that is not there.
+  const settledOn = textAt(payment, 'network', 'payment');
+  if (settledOn !== networkId) return fail(`the answer was settled on ${settledOn}, not on ${networkId}, the network of the terms`);
 
   return {
     price: formatUsdc6(amount),

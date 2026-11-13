@@ -57,7 +57,9 @@ describe('checkPaidExample', () => {
   it('builds the Base Sepolia link and name for eip155:84532', () => {
     const sepolia = terms();
     sepolia.accepts[0].network = 'eip155:84532';
-    const result = checkPaidExample(sepolia, answer());
+    const settled = answer();
+    settled.payment.network = 'eip155:84532';
+    const result = checkPaidExample(sepolia, settled);
     expect(result.networkName).toBe('Base Sepolia');
     expect(result.testnet).toBe(true);
     expect(result.settlementUrl).toBe(`https://sepolia.basescan.org/tx/${answer().payment.transaction}`);
@@ -94,6 +96,20 @@ describe('checkPaidExample', () => {
     const none = terms();
     none.accepts = [];
     expect(() => checkPaidExample(none, answer())).toThrow(PaidExampleError);
+  });
+
+  it('refuses an answer settled on another network than the terms name, so the link never opens on the wrong explorer', () => {
+    const sepolia = terms();
+    sepolia.accepts[0].network = 'eip155:84532';
+    expect(() => checkPaidExample(sepolia, answer())).toThrow(PaidExampleError);
+    expect(() => checkPaidExample(sepolia, answer())).toThrow('the answer was settled on eip155:8453, not on eip155:84532, the network of the terms');
+    const elsewhere = answer();
+    elsewhere.payment.network = 'eip155:1';
+    expect(() => checkPaidExample(terms(), elsewhere)).toThrow(/settled on eip155:1/);
+    const unnamed = answer();
+    delete (unnamed.payment as { network?: string }).network;
+    expect(() => checkPaidExample(terms(), unnamed)).toThrow(PaidExampleError);
+    expect(checkPaidExample(terms(), answer()).networkId).toBe('eip155:8453');
   });
 
   it('refuses a settlement transaction that is not a lowercase 64 digit hash', () => {
