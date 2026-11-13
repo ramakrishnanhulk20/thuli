@@ -467,7 +467,7 @@ describe('migrate', () => {
       schema_migrations: ['name', 'sha256', 'applied_at'],
       payment_claims: [
         'key', 'state', 'owner', 'valid_before', 'updated_at', 'wallet', 'tx', 'settled_at', 'owned_until', 'result', 'screenings',
-        'owner_counted',
+        'owner_counted', 'named_txs',
       ],
       leases: ['id', 'pool', 'expires_at'],
       rate_events: ['id', 'bucket', 'client', 'at'],

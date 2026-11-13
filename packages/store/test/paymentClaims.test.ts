@@ -11,7 +11,9 @@ import {
   keepPaymentUnsure,
   leaveSettledPayment,
   markPaymentSettled,
+  MAX_NAMED_TXS,
   MAX_PAYMENT_CLAIMS,
+  namedPaymentTxs,
   PAID_RESULT_KEEP_SECONDS,
   REDEEM_SCREEN_TRIES,
   redeemPayment,
@@ -220,6 +222,34 @@ for (const { name, open } of TARGETS) {
       await keepPaymentUnsure(db, KEY, 'first');
       await releasePayment(db, KEY, 'first');
       expect(await row(KEY)).toEqual({ state: 'held', owner: 'retry', valid_before: (NOW + 300n).toString() });
+    });
+
+    it('C25: keeps the transactions named for an unsure claim for its next holder, refuses a bad hash, and takes an expired authorization only while one waits', async () => {
+      const named = `0x${'7a'.repeat(32)}`;
+      expect(await claimPayment(db, KEY, NOW + 300n, 'first', at(NOW))).toBe('taken');
+      await expect(keepPaymentUnsure(db, KEY, 'first', ['0xabc'])).rejects.toThrow(StoreError);
+      await expect(keepPaymentUnsure(db, KEY, 'first', [`0x${'7A'.repeat(32)}`])).rejects.toThrow(StoreError);
+      await expect(keepPaymentUnsure(db, KEY, 'first', Array.from({ length: MAX_NAMED_TXS + 1 }, () => named))).rejects.toThrow(StoreError);
+      expect((await row(KEY))?.state).toBe('held');
+
+      await keepPaymentUnsure(db, KEY, 'first', [named]);
+      expect(await namedPaymentTxs(db, KEY, 'first')).toEqual([]);
+      expect(await claimPayment(db, KEY, NOW + 300n, 'second', at(NOW + 1n))).toBe('taken');
+      expect(await namedPaymentTxs(db, KEY, 'second')).toEqual([named]);
+      expect(await namedPaymentTxs(db, KEY, 'first')).toEqual([]);
+      await keepPaymentUnsure(db, KEY, 'second');
+
+      // Past its validBefore the authorization cannot be settled, and is taken only to read that receipt, for a day.
+      expect(await claimPayment(db, KEY, NOW + 300n, 'late', at(NOW + 300n + DAY - 1n))).toBe('taken');
+      expect(await namedPaymentTxs(db, KEY, 'late')).toEqual([named]);
+      await keepPaymentUnsure(db, KEY, 'late');
+      expect(await claimPayment(db, KEY, NOW + 300n, 'gone', at(NOW + 300n + DAY))).toBe('expired');
+
+      // With nothing named, an unsure claim ends with its authorization.
+      const bare = `${KEY}-bare`;
+      expect(await claimPayment(db, bare, NOW + 300n, 'a', at(NOW))).toBe('taken');
+      await keepPaymentUnsure(db, bare, 'a');
+      expect(await claimPayment(db, bare, NOW + 300n, 'b', at(NOW + 300n))).toBe('expired');
     });
 
     it('C25: release frees the key only for its holder', async () => {

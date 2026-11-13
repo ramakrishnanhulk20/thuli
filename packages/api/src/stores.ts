@@ -7,6 +7,7 @@ import {
   dayCount,
   dropLease,
   keepPaymentUnsure,
+  namedPaymentTxs,
   leaveSettledPayment,
   liveLeases,
   markPaymentSettled,
@@ -59,8 +60,13 @@ export interface ClaimStore {
   redeem(key: string, wallet: Address, owner: string, nowSeconds: bigint): Promise<Redeemed>;
   /** The settlement went through: settled at nowSeconds for settlement, owned by owner. Does nothing unless owner holds key. */
   markSettled(key: string, owner: string, settlement: Settlement, nowSeconds: bigint): Promise<void>;
-  /** The outcome is unknown: one retry of the same authorization at a time may take it. Does nothing unless owner holds key. */
-  keepUnsure(key: string, owner: string): Promise<void>;
+  /**
+   * The outcome is unknown: one retry of the same authorization at a time may take it. transactions are the hashes a
+   * facilitator named for the payment in this request, kept with the claim. Does nothing unless owner holds key.
+   */
+  keepUnsure(key: string, owner: string, transactions: readonly string[]): Promise<void>;
+  /** The transactions earlier requests kept with the claim, oldest first. Empty unless owner holds key. */
+  named(key: string, owner: string): Promise<string[]>;
   /** The settlement failed outright, so an honest retry may try again. Does nothing unless owner holds key. */
   release(key: string, owner: string): Promise<void>;
   /** Stores the result the payment bought, for every later redeem. Does nothing unless owner owns the settled key. */
@@ -139,7 +145,8 @@ export function claimStoreOver(claims: PaymentClaims): ClaimStore {
     redeem: async (key, wallet, owner, nowSeconds) => claims.redeem(key, wallet, owner, nowSeconds, nowSeconds + BigInt(LEASE_SECONDS)),
     markSettled: async (key, owner, settlement, nowSeconds) =>
       claims.markSettled(key, owner, settlement, nowSeconds, nowSeconds + BigInt(LEASE_SECONDS)),
-    keepUnsure: async (key, owner) => claims.keepUnsure(key, owner),
+    keepUnsure: async (key, owner, transactions) => claims.keepUnsure(key, owner, transactions),
+    named: async (key, owner) => claims.named(key, owner),
     release: async (key, owner) => claims.release(key, owner),
     serve: async (key, owner, body) => claims.serve(key, owner, body),
     leave: async (key, owner, handBackTry) => claims.leave(key, owner, handBackTry),
@@ -207,7 +214,8 @@ function postgresClaims(db: Db): ClaimStore {
     claim: (key, validBefore, owner, nowSeconds) => claimPayment(db, key, validBefore, owner, { nowSeconds, latestSeconds }),
     redeem: (key, wallet, owner, nowSeconds) => redeemPayment(db, key, wallet, owner, owned(nowSeconds)),
     markSettled: (key, owner, settlement, nowSeconds) => markPaymentSettled(db, key, owner, settlement, owned(nowSeconds)),
-    keepUnsure: (key, owner) => keepPaymentUnsure(db, key, owner),
+    keepUnsure: (key, owner, transactions) => keepPaymentUnsure(db, key, owner, transactions),
+    named: (key, owner) => namedPaymentTxs(db, key, owner),
     release: (key, owner) => releasePayment(db, key, owner),
     serve: (key, owner, body) => servePayment(db, key, owner, body),
     leave: (key, owner, handBackTry) => leaveSettledPayment(db, key, owner, handBackTry),

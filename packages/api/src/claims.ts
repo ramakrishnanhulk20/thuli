@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { parseAddress, type Address } from '@thuli/core';
-import { PAID_RESULT_KEEP_SECONDS, REDEEM_SCREEN_TRIES } from '@thuli/store';
+import { MAX_NAMED_TXS, PAID_RESULT_KEEP_SECONDS, REDEEM_SCREEN_TRIES } from '@thuli/store';
 import { PRICE_UNITS, type NetworkId } from './config.ts';
 
 /** Claims remembered at once (C41). Past this, with none expired, a new payment is refused as busy. */
@@ -43,6 +43,8 @@ interface Claim {
   screenings: number;
   /** True while the current owner's taking counted a try, the only owner that may hand one back. */
   ownerCounted: boolean;
+  /** Every transaction a facilitator named for this payment while its settlement was not proven, oldest first. */
+  named: string[];
 }
 
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
@@ -69,9 +71,12 @@ export type Redeemed =
  * refused without reaching it.
  *
  * A claim is held by the one request settling it. If that settlement failed outright, it is released, so an honest
- * retry can try again. If its outcome is unknown (the facilitator threw, timed out, or left it pending without proof),
- * it stays as unsure: owned by no request, it lets the same authorization come back and try again through the
- * facilitator, one copy at a time, and it is never served on a guess. If it settled, it becomes settled, with the wallet
+ * retry can try again. If its outcome is unknown (the facilitator threw, timed out, said pending, or named a
+ * transaction without proof), it stays as unsure: owned by no request, it lets the same authorization come back and try
+ * again, one copy at a time, and it is never served on a guess. An unsure claim keeps every transaction a facilitator
+ * named for it, so the next copy can read those receipts itself, and while it holds one it outlives its authorization
+ * by PAID_RESULT_KEEP_SECONDS: the payment can no longer be settled, but one of those transactions may have paid it.
+ * If it settled, it becomes settled, with the wallet
  * and transaction it paid for, owned by that request while it screens; once the result is stored it is served. For
  * PAID_RESULT_KEEP_SECONDS from the settlement, a copy of the header asking for the same wallet redeems it: a settled
  * claim no live request owns is screened by that copy, a settled claim another live request is screening is in use,
@@ -101,9 +106,11 @@ export class PaymentClaims {
    * the route allows, a key another request holds, settled or used, and a full map.
    */
   claim(key: string, validBefore: bigint, owner: string, nowSeconds: bigint): ClaimResult {
-    if (hasExpired(validBefore, nowSeconds)) return 'expired';
-    if (validBefore > nowSeconds + this.#latestSeconds) return 'too-long';
+    const expired = hasExpired(validBefore, nowSeconds);
+    if (!expired && validBefore > nowSeconds + this.#latestSeconds) return 'too-long';
     let entry = this.#claims.get(key);
+    // An expired authorization is taken only to read the receipt of a transaction already named for it.
+    if (expired && !(entry !== undefined && this.#waitsOnReceipt(entry, nowSeconds))) return 'expired';
     if (entry !== undefined && this.#due(entry, nowSeconds)) {
       this.#claims.delete(key);
       entry = undefined;
@@ -117,7 +124,7 @@ export class PaymentClaims {
     }
     if (this.#claims.size >= MAX_CLAIMS) this.#forgetDue(nowSeconds);
     if (this.#claims.size >= MAX_CLAIMS) return 'full';
-    this.#claims.set(key, { owner, state: 'held', validBefore, settled: null, ownedUntil: null, result: null, screenings: 0, ownerCounted: false });
+    this.#claims.set(key, { owner, state: 'held', validBefore, settled: null, ownedUntil: null, result: null, screenings: 0, ownerCounted: false, named: [] });
     return 'taken';
   }
 
@@ -188,13 +195,25 @@ export class PaymentClaims {
     }
   }
 
-  /** The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same header can take it. */
-  keepUnsure(key: string, owner: string): void {
+  /**
+   * The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same header can take
+   * it. `transactions` are the hashes a facilitator named for the payment in the request that is ending; they join the
+   * ones the claim already holds, oldest first, up to MAX_NAMED_TXS.
+   */
+  keepUnsure(key: string, owner: string, transactions: readonly string[] = []): void {
     const entry = this.#take(key, owner);
     if (entry !== undefined) {
       entry.state = 'unsure';
       entry.owner = null;
+      for (const hash of transactions) {
+        if (entry.named.length < MAX_NAMED_TXS && !entry.named.includes(hash)) entry.named.push(hash);
+      }
     }
+  }
+
+  /** The transactions named for a claim in earlier requests, oldest first. Empty unless owner holds the key. */
+  named(key: string, owner: string): string[] {
+    return [...(this.#take(key, owner)?.named ?? [])];
   }
 
   /** Frees the key only for the request that holds it, and only while its outcome is a plain failure. */
@@ -221,7 +240,12 @@ export class PaymentClaims {
   // one not before a day from its settlement, so its buyer can always come back for the result inside that day.
   #due(entry: Claim, nowSeconds: bigint): boolean {
     const kept = entry.settled !== null && entry.settled.at + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
-    return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds) && !kept;
+    return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds) && !kept && !this.#waitsOnReceipt(entry, nowSeconds);
+  }
+
+  // An unsure claim that holds a named transaction may have been paid by it, and only that receipt can say.
+  #waitsOnReceipt(entry: Claim, nowSeconds: bigint): boolean {
+    return entry.state === 'unsure' && entry.named.length > 0 && entry.validBefore + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
   }
 
   // Runs only when the map is full, so its cost is paid once per wave of new claims, not on every request.

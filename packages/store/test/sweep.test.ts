@@ -106,6 +106,21 @@ describe('sweep', () => {
     });
   });
 
+  it('C25, C41: keeps an unsure claim that holds a named transaction for a day past its validBefore, and one that holds none for an hour', async () => {
+    const day = BigInt(PAID_RESULT_KEEP_SECONDS);
+    // Both authorizations ended a day ago, to the second.
+    const validBefore = NOW_SECONDS - day;
+    expect(await claimPayment(db, 'waiting', validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
+    await keepPaymentUnsure(db, 'waiting', 'payer', [`0x${'7a'.repeat(32)}`]);
+    expect(await claimPayment(db, 'bare', validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
+    await keepPaymentUnsure(db, 'bare', 'payer');
+
+    expect(await sweep(db, NOW)).toEqual({ claims: 1, leases: 0, events: 0, checks: 0 });
+    expect(await db.query('SELECT key FROM payment_claims')).toEqual([{ key: 'waiting' }]);
+    expect(await sweep(db, plus(0.5))).toEqual({ claims: 1, leases: 0, events: 0, checks: 0 });
+    expect(await db.query('SELECT key FROM payment_claims')).toEqual([]);
+  });
+
   it('C41: a sweep far in the future empties every table outside input can grow', async () => {
     expect(await claimPayment(db, 'held', NOW_SECONDS + 300n, 'a', at(NOW_SECONDS))).toBe('taken');
     expect(await claimPayment(db, 'unsure', NOW_SECONDS + 300n, 'b', at(NOW_SECONDS))).toBe('taken');

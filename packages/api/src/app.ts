@@ -11,7 +11,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { createMiddleware } from 'hono/factory';
 import { z } from 'zod';
 import { AddressError, CURRENT_RULEBOOK, parseAddress, type Address } from '@thuli/core';
-import { REDEEM_SCREEN_TRIES, type CheckKey } from '@thuli/store';
+import { MAX_NAMED_TXS, REDEEM_SCREEN_TRIES, type CheckKey } from '@thuli/store';
 import {
   heldScreen,
   NOT_CHECKED,
@@ -21,7 +21,7 @@ import {
   type SingleScreen,
 } from '@thuli/worker/src/screen/single.ts';
 import { registerCampaignRoutes, type CampaignDeps } from './campaigns.ts';
-import { MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult, type Redeemed } from './claims.ts';
+import { hasExpired, MAX_TIMEOUT_SECONDS, readPaymentTerms, type ClaimResult, type Redeemed } from './claims.ts';
 import { PRICE, PRICE_UNITS, REQUEST_DEADLINE_MS, SETTLE_TIMEOUT_MS, type ApiConfig } from './config.ts';
 import type { Ticket } from './guard.ts';
 import { canonicalClient, type Limit, type Pass } from './limits.ts';
@@ -135,7 +135,7 @@ interface PaidRequest {
   /** The moment, in ms on the app's clock, by which this request has answered and stopped waiting on anything. */
   deadlineAt: number;
   /** The claim this request took, or may have taken when the store failed while it was being written. */
-  claim: { key: string; payer: Address; nonce: `0x${string}` } | null;
+  claim: { key: string; payer: Address; nonce: `0x${string}`; validBefore: bigint } | null;
   /** True once the claim was settled, kept unsure or redeemed. From then on it is never released, even if that write failed. */
   kept: boolean;
   /** True once this request may own a settled claim, so it gives the claim back if it ends with no result stored. */
@@ -159,8 +159,10 @@ interface PaidRequest {
   payment: Payment | null;
   /** True when the latest settle call threw rather than answering, so its outcome is unknown. */
   settleThrew: boolean;
-  /** The transaction a pending settle answer named in this request, from any of its settle calls, or null. */
-  pendingTx: string | null;
+  /** True when any settle answer of this request said the settlement is pending, with or without a transaction. */
+  sawPending: boolean;
+  /** Every transaction a failed settle answer of this request named, thrown or not, lowercase, in the order named. */
+  named: string[];
   /**
    * Set when the reply must replace the payment middleware's: retry for an unknown outcome, busy for a full claim map,
    * settled for a payment that went through and that another request is screening now.
@@ -422,9 +424,14 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // now too low) in that same shape, with no transaction named. So a 4xx is never read as "nothing moved" (C25).
   //
   // One settle can also be two calls: after a pending answer the library asks again, and the hook sees only the last
-  // answer. The transaction a pending answer named is kept here, so the claim is never released while it may still land.
-  const pendingHash = (answer: { errorReason?: string | undefined; transaction?: string | undefined }) =>
-    answer.errorReason === 'settlement_pending' && typeof answer.transaction === 'string' && answer.transaction !== '' ? answer.transaction : null;
+  // answer. So what each answer said is noted here: that it was pending, and any transaction it named, whatever its
+  // reason. A transaction a facilitator names may be the payment landing, so it is never dropped: the hook reads its
+  // receipt, and a claim left unsure keeps it for the next request (C25).
+  const noted = (request: PaidRequest, answer: { errorReason?: string | undefined; transaction?: string | undefined }) => {
+    if (answer.errorReason === 'settlement_pending') request.sawPending = true;
+    const hash = TxHashText.safeParse(answer.transaction);
+    if (hash.success && !request.named.includes(hash.data) && request.named.length < MAX_NAMED_TXS) request.named.push(hash.data);
+  };
   const facilitator: FacilitatorClient = {
     getSupported: () => config.facilitator.getSupported(),
     verify: (payload, requirements) => config.facilitator.verify(payload, requirements),
@@ -433,12 +440,12 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       if (request !== undefined) request.settleThrew = false;
       try {
         const answer = await config.facilitator.settle(payload, requirements);
-        if (request !== undefined && !answer.success) request.pendingTx = pendingHash(answer) ?? request.pendingTx;
+        if (request !== undefined && !answer.success) noted(request, answer);
         return answer;
       } catch (error) {
         if (request !== undefined) {
           request.settleThrew = true;
-          if (error instanceof SettleError) request.pendingTx = pendingHash(error) ?? request.pendingTx;
+          if (error instanceof SettleError) noted(request, error);
         }
         throw error;
       }
@@ -454,7 +461,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     const terms = readPaymentTerms(paymentPayload.payload, requirements, config);
     if (!terms.ok) return refuse(terms.reason);
     const nowSeconds = BigInt(Math.floor(now().getTime() / 1000));
-    const taken = { key: terms.key, payer: terms.payer, nonce: terms.nonce };
+    const taken = { key: terms.key, payer: terms.payer, nonce: terms.nonce, validBefore: terms.validBefore };
 
     // A header whose payment already went through is never settled again: it gets its stored result, or the screening
     // it paid for, and only for the wallet it paid for (C24, C25).
@@ -527,15 +534,18 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   });
 
   /**
-   * True only when the receipt of hash shows this authorization paying exactly the price to payTo. Never throws. A read
-   * cut by the deadline is not a proof, so the payment is kept unsure and the same header comes back.
+   * What the receipt of hash says about this payment. 'paid' only when it shows this authorization paying exactly the
+   * price to payTo. 'not-paid' when the receipt was read and shows anything else: that transaction is mined and is not
+   * this payment, so it decides nothing more. 'unread' when there is no receipt yet or the read failed or was cut by the
+   * deadline: not a proof either way, so the payment stays unsure and the same header comes back. Never throws.
    */
-  async function paidOnChain(request: PaidRequest, hash: `0x${string}`, claim: NonNullable<PaidRequest['claim']>): Promise<boolean> {
+  async function receiptSays(request: PaidRequest, hash: `0x${string}`, claim: NonNullable<PaidRequest['claim']>): Promise<'paid' | 'not-paid' | 'unread'> {
     try {
       const receipt = await byDeadline(request.deadlineAt, () => readReceipt(hash));
-      return receiptPays(receipt, { usdc: config.usdc, payer: claim.payer, payTo: config.payTo, nonce: claim.nonce, amount: BigInt(PRICE_UNITS) });
+      const pays = receiptPays(receipt, { usdc: config.usdc, payer: claim.payer, payTo: config.payTo, nonce: claim.nonce, amount: BigInt(PRICE_UNITS) });
+      return pays ? 'paid' : 'not-paid';
     } catch {
-      return false;
+      return 'unread';
     }
   }
 
@@ -560,10 +570,14 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     }
   }
 
-  // Settlement with no clear answer (C25). A pending settle with a transaction hash is served only if that receipt proves
-  // this exact payment. Anything else unclear (a throw, a timeout, pending with no hash or no proof) keeps the claim and
-  // answers 503 retry: the buyer resends the same header, which can never pay twice, and nothing is served on a guess.
-  // A plain "failed" answer falls through, so the claim is released and the buyer gets 402 as before.
+  // Settlement with no clear answer (C25). Every transaction a facilitator has named for this authorization, in this
+  // request or in an earlier one that left the claim unsure, is a candidate: the payment is served only if one of
+  // their receipts proves this exact payment. Otherwise anything unclear keeps the claim, with the transactions, and
+  // answers 503 retry: a candidate with no receipt yet, a list of earlier ones that could not be read, and, while the
+  // authorization can still be settled, a throw, a timeout or an answer that said pending. The buyer resends the same
+  // header, which can never pay twice, and nothing is served on a guess. What falls through, so that the claim is
+  // released and the buyer gets 402: a plain "failed" answer with none of these, and an authorization past its
+  // validBefore with no receipt left to wait for, since nothing can settle it any more.
   resourceServer.onSettleFailure(async ({ phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) return;
@@ -573,28 +587,38 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       request.answer = 'retry';
       request.kept = true;
       try {
-        await byDeadline(request.deadlineAt, () => claims.keepUnsure(claim.key, request.owner));
+        await byDeadline(request.deadlineAt, () => claims.keepUnsure(claim.key, request.owner, request.named));
       } catch (storeError) {
         storeFailed('keeping an unsure payment', storeError);
       }
     };
     try {
-      // The hash this request was told is pending, whichever of its settle calls said so.
-      const pendingTx = request.pendingTx;
-      if (pendingTx === null) {
-        if (request.settleThrew) await keepForRetry();
-        return;
+      let earlier: string[] = [];
+      let unread = false;
+      try {
+        earlier = await byDeadline(request.deadlineAt, () => claims.named(claim.key, request.owner));
+      } catch (storeError) {
+        storeFailed('reading the transactions named for a payment', storeError);
+        unread = true;
       }
-      const hash = TxHashText.safeParse(pendingTx);
-      if (!hash.success || !(await paidOnChain(request, hash.data, claim))) {
-        await keepForRetry();
-        return;
+      // This request's own first: they are the newest word on the payment. Read one at a time, a bounded few (C41).
+      const candidates = [...new Set([...request.named, ...earlier])].slice(0, MAX_NAMED_TXS);
+      let waiting = unread;
+      for (const candidate of candidates) {
+        const hash = TxHashText.safeParse(candidate);
+        if (!hash.success) continue;
+        const said = await receiptSays(request, hash.data, claim);
+        if (said === 'unread') waiting = true;
+        if (said !== 'paid') continue;
+        await markSettled(request, claim.key, Payment.parse({ network: config.networkId, payer: claim.payer, transaction: hash.data }));
+        return {
+          recovered: true as const,
+          result: { success: true, transaction: hash.data, network: config.networkId, payer: claim.payer },
+        };
       }
-      await markSettled(request, claim.key, Payment.parse({ network: config.networkId, payer: claim.payer, transaction: hash.data }));
-      return {
-        recovered: true as const,
-        result: { success: true, transaction: hash.data, network: config.networkId, payer: claim.payer },
-      };
+      const settleable = !hasExpired(claim.validBefore, BigInt(Math.floor(now().getTime() / 1000)));
+      if (waiting || (settleable && (request.settleThrew || request.sawPending))) await keepForRetry();
+      return;
     } catch {
       // The library logs and skips a hook that throws, which would release the claim. Unknown stays unknown instead.
       await keepForRetry();
@@ -710,7 +734,8 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       stored: null,
       payment: null,
       settleThrew: false,
-      pendingTx: null,
+      sawPending: false,
+      named: [],
       answer: null,
     };
     try {

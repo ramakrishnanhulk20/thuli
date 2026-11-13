@@ -25,6 +25,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { parseAddress, type Address } from '@thuli/core';
 import {
   dayCount,
+  MAX_NAMED_TXS,
   MAX_PAYMENT_CLAIMS,
   migrate,
   openMemoryDb,
@@ -572,7 +573,8 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
       const later = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
       expect(later.status, name).toBe(200);
       expect(screen, name).toHaveBeenCalledTimes(1);
-      expect(readReceipt, name).not.toHaveBeenCalled();
+      // A transaction the refusal named is looked up, once, and not finding it changes nothing. The others name none.
+      expect(readReceipt, name).toHaveBeenCalledTimes(name === 'a transaction hash' ? 1 : 0);
     }
   });
 
@@ -640,6 +642,205 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     const served = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
     expect(served.status).toBe(200);
     expect(screen).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the claim for an answer that says pending and names no transaction, as a 200 or as a throw, and serves the header once it settles', async () => {
+    for (const shape of ['a 200', 'a throw'] as const) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = async (_payload, requirements) => {
+        const answer: SettleResponse = { success: false, errorReason: 'settlement_pending', transaction: '', network: requirements.network };
+        if (shape === 'a throw') throw new SettleError(400, answer);
+        return answer;
+      };
+      const readReceipt = vi.fn(noChain);
+      const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt });
+      const header = await signedHeader(appFetch, client);
+      const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(first.status, shape).toBe(503);
+      expect(await first.json(), shape).toEqual({ retry: true });
+      expect(first.headers.get('payment-response'), shape).toBeNull();
+      expect(screen, shape).not.toHaveBeenCalled();
+      expect(readReceipt, shape).not.toHaveBeenCalled();
+
+      // The claim was kept, not released: the same header is settled on the next try and served once.
+      facilitator.respond = null;
+      const later = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(later.status, shape).toBe(200);
+      expect(screen, shape).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('reads the receipt of any transaction a failed answer names, whatever its reason: served when it proves the payment, kept when it does not', async () => {
+    // The reference facilitator answers this way when it sent the transaction and then could not keep track of it.
+    const named = (payload: PaymentPayload, requirements: PaymentRequirements): SettleResponse => ({
+      success: false,
+      errorReason: 'invalid_transaction_state',
+      transaction: PENDING_TX,
+      network: requirements.network,
+      payer: authorizationFrom(payload).from,
+    });
+    for (const shape of ['a 200', 'a throw'] as const) {
+      for (const proven of [true, false]) {
+        const label = `${shape}, receipt ${proven ? 'proves the payment' : 'cannot be read'}`;
+        const facilitator = new StubFacilitator('eip155:84532');
+        facilitator.respond = async (payload, requirements) => {
+          if (shape === 'a throw') throw new SettleError(400, named(payload, requirements));
+          return named(payload, requirements);
+        };
+        const receipt = provingReceipt(facilitator);
+        const { appFetch, client, screen } = await setup({ facilitator, readReceipt: proven ? receipt.read : noChain });
+        const header = await signedHeader(appFetch, client);
+        const reply = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+        if (proven) {
+          expect(reply.status, label).toBe(200);
+          expect(PaidScreenResponse.parse(await reply.json()).payment.transaction, label).toBe(PENDING_TX);
+          expect(receipt.reads, label).toEqual([PENDING_TX]);
+          expect(screen, label).toHaveBeenCalledTimes(1);
+        } else {
+          expect(reply.status, label).toBe(503);
+          expect(await reply.json(), label).toEqual({ retry: true });
+          expect(screen, label).not.toHaveBeenCalled();
+        }
+      }
+    }
+  });
+
+  it('serves a payment whose pending transaction landed after the request that saw it, though the facilitator refuses every resend', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    // Request 1: both of the library's asks say pending with the hash, and the transaction is not mined yet.
+    facilitator.respond = pendingAnswer;
+    let mined = false;
+    const receipt = provingReceipt(facilitator);
+    const readReceipt: ReadReceipt = async (hash) => {
+      if (!mined) throw new Error('no receipt yet');
+      return receipt.read(hash);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt });
+    const header = await signedHeader(appFetch, client);
+    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(first.status).toBe(503);
+    expect(await first.json()).toEqual({ retry: true });
+
+    // From here the facilitator refuses the authorization as used and names nothing. The hash lives on with the claim.
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_nonce_already_used');
+    };
+    const second = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(second.status).toBe(503);
+    expect(screen).not.toHaveBeenCalled();
+
+    mined = true;
+    const third = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(third.status).toBe(200);
+    expect(PaidScreenResponse.parse(await third.json()).payment.transaction).toBe(PENDING_TX);
+    expect(decodePaymentResponseHeader(third.headers.get('payment-response') as string)).toMatchObject({ success: true, transaction: PENDING_TX });
+    expect(screen).toHaveBeenCalledTimes(1);
+
+    // Settled now: one more copy gets the stored result, and the facilitator is not asked again.
+    const asked = facilitator.settled.length;
+    const fourth = await fetchAs('198.51.100.5')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(fourth.status).toBe(200);
+    expect(fourth.headers.get(STORED_HEADER)).toBe('true');
+    expect(facilitator.settled).toHaveLength(asked);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
+  it('never answers "expired" to a claim that holds a named transaction: its buyer is served on the receipt past validBefore, for a day', async () => {
+    const pastValidBefore = async (minedLater: boolean) => {
+      let clock = new Date();
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = pendingAnswer;
+      let mined = false;
+      const receipt = provingReceipt(facilitator);
+      const readReceipt: ReadReceipt = async (hash) => {
+        if (!mined) throw new Error('no receipt yet');
+        return receipt.read(hash);
+      };
+      const copy = await setup({ facilitator, readReceipt, now: () => clock });
+      const header = await signedHeader(copy.appFetch, copy.client);
+      expect((await copy.appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+      const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
+      // An authorization past its validBefore is refused by any facilitator, which names nothing.
+      facilitator.respond = async () => {
+        throw refusal('invalid_exact_evm_payload_authorization_valid_before');
+      };
+      mined = minedLater;
+      const at = (seconds: number) => {
+        clock = new Date(seconds * 1000);
+      };
+      return { ...copy, header, validBefore, at };
+    };
+
+    // The transaction landed: a minute past validBefore the buyer is served on its receipt, not told "expired".
+    const landed = await pastValidBefore(true);
+    landed.at(landed.validBefore + 60);
+    const served = await landed.fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, landed.header));
+    expect(served.status).toBe(200);
+    expect(PaidScreenResponse.parse(await served.json()).payment.transaction).toBe(PENDING_TX);
+    expect(landed.screen).toHaveBeenCalledTimes(1);
+
+    // It never landed: the claim waits on that receipt for a day past validBefore, then the header is expired.
+    const lost = await pastValidBefore(false);
+    lost.at(lost.validBefore + 60);
+    const waiting = await lost.fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, lost.header));
+    expect(waiting.status).toBe(503);
+    expect(await waiting.json()).toEqual({ retry: true });
+    lost.at(lost.validBefore + PAID_RESULT_KEEP_SECONDS);
+    const expired = await lost.fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, lost.header));
+    expect(expired.status).toBe(402);
+    expect(decodePaymentResponseHeader(expired.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(lost.screen).not.toHaveBeenCalled();
+  });
+
+  it('lets go of an expired authorization once its named transaction is read and is not this payment: 402, with nothing left waiting', async () => {
+    let clock = new Date();
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    let mined = false;
+    // Once mined, the named transaction turns out to be the payer cancelling the authorization.
+    const receipt = receiptOf(facilitator, ({ from, nonce }) => [authorizationLog('AuthorizationCanceled', USDC_SEPOLIA, from, nonce)]);
+    const readReceipt: ReadReceipt = async (hash) => {
+      if (!mined) throw new Error('no receipt yet');
+      return receipt.read(hash);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt, now: () => clock });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+    const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
+
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_payload_authorization_valid_before');
+    };
+    mined = true;
+    clock = new Date((validBefore + 60) * 1000);
+    const late = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(late.status).toBe(402);
+
+    // The claim was released, so the next copy is plainly expired and the facilitator is not asked again.
+    const asked = facilitator.settled.length;
+    const again = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(again.status).toBe(402);
+    expect(decodePaymentResponseHeader(again.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(facilitator.settled).toHaveLength(asked);
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it('still answers "expired" past validBefore to a claim left unsure with no transaction named', async () => {
+    let clock = new Date();
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = async () => {
+      throw new FacilitatorTimeoutError('settle', 90_000);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, now: () => clock });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+    const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
+    clock = new Date(validBefore * 1000);
+    const late = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(late.status).toBe(402);
+    expect(decodePaymentResponseHeader(late.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(facilitator.settled).toHaveLength(1);
+    expect(screen).not.toHaveBeenCalled();
   });
 
   it('never serves an authorization whose nonce was spent without paying us, by a cancel or by paying the payer itself', async () => {
@@ -1504,7 +1705,7 @@ async function claimBackend() {
       fillUnsure: async (count: number, validBefore: bigint, nowSeconds: bigint) => {
         for (let index = 0; index < count; index += 1) {
           await store.claim(`unsure-${index}`, validBefore, 'filler', nowSeconds);
-          await store.keepUnsure(`unsure-${index}`, 'filler');
+          await store.keepUnsure(`unsure-${index}`, 'filler', []);
         }
       },
     };
@@ -1545,13 +1746,51 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
 
     expect(await claims.claim('unsure', now + 50n, 'first', now)).toBe('taken');
     expect(await claims.claim('unsure', now + 50n, 'second', now)).toBe('in-use');
-    await claims.keepUnsure('unsure', 'first');
+    await claims.keepUnsure('unsure', 'first', []);
     expect(await claims.claim('unsure', now + 50n, 'second', now)).toBe('taken');
     expect(await claims.claim('unsure', now + 50n, 'third', now)).toBe('in-use');
     await claims.release('unsure', 'first');
     await claims.markSettled('unsure', 'second', settlementFor(WALLET), now);
     await claims.release('unsure', 'second');
     expect(await claims.claim('unsure', now + 50n, 'fourth', now)).toBe('in-use');
+  });
+
+  it('C25: keeps every transaction named for an unsure claim, oldest first and at most MAX_NAMED_TXS, for the next holder only, and lets it outlive its validBefore by a day', async () => {
+    const { store: claims, count } = await claimBackend();
+    const now = 1_000n;
+    const day = BigInt(PAID_RESULT_KEEP_SECONDS);
+    const hash = (n: number) => `0x${n.toString(16).padStart(2, '0').repeat(32)}`;
+    expect(await claims.claim('paid', now + 300n, 'first', now)).toBe('taken');
+    expect(await claims.named('paid', 'first')).toEqual([]);
+    await claims.keepUnsure('paid', 'first', [hash(1), hash(2)]);
+    // Nobody holds it now, so nobody reads its transactions.
+    expect(await claims.named('paid', 'first')).toEqual([]);
+    expect(await claims.claim('paid', now + 300n, 'second', now + 5n)).toBe('taken');
+    expect(await claims.named('paid', 'second')).toEqual([hash(1), hash(2)]);
+    expect(await claims.named('paid', 'first')).toEqual([]);
+    // A repeat adds nothing, a new one goes last, and past the cap the new ones are the ones left out.
+    await claims.keepUnsure('paid', 'second', [hash(2), hash(3)]);
+    expect(await claims.claim('paid', now + 300n, 'third', now + 6n)).toBe('taken');
+    expect(await claims.named('paid', 'third')).toEqual([hash(1), hash(2), hash(3)]);
+    await claims.keepUnsure('paid', 'third', Array.from({ length: MAX_NAMED_TXS }, (_, index) => hash(10 + index)));
+    expect(await claims.claim('paid', now + 300n, 'fourth', now + 7n)).toBe('taken');
+    expect(await claims.named('paid', 'fourth')).toEqual([hash(1), hash(2), hash(3), ...Array.from({ length: MAX_NAMED_TXS - 3 }, (_, index) => hash(10 + index))]);
+    await claims.keepUnsure('paid', 'fourth', []);
+
+    // Past validBefore the authorization is still taken, to read those receipts, for a day and no longer.
+    expect(await claims.claim('paid', now + 300n, 'late', now + 300n)).toBe('taken');
+    await claims.keepUnsure('paid', 'late', []);
+    expect(await claims.claim('paid', now + 300n, 'last', now + 300n + day - 1n)).toBe('taken');
+    await claims.keepUnsure('paid', 'last', []);
+    expect(await claims.claim('paid', now + 300n, 'gone', now + 300n + day)).toBe('expired');
+
+    // An unsure claim with nothing named ends with its authorization, as before, and a fresh claim replaces it.
+    expect(await claims.claim('bare', now + 300n, 'a', now)).toBe('taken');
+    await claims.keepUnsure('bare', 'a', []);
+    expect(await claims.claim('bare', now + 300n, 'b', now + 300n)).toBe('expired');
+    expect(await claims.claim('bare', now + 900n, 'c', now + 600n)).toBe('taken');
+    expect(await claims.named('bare', 'c')).toEqual([]);
+    expect(await count()).toBeGreaterThanOrEqual(1);
   });
 
   it('refuses a validBefore past maxTimeoutSeconds plus the clock allowance, and remembers every claim until its validBefore', async () => {
@@ -1565,10 +1804,10 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     expect(await claims.claim('settled', latest, 'payer', now)).toBe('taken');
     await claims.markSettled('settled', 'payer', settlementFor(WALLET), now);
     expect(await claims.claim('unsure', latest, 'retrier', now)).toBe('taken');
-    await claims.keepUnsure('unsure', 'retrier');
+    await claims.keepUnsure('unsure', 'retrier', []);
     expect(await claims.claim('settled', latest, 'c', latest - 1n)).toBe('in-use');
     expect(await claims.claim('unsure', latest, 'late', latest - 1n)).toBe('taken');
-    await claims.keepUnsure('unsure', 'late');
+    await claims.keepUnsure('unsure', 'late', []);
     expect(await claims.claim('settled', latest, 'd', latest)).toBe('expired');
     expect(await claims.claim('unsure', latest, 'e', latest)).toBe('expired');
   });

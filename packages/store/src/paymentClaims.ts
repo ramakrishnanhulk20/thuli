@@ -18,6 +18,14 @@ export const PAID_RESULT_KEEP_SECONDS = 86_400;
  */
 export const REDEEM_SCREEN_TRIES = 2;
 
+/**
+ * Transaction hashes kept with one claim at most (C41): every one a facilitator named for the payment while its
+ * settlement was not proven. One settle is at most two facilitator calls, and a claim is tried a handful of times.
+ */
+export const MAX_NAMED_TXS = 8;
+
+const NAMED_TX = /^0x[0-9a-f]{64}$/;
+
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
 /** latestSeconds is the route's timeout plus the clock allowance: the furthest validBefore a claim accepts. */
@@ -58,22 +66,37 @@ async function claimCount(tx: Queryable): Promise<number> {
   return row?.claims ?? 0;
 }
 
+interface ClaimRow {
+  state: string;
+  valid_before: string;
+  settled_at: string | null;
+  named: number;
+}
+
+// An unsure claim that holds a transaction a facilitator named may have been paid by it. It waits for that receipt past
+// its authorization's end, for as long as a settled claim is kept, so its buyer can still come back for the result.
+function waitsOnReceipt(entry: ClaimRow, nowSeconds: bigint): boolean {
+  return entry.state === 'unsure' && entry.named > 0 && BigInt(entry.valid_before) + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
+}
+
 // A settled or served claim outlives its authorization: it stays a whole day from its settlement, so the buyer can
 // always come back for the result inside that day.
-function isDue(entry: { state: string; valid_before: string; settled_at: string | null }, nowSeconds: bigint): boolean {
+function isDue(entry: ClaimRow, nowSeconds: bigint): boolean {
   const kept = entry.settled_at !== null && BigInt(entry.settled_at) + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
-  return entry.state !== 'held' && BigInt(entry.valid_before) <= nowSeconds && !kept;
+  return entry.state !== 'held' && BigInt(entry.valid_before) <= nowSeconds && !kept && !waitsOnReceipt(entry, nowSeconds);
 }
 
 /**
  * Takes the claim on one payment authorization for owner (threat model C25), shared by every server copy. The same
  * steps and answers as PaymentClaims.claim in packages/api/src/claims.ts:
  * - 'expired' when validBefore is at or before nowSeconds, and 'too-long' when it is past nowSeconds plus
- *   latestSeconds. Neither writes anything.
+ *   latestSeconds. Neither writes anything. One expired authorization is still taken: an 'unsure' row that holds a
+ *   transaction a facilitator named, for PAID_RESULT_KEEP_SECONDS past its validBefore. The authorization can no longer
+ *   be settled, but that transaction may have paid it, and only its receipt can say.
  * - A row that is not held and whose validBefore has passed is treated as absent and replaced, unless it settled less
- *   than PAID_RESULT_KEEP_SECONDS ago.
- * - An 'unsure' row is taken over by owner and keeps the later of the two validBefore values. Any other row is
- *   'in-use'.
+ *   than PAID_RESULT_KEEP_SECONDS ago or is waiting on such a receipt.
+ * - An 'unsure' row is taken over by owner and keeps the later of the two validBefore values and its named
+ *   transactions. Any other row is 'in-use'.
  * - At MAX_PAYMENT_CLAIMS rows, the due ones are deleted first, and the answer is 'full' if it is still at the cap.
  * The decision runs in one transaction under an advisory lock on the key, and a new row also under one lock on the
  * cap, so copies of one authorization started together get exactly one 'taken'.
@@ -88,16 +111,18 @@ export async function claimPayment(
   timing: ClaimTiming,
 ): Promise<ClaimResult> {
   const { nowSeconds, latestSeconds } = timing;
-  if (validBefore <= nowSeconds) return 'expired';
-  if (validBefore > nowSeconds + latestSeconds) return 'too-long';
+  const expired = validBefore <= nowSeconds;
+  if (!expired && validBefore > nowSeconds + latestSeconds) return 'too-long';
   const now = nowSeconds.toString();
   const before = validBefore.toString();
   return db.transaction(async (tx) => {
     await tx.query('SELECT pg_advisory_xact_lock(1001, hashtext($1))', [key]);
-    let [entry] = await tx.query<{ state: string; valid_before: string; settled_at: string | null }>(
-      'SELECT state, valid_before::text AS valid_before, settled_at::text AS settled_at FROM payment_claims WHERE key = $1',
+    let [entry] = await tx.query<ClaimRow>(
+      `SELECT state, valid_before::text AS valid_before, settled_at::text AS settled_at, jsonb_array_length(named_txs) AS named
+         FROM payment_claims WHERE key = $1`,
       [key],
     );
+    if (expired && !(entry !== undefined && waitsOnReceipt(entry, nowSeconds))) return 'expired';
     if (entry !== undefined && isDue(entry, nowSeconds)) {
       await tx.query('DELETE FROM payment_claims WHERE key = $1', [key]);
       entry = undefined;
@@ -117,7 +142,8 @@ export async function claimPayment(
     if ((await claimCount(tx)) >= MAX_PAYMENT_CLAIMS) {
       await tx.query(
         `DELETE FROM payment_claims
-          WHERE state <> 'held' AND valid_before <= $1::bigint AND (settled_at IS NULL OR settled_at <= $2::bigint)`,
+          WHERE state <> 'held' AND valid_before <= $1::bigint AND (settled_at IS NULL OR settled_at <= $2::bigint)
+            AND NOT (state = 'unsure' AND jsonb_array_length(named_txs) > 0 AND valid_before > $2::bigint)`,
         [now, (nowSeconds - BigInt(PAID_RESULT_KEEP_SECONDS)).toString()],
       );
       if ((await claimCount(tx)) >= MAX_PAYMENT_CLAIMS) return 'full';
@@ -250,13 +276,44 @@ export async function leaveSettledPayment(db: Db, key: string, owner: string, ha
 
 /**
  * The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same authorization can
- * take it and ask again. Does nothing unless owner holds the key.
+ * take it and ask again. `transactions` are the hashes a facilitator named for this payment in the request that is
+ * ending. They are added to the ones the claim already holds, so the next request can read their receipts even when
+ * the facilitator will not answer for the payment again (C25). Does nothing unless owner holds the key.
+ * @throws StoreError when a transaction is not 0x and 64 lowercase hex characters, or more than MAX_NAMED_TXS are given.
  */
-export async function keepPaymentUnsure(db: Db, key: string, owner: string): Promise<void> {
+export async function keepPaymentUnsure(db: Db, key: string, owner: string, transactions: readonly string[] = []): Promise<void> {
+  if (transactions.length > MAX_NAMED_TXS) throw new StoreError(`at most ${MAX_NAMED_TXS} named transactions for one claim`);
+  if (transactions.some((hash) => typeof hash !== 'string' || !NAMED_TX.test(hash))) {
+    throw new StoreError('a named transaction must be 0x and 64 lowercase hex characters');
+  }
+  // The hashes already held come first and are never pushed out: past the cap a new one is the one left out.
   await db.query(
-    "UPDATE payment_claims SET state = 'unsure', owner = NULL WHERE key = $1 AND state = 'held' AND owner = $2",
+    `UPDATE payment_claims
+        SET state = 'unsure', owner = NULL,
+            named_txs = (
+              SELECT COALESCE(jsonb_agg(hash ORDER BY first_at), '[]'::jsonb)
+                FROM (
+                  SELECT hash, min(at) AS first_at
+                    FROM jsonb_array_elements_text(named_txs || $3::jsonb) WITH ORDINALITY AS named(hash, at)
+                   GROUP BY hash ORDER BY first_at LIMIT $4::int
+                ) AS kept
+            )
+      WHERE key = $1 AND state = 'held' AND owner = $2`,
+    [key, owner, JSON.stringify(transactions), MAX_NAMED_TXS],
+  );
+}
+
+/**
+ * The transactions a facilitator has named for a claim, oldest first: what keepPaymentUnsure stored in earlier
+ * requests. Empty unless owner holds the key.
+ */
+export async function namedPaymentTxs(db: Db, key: string, owner: string): Promise<string[]> {
+  const [row] = await db.query<{ named: unknown }>(
+    "SELECT named_txs AS named FROM payment_claims WHERE key = $1 AND state = 'held' AND owner = $2",
     [key, owner],
   );
+  const named: unknown = typeof row?.named === 'string' ? JSON.parse(row.named) : row?.named;
+  return Array.isArray(named) ? named.filter((hash): hash is string => typeof hash === 'string' && NAMED_TX.test(hash)) : [];
 }
 
 /** The settlement failed outright. Frees the key for an honest retry, but only when owner holds it. */
