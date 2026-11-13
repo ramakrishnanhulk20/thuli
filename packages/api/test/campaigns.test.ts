@@ -869,12 +869,14 @@ describe('campaign routes', () => {
     try {
       for (const chain of ['ethereum', 'base'] as const) {
         calls.length = 0;
+        answers.eth_chainId = chain === 'ethereum' ? '0x1' : '0x2105';
         const reader = accountReader(`http://127.0.0.1:${(rpc.address() as AddressInfo).port}`, chain);
         expect(await reader.sentCount(walletOf(0)), chain).toBe(42);
         expect(await reader.balance(walletOf(0)), chain).toBe(10n ** 18n);
         expect(await reader(walletOf(0)), chain).toBe(false);
-        // The wallet-type check keeps the tag it always had.
+        // The chain id is asked once, before the first read. The wallet-type check keeps the tag it always had.
         expect(calls, chain).toEqual([
+          { method: 'eth_chainId', params: undefined },
           { method: 'eth_getTransactionCount', params: [walletOf(0), 'finalized'] },
           { method: 'eth_getBalance', params: [walletOf(0), 'finalized'] },
           { method: 'eth_getCode', params: [walletOf(0), 'latest'] },
@@ -883,6 +885,87 @@ describe('campaign routes', () => {
       expect(BASE_PUBLIC_RPC).toBe('https://mainnet.base.org');
     } finally {
       await new Promise((resolve) => rpc.close(resolve));
+    }
+  });
+
+  it('a door reader answers nothing from an endpoint of another chain, and asks the chain id again after a read of it that failed (C2)', async () => {
+    const methods: string[] = [];
+    const answers: Record<string, string | null> = { eth_chainId: '0x14a34', eth_getTransactionCount: '0x2a', eth_getBalance: '0xde0b6b3a7640000', eth_getCode: '0x' };
+    const rpc = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      request.on('end', () => {
+        const call = JSON.parse(body) as { id: number; method: string };
+        methods.push(call.method);
+        const result = answers[call.method];
+        if (result === null) {
+          response.statusCode = 503;
+          response.end('down');
+          return;
+        }
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, result }));
+      });
+    });
+    await new Promise<void>((resolve) => rpc.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+    const chainIdReads = () => methods.filter((method) => method === 'eth_chainId').length;
+    try {
+      // Base Sepolia behind the setting for Base: faucet money would otherwise let a wallet through the door.
+      const onSepolia = accountReader(url, 'base');
+      await expect(onSepolia.sentCount(walletOf(0))).rejects.toThrow('the endpoint is on another chain');
+      await expect(onSepolia.balance(walletOf(0))).rejects.toThrow('the endpoint is on another chain');
+      await expect(onSepolia(walletOf(0))).rejects.toThrow('the endpoint is on another chain');
+      expect(methods).toEqual(['eth_chainId']);
+
+      // A chain id read that only failed is asked again, and once it is right it is not asked a third time.
+      methods.length = 0;
+      answers.eth_chainId = null;
+      const flaky = accountReader(url, 'base');
+      await expect(flaky.sentCount(walletOf(0))).rejects.toThrow();
+      expect(methods.every((method) => method === 'eth_chainId')).toBe(true);
+      answers.eth_chainId = '0x2105';
+      expect(await flaky.sentCount(walletOf(0))).toBe(42);
+      const asked = chainIdReads();
+      expect(await flaky.balance(walletOf(0))).toBe(10n ** 18n);
+      expect(await flaky(walletOf(0))).toBe(false);
+      expect(chainIdReads()).toBe(asked);
+    } finally {
+      await new Promise((resolve) => rpc.close(resolve));
+    }
+  });
+
+  it('a door reader does not follow an HTTP redirect to another host (C38)', async () => {
+    let reached = 0;
+    const elsewhere = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      request.on('end', () => {
+        reached += 1;
+        const call = JSON.parse(body) as { id: number; method: string };
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, result: call.method === 'eth_chainId' ? '0x1' : '0x2a' }));
+      });
+    });
+    await new Promise<void>((resolve) => elsewhere.listen(0, '127.0.0.1', resolve));
+    const redirecting = createServer((request, response) => {
+      request.resume();
+      response.statusCode = 307;
+      response.setHeader('location', `http://127.0.0.1:${(elsewhere.address() as AddressInfo).port}/`);
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirecting.listen(0, '127.0.0.1', resolve));
+    try {
+      const reader = accountReader(`http://127.0.0.1:${(redirecting.address() as AddressInfo).port}`, 'ethereum');
+      await expect(reader.sentCount(walletOf(0))).rejects.toThrow();
+      expect(reached).toBe(0);
+    } finally {
+      await new Promise((resolve) => redirecting.close(resolve));
+      await new Promise((resolve) => elsewhere.close(resolve));
     }
   });
 

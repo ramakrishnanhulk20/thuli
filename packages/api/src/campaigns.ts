@@ -862,19 +862,46 @@ export const BASE_PUBLIC_RPC = 'https://mainnet.base.org';
 
 /**
  * The account reader for Ethereum mainnet or Base mainnet: whether an address is a contract from its code, by the
- * facts' rule (isContractCode), and its sent count and balance at the finalized block. Offchain lookups are off (C38),
- * and each read gives up after 10 seconds.
+ * facts' rule (isContractCode), and its sent count and balance at the finalized block. Offchain lookups are off and an
+ * HTTP redirect is refused (C38), and each read gives up after 10 seconds.
+ *
+ * Before its first answer the reader asks the endpoint for its chain id, once, and every read rejects while the
+ * endpoint names any other chain: an endpoint of another network would answer every question, about the wrong wallets.
+ * A chain id read that fails is asked again on the next read, so one blip does not close the door for good.
  */
 export function accountReader(rpcUrl: string, chain: ScreenedChain): AccountReader {
+  const expected = chain === 'ethereum' ? mainnet : base;
   const client = createPublicClient({
-    chain: chain === 'ethereum' ? mainnet : base,
-    transport: http(rpcUrl, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1 }),
+    chain: expected,
+    transport: http(rpcUrl, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }),
     ccipRead: false,
   });
-  return Object.assign(async (address: Address) => isContractCode(await client.getCode({ address })), {
-    sentCount: (address: Address) => client.getTransactionCount({ address, blockTag: 'finalized' }),
-    balance: (address: Address) => client.getBalance({ address, blockTag: 'finalized' }),
+  let chainChecked: Promise<void> | null = null;
+  const onItsChain = async <T>(read: () => Promise<T>): Promise<T> => {
+    chainChecked ??= client.getChainId().then((answered) => {
+      if (answered !== expected.id) {
+        console.error(`api ask door: the ${chain} endpoint answers for chain ${answered}, not ${expected.id}`);
+        throw new WrongChain();
+      }
+    });
+    try {
+      await chainChecked;
+    } catch (error) {
+      // A wrong chain stays refused; a read that only failed is asked again next time.
+      if (!(error instanceof WrongChain)) chainChecked = null;
+      throw error;
+    }
+    return read();
+  };
+  return Object.assign(async (address: Address) => onItsChain(async () => isContractCode(await client.getCode({ address }))), {
+    sentCount: (address: Address) => onItsChain(() => client.getTransactionCount({ address, blockTag: 'finalized' })),
+    balance: (address: Address) => onItsChain(() => client.getBalance({ address, blockTag: 'finalized' })),
   });
+}
+
+class WrongChain extends Error {
+  override name = 'WrongChain';
+  override message = 'the endpoint is on another chain';
 }
 
 /**
