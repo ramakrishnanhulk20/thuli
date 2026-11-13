@@ -159,6 +159,8 @@ interface PaidRequest {
   payment: Payment | null;
   /** True when the latest settle call threw rather than answering, so its outcome is unknown. */
   settleThrew: boolean;
+  /** The transaction a pending settle answer named in this request, from any of its settle calls, or null. */
+  pendingTx: string | null;
   /**
    * Set when the reply must replace the payment middleware's: retry for an unknown outcome, busy for a full claim map,
    * settled for a payment that went through and that another request is screening now.
@@ -415,16 +417,14 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // The settle-failure hook is handed the same kind of error whether the facilitator answered "failed" or the call
   // threw, so the throw is noted here, per call, where the two can still be told apart.
   //
-  // One throw is not an unknown outcome. A facilitator that refuses a payment before sending it may say so with a 4xx
-  // status and a settle body, where another says it with a 200: Coinbase's answers an unfunded wallet with 400
-  // insufficient_funds. The client turns that into a thrown SettleError. It is the facilitator's own "failed", so the
-  // buyer gets 402 with the reason and the claim is released, instead of a retry that can never succeed and a claim
-  // held for nothing. A 5xx, an answer that names a transaction, and every other throw stay unknown (C25).
-  const refusedBeforeSending = (error: unknown) =>
-    error instanceof SettleError &&
-    error.statusCode >= 400 &&
-    error.statusCode < 500 &&
-    (error.transaction === undefined || error.transaction === '');
+  // Every throw is an unknown outcome, a refusal included. Coinbase's facilitator refuses with a 4xx and a settle body,
+  // which the client throws, and it answers a payment that already went through (its nonce used, the payer's balance
+  // now too low) in that same shape, with no transaction named. So a 4xx is never read as "nothing moved" (C25).
+  //
+  // One settle can also be two calls: after a pending answer the library asks again, and the hook sees only the last
+  // answer. The transaction a pending answer named is kept here, so the claim is never released while it may still land.
+  const pendingHash = (answer: { errorReason?: string | undefined; transaction?: string | undefined }) =>
+    answer.errorReason === 'settlement_pending' && typeof answer.transaction === 'string' && answer.transaction !== '' ? answer.transaction : null;
   const facilitator: FacilitatorClient = {
     getSupported: () => config.facilitator.getSupported(),
     verify: (payload, requirements) => config.facilitator.verify(payload, requirements),
@@ -432,9 +432,14 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       const request = paidRequests.getStore();
       if (request !== undefined) request.settleThrew = false;
       try {
-        return await config.facilitator.settle(payload, requirements);
+        const answer = await config.facilitator.settle(payload, requirements);
+        if (request !== undefined && !answer.success) request.pendingTx = pendingHash(answer) ?? request.pendingTx;
+        return answer;
       } catch (error) {
-        if (request !== undefined) request.settleThrew = !refusedBeforeSending(error);
+        if (request !== undefined) {
+          request.settleThrew = true;
+          if (error instanceof SettleError) request.pendingTx = pendingHash(error) ?? request.pendingTx;
+        }
         throw error;
       }
     },
@@ -559,7 +564,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // this exact payment. Anything else unclear (a throw, a timeout, pending with no hash or no proof) keeps the claim and
   // answers 503 retry: the buyer resends the same header, which can never pay twice, and nothing is served on a guess.
   // A plain "failed" answer falls through, so the claim is released and the buyer gets 402 as before.
-  resourceServer.onSettleFailure(async ({ error, phase }) => {
+  resourceServer.onSettleFailure(async ({ phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) return;
     const claim = request.claim;
@@ -574,12 +579,13 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       }
     };
     try {
-      const pending = error instanceof SettleError && error.errorReason === 'settlement_pending';
-      if (!pending) {
+      // The hash this request was told is pending, whichever of its settle calls said so.
+      const pendingTx = request.pendingTx;
+      if (pendingTx === null) {
         if (request.settleThrew) await keepForRetry();
         return;
       }
-      const hash = TxHashText.safeParse(error.transaction);
+      const hash = TxHashText.safeParse(pendingTx);
       if (!hash.success || !(await paidOnChain(request, hash.data, claim))) {
         await keepForRetry();
         return;
@@ -704,6 +710,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       stored: null,
       payment: null,
       settleThrew: false,
+      pendingTx: null,
       answer: null,
     };
     try {

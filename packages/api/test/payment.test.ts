@@ -542,48 +542,104 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     }
   });
 
-  it('reads a settle refused with a 4xx and no transaction as failed: 402 with the reason, and the same header may pay later', async () => {
-    const facilitator = new StubFacilitator('eip155:84532');
-    // Coinbase's facilitator answers an unfunded wallet this way, and the client throws it.
-    facilitator.respond = async () => {
-      throw new SettleError(400, { success: false, errorReason: 'insufficient_funds', errorMessage: 'contract call failed', transaction: '', network: 'eip155:84532' });
-    };
-    const readReceipt = vi.fn(noChain);
-    const { appFetch, client, screen } = await setup({ facilitator, readReceipt });
-    const header = await signedHeader(appFetch, client);
-    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(first.status).toBe(402);
-    expect(decodePaymentResponseHeader(first.headers.get('payment-response') as string).errorReason).toBe('insufficient_funds');
-    expect(JSON.stringify(await first.json())).not.toContain('decision');
-    expect(screen).not.toHaveBeenCalled();
+  const refusal = (reason: string, status = 400, transaction = '') =>
+    new SettleError(status, { success: false, errorReason: reason, transaction, network: 'eip155:84532' });
 
-    // The claim was released, not kept unsure: once the wallet is funded the same header settles and is screened once.
-    facilitator.respond = null;
-    const funded = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(funded.status).toBe(200);
-    expect(screen).toHaveBeenCalledTimes(1);
-    expect(facilitator.settled).toHaveLength(2);
-    expect(readReceipt).not.toHaveBeenCalled();
-  });
-
-  it('keeps a thrown settle answer unknown when it carries a 5xx status or names a transaction: 503 retry, never 402', async () => {
-    const unknown = {
-      'a 5xx status': new SettleError(502, { success: false, errorReason: 'unexpected_settle_error', transaction: '', network: 'eip155:84532' }),
-      'a transaction hash': new SettleError(400, { success: false, errorReason: 'unexpected_settle_error', transaction: SETTLE_TX, network: 'eip155:84532' }),
+  it('reads every thrown settle answer as unknown, a 4xx refusal that names no transaction included: 503 retry, never 402', async () => {
+    // Coinbase's facilitator answers an unfunded wallet, and a payment that already went through, in this same shape.
+    const thrown = {
+      'insufficient funds': refusal('insufficient_funds'),
+      'a nonce already used': refusal('invalid_exact_evm_nonce_already_used'),
+      'a 5xx status': refusal('unexpected_settle_error', 502),
+      'a transaction hash': refusal('unexpected_settle_error', 400, SETTLE_TX),
     };
-    for (const [name, failure] of Object.entries(unknown)) {
+    for (const [name, failure] of Object.entries(thrown)) {
       const facilitator = new StubFacilitator('eip155:84532');
       facilitator.respond = async () => {
         throw failure;
       };
-      const { appFetch, client, screen } = await setup({ facilitator });
+      const readReceipt = vi.fn(noChain);
+      const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt });
       const header = await signedHeader(appFetch, client);
       const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
       expect(first.status, name).toBe(503);
       expect(await first.json(), name).toEqual({ retry: true });
       expect(first.headers.get('payment-response'), name).toBeNull();
       expect(screen, name).not.toHaveBeenCalled();
+
+      // The claim was kept, so once the facilitator settles, the same header is served, and served once.
+      facilitator.respond = null;
+      const later = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(later.status, name).toBe(200);
+      expect(screen, name).toHaveBeenCalledTimes(1);
+      expect(readReceipt, name).not.toHaveBeenCalled();
     }
+  });
+
+  it('keeps the hash a pending answer named when the library asks again and is refused: served on its receipt, else 503, never 402', async () => {
+    // One settle is two facilitator calls here: pending with a hash, then a refusal. Both shapes of refusal are tried.
+    const secondAnswers: Record<string, () => Promise<SettleResponse>> = {
+      'a thrown 400': async () => {
+        throw refusal('invalid_exact_evm_nonce_already_used');
+      },
+      'a 200 that says failed': async () => ({
+        success: false,
+        errorReason: 'invalid_exact_evm_nonce_already_used',
+        transaction: '',
+        network: 'eip155:84532',
+      }),
+    };
+    const paidLogs = ({ from, nonce }: Signed) => [authorizationLog('AuthorizationUsed', USDC_SEPOLIA, from, nonce), transferLog(USDC_SEPOLIA, from, PAY_TO, PRICE)];
+    for (const [name, second] of Object.entries(secondAnswers)) {
+      for (const proven of [true, false]) {
+        const label = `${name}, receipt ${proven ? 'proves the payment' : 'cannot be read'}`;
+        const facilitator = new StubFacilitator('eip155:84532');
+        let calls = 0;
+        facilitator.respond = async (payload, requirements) => {
+          calls += 1;
+          return calls === 1 ? pendingAnswer(payload, requirements) : second();
+        };
+        const receipt = receiptOf(facilitator, paidLogs);
+        const { appFetch, client, screen } = await setup({ facilitator, readReceipt: proven ? receipt.read : noChain });
+        const header = await signedHeader(appFetch, client);
+        const reply = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+        expect(calls, label).toBe(2);
+        if (proven) {
+          expect(reply.status, label).toBe(200);
+          expect(PaidScreenResponse.parse(await reply.json()).payment.transaction, label).toBe(PENDING_TX);
+          expect(receipt.reads, label).toEqual([PENDING_TX]);
+          expect(screen, label).toHaveBeenCalledTimes(1);
+        } else {
+          expect(reply.status, label).toBe(503);
+          expect(await reply.json(), label).toEqual({ retry: true });
+          expect(screen, label).not.toHaveBeenCalled();
+        }
+      }
+    }
+  });
+
+  it('keeps the claim when a settle that timed out is followed by a refusal on the resend, then serves the header once it settles', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = async () => {
+      throw new FacilitatorTimeoutError('settle', 90_000);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+
+    // The first settle may have gone through, so a facilitator that now says "already used" is not a reason to let go.
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_nonce_already_used');
+    };
+    const resend = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(resend.status).toBe(503);
+    expect(await resend.json()).toEqual({ retry: true });
+    expect(screen).not.toHaveBeenCalled();
+
+    facilitator.respond = null;
+    const served = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(served.status).toBe(200);
+    expect(screen).toHaveBeenCalledTimes(1);
   });
 
   it('never serves an authorization whose nonce was spent without paying us, by a cancel or by paying the payer itself', async () => {
