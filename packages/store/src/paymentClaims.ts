@@ -98,7 +98,8 @@ interface ClaimRow {
 
 // A claim that holds a transaction a facilitator named may have been paid by it. It waits for that receipt past its
 // authorization's end, for as long as a settled claim is kept, so its buyer can still come back for the result. Only a
-// claim that has not settled holds one: unsure, or held by the request that is reading the receipt right now.
+// claim that has not settled holds one: unsure, or held by a request that is settling it or reading its receipt, or that
+// is gone.
 function waitsOnReceipt(entry: ClaimRow, nowSeconds: bigint): boolean {
   return entry.named > 0 && BigInt(entry.valid_before) + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
 }

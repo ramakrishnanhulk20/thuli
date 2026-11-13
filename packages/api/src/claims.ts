@@ -281,7 +281,7 @@ export class PaymentClaims {
   }
 
   // A claim that holds a named transaction may have been paid by it, and only that receipt can say. Only a claim that
-  // has not settled holds one: unsure, or held by the request that is reading the receipt right now.
+  // has not settled holds one: unsure, or held by a request that is settling it or reading its receipt, or that is gone.
   #waitsOnReceipt(entry: Claim, nowSeconds: bigint): boolean {
     return entry.named.length > 0 && entry.validBefore + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
   }
