@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { formatInt } from '@/lib/format';
+import { countOf, formatInt } from '@/lib/format';
 import { addressUrl, shortAddress, shortHash, txUrl } from '@/lib/explorer';
 import { hopsText, ruleMeaning } from '@/lib/rules';
 import { OUTCOME_STYLES, type Loaded, type WalletDetail } from '@/lib/replay/replayTypes';
@@ -89,7 +89,7 @@ function WhatTheCodeFound({ detail, groups, onOpenFamily }: { detail: WalletDeta
 
   return (
     <dl className={styles.facts}>
-      <Fact name="Wallet age">{facts.ageDays === null ? 'not read' : `${formatInt(facts.ageDays)} days at the snapshot`}</Fact>
+      <Fact name="Wallet age">{facts.ageDays === null ? 'not read' : `${countOf(facts.ageDays, 'day')} at the snapshot`}</Fact>
       <Fact name="Transactions before the snapshot">{facts.txCount === null ? 'not read' : formatInt(facts.txCount)}</Fact>
       <Fact name="Account type">{facts.accountType}</Fact>
       <Fact name="First funder">

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import { formatFraction, formatInt, formatPercent } from '../lib/format';
+import { countOf, formatFraction, formatInt, formatPercent } from '../lib/format';
 import { buildRepeatability, buildScorecard, intervalLine, loadConsistency, loadScorecard, routesTotal } from '../lib/replay/load';
 import type { ConsistencyFile, HopFile, RateWithRange, VersionsFile } from '../lib/replay/types';
 
@@ -16,6 +16,15 @@ const versions = readJson<VersionsFile>('versions.json');
 const hop = readJson<HopFile>('hop.json');
 const page = loadScorecard(root);
 const row = (key: string) => page.rows.find((entry) => entry.key === key) as (typeof page.rows)[number];
+
+describe('countOf', () => {
+  it('writes one of a thing without an s and every other count with one', () => {
+    expect(countOf(1, 'day')).toBe('1 day');
+    expect(countOf(0, 'day')).toBe('0 days');
+    expect(countOf(2, 'transaction')).toBe('2 transactions');
+    expect(countOf(1204, 'day')).toBe('1,204 days');
+  });
+});
 
 describe('scorecard rows', () => {
   it('has the four rows in order', () => {

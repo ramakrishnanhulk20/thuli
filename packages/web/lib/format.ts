@@ -4,6 +4,11 @@ export function formatInt(n: number): string {
   return whole.format(Math.round(n));
 }
 
+/** A count with its noun: "1 day", "2 days", "1,204 days". The plural is the noun with an s. */
+export function countOf(n: number, noun: string): string {
+  return `${formatInt(n)} ${noun}${Math.round(n) === 1 ? '' : 's'}`;
+}
+
 export function formatUsd(n: number): string {
   return `$${formatInt(n)}`;
 }

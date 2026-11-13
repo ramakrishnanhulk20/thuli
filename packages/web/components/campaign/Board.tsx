@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { relativeTime } from '@/lib/check';
 import { addressLink, historyChainId, shortAddress, txLink } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
-import { formatInt } from '@/lib/format';
+import { countOf, formatInt } from '@/lib/format';
 import {
   APPEAL_COPY,
   appealChip,
@@ -54,7 +54,7 @@ export function Facts({ ask }: { ask: AskJson }) {
   return (
     <div className={styles.facts} data-facts>
       <Fact name="History read on">{facts.chain === 'base' ? 'Base' : 'Ethereum'}</Fact>
-      <Fact name="Wallet age">{facts.ageDays === null ? 'not read' : `${formatInt(facts.ageDays)} days`}</Fact>
+      <Fact name="Wallet age">{facts.ageDays === null ? 'not read' : countOf(facts.ageDays, 'day')}</Fact>
       <Fact name="Transactions sent">{facts.txCount === null ? 'not read' : formatInt(facts.txCount)}</Fact>
       <Fact name="First funder">
         {funder === null ? (

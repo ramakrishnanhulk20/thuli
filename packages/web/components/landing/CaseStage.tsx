@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import gsap from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
 import { motion } from 'motion/react';
-import { formatInt, formatUsd } from '@/lib/format';
+import { countOf, formatInt, formatUsd } from '@/lib/format';
 import type { CaseFileData } from '@/lib/replay/caseFile';
 import { Drop } from '../Drop';
 import styles from './landing.module.css';
@@ -111,7 +111,7 @@ export function CaseStage({ data }: { data: CaseFileData }) {
   const steps = [
     {
       heading: 'It looks like a new wallet.',
-      body: `${data.ageDays} days old, ${data.txCount} transactions before the snapshot, and a claim for ${formatInt(data.robo)} ROBO, about ${formatUsd(data.usd)} at the claim-day price. On its own, nothing here proves anything.`,
+      body: `${countOf(data.ageDays, 'day')} old, ${countOf(data.txCount, 'transaction')} before the snapshot, and a claim for ${formatInt(data.robo)} ROBO, about ${formatUsd(data.usd)} at the claim-day price. On its own, nothing here proves anything.`,
     },
     {
       heading: 'Thuli follows the money back.',
