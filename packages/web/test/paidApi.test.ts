@@ -35,9 +35,10 @@ describe('loadPaidExample', () => {
   });
 
   it('names the network and builds the settlement link on its explorer', () => {
-    expect(example.networkName).toBe('Base Sepolia');
-    expect(example.testnet).toBe(true);
-    expect(example.settlementUrl).toBe(`https://sepolia.basescan.org/tx/${answer().payment.transaction}`);
+    expect(example.networkName).toBe('Base');
+    expect(example.testnet).toBe(false);
+    expect(example.settlementUrl).toBe(`https://basescan.org/tx/${answer().payment.transaction}`);
+    expect(answer().payment.network).toBe(example.networkId);
   });
 });
 
@@ -53,13 +54,13 @@ describe('the reason the receipt shows', () => {
 });
 
 describe('checkPaidExample', () => {
-  it('builds the Base mainnet link and name for eip155:8453', () => {
-    const base = terms();
-    base.accepts[0].network = 'eip155:8453';
-    const result = checkPaidExample(base, answer());
-    expect(result.networkName).toBe('Base');
-    expect(result.testnet).toBe(false);
-    expect(result.settlementUrl).toBe(`https://basescan.org/tx/${answer().payment.transaction}`);
+  it('builds the Base Sepolia link and name for eip155:84532', () => {
+    const sepolia = terms();
+    sepolia.accepts[0].network = 'eip155:84532';
+    const result = checkPaidExample(sepolia, answer());
+    expect(result.networkName).toBe('Base Sepolia');
+    expect(result.testnet).toBe(true);
+    expect(result.settlementUrl).toBe(`https://sepolia.basescan.org/tx/${answer().payment.transaction}`);
   });
 
   it('refuses a changed scheme', () => {

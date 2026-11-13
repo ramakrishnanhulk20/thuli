@@ -1,16 +1,16 @@
 {
   "wallet": "0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a",
-  "checkedAt": "2026-11-11T07:49:55.310Z",
+  "checkedAt": "2026-11-13T05:11:00.552Z",
   "scope": "one wallet on Ethereum, no claim list",
   "rulebook": "v2",
   "decision": {
     "action": "partial",
     "shareBps": 5000,
     "rule": "A8",
-    "reason": "A8: The wallet is 261 days old with 3 pre-snapshot activities. No linked group, shared funding, shared collector, wallet-made links, or shared exchange claimants are recorded; the funder is unknown and its claimant count is unreadable.",
+    "reason": "A8: The EOA is 263 days old with 3 pre-snapshot activities and no recorded claimant-group, shared-funding, collector-sweep, wallet-made, or exchange links. The first funder is unknown and its claimant count is unreadable.",
     "citedTxs": []
   },
-  "servRequestId": "0fc3aea3-9a57-41e1-9d4b-c474c3df9899",
+  "servRequestId": "41e77638-6926-4512-a99f-8cdb245e0c67",
   "notChecked": [
     "group",
     "sharedDepositAddress",
@@ -18,8 +18,8 @@
     "claimPaidToOtherAddress"
   ],
   "payment": {
-    "network": "eip155:84532",
+    "network": "eip155:8453",
     "payer": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
-    "transaction": "0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1"
+    "transaction": "0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4"
   }
 }
