@@ -456,13 +456,16 @@ the terms in the `PAYMENT-REQUIRED` header, which is base64 of a JSON object:
 
 - `x402Version`: `2`
 - `error`: `"Payment required"`
-- `resource`: `{ url, description, mimeType: "application/json" }`. `url` is `PUBLIC_ORIGIN` plus the path when that is
-  set (Base mainnet requires it), otherwise the request's own URL.
+- `resource`: `{ url, description, mimeType: "application/json" }`. `url` is the server's public origin plus the path:
+  `PUBLIC_ORIGIN`, or else the production host Vercel names in `VERCEL_PROJECT_PRODUCTION_URL`, both held to the same
+  shape. A server on Base mainnet needs one of them. With neither, on Base Sepolia, it is the request's own URL.
 - `accepts`: one entry, `{ scheme: "exact", network, amount: "50000", asset, payTo, maxTimeoutSeconds: 300, extra }`.
   `network` is `eip155:84532` on Base Sepolia or `eip155:8453` on Base. `asset` is that network's USDC:
   `0x036CbD53842c5426634e7929541eC2318f3dCF7e` on Base Sepolia, `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` on Base.
   `extra` holds `paymentFlow: "upfront"` plus any token details the x402 library adds for signing.
-- `extensions.bazaar`: the discovery listing, with an input example and the JSON schema of the success body below.
+- `extensions.bazaar`: the discovery listing, with an input example and the JSON schema of the success body below. A
+  settled payment that carries it asks the facilitator's catalogue to list the route. A server only its own machine can
+  reach is started with `unlisted` and sends none: the proof script's own server is.
 
 A request that looks like a browser page load (an Accept header with `text/html` and a Mozilla user agent) gets the
 x402 library's HTML paywall instead of the JSON body. A `fetch` from the web app does not, unless it sets that Accept
@@ -562,10 +565,10 @@ Errors, in the order the route checks for them:
 | 503 | `{"busy": true}` | the store that keeps the ceilings could not be reached; no payment was asked for |
 | 402 | `{"error": "Payment required"}` with `PAYMENT-REQUIRED` | no payment header |
 | 402 | `{"error": "No matching payment requirements"}` with a fresh `PAYMENT-REQUIRED` | the payment header does not match the terms |
-| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A facilitator failure carries the facilitator's reason. |
+| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A facilitator failure carries the facilitator's reason, whether it came with a 200 or, as Coinbase's facilitator sends a refusal, with a 4xx that names no transaction (`insufficient_funds`, `invalid_exact_evm_payload_signature`). |
 | 503 | `{"busy": true}` | under 120.5 seconds of the deadline are left, so nothing was claimed or settled |
 | 503 | `{"retry": true}` | the store could not record the claim on this payment, so it was not settled. Send the same payment header again. |
-| 503 | `{"retry": true}` | the settlement's outcome is unknown. Send the same payment header again; it can never pay twice. |
+| 503 | `{"retry": true}` | the settlement's outcome is unknown: no answer, a timeout, a 5xx, or a failure that names a transaction. Send the same payment header again; it can never pay twice. |
 | 503 | `{"settled": true, "retry": true, "message": "The payment has settled. Send the same payment header again to get the screening it bought."}` with `Retry-After: 10` | the payment settled and no result is stored yet: under 20 seconds were left to screen, a screening before the last try ran out of time, or another request is screening this payment now. Send the same payment header again; it is never charged again. |
 | 500 | `{"error": "the payment could not be confirmed"}` or `{"error": "internal error"}` | an internal fault; no detail is returned |
 
@@ -629,7 +632,7 @@ runs, whatever path the host gives its files. The pieces the site and the standa
 
 - `loadApiConfig(env)` in `packages/api/src/config.ts` reads and checks the settings: `X402_NETWORK` (`base` or
   `base-sepolia`, no default); `PAYTO_ADDRESS_TESTNET` on Base Sepolia or `PAYTO_ADDRESS` on Base; `CDP_API_KEY_ID`,
-  `CDP_API_KEY_SECRET`, `PUBLIC_ORIGIN` and `BASE_RPC_URL` on Base; optional `FACILITATOR_URL` on Base Sepolia;
+  `CDP_API_KEY_SECRET`, `BASE_RPC_URL` and a public origin (`PUBLIC_ORIGIN` or Vercel's production host) on Base; optional `FACILITATOR_URL` on Base Sepolia;
   optional `TRUSTED_CLIENT_HEADER`; optional `DATABASE_URL`, a `postgres://` or `postgresql://` URL; and `PORT` for the
   standalone server. It refuses to start while any variable whose name ends in `PRIVATE_KEY` is set, so the web app's
   server environment must hold no private key. The database URL holds a password, so it is kept out of anything that
@@ -940,7 +943,8 @@ searching the code.
 - A deployed worker host. There is no container, process manager or host configuration; the worker runs as scripts on
   one machine.
 - A campaign on Base mainnet. The factory is deployed there and one proof vault paid 1 real USDC (4.1). That is one
-  vault, one list and one wallet; the campaign and the paid route's proofs are on Base Sepolia.
+  vault, one list and one wallet; the campaign is on Base Sepolia. The paid route has settled one real payment on
+  Base mainnet (0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4, 13 Nov 2026), in a run on one machine.
 - Owner sign-in for appeals. Appeals are filed through the public route, checked by the outside check and settled by an
   operator's command (4.6). No owner can sign in to settle one, the scorecard does not score appeals, and no Reppo
   evaluation has been run for one yet.

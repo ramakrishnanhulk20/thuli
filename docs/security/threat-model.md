@@ -272,14 +272,17 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   for the wallet the payment was made for and within a day of the settlement, redeemed: it gets that payment's stored
   result and settles nothing (C48). The payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
   price (the exact scheme needs strict equality), inside its validity window. The route settles on the network the
-  configuration names: it is proved on Base Sepolia, and Base mainnet is supported by configuration and has not been
-  run. Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
+  configuration names: it is proved on Base Sepolia, and one real payment has been settled on Base mainnet
+  (13 Nov 2026). Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
   (hold, with the cause), so a settled payment always buys a result. Shown by: one payment header replayed in 10 parallel
   requests yields one result, and a Base Sepolia payment to a mainnet route is refused. When settlement is pending, the
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer
   of exactly the price from the payer to our payTo in the network's USDC; a used nonce alone is not proof, because a
   payer can cancel or spend it elsewhere. A timeout or error returns retry with the claim kept, so a header never pays
-  twice and is never served on a guess. An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
+  twice and is never served on a guess. One answer is not an unknown: a settle the facilitator refuses outright, with a
+  4xx answer that names no transaction, is a failed settle, so the buyer gets 402 with the facilitator's reason and the
+  claim is released. Coinbase's facilitator answers an unfunded wallet and a bad signature this way (shown live with
+  payments that could not move money: `insufficient_funds` and `invalid_exact_evm_payload_signature`). An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
   route's timeout plus 30 seconds is refused, and a used claim is remembered until its validBefore, so no copy of a header
   can outlive its claim. With a database configured the claims live in Postgres, shared by every server copy and kept
   across a restart. Once a settlement is confirmed the buyer gets the result whatever the store does: a claim the store

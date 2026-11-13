@@ -10,7 +10,7 @@ Thuli is Tamil for "a drop": every drop of an airdrop should land in a real hand
 
 Each number has its limits stated in [What was measured](#what-was-measured).
 
-Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. Everything on chain is Base Sepolia with test USDC, which has no value. The site is not hosted yet, so this repository is how you see it: each claim below comes with a command you can run on a fresh clone.
+Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. The campaign and its vaults are on Base Sepolia with test USDC, which has no value. Two things have run with real USDC on Base mainnet: one small proof vault, and one 5 cent payment to the paid API. The site is not hosted yet, so this repository is how you see it: each claim below comes with a command you can run on a fresh clone.
 
 [Docs](packages/web/content/docs/index.mdx) (the `/docs` route of the app) | [Architecture](ARCHITECTURE.md) | [Threat model](docs/security/threat-model.md) | [Licence](LICENSE)
 
@@ -99,7 +99,7 @@ For a wallet:
 
 For another agent or a developer:
 
-- A paid API over x402, a standard that puts payment inside an HTTP request. `POST /api/x402/screen` costs $0.05 in USDC (exactly `50000` base units) for one wallet. The payment settles before the screening runs and is charged once, and for 24 hours the same payment header for the same wallet returns the stored result at no charge. It has been proved only on Base Sepolia, with test USDC.
+- A paid API over x402, a standard that puts payment inside an HTTP request. `POST /api/x402/screen` costs $0.05 in USDC (exactly `50000` base units) for one wallet. The payment settles before the screening runs and is charged once, and for 24 hours the same payment header for the same wallet returns the stored result at no charge. It has taken one real payment, 5 cents of USDC on Base mainnet ([transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4)), after a full run on Base Sepolia with test USDC.
 - Public replay files under [`packages/web/public/replay`](packages/web/public/replay): the summary, one entry per claim wallet, one file per linked family, the rulebook scorecard, the Hop control numbers and the repeatability run. No file holds a raw model reply.
 - A page of ten live attacks at `/break`: five simulated calls against the proof vault, four requests to the site's own routes, and one check that a reason is shown as plain text.
 
@@ -397,7 +397,7 @@ Optional steps that need a tool or a test key:
 
 - Contract tests. Install Foundry from [getfoundry.sh](https://getfoundry.sh), run `npm install --prefix packages/contracts`, then `npm run contracts:test`. Expect `77 tests passed, 0 failed, 2 skipped (79 total tests)`.
 - A live check of any wallet at `/check`. It calls SERV, so it needs a SERV API key: make one under "API keys" at [console.openserv.ai](https://console.openserv.ai). Copy `.env.web.example` to `packages/web/.env.local` and fill the values listed in the Quick start. It shows a decision, a rule, a reason and the transactions behind it within about two minutes.
-- The paid route, `npm run prove:paid`. It needs the SERV values in `.env.api`, and a throwaway test key in `.env.payer` as `PAYER_PRIVATE_KEY` (make one with Foundry's `cast wallet new`) holding at least 5 cents of Base Sepolia test USDC from [Circle's faucet](https://faucet.circle.com). It pays for one screening, then fetches the stored result 10 more times with the same payment header and checks that each copy is identical. It also checks that a fresh header that never settled buys no result, and that exactly 5 cents left the wallet, so the payment was charged once.
+- The paid route, `npm run prove:paid`. It needs the SERV values in `.env.api`, and a throwaway test key in `.env.payer` as `PAYER_PRIVATE_KEY` (make one with Foundry's `cast wallet new`) holding at least 5 cents of Base Sepolia test USDC from [Circle's faucet](https://faucet.circle.com). With `X402_NETWORK=base` and the Coinbase keys in `.env.api`, the same command pays 5 cents of real USDC on Base. It pays for one screening, then fetches the stored result 10 more times with the same payment header and checks that each copy is identical. It also checks that a fresh header that never settled buys no result, and that exactly 5 cents left the wallet, so the payment was charged once.
 - The whole campaign path on a local copy of Base Sepolia, `npm run rehearse:campaign`. It needs Foundry's `anvil` and the SERV, Ethereum and Base Sepolia values in `.env`. Six throwaway keys ask, live SERV screens them, the approved wallets take three slots and the worker submits their claims. Two more campaigns on the same copy show the worker recovering from a post it never recorded, a publish that stalls, a pause across a list's activation and a dropped transaction. It prints `pass` or `FAIL` for each check and sends no transaction to a public network.
 
 ## Quick start
@@ -429,7 +429,7 @@ Environment files. Each is a file you create, and none is committed. Only names 
 
 The replay, decide, feedback and scoring scripts, `prove:slice`, `appeal:demo` and `vault:deploy` load `.env` as required, so they stop at once with `node: .env: not found` (exit code 9) until you create it. `prove:vault`, `db:migrate`, `worker`, `vault:create`, `vault:verify`, `campaign:create`, `campaign:requeue`, `appeal:list`, `appeal:settle`, `appeal:export`, `consistency` and `rehearse:campaign` carry on without it and stop on their own message about the missing setting (exit code 1 or 2). `api:dev` stops the same way without `.env.api`, and `prove:paid` without `.env.api` and `.env.payer`.
 
-`X402_NETWORK` has no default, so testnet is a choice you make: `base-sepolia` for test USDC or `base` for real USDC. The paid route has been proved only on `base-sepolia`.
+`X402_NETWORK` has no default, so testnet is a choice you make: `base-sepolia` for test USDC or `base` for real USDC. The paid route has been run on both.
 
 The local database. `npm run db:migrate` needs `DATABASE_URL` set, as a `postgres://` or `postgresql://` connection string, in `.env` or in your shell. It applies the SQL files in [`packages/store/migrations`](packages/store/migrations), prints what it applied, and is safe to run again. With `DATABASE_URL` unset it stops with exit code 2 and the line `DATABASE_URL is not set. Put a postgres:// connection string in .env.` The site alone needs no database locally: leave `DATABASE_URL` empty and it runs an in-process one whose contents are lost on restart.
 
@@ -482,56 +482,53 @@ curl -i -X POST http://localhost:3000/api/x402/screen \
   -d '{"wallet": "0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a"}'
 ```
 
-The 402 answer, decoded from `PAYMENT-REQUIRED` ([`payment-required.json`](packages/api/examples/payment-required.json)), with the discovery listing cut:
+The 402 answer, decoded from `PAYMENT-REQUIRED` ([`payment-required.json`](packages/api/examples/payment-required.json)). It was captured from the real payment on Base described below, made to a server only its own machine could reach, so its address is a local one and it carries no discovery listing:
 
 ```json
 {
   "x402Version": 2,
   "error": "Payment required",
   "resource": {
-    "url": "http://localhost:3300/api/x402/screen",
+    "url": "http://127.0.0.1:51851/api/x402/screen",
     "description": "Screens one Ethereum wallet with Thuli's airdrop rulebook v2 and returns a decision (full, partial, hold or exclude) with the rule, a plain reason and the transactions behind it. One wallet on its own, no claim list.",
     "mimeType": "application/json"
   },
   "accepts": [
     {
       "scheme": "exact",
-      "network": "eip155:84532",
+      "network": "eip155:8453",
       "amount": "50000",
-      "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-      "payTo": "0x93d50219322Bf8B7145FE3780a087ec1EC564C2e",
+      "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "payTo": "0x96E854aBDdc5C618ca843956d1303017b586aB75",
       "maxTimeoutSeconds": 300,
       "extra": {
-        "name": "USDC",
+        "name": "USD Coin",
         "version": "2",
         "paymentFlow": "upfront"
       }
     }
-  ],
-  "extensions": {
-    "bazaar": { "...": "input example and JSON schema of the success body" }
-  }
+  ]
 }
 ```
 
-That asks for `50000` base units, which is 5 cents, of Base Sepolia test USDC. A client signs that payment and asks again with a `PAYMENT-SIGNATURE` header. The x402 libraries do this for you. The committed worked example is [`packages/api/scripts/prove-paid.ts`](packages/api/scripts/prove-paid.ts), which uses `x402Client`, `ExactEvmScheme` and `wrapFetchWithPayment` from the `@x402/*` packages.
+That asks for `50000` base units, which is 5 cents, of USDC on Base. A public site's terms name the site's own address and also carry `extensions.bazaar`, the discovery listing. A client signs that payment and asks again with a `PAYMENT-SIGNATURE` header. The x402 libraries do this for you. The committed worked example is [`packages/api/scripts/prove-paid.ts`](packages/api/scripts/prove-paid.ts), which uses `x402Client`, `ExactEvmScheme` and `wrapFetchWithPayment` from the `@x402/*` packages.
 
 The paid answer, a 200 with a `PAYMENT-RESPONSE` header ([`paid-screen-response.json`](packages/api/examples/paid-screen-response.json)):
 
 ```json
 {
   "wallet": "0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a",
-  "checkedAt": "2026-11-11T07:49:55.310Z",
+  "checkedAt": "2026-11-13T05:11:00.552Z",
   "scope": "one wallet on Ethereum, no claim list",
   "rulebook": "v2",
   "decision": {
     "action": "partial",
     "shareBps": 5000,
     "rule": "A8",
-    "reason": "A8: The wallet is 261 days old with 3 pre-snapshot activities. No linked group, shared funding, shared collector, wallet-made links, or shared exchange claimants are recorded; the funder is unknown and its claimant count is unreadable.",
+    "reason": "A8: The EOA is 263 days old with 3 pre-snapshot activities and no recorded claimant-group, shared-funding, collector-sweep, wallet-made, or exchange links. The first funder is unknown and its claimant count is unreadable.",
     "citedTxs": []
   },
-  "servRequestId": "0fc3aea3-9a57-41e1-9d4b-c474c3df9899",
+  "servRequestId": "41e77638-6926-4512-a99f-8cdb245e0c67",
   "notChecked": [
     "group",
     "sharedDepositAddress",
@@ -539,14 +536,18 @@ The paid answer, a 200 with a `PAYMENT-RESPONSE` header ([`paid-screen-response.
     "claimPaidToOtherAddress"
   ],
   "payment": {
-    "network": "eip155:84532",
+    "network": "eip155:8453",
     "payer": "0x86D40838B9805FF63343B8F060EF3fC336f59E78",
-    "transaction": "0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1"
+    "transaction": "0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4"
   }
 }
 ```
 
-Realised, with test USDC that has no value: that payment settled in [this Base Sepolia transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1). A later paid call through the built site, [in this transaction](https://sepolia.basescan.org/tx/0x4dd9f6a26f42f72e562203ea9a9ac4cbcb27753ca580a4778ca7fa225a3574a1), was charged once and its stored result was fetched again. This wallet is held on rule A4 in the ROBO replay, as one of 19 linked wallets. Screened alone, it has no list around it, so the paid route cannot see the group. It answered partial on rule A8 and listed `group` under `notChecked`. Read a `full` or `partial` answer from this route as "its own history raised no hold", not as "it belongs to no group".
+Realised, with real USDC: that payment settled on 13 November 2026 in [this Base transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4), through Coinbase's facilitator. Ten more requests with the same header returned the identical stored result, a fresh header that never settled bought nothing, and the paying wallet's balance fell by exactly 0.05 USDC. The API ran in the proof script's own process on one machine, so this does not show a payment taken by a hosted site. Before it, with test USDC that has no value, the same proof ran on Base Sepolia ([transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1)), and a paid call through the built site was charged once and its stored result fetched again ([transaction](https://sepolia.basescan.org/tx/0x4dd9f6a26f42f72e562203ea9a9ac4cbcb27753ca580a4778ca7fa225a3574a1)).
+
+This wallet is held on rule A4 in the ROBO replay, as one of 19 linked wallets. Screened alone, it has no list around it, so the paid route cannot see the group. It answered partial on rule A8 and listed `group` under `notChecked`. Read a `full` or `partial` answer from this route as "its own history raised no hold", not as "it belongs to no group".
+
+The same day's testing found one difference between facilitators. Coinbase's refuses a payment it will not send with a 400 answer, where the public test facilitator answers 200 with `success: false`, and the client library throws on the 400. The route used to read every throw as an unknown outcome and answer `{"retry": true}`, so a buyer whose wallet was short was told to try again and never told why. It now reads a 4xx refusal that names no transaction as a failed settle. Shown live against Coinbase's facilitator, with payments that could not move money: a signed payment from a wallet holding nothing is answered 402 with `insufficient_funds`, and one with a broken signature 402 with `invalid_exact_evm_payload_signature`. A 5xx, an answer that names a transaction, and every other throw still answer retry.
 
 A paid request always gets a decision. If the screening fails, the body is a hold on rule `A1` whose reason names the cause. Once a payment has settled, the same payment header for the same wallet returns the stored result for 24 hours, marked by a `thuli-stored-result` response header, with no new settlement and no new charge. A payment gets at most two screenings: if the last one cannot finish in time, a hold that says the screening ran out of time is stored and served as the result. Limits: one paid request in flight per caller, 20 requests per caller per minute, 12 SERV calls and 120 seconds per screening, and every paid request answers within 240 seconds.
 
@@ -694,7 +695,7 @@ The threat model was written on 27 October 2026, before any code, by an independ
 
 This is the state of the code on 11 November 2026. The [limits page](packages/web/content/docs/limits.mdx) and section 4.8 of [ARCHITECTURE.md](ARCHITECTURE.md) list the same items.
 
-- A campaign on Base mainnet. The factory is deployed and verified there, and one proof vault paid 1 real USDC, but the public campaign runs on Base Sepolia and the paid route has been proved only on Base Sepolia.
+- A campaign on Base mainnet. The factory is deployed and verified there, and one proof vault paid 1 real USDC, but the public campaign runs on Base Sepolia with test money.
 - Self-serve campaigns: owner sign-in, an owner dashboard and a way to upload a project's own claim list. Today a project registers a campaign with `npm run vault:create` and `npm run campaign:create`.
 - Owner sign-in for appeals. Wallets file appeals through the site and the worker sends them to the outside check, but the owner's settle is an operator's command, `npm run appeal:settle`. Contract wallets cannot appeal.
 - A Reppo evaluation of an appeal. None has been run yet, because the account needs credit.
