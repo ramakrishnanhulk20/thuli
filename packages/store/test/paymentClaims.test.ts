@@ -279,6 +279,18 @@ for (const { name, open } of TARGETS) {
       expect((await forWallet(old))?.for_wallet).toBe(OTHER_WALLET);
       await keepPaymentUnsure(db, old, 'first-taker');
       expect(await claimPayment(db, old, WALLET, NOW + 300n, 'other', at(NOW + 1n))).toBe('in-use');
+
+      // Such a row that already holds a named transaction is never taken, by anyone: nobody can say whose payment it is.
+      const orphan = `${KEY}-orphan`;
+      await db.query(
+        "INSERT INTO payment_claims (key, state, owner, valid_before, updated_at, named_txs) VALUES ($1, 'unsure', NULL, $2::bigint, now(), $3::jsonb)",
+        [orphan, (NOW + 300n).toString(), JSON.stringify([named])],
+      );
+      expect(await claimPayment(db, orphan, WALLET, NOW + 300n, 'buyer', at(NOW))).toBe('in-use');
+      expect(await claimPayment(db, orphan, OTHER_WALLET, NOW + 300n, 'stranger', at(NOW + 400n))).toBe('in-use');
+      expect((await forWallet(orphan))?.for_wallet).toBeNull();
+      // It ends with its day, like any claim that waits on a receipt.
+      expect(await claimPayment(db, orphan, WALLET, NOW + 300n, 'buyer', at(NOW + 300n + DAY))).toBe('expired');
     });
 
     it('C25: a release sets a claim that holds a named transaction back to unsure and deletes one that holds none, each only for its holder', async () => {

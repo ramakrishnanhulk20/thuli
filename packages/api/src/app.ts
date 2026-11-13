@@ -439,6 +439,12 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     settle: async (payload, requirements) => {
       const request = paidRequests.getStore();
       if (request !== undefined) request.settleThrew = false;
+      // An authorization past its validBefore can never settle, so the facilitator is not asked. Such a claim was taken
+      // only because it still holds a transaction named for it; the settle-failure hook reads that receipt, and if it
+      // does not prove the payment the buyer gets this fixed reason, never a facilitator's words about an old header.
+      if (request?.claim != null && hasExpired(request.claim.validBefore, BigInt(Math.floor(now().getTime() / 1000)))) {
+        return { success: false, errorReason: 'payment_expired', transaction: '', network: requirements.network };
+      }
       try {
         const answer = await config.facilitator.settle(payload, requirements);
         if (request !== undefined && !answer.success) noted(request, answer);
@@ -575,12 +581,13 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // request or in an earlier one that left the claim unsure, is a candidate: the payment is served only if one of
   // their receipts proves this exact payment, and only to the wallet the claim was first taken for, which is this
   // request's, or it would not hold the claim. Otherwise anything unclear keeps the claim and answers 503 retry: a
-  // candidate with no receipt yet, a list of earlier ones that could not be read, and, while the authorization can
-  // still be settled, a throw, a timeout or an answer that said pending. The buyer resends the same header, which can
-  // never pay twice, and nothing is served on a guess. A candidate with no receipt yet stays with the claim; one whose
-  // receipt was read as not this payment is taken off it, and nothing else ever is. What falls through, so that the
-  // buyer gets 402: a plain "failed" answer with none of these, and an authorization past its validBefore with no
-  // receipt left to wait for, since nothing can settle it any more.
+  // candidate with no receipt yet, a list of earlier ones that could not be read, a throw, a timeout or an answer
+  // that said pending. The buyer resends the same header, which can never pay twice, and nothing is served on a
+  // guess. So a thrown error's own words never reach a buyer. A candidate with no receipt yet stays with the claim;
+  // one whose receipt was read as not this payment is taken off it, and beyond that only the cap of MAX_NAMED_TXS
+  // ever takes one off, the oldest first. What falls through, so that the buyer gets 402: an answer that plainly
+  // failed with nothing left to wait for, which is a facilitator's 200 with success false or this route's own
+  // "payment_expired" for an authorization that was past its validBefore when the request came.
   resourceServer.onSettleFailure(async ({ phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) return;
@@ -622,8 +629,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
         };
       }
       const waiting = unread || unreadYet.length > 0;
-      const settleable = !hasExpired(claim.validBefore, BigInt(Math.floor(now().getTime() / 1000)));
-      if (waiting || (settleable && (request.settleThrew || request.sawPending))) {
+      if (waiting || request.settleThrew || request.sawPending) {
         await keepForRetry({ add: unreadYet, drop: notPaid });
         return;
       }

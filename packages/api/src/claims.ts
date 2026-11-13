@@ -118,7 +118,8 @@ export class PaymentClaims {
     const expired = hasExpired(validBefore, nowSeconds);
     if (!expired && validBefore > nowSeconds + this.#latestSeconds) return 'too-long';
     let entry = this.#claims.get(key);
-    // An expired authorization is taken only to read the receipt of a transaction already named for it.
+    // An expired authorization is taken only to read the receipt of a transaction already named for it. While another
+    // request holds that claim, a copy is in use like any other, not expired.
     if (expired && !(entry !== undefined && this.#waitsOnReceipt(entry, nowSeconds))) return 'expired';
     if (entry !== undefined && this.#due(entry, nowSeconds)) {
       this.#claims.delete(key);
@@ -279,9 +280,10 @@ export class PaymentClaims {
     return entry.state !== 'held' && hasExpired(entry.validBefore, nowSeconds) && !kept && !this.#waitsOnReceipt(entry, nowSeconds);
   }
 
-  // An unsure claim that holds a named transaction may have been paid by it, and only that receipt can say.
+  // A claim that holds a named transaction may have been paid by it, and only that receipt can say. Only a claim that
+  // has not settled holds one: unsure, or held by the request that is reading the receipt right now.
   #waitsOnReceipt(entry: Claim, nowSeconds: bigint): boolean {
-    return entry.state === 'unsure' && entry.named.length > 0 && entry.validBefore + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
+    return entry.named.length > 0 && entry.validBefore + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
   }
 
   // Runs only when the map is full, so its cost is paid once per wave of new claims, not on every request.

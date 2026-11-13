@@ -96,10 +96,11 @@ interface ClaimRow {
   for_wallet: string | null;
 }
 
-// An unsure claim that holds a transaction a facilitator named may have been paid by it. It waits for that receipt past
-// its authorization's end, for as long as a settled claim is kept, so its buyer can still come back for the result.
+// A claim that holds a transaction a facilitator named may have been paid by it. It waits for that receipt past its
+// authorization's end, for as long as a settled claim is kept, so its buyer can still come back for the result. Only a
+// claim that has not settled holds one: unsure, or held by the request that is reading the receipt right now.
 function waitsOnReceipt(entry: ClaimRow, nowSeconds: bigint): boolean {
-  return entry.state === 'unsure' && entry.named > 0 && BigInt(entry.valid_before) + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
+  return entry.named > 0 && BigInt(entry.valid_before) + BigInt(PAID_RESULT_KEEP_SECONDS) > nowSeconds;
 }
 
 // A settled or served claim outlives its authorization: it stays a whole day from its settlement, so the buyer can
@@ -120,7 +121,9 @@ function isDue(entry: ClaimRow, nowSeconds: bigint): boolean {
  *   than PAID_RESULT_KEEP_SECONDS ago or is waiting on such a receipt.
  * - An 'unsure' row is taken over by owner, for the wallet it was first taken for only, and keeps the later of the two
  *   validBefore values and its named transactions. For any other wallet it is 'in-use', as any other row is: a mined
- *   transaction shows all it takes to rebuild the header, so a copy must not move the payment to another wallet.
+ *   transaction shows all it takes to rebuild the header, so a copy must not move the payment to another wallet. A row
+ *   written before the wallet was recorded takes its next taker's wallet, unless it holds a named transaction, in which
+ *   case it is 'in-use' for everyone.
  * - At MAX_PAYMENT_CLAIMS rows, the due ones are deleted first, and the answer is 'full' if it is still at the cap.
  * The decision runs in one transaction under an advisory lock on the key, and a new row also under one lock on the
  * cap, so copies of one authorization started together get exactly one 'taken'.
@@ -158,8 +161,9 @@ export async function claimPayment(
     }
     if (entry !== undefined) {
       if (entry.state !== 'unsure') return 'in-use';
-      // A row from before the column has no wallet yet and takes this one.
-      if (entry.for_wallet !== null && entry.for_wallet !== forWallet) return 'in-use';
+      // A row from before the column has no wallet yet and takes this one, unless it already holds a named
+      // transaction: nobody can say whose payment that is, so such a row is never taken and ends with its day.
+      if (entry.for_wallet === null ? entry.named > 0 : entry.for_wallet !== forWallet) return 'in-use';
       await tx.query(
         `UPDATE payment_claims
             SET state = 'held', owner = $2, valid_before = GREATEST(valid_before, $3::bigint), updated_at = to_timestamp($4::bigint),
@@ -175,7 +179,7 @@ export async function claimPayment(
       await tx.query(
         `DELETE FROM payment_claims
           WHERE state <> 'held' AND valid_before <= $1::bigint AND (settled_at IS NULL OR settled_at <= $2::bigint)
-            AND NOT (state = 'unsure' AND jsonb_array_length(named_txs) > 0 AND valid_before > $2::bigint)`,
+            AND NOT (jsonb_array_length(named_txs) > 0 AND valid_before > $2::bigint)`,
         [now, (nowSeconds - BigInt(PAID_RESULT_KEEP_SECONDS)).toString()],
       );
       if ((await claimCount(tx)) >= MAX_PAYMENT_CLAIMS) return 'full';

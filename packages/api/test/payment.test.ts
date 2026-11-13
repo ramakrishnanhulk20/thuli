@@ -899,11 +899,14 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     };
     mined = true;
     clock = new Date((validBefore + 60) * 1000);
+    // Past validBefore the facilitator is not asked at all: only the named receipt is read, and it does not pay.
+    const asked = facilitator.settled.length;
     const late = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
     expect(late.status).toBe(402);
+    expect(decodePaymentResponseHeader(late.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(facilitator.settled).toHaveLength(asked);
 
-    // The claim was released, so the next copy is plainly expired and the facilitator is not asked again.
-    const asked = facilitator.settled.length;
+    // The claim was released, so the next copy is plainly expired too.
     const again = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
     expect(again.status).toBe(402);
     expect(decodePaymentResponseHeader(again.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
@@ -942,6 +945,33 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     const late = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
     expect(late.status).toBe(402);
     expect(decodePaymentResponseHeader(late.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(facilitator.settled).toHaveLength(asked);
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it("answers retry for every throw, one that lands past validBefore included, and never hands a thrown error's words to the buyer (C34)", async () => {
+    let clock = new Date();
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, now: () => clock });
+    const header = await signedHeader(appFetch, client);
+    const validBefore = Number(authorizationFrom(decodePaymentSignatureHeader(Object.values(header)[0] as string)).validBefore);
+    // The settle is asked in time, takes long, and fails after the authorization has run out.
+    facilitator.respond = async () => {
+      clock = new Date((validBefore + 5) * 1000);
+      throw new Error('Facilitator settle failed (502): upstream https://facilitator.example/settle?key=secret-token said no');
+    };
+    const reply = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(reply.status).toBe(503);
+    const body = await reply.text();
+    expect(JSON.parse(body)).toEqual({ retry: true });
+    expect(reply.headers.get('payment-response')).toBeNull();
+    expect(`${body} ${JSON.stringify([...reply.headers])}`).not.toMatch(/secret-token|facilitator\.example|502/);
+
+    // The next copy is refused as expired by the route itself, and the facilitator is not asked.
+    const asked = facilitator.settled.length;
+    const again = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(again.status).toBe(402);
+    expect(decodePaymentResponseHeader(again.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
     expect(facilitator.settled).toHaveLength(asked);
     expect(screen).not.toHaveBeenCalled();
   });
@@ -1911,6 +1941,12 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     expect(await claims.claim('paid', WALLET, now + 300n, 'last', now + 300n + day - 1n)).toBe('taken');
     await claims.keepUnsure('paid', 'last', NOTHING_NAMED);
     expect(await claims.claim('paid', WALLET, now + 300n, 'gone', now + 300n + day)).toBe('expired');
+
+    // While one request holds a waiting claim past validBefore, another copy is in use, not expired.
+    expect(await claims.claim('held', WALLET, now + 300n, 'first', now)).toBe('taken');
+    await claims.keepUnsure('held', 'first', { add: [hash(40)], drop: [] });
+    expect(await claims.claim('held', WALLET, now + 300n, 'reader', now + 400n)).toBe('taken');
+    expect(await claims.claim('held', WALLET, now + 300n, 'copy', now + 401n)).toBe('in-use');
 
     // An unsure claim with nothing named ends with its authorization, as before, and a fresh claim replaces it.
     expect(await claims.claim('bare', WALLET, now + 300n, 'a', now)).toBe('taken');
