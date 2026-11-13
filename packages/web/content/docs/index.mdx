@@ -46,7 +46,7 @@ Not built yet:
 - A campaign and the paid route on Base mainnet. The vault factory is deployed on Base mainnet and one proof vault there paid 1 real USDC (see [Contracts and addresses](/docs/contracts)), but the campaign runs on Base Sepolia and the paid route has been proved only on Base Sepolia.
 - A hosted database. The paid and free routes use Postgres when a database is configured, and the store was tested against an in-process one. No database is hosted for Thuli yet.
 - Self-serve campaigns for a project: owner sign-in, an owner dashboard and a route to upload its own claim list. Today a project registers a campaign with two commands, described on [Contracts and addresses](/docs/contracts).
-- An appeal checked by the outside judge. A campaign takes a signed appeal and sends Thuli's own decision to Reppo for a check, and no appeal has been run against the real service yet. The owner's call is made by an operator's command, because owner sign-in is not built. See [Live campaign](/docs/campaigns).
+- Owner sign-in for appeals. A campaign takes a signed appeal and sends Thuli's own decision to Reppo for a check. One appeal has been checked that way against the real service, with the route `review`, and the owner upheld the decision. The owner's call is made by an operator's command, because owner sign-in is not built. See [Live campaign](/docs/campaigns).
 - A hosted worker. The worker that screens asks, posts each list's root to the vault and submits claims is built, and it runs as a script on one machine. There is no container or host configuration for it yet.
 - Paid data lookups. Nothing calls a paid data provider today.
 

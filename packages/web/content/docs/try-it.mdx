@@ -27,9 +27,9 @@ What to expect:
 - A wallet that has never been used is turned away at the door. If it has sent no transaction and holds no balance on Ethereum or on Base, the page says "This wallet has never been used" and stores nothing. It still counts toward the visitor's 5 signed asks an hour.
 - A wallet whose history shows no incoming transfer of value has no first funder to read. A fact that cannot be read means hold, under rule A1, and the board shows the rule and the reason.
 - A wallet with some history that is young or quiet gets a partial reward, not a hold. By default that is under 30 days old or fewer than 5 transactions sent, under rule A8.
-- A wallet used only on other chains looks new, because only Ethereum mainnet is read.
+- A wallet used only on a third chain looks new, because only Ethereum and Base are read.
 - When every slot is taken, the page says "Every slot is taken" and offers no button. When the campaign has taken all the asks it will, it says "This campaign has stopped taking requests". When 200 undecided asks are already waiting, the route answers full and the page says "This campaign is full". Nothing is stored, and signing cost nothing.
-- No appeal has been run live yet.
+- One appeal has been run live, on a local copy of the site. It is described on [Live campaign](/docs/campaigns).
 
 With the repository, `npm run rehearse:campaign` runs the whole path on a local copy of Base Sepolia. Six signed asks are screened through the real decision path with live SERV, the approved wallets take the campaign's three slots, the list goes to a vault made by the real factory, the copy's clock moves past the delay, and the worker submits each claim. It needs Foundry's `anvil`, and the Base Sepolia, SERV and Ethereum settings from `.env`. It loads no key from `.env`: the owner, the agent and the six asking wallets are fresh keys made for the run, and every transaction stays inside the local copy.
 

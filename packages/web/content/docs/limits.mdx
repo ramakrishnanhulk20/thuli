@@ -60,7 +60,7 @@ The campaign worker is the script that screens each ask, posts the approved wall
 - Model screening is capped at 2,000 a day across every campaign. An attacker with many addresses and aged wallets can use the day up, and real asks then wait until after midnight UTC. To fix it, a larger budget, or a small cost for each ask.
 - Owner sign-in is not built, so an operator's command settles appeals: `npm run appeal:settle`, a dry run unless `--write` is given. To fix it, owner sign-in and an owner route that calls the same settlement.
 - The scorecard does not score appeals yet. `npm run appeal:export` writes checked appeals as input for the next rulebook change, and nothing reads that file. To fix it, add the exported appeals to the scorecard's input.
-- No Reppo evaluation has been run for an appeal yet. The tests use a stand-in for the outside check. To fix it, credit the Reppo account and run one, then record the result.
+- One appeal has been checked by Reppo live, on 13 November 2026: the route was `review`, it cost 440 credits, and the owner upheld the decision. The routes `ship` and `block`, a live reversal and the failure paths have run only in tests, against a stand-in for the outside check. To fix it, run more appeals, one of them reversed, and record each result. See [Live campaign](/docs/campaigns).
 
 ## What Thuli has not built
 
@@ -76,7 +76,7 @@ The campaign worker is the script that screens each ask, posts the approved wall
 ## What Thuli has not measured
 
 - How a model answers under a different rulebook text. The [versions](/docs/versions) comparison checks one stored reply per wallet under both rulebooks.
-- Reppo judged decisions made before the shared-funder rule, so no verdict is on a v2 decision. No Reppo evaluation has been run for an appeal yet.
+- Reppo judged decisions made before the shared-funder rule, so no verdict in that sample is on a v2 decision. The one appeal Reppo has checked is a single v2 decision and is not part of the sample.
 - The false-hold rate on real users. Hop's probably-real wallets are not proved real, and the rate comes from a sample. Holds outside Bitquery's key are an upper bound on false holds, because the key may miss farms. Catching Hop's eliminated wallets is partly by construction, not a recall claim.
 - Dollar figures on the site are unrealised: they value ROBO at the claim-day price, nothing was sold or paid, and a real sale would move the price.
 - The cost of paid data lookups, because they are not built.

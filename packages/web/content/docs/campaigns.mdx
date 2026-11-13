@@ -346,9 +346,13 @@ Only a reversal changes an outcome, and only toward an approval. The command wor
 
 `appeal:export` writes the checked appeals, with Reppo's whole verdict, to a private file as input for the next rulebook change. The scorecard does not read that file and does not score appeals yet.
 
-### No appeal has been run live
+### One appeal has been run live
 
-No outside check has been made for a real appeal yet: the Reppo account needs credit. The appeal path is covered by tests in the repository, and nothing on this page is a result from a live appeal.
+On 13 November 2026 one appeal ran end to end, on a local copy of the site and the worker against the real services. A test wallet one day old on Base asked, was cut to a partial reward under rule A8 and took a slot. It then filed a signed appeal. The worker sent Thuli's decision to Reppo once, as evaluation `cmwegxukf000508l98c92l3va`. The check finished 86 seconds later with the route `review`: Reppo's note says its judges disagreed, one scoring the decision 60 and one 100. Realised: 440 Reppo credits, 22 cents, charged once. The campaign's owner then upheld the decision with `npm run appeal:settle`, and the ask stayed as it was. The board showed the route, the note, the evaluation id and the outcome beside the decision.
+
+That is one appeal, one evaluation and one route. No live appeal has come back `ship` or `block`, none has been reversed live, and the failure paths in the table above (an unclear payment, the service busy, no credit) have run only in tests, against a stand-in for Reppo.
+
+A decision stored by an earlier version of the worker has no record to send, so an appeal against it ends unchecked with the cause "the decision kept no record to send". One such appeal was filed the same day: nothing was sent and nothing was charged.
 
 ## If something goes wrong
 
