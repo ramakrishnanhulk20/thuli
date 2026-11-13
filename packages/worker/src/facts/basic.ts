@@ -76,13 +76,22 @@ const VIEM_CHAINS: Readonly<Record<ScreenedChain, Chain>> = { ethereum: mainnet,
 /** Each screened chain's id, the one its RPC endpoint must answer with. */
 export const SCREENED_CHAIN_ID: Readonly<Record<ScreenedChain, number>> = { ethereum: mainnet.id, base: base.id };
 
+// A rate limit or a server fault says nothing about what the endpoint serves, whatever its body holds. viem hands a
+// JSON-RPC error body on to its callers even under such a status, where it would read as the node refusing the method,
+// so the answer is cut off here, before the body is read: the call fails as "no answer" and is sent again (C11, C60).
+function outageIsNoAnswer(response: Response): void {
+  if (response.status !== 429 && response.status < 500) return;
+  void response.body?.cancel().catch(() => undefined);
+  throw new Error(`the endpoint answered with status ${response.status}`);
+}
+
 /** A read-only client for one screened chain, with the fact reads' timeout and one retry. */
 export function chainClient(chain: ScreenedChain, rpcUrl: string) {
   // ccipRead off: a chain read must never be redirected to an off-chain URL a contract names. An HTTP redirect is
   // refused for the same reason: the configured endpoint answers, or nothing does (threat model C38).
   return createPublicClient({
     chain: VIEM_CHAINS[chain],
-    transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }),
+    transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' }, onFetchResponse: outageIsNoAnswer }),
     ccipRead: false,
   });
 }

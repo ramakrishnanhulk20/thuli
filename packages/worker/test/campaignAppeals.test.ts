@@ -960,6 +960,7 @@ describe('the appeal step in the loop', () => {
       facts: async () => {
         throw new Error('no facts are read in these runs');
       },
+      usedOnBase: async () => false,
       accountState: async () => ({ nonce: 1, code: '0x' }),
       serv: { viaGraph: async () => Promise.reject(new Error('no SERV')), viaV2: async () => Promise.reject(new Error('no SERV')), sleep: async () => undefined },
       chain: chainless,

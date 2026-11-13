@@ -531,7 +531,9 @@ export const MAX_FAILED_SEND_BLOCKS = 4;
  * it; or the transfers read for a block that paid it do not add up to that block's rise in its balance. The last is two
  * reads of one fact disagreeing: a trace answer cut short would otherwise drop the real funding and leave a smaller
  * payer as the funder. It also refuses a block that paid the wallet with no transaction at all (a staking withdrawal, a
- * block's fees), since nothing read there says who paid. Both pages of a used wallet are marked incomplete, so core finds a funder among the rows or says 'unknown', never
+ * block's fees), since nothing read there says who paid. Not covered by that check: a block in which the wallet itself
+ * sent, the block of its first send that succeeded and any block of failed sends before it. Fees move the balance
+ * there, so the rows of those blocks are taken as the traces give them. Both pages of a used wallet are marked incomplete, so core finds a funder among the rows or says 'unknown', never
  * 'none'. A wallet never used comes back as two empty, complete pages, what the explorer reads for it.
  *
  * @throws HistoryError when any read fails or any of those cases holds. Its message holds no endpoint address (C40).
@@ -558,7 +560,9 @@ export async function rpcHistory(client: HistoryClient, wallet: Address, block: 
   for (let failedBlocks = 0; ; ) {
     const spent = await firstBlockWithSentCount(client, wallet, nextCount, from, block);
     const end = spent ?? block;
-    const paid = await inflowsIn(client, wallet, from, end, MAX_INFLOW_BLOCKS);
+    // A wallet that has not sent by the read block is searched through that block itself, so an inflow there is found
+    // by its balance rise and checked like any other. A block the wallet sent in is not searched: fees move it too.
+    const paid = await inflowsIn(client, wallet, from, spent ?? block + 1, MAX_INFLOW_BLOCKS);
     if (paid === 'too many') throw tooMany();
     for (const inflow of paid) {
       blocks.add(inflow.block);

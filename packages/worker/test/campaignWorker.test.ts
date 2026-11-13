@@ -560,6 +560,8 @@ function deps(vault: StandInVault, serv: DecideDeps = confirmingServ()): WorkerD
       if (read instanceof Error) throw read;
       return read;
     },
+    // These asks stand for wallets used on Ethereum only, the one kind a worker with Base history off may decide.
+    usedOnBase: async () => false,
     serv,
     chain: vault,
     factory: FACTORY,
@@ -1369,13 +1371,13 @@ describe('found by a second independent check of the worker', () => {
     });
   });
 
-  it('gives the same wallet back, deciding nothing and calling no model, on a worker that read Ethereum alone (C11, C60)', async () => {
+  it('gives the same wallet back, deciding nothing and calling no model, on a worker whose Base history is off (C11, C60)', async () => {
     await createCampaign(db, terms());
     const serv = confirmingServ();
     const wallet = await ask(neverUsed());
     const [first] = await screenAll(deps(new StandInVault(3n * REWARD), serv));
 
-    expect(first).toEqual({ kind: 'released', campaignId: CAMPAIGN, wallet: wallet.address, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread, status: 'queued' });
+    expect(first).toEqual({ kind: 'released', campaignId: CAMPAIGN, wallet: wallet.address, cause: CAMPAIGN_SCREEN_CAUSES.unseen, status: 'queued' });
     expect(await getAsk(db, CAMPAIGN, wallet.address)).toMatchObject({ status: 'failed', servRequestId: null, slot: null, facts: null });
     expect(serv.viaGraph).not.toHaveBeenCalled();
     expect(serv.viaV2).not.toHaveBeenCalled();

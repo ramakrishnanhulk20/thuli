@@ -10,6 +10,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { firstActivityTime, fundingTransfer, parseAddress, SECONDS_PER_DAY, walletAgeDays, type Transfer } from '@thuli/core';
 import { rpcFirstActivity } from '../src/campaign/chain.ts';
 import { chainClient, collectBasicFacts } from '../src/facts/basic.ts';
+import { connectBaseSepolia } from '../src/vault/chain.ts';
+import { connectBase } from '../src/vault/chainBase.ts';
 import {
   callBudget,
   firstSendBlock,
@@ -489,6 +491,23 @@ describe('rpcHistory gathers every inflow up to the first own send', () => {
     expect(fundingTransfer(WALLET, await rpcHistory(short(B + 400, () => true), WALLET, TOP))).toMatchObject({ status: 'found', transfer: { from: EXCHANGE } });
   });
 
+  it('checks the read block itself for a wallet that never sent, so an answer cut short there is refused too (C11)', async () => {
+    const dust = callTrace(B, SENDER, SELF, 1_000n);
+    const atTop = callTrace(TOP, EXCHANGE, SELF, ONE_ETH);
+    const traces = [dust, atTop];
+    expect(await judged({ derive: true, traces })).toMatchObject({ funder: EXCHANGE, evidence: atTop.transactionHash });
+    const { client } = standIn({ derive: true, traces });
+    const cutAtTop: HistoryClient = {
+      request: async (method, params, signal) => {
+        const answer = await client.request(method, params, signal);
+        const asked = Number((params[0] as { fromBlock?: string } | undefined)?.fromBlock);
+        return method === 'trace_filter' && asked === TOP ? [] : answer;
+      },
+    };
+    // Without the check the dust sender would be the funder of a wallet whose real funding sits in the read block.
+    await expect(rpcHistory(cutAtTop, WALLET, TOP)).rejects.toThrow("the transfers read for a block do not add up to the rise in the wallet's balance there");
+  });
+
   it('refuses a block that paid the wallet with no transaction after its first block, and counts a failed inflow as no rise', async () => {
     const funding = callTrace(B, EXCHANGE, SELF, ONE_ETH);
     const send = callTrace(SEND, SELF, SHOP, 1n);
@@ -762,6 +781,36 @@ describe('historyClientOf', () => {
     }
   });
 
+  it('reads an outage as no answer whatever its body says, and still reads a refusal under a 4xx as a refusal (C11, C60)', async () => {
+    const answering = (status: number, code: number) => {
+      let fetches = 0;
+      vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+        fetches += 1;
+        const { id } = JSON.parse(String(init?.body)) as { id: number };
+        const body = { jsonrpc: '2.0', id, error: { code, message: `backend offline at ${URL_WITH_TOKEN}` } };
+        return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+      });
+      return { client: historyClientOf(chainClient('base', URL_WITH_TOKEN), async () => undefined), fetches: () => fetches };
+    };
+    // A rate limit or a server fault with a JSON-RPC error in its body, under codes no list names.
+    for (const [status, code] of [[503, -32010], [503, -32603], [429, -32016], [502, -32000]] as const) {
+      const label = `${status} with ${code}`;
+      const { client, fetches } = answering(status, code);
+      const error = await client.request('eth_getBalance', [SELF, '0x1']).catch((caught: unknown) => caught);
+      expect(error, label).toBeInstanceOf(HistoryError);
+      expect(error, label).not.toBeInstanceOf(RpcRefused);
+      expect((error as Error).message, label).toBe('the RPC gave no answer to eth_getBalance');
+      expect(fetches(), label).toBeGreaterThanOrEqual(NO_ANSWER_WAITS_MS.length + 1);
+      // So at start it can never be taken for an endpoint that serves no old state or no traces.
+      expect(await historyProbe(client, 8_453), label).toEqual({ ok: false, lacks: 'no answer' });
+    }
+    // The endpoint answered for itself and said no: that is what it serves.
+    for (const status of [400, 403]) {
+      const { client } = answering(status, -32601);
+      await expect(client.request('trace_filter', [{}]), String(status)).rejects.toBeInstanceOf(RpcRefused);
+    }
+  });
+
   it('does not follow an HTTP redirect to another host: the configured endpoint answers, or nothing does (C38)', async () => {
     let reached = 0;
     const elsewhere = createServer((request, response) => {
@@ -792,6 +841,15 @@ describe('historyClientOf', () => {
       const direct = historyClientOf(chainClient('ethereum', `http://127.0.0.1:${(elsewhere.address() as AddressInfo).port}`), async () => undefined);
       expect(await direct.request('eth_getBalance', [SELF, '0x1'])).toBe('0x2a');
       expect(reached).toBe(1);
+
+      // The worker's vault connections refuse the redirect too: they fail before the other host hears anything.
+      const redirected = `http://127.0.0.1:${(redirecting.address() as AddressInfo).port}`;
+      await expect(connectBaseSepolia(redirected)).rejects.toThrow();
+      await expect(connectBase(redirected, false)).rejects.toThrow();
+      expect(reached).toBe(1);
+      // Reached directly, that host is asked, and refused for naming chain 42.
+      await expect(connectBaseSepolia(`http://127.0.0.1:${(elsewhere.address() as AddressInfo).port}`)).rejects.toThrow('the RPC is on chain 42');
+      expect(reached).toBeGreaterThan(1);
     } finally {
       await new Promise((resolve) => redirecting.close(resolve));
       await new Promise((resolve) => elsewhere.close(resolve));

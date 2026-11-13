@@ -1,6 +1,7 @@
 import {
   firstActivityTime,
   olderChain,
+  onChainOnly,
   SCREENED_CHAIN_NAME,
   SCREENED_CHAINS,
   type AccountState,
@@ -63,7 +64,8 @@ export interface PickedChain {
 }
 
 // A read's signal stops it between calls here, whatever the client under it does with a signal, and is handed on so the
-// client can drop a call still waiting to be sent. A call already sent ends by its own 15 second timeout.
+// client can drop a call still waiting to be sent. A call already sent ends by its own timeout: 15 seconds, and once
+// more when the client under it sends a timed-out call again.
 function stoppedBy(client: HistoryClient, signal: AbortSignal): HistoryClient {
   return {
     request: (method, params) => (signal.aborted ? Promise.reject(new HistoryError('the read was stopped')) : client.request(method, params, signal)),
@@ -240,6 +242,27 @@ export function ethereumFacts(sources: FactSources): (wallet: Address) => Promis
   };
 }
 
+/**
+ * Whether a wallet was used on Base, for a worker whose RPC history is off: a transaction sent, or a balance, at the
+ * finalized block, the door's own test of "used", made with two plain calls that any endpoint serves. The door lets a
+ * wallet in for its use on either chain, so such a worker reads this before it decides anything from Ethereum (C60).
+ * The endpoint must name Base's chain id first (C2).
+ *
+ * @throws the client's error when a read fails, or WrongChainError; nothing is guessed.
+ */
+export function usedOnBase(sources: Pick<FactSources, 'rpcUrl'>): (wallet: Address) => Promise<boolean> {
+  const client = chainClient('base', sources.rpcUrl);
+  const onItsChain = onChainOnly(() => client.getChainId(), SCREENED_CHAIN_ID.base);
+  return (wallet) =>
+    onItsChain(async () => {
+      const [sent, balance] = await Promise.all([
+        client.getTransactionCount({ address: wallet, blockTag: 'finalized' }),
+        client.getBalance({ address: wallet, blockTag: 'finalized' }),
+      ]);
+      return sent > 0 || balance > 0n;
+    });
+}
+
 const RPC_SETTING: Readonly<Record<ScreenedChain, string>> = { ethereum: 'ETH_RPC_URL', base: 'BASE_RPC_URL' };
 const LACK_WORDS: Readonly<Record<HistoryLack, string>> = {
   chain: "did not answer with that chain's id",
@@ -265,7 +288,7 @@ const EVERY_LACK: readonly HistoryLack[] = ['chain', 'old state', 'traces', 'no 
  * and what it lacks. Fixed words only, never an address or a value (C40).
  */
 export function historyOffLine(lacks: Lacks): string {
-  return `screen: RPC history is off because ${lackWords(lacks, EVERY_LACK)}, so every ask is screened on Ethereum only, and a wallet with no Ethereum history is not decided`;
+  return `screen: RPC history is off because ${lackWords(lacks, EVERY_LACK)}, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided`;
 }
 
 /** Said once at start when both endpoints passed the probe. */

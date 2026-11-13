@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { CHAINS, CURRENT_RULEBOOK, DEFAULT_SETTINGS, graphVersion, parseAddress, SCREENED_CHAIN_NAME, type Address } from '@thuli/core';
 import { addAsk, createCampaign, getAsk, migrate, openMemoryDb } from '@thuli/store';
-import { ethereumFacts, screenChains } from '../src/campaign/chain.ts';
+import { ethereumFacts, screenChains, usedOnBase } from '../src/campaign/chain.ts';
 import { scrubber } from '../src/campaign/config.ts';
 import { screenNextAsk } from '../src/campaign/screen.ts';
 import { emptyChainMemory } from '../src/campaign/vault.ts';
@@ -102,6 +102,7 @@ async function main(): Promise<number> {
       db,
       facts: ethereumFacts(explorer),
       accountState: accountStateAtFinalizedBlock({ rpcUrl: env.ETH_RPC_URL }, 'ethereum'),
+      usedOnBase: usedOnBase({ rpcUrl: env.BASE_RPC_URL }),
       ...(chains === undefined ? {} : { chains }),
       serv: {
         viaGraph: (record: Parameters<typeof decideViaGraph>[0]) => decideViaGraph(record, { ...connection, graphId }),

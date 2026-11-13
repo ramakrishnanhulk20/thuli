@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { connectPostgres, openCampaigns } from '@thuli/store';
 import { reppoForAppeals } from '../src/campaign/appeals.ts';
-import { ethereumFacts, screenChains } from '../src/campaign/chain.ts';
+import { ethereumFacts, screenChains, usedOnBase } from '../src/campaign/chain.ts';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
 import { runLoop } from '../src/campaign/loop.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
@@ -72,6 +72,7 @@ async function main(): Promise<number> {
           ...(config.blockscoutApiKey === null ? {} : { apiKey: config.blockscoutApiKey }),
         }),
         accountState: accountStateAtFinalizedBlock({ rpcUrl: config.ethRpcUrl }, 'ethereum'),
+        usedOnBase: usedOnBase({ rpcUrl: config.baseRpcUrl }),
         ...(chains === undefined ? {} : { chains }),
         serv: {
           viaGraph: (record) => decideViaGraph(record, { ...serv, graphId: config.servGraphId }),

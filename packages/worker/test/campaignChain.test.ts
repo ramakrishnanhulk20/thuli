@@ -21,6 +21,7 @@ import { addAsk, createCampaign, getAsk, migrate, openMemoryDb, type CampaignInp
 import {
   ethereumFacts,
   HISTORY_ON,
+  usedOnBase,
   historyOffLine,
   PICK_TIME_LIMIT_MS,
   pickChain,
@@ -339,14 +340,14 @@ describe('screenChains', () => {
           both.base.refusing = { method: 'trace_filter', times: 9, message: `rejected for ${BASE_URL}` };
           return null;
         },
-        line: "screen: RPC history is off because Base's endpoint (BASE_RPC_URL) serves no traces, so every ask is screened on Ethereum only, and a wallet with no Ethereum history is not decided",
+        line: "screen: RPC history is off because Base's endpoint (BASE_RPC_URL) serves no traces, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
       },
       {
         set: (both) => {
           both.ethereum.refusing = { method: 'eth_getBalance', times: 9, message: 'missing trie node' };
           return null;
         },
-        line: "screen: RPC history is off because Ethereum's endpoint (ETH_RPC_URL) serves no old state, so every ask is screened on Ethereum only, and a wallet with no Ethereum history is not decided",
+        line: "screen: RPC history is off because Ethereum's endpoint (ETH_RPC_URL) serves no old state, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
       },
       {
         set: (both) => {
@@ -354,7 +355,7 @@ describe('screenChains', () => {
           both.base.refusing = { method: 'eth_getBalance', times: 9, message: 'missing trie node' };
           return null;
         },
-        line: "screen: RPC history is off because Ethereum's endpoint (ETH_RPC_URL) serves no traces and Base's endpoint (BASE_RPC_URL) serves no old state, so every ask is screened on Ethereum only, and a wallet with no Ethereum history is not decided",
+        line: "screen: RPC history is off because Ethereum's endpoint (ETH_RPC_URL) serves no traces and Base's endpoint (BASE_RPC_URL) serves no old state, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
       },
     ];
     for (const { set, line } of cases) {
@@ -472,6 +473,18 @@ describe('the Ethereum reader of a worker with RPC history off', () => {
     node.refusing = { method: 'eth_getCode', times: 9, message: 'busy' };
     await expect(ethereumFacts(sources)(WALLET)).rejects.toThrow('a read of the wallet failed, so its facts were not used');
   });
+
+  it("reads nothing through an Ethereum endpoint that names another chain: the paid check's reader and the worker's both refuse (C2)", async () => {
+    const sepolia = new SimulatedNode(ETH_URL, 11_155_111, ETH_FINALIZED, 1_794_000_100, 12);
+    explorer(sepolia, { items: [], next_page_params: null });
+    const sources = { rpcUrl: ETH_URL, blockscoutApi: EXPLORER };
+    const paid = factsAtFinalizedBlock(sources);
+    await expect(paid(WALLET)).rejects.toThrow('the endpoint is on another chain');
+    await expect(paid(WALLET)).rejects.toThrow('the endpoint is on another chain');
+    await expect(ethereumFacts(sources)(WALLET)).rejects.toThrow('the endpoint is on another chain');
+    // The chain id is all that was asked of it: once by the paid check's reader, once by the worker's.
+    expect(sepolia.calls.map((call) => call.method)).toEqual(['eth_chainId', 'eth_chainId']);
+  });
 });
 
 describe('the Blockscout key goes to one exact host only (F6)', () => {
@@ -584,7 +597,12 @@ const modelCalls = (serv: ReturnType<typeof confirmingServ>) => serv.viaGraph.mo
  * Screen deps on the given chain readers, or with RPC history off when chains is undefined. The Ethereum-only readers
  * read `ethereumOnly` and record each call, so a test can show they are never called while RPC history is on.
  */
-function screenDeps(chains: ChainReaders | undefined, serv: DecideDeps, ethereumOnly = new Map<Address, Facts>()) {
+function screenDeps(
+  chains: ChainReaders | undefined,
+  serv: DecideDeps,
+  ethereumOnly = new Map<Address, Facts>(),
+  usedOnBase: (wallet: Address) => Promise<boolean> = async () => false,
+) {
   const deps = {
     db,
     facts: vi.fn(async (wallet: Address) => {
@@ -593,6 +611,7 @@ function screenDeps(chains: ChainReaders | undefined, serv: DecideDeps, ethereum
       return facts;
     }),
     accountState: vi.fn(async (_address: Address) => WALLET_STATE),
+    usedOnBase: vi.fn(usedOnBase),
     ...(chains === undefined ? {} : { chains }),
     serv,
     now: () => clock,
@@ -972,47 +991,100 @@ describe('screening with RPC history off', () => {
     await db.close();
   });
 
-  it('with RPC history off, screens a wallet with Ethereum history on Ethereum and decides nothing for one with none (k, C11, C55, C60)', async () => {
+  it('with RPC history off, decides only a wallet that was not used on Base, from its Ethereum history, and gives every other ask back (k, C11, C55, C60)', async () => {
     const both = nodes();
     both.base.refusing = { method: 'trace_filter', times: 9, message: 'rejected due to request filter settings' };
     serve([both.ethereum, both.base]);
     expect(await screenChains(loadWorkerConfig(ENV), (line) => lines.push(line))).toBeUndefined();
     expect(lines).toEqual([historyOffLine({ base: 'traces' })]);
+    expect(historyOffLine({ base: 'traces' })).toBe(
+      "screen: RPC history is off because Base's endpoint (BASE_RPC_URL) serves no traces, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
+    );
 
     lines = [];
-    // The door counts Base, so a wallet used only there is stored and reaches this worker empty on Ethereum.
+    // Four asks the door let in: a wallet used only on Base; one used on Base that anyone sent 1 wei on Ethereum; one
+    // used only on Ethereum; and one whose Ethereum history the explorer does not show yet.
     const onBase = await ask();
+    const dusted = await ask();
     const onEthereum = await ask();
+    const unseen = await ask();
+    both.base.pay(BASE_FUNDED, freshAddress(), onBase, 1n);
+    both.base.used(dusted, freshAddress(), BASE_FUNDED, BASE_ACTIVE, 50);
     const serv = confirmingServ();
     const single: Facts['missing'] = ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'];
     const blank = { group: null, sharedDepositAddress: null, fundingBurst: null, claimPaidToOtherAddress: null };
+    const funder = () => ({ address: parseAddress(freshAddress()), kind: 'unknown' as const, fanoutInList: null, hopsTraced: 1 });
     const neverUsed: Facts = { ...blank, walletAgeDays: 0, txCountAtSnapshot: 0, accountType: 'eoa', firstFunder: null, evidenceTxs: [], missing: [...single, 'firstFunder'] };
+    const dust: Facts = { ...blank, walletAgeDays: 0, txCountAtSnapshot: 0, accountType: 'eoa', firstFunder: funder(), evidenceTxs: [`0x${'cd'.repeat(32)}`], missing: single };
+    const used: Facts = { ...blank, walletAgeDays: 400, txCountAtSnapshot: 50, accountType: 'eoa', firstFunder: funder(), evidenceTxs: [`0x${'ab'.repeat(32)}`], missing: single };
+    // Base's two plain reads are served by an endpoint without traces: the production reader, on the simulated node.
+    const deps = screenDeps(
+      undefined,
+      serv,
+      new Map([[onBase, neverUsed], [dusted, dust], [onEthereum, used], [unseen, neverUsed]]),
+      usedOnBase({ rpcUrl: BASE_URL }),
+    );
+
+    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'released', wallet: onBase, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread, status: 'queued' });
+    // The wallet with 1 wei on Ethereum has facts there, and is still not decided from them: its history is on Base.
+    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'released', wallet: dusted, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread, status: 'queued' });
+    expect(deps.facts).not.toHaveBeenCalled();
+    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'decided', wallet: onEthereum, action: 'full' });
+    expect(await getAsk(db, CAMPAIGN, onEthereum)).toMatchObject({ facts: { chain: 'ethereum' } });
+    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'released', wallet: unseen, cause: CAMPAIGN_SCREEN_CAUSES.unseen, status: 'queued' });
+    expect(modelCalls(serv)).toBe(1);
+    for (const wallet of [onBase, dusted, unseen]) {
+      expect(await getAsk(db, CAMPAIGN, wallet)).toMatchObject({ status: 'queued', action: null, reason: null, facts: null });
+    }
+    expect(CAMPAIGN_SCREEN_CAUSES.baseUnread).toBe('the wallet was used on Base, and Base history is off');
+
+    // Tried to their last attempt, the three end held for review as failed asks an operator can queue again. None is
+    // ever stored as a decided hold, and no model call was spent on them.
+    const rest = await screenAll(deps);
+    expect(rest).toHaveLength(3 * (MAX_ASK_ATTEMPTS - 1));
+    expect(rest.every((outcome) => outcome.kind === 'released')).toBe(true);
+    for (const wallet of [onBase, dusted, unseen]) {
+      expect(await getAsk(db, CAMPAIGN, wallet)).toMatchObject({ status: 'failed', servRequestId: null, facts: null });
+    }
+    expect(modelCalls(serv)).toBe(1);
+  });
+
+  it('with RPC history off, decides nothing while Base cannot say whether the wallet was used there: an endpoint of another chain, or a read that failed (C2, C11)', async () => {
+    const wallet = await ask();
+    const serv = confirmingServ();
     const used: Facts = {
-      ...blank,
       walletAgeDays: 400,
       txCountAtSnapshot: 50,
       accountType: 'eoa',
       firstFunder: { address: parseAddress(freshAddress()), kind: 'unknown', fanoutInList: null, hopsTraced: 1 },
+      group: null,
+      sharedDepositAddress: null,
+      fundingBurst: null,
+      claimPaidToOtherAddress: null,
       evidenceTxs: [`0x${'ab'.repeat(32)}`],
-      missing: single,
+      missing: ['group', 'sharedDepositAddress', 'claimPaidToOtherAddress'],
     };
-    const deps = screenDeps(undefined, serv, new Map([[onBase, neverUsed], [onEthereum, used]]));
+    const facts = new Map([[wallet, used]]);
 
-    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'released', wallet: onBase, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread, status: 'queued' });
-    expect(CAMPAIGN_SCREEN_CAUSES.baseUnread).toBe('the wallet has no Ethereum history, and Base history is off');
-    expect(await getAsk(db, CAMPAIGN, onBase)).toMatchObject({ status: 'queued', action: null, reason: null, facts: null });
+    const sepolia = new SimulatedNode(BASE_URL, 84_532, BASE_FINALIZED, 1_794_000_000, 2);
+    serve([sepolia]);
+    const wrongChain = screenDeps(undefined, serv, facts, usedOnBase({ rpcUrl: BASE_URL }));
+    expect(await screenNextAsk(wrongChain)).toMatchObject({ kind: 'released', cause: CAMPAIGN_SCREEN_CAUSES.chains, status: 'queued' });
+    expect(sepolia.calls.map((call) => call.method)).toEqual(['eth_chainId']);
+
+    clock = new Date(clock.getTime() + retryDelaySeconds(1) * 1000);
+    const base = nodes().base;
+    base.refusing = { method: 'eth_getBalance', times: 9, message: 'busy' };
+    serve([base]);
+    const failing = screenDeps(undefined, serv, facts, usedOnBase({ rpcUrl: BASE_URL }));
+    expect(await screenNextAsk(failing)).toMatchObject({ kind: 'released', cause: CAMPAIGN_SCREEN_CAUSES.chains, status: 'queued' });
+    expect(wrongChain.facts).not.toHaveBeenCalled();
+    expect(failing.facts).not.toHaveBeenCalled();
     expect(modelCalls(serv)).toBe(0);
 
-    expect(await screenNextAsk(deps)).toMatchObject({ kind: 'decided', wallet: onEthereum, action: 'full' });
-    expect(await getAsk(db, CAMPAIGN, onEthereum)).toMatchObject({ facts: { chain: 'ethereum' } });
-
-    // Tried to its last attempt, the Base wallet is held for review as a failed ask an operator can queue again. It is
-    // never stored as a decided hold, and no model call was spent on it.
-    const rest = await screenAll(deps);
-    expect(rest).toHaveLength(MAX_ASK_ATTEMPTS - 1);
-    for (const outcome of rest) expect(outcome).toMatchObject({ kind: 'released', wallet: onBase, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread });
-    expect(rest.at(-1)).toMatchObject({ status: 'failed' });
-    expect(await getAsk(db, CAMPAIGN, onBase)).toMatchObject({ status: 'failed', servRequestId: null, facts: null });
-    expect(modelCalls(serv)).toBe(1);
+    // Once Base answers that the wallet was never used there, it is decided from Ethereum.
+    clock = new Date(clock.getTime() + retryDelaySeconds(2) * 1000);
+    serve([nodes().base]);
+    expect(await screenNextAsk(screenDeps(undefined, serv, facts, usedOnBase({ rpcUrl: BASE_URL })))).toMatchObject({ kind: 'decided', action: 'full' });
   });
 });

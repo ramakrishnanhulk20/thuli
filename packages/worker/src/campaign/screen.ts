@@ -91,7 +91,8 @@ export const CAMPAIGN_SCREEN_CAUSES = Object.freeze({
   dayBudget: "the day's budget of model screenings is used up",
   dayCounter: "the day's count of model screenings could not be read",
   chains: "the wallet's history could not be read on both chains",
-  baseUnread: 'the wallet has no Ethereum history, and Base history is off',
+  baseUnread: 'the wallet was used on Base, and Base history is off',
+  unseen: 'the wallet shows no history on Ethereum, though the door counted it as used',
 });
 
 const SCREEN_LABEL = 'screen';
@@ -112,10 +113,15 @@ export interface ScreenDeps {
   /**
    * A reader per screened chain, given only while Base history is on (screenChains, when both chains' RPC endpoints
    * pass its probe). With it, each ask is screened on the chain pickChain names, its funder's kind read on that same
-   * chain, and facts and accountState above are never called. Left out, every ask is screened on Ethereum through
-   * them, and a wallet with no Ethereum history is not decided.
+   * chain, and facts, accountState and usedOnBase are never called. Left out, an ask is screened on Ethereum through
+   * them, and only for a wallet usedOnBase says was not used on Base.
    */
   chains?: ChainReaders;
+  /**
+   * Whether the wallet has sent a transaction or holds a balance on Base at its finalized block, chain.ts's usedOnBase
+   * in production. Asked only while Base history is off, before anything is decided from Ethereum.
+   */
+  usedOnBase(wallet: Address): Promise<boolean>;
   /** SERV's two routes and the wait between retries, as decideWallet takes them. */
   serv: DecideDeps;
   now(): Date;
@@ -227,15 +233,21 @@ interface OwnFacts {
  * unreadable facts, so an ask is never decided from one chain while the other could not be read (C11). `reads` stops
  * the chain reads still to send when the try is over.
  *
- * With Base history off the facts are read on Ethereum through deps.facts. The door counts a wallet used on Base as
- * used, so a wallet that reaches a worker in this mode with nothing on Ethereum has its history where this worker
- * cannot read it. That is not a wallet never used: the try fails with CAMPAIGN_SCREEN_CAUSES.baseUnread, the ask ends
- * held for review after its last try, and an operator can queue it again once a worker reads both chains (C55, C60).
+ * With Base history off this worker cannot tell which chain is the older one for a wallet used on both, and the door
+ * lets a wallet in for its use on either. So it first asks whether the wallet was used on Base at all, with plain
+ * calls: if it was, the try fails with CAMPAIGN_SCREEN_CAUSES.baseUnread, and if that cannot be read, with the chains
+ * cause. Only a wallet not used on Base is read on Ethereum through deps.facts and decided from it, so here too an ask
+ * is never decided from one chain while the other could hold its history (C60). A wallet that then shows nothing on
+ * Ethereum either contradicts the door, most likely an explorer still catching up: the try fails with
+ * CAMPAIGN_SCREEN_CAUSES.unseen. An ask whose tries all fail ends held for review, and an operator can queue it again
+ * once a worker reads both chains (C55).
  */
 async function ownFacts(wallet: Address, deps: ScreenDeps, reads: AbortSignal): Promise<OwnFacts> {
   if (deps.chains === undefined) {
+    const onBase = await refusedUnless(async () => deps.usedOnBase(wallet), CAMPAIGN_SCREEN_CAUSES.chains);
+    if (onBase !== false) throw new ScreenRefused(onBase === true ? CAMPAIGN_SCREEN_CAUSES.baseUnread : CAMPAIGN_SCREEN_CAUSES.chains);
     const read = await refusedUnless(async () => inSingleScope(Facts.parse(await deps.facts(wallet))), SCREEN_CAUSES.facts);
-    if (neverUsed(read)) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.baseUnread);
+    if (neverUsed(read)) throw new ScreenRefused(CAMPAIGN_SCREEN_CAUSES.unseen);
     return { chain: 'ethereum', read, accountState: (address) => deps.accountState(address) };
   }
   const picked = await pickChain(wallet, deps.chains, reads);
@@ -277,8 +289,8 @@ async function decisionFor(taken: TakenAsk, deps: ScreenDeps, serv: DecideDeps, 
   // Safe without the model: such a wallet starts on hold under A1 and its ceiling is hold before any model runs, so a
   // SERV answer could only have written the reason. Deciding it here means a free new key costs no SERV run (C24, C26),
   // and the outcome is exactly the code's start and ceiling, which approve nothing (C11, C12). Nothing was refused, so
-  // the refused-answer retry does not apply. Only a worker that read both chains gets here with such a wallet: ownFacts
-  // fails the try for one that read Ethereum alone.
+  // the refused-answer retry does not apply. Only a worker that read both chains' histories gets here with such a
+  // wallet: ownFacts fails the try for one whose Base history is off.
   if (neverUsed(single) && start.outcome === 'hold' && start.rule === 'A1' && ceiling === 'hold') {
     const decision: AskDecision = {
       campaignId: taken.campaignId,
@@ -400,7 +412,7 @@ async function release(taken: TakenAsk, cause: string, deps: ScreenDeps, signal:
  *
  * Nothing but a checked answer becomes a decision. A campaign that is missing or names a rulebook other than
  * CURRENT_RULEBOOK, settings that are not valid, a chain whose history the picker could not settle, facts that cannot
- * be read, a wallet with no Ethereum history while Base history is off, no answer from SERV, SERV out of credit, the call cap, the time limit, or a decision the store refuses all
+ * be read, a wallet that was used on Base or shows nothing on Ethereum while Base history is off, no answer from SERV, SERV out of credit, the call cap, the time limit, or a decision the store refuses all
  * give the ask back with releaseAsk: queued again below MAX_ASK_ATTEMPTS, not to be taken before retryDelaySeconds for
  * its attempt has passed, and held for review with rule A1 at it (C11, C41). An answer the checks refuse is a hold with
  * rule A1; on the first REFUSED_ANSWER_TRIES tries of the ask it is given back like a failed try, and from then on it is

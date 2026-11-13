@@ -374,6 +374,8 @@ export async function rehearse(sources: RehearsalSources): Promise<number> {
         if (read === undefined) throw new RehearsalError('no facts were read for this wallet');
         return read;
       },
+      // The askers are fresh keys that stand for real Ethereum wallets, whose Ethereum facts are the ones rehearsed.
+      usedOnBase: async () => false,
       accountState: readAccount,
       serv: { viaGraph: counted(sources.serv.viaGraph), viaV2: counted(sources.serv.viaV2), sleep: sources.serv.sleep },
       chain: campaignVault(publicClient, agent),
