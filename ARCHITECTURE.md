@@ -511,8 +511,8 @@ The facilitator's verify call is cut at 15 seconds (`VERIFY_TIMEOUT_MS`), each s
 call each server copy makes once before its first payment at 30. A call cut off may still finish at the facilitator; the
 claim, kept unsure, is what makes that safe.
 
-What a payment buys. A payment claim lives in the store (`payment_claims`, migrations `004_paid_results.sql` and
-`007_screening_tries.sql`) in one of these states: held (one request is settling it), unsure (the settlement's outcome is
+What a payment buys. A payment claim lives in the store (`payment_claims`, migrations `004_paid_results.sql`,
+`007_screening_tries.sql`, `012_named_transactions.sql` and `013_claim_wallet.sql`) in one of these states: held (one request is settling it), unsure (the settlement's outcome is
 not known), settled (the money moved and no result is stored yet) and served (the result is stored with the claim). A
 claim written before migration 004 is kept as used and is never redeemed.
 
@@ -526,6 +526,8 @@ the way can be fetched again.
 | settled, no request is screening it | A screening, by this request. |
 | settled, another request is screening it now | 503 with the settled-retry body below and `Retry-After: 10`. Never "used up". |
 | settled or served for another wallet | 402, refused as a used payment (`payment_already_used`), and nothing runs. |
+| unsure, first taken for another wallet | The same 402. A claim is taken again only for the wallet it was first taken for. |
+| unsure, for this wallet, holding a transaction a facilitator named | Settled again through the facilitator, and if that fails, served once that transaction's receipt proves the payment. Kept for a day past the payment's validBefore. |
 | more than a day old | Nothing: the claim is gone, and the header is treated as a new payment. |
 
 A redeem passes the same client and service limits as any paid request and never counts as a failed payment.
@@ -563,10 +565,10 @@ Errors, in the order the route checks for them:
 | 503 | `{"busy": true}` | the store that keeps the ceilings could not be reached; no payment was asked for |
 | 402 | `{"error": "Payment required"}` with `PAYMENT-REQUIRED` | no payment header |
 | 402 | `{"error": "No matching payment requirements"}` with a fresh `PAYMENT-REQUIRED` | the payment header does not match the terms |
-| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A settle the facilitator answers as plainly failed (a 200 with `success: false`, no pending reason and no transaction left to wait for) carries the facilitator's reason. |
+| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A settle the facilitator answers as plainly failed (a 200 with `success: false` and no pending reason) carries the facilitator's reason, and so does any failed answer for an authorization past its validBefore; in both cases only when no named transaction's receipt is left to wait for. |
 | 503 | `{"busy": true}` | under 120.5 seconds of the deadline are left, so nothing was claimed or settled |
 | 503 | `{"retry": true}` | the store could not record the claim on this payment, so it was not settled. Send the same payment header again. |
-| 503 | `{"retry": true}` | the settlement's outcome is unknown: no answer, a timeout, any error answer from the facilitator, an answer that says pending, or one that names a transaction whose receipt is not there yet. Every transaction named is kept with the claim, and a later copy of the header is served once a receipt proves the payment. Coinbase's facilitator refuses a payment it will not send with a 400 that names no transaction, the shape a second settle of a paid authorization would also get, so that answer is unknown too and a buyer short of funds is not told why. Send the same payment header again; it can never pay twice. |
+| 503 | `{"retry": true}` | the settlement's outcome is unknown: a named transaction whose receipt is not there yet, or, while the authorization is inside its validBefore, no answer, a timeout, any error answer from the facilitator or an answer that says pending. A named transaction stays with the claim until its receipt is read, and a later copy of the header for the same wallet is served once a receipt proves the payment. Coinbase's facilitator refuses a payment it will not send with a 400 that names no transaction, the shape a second settle of a paid authorization would also get, so that answer is unknown too and a buyer short of funds is not told why. Send the same payment header again; it can never pay twice. |
 | 503 | `{"settled": true, "retry": true, "message": "The payment has settled. Send the same payment header again to get the screening it bought."}` with `Retry-After: 10` | the payment settled and no result is stored yet: under 20 seconds were left to screen, a screening before the last try ran out of time, or another request is screening this payment now. Send the same payment header again; it is never charged again. |
 | 500 | `{"error": "the payment could not be confirmed"}` or `{"error": "internal error"}` | an internal fault; no detail is returned |
 
@@ -1235,16 +1237,17 @@ way on every run is logged once, again only when its cause changes, and a line s
    plain RPC calls and no explorer (`rpcHistory` in `packages/worker/src/facts/rpcHistory.ts`): a halving search for
    the first block where the sent count or the balance is above zero, every block that paid the wallet until its first
    own transaction that succeeded, and those blocks' transfers from their traces, which must add up to each block's
-   rise in the balance for every block before the wallet's own first send. The funder's kind is read on the same chain. The chain is stored in the ask's public facts as
+   rise in the balance for every block in which the wallet itself sent nothing. The funder's kind is read on the same chain. The chain is stored in the ask's public facts as
    `chain` (`ethereum` or `base`). If either chain cannot be read, or any read of the facts fails, the try fails and
    is taken again: a failed read is never stored as a hold. About 220 RPC calls an ask, and at most 1,000
    (`MAX_READ_CALLS`) for each of its three history reads; the reads of a try stop when the try ends.
    At start, an endpoint that answers and serves no old state or no traces turns the two-chain read off: one log line
    says which endpoint lacks what. The worker then asks Base, with two plain calls, whether the wallet was used there. A
    wallet used on Base is not decided ("the wallet was used on Base, and Base history is off"); only a wallet not used
-   there is read on Ethereum through the explorer reader. An endpoint that gives no answer, a rate limit or a server
-   fault included, is asked again after 2, 5, 15 and 30 seconds, and if it stays silent, or names another chain's id,
-   the worker does not start. `npm run campaign:screen` runs this path for any wallet and stores nothing.
+   there is read on Ethereum through the explorer reader. An endpoint that gives no answer to a plain read, a rate
+   limit or a server fault included, is asked again after 2, 5, 15 and 30 seconds, and if it stays silent, or names
+   another chain's id, the worker does not start. An endpoint that answers plain reads and leaves its trace calls
+   unanswered twice is read as serving no traces, which is how the free public endpoints in `.env.example` behave. `npm run campaign:screen` runs this path for any wallet and stores nothing.
 3. The first funder's kind is read from the chain. The facts reader leaves it unknown, so the worker reads the funder's
    code and its count of transactions sent at a finalized block, when the ask is screened, and applies core's
    `funderKind`: contract code makes it a `contract`, a plain address with 10,000 or more transactions sent
