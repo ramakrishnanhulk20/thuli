@@ -414,6 +414,17 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
 
   // The settle-failure hook is handed the same kind of error whether the facilitator answered "failed" or the call
   // threw, so the throw is noted here, per call, where the two can still be told apart.
+  //
+  // One throw is not an unknown outcome. A facilitator that refuses a payment before sending it may say so with a 4xx
+  // status and a settle body, where another says it with a 200: Coinbase's answers an unfunded wallet with 400
+  // insufficient_funds. The client turns that into a thrown SettleError. It is the facilitator's own "failed", so the
+  // buyer gets 402 with the reason and the claim is released, instead of a retry that can never succeed and a claim
+  // held for nothing. A 5xx, an answer that names a transaction, and every other throw stay unknown (C25).
+  const refusedBeforeSending = (error: unknown) =>
+    error instanceof SettleError &&
+    error.statusCode >= 400 &&
+    error.statusCode < 500 &&
+    (error.transaction === undefined || error.transaction === '');
   const facilitator: FacilitatorClient = {
     getSupported: () => config.facilitator.getSupported(),
     verify: (payload, requirements) => config.facilitator.verify(payload, requirements),
@@ -423,7 +434,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       try {
         return await config.facilitator.settle(payload, requirements);
       } catch (error) {
-        if (request !== undefined) request.settleThrew = true;
+        if (request !== undefined) request.settleThrew = !refusedBeforeSending(error);
         throw error;
       }
     },

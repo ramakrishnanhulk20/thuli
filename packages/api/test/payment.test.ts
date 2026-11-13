@@ -15,6 +15,7 @@ import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, decodePaymentSignatureHeader } from '@x402/core/http';
 import { FacilitatorTimeoutError, type FacilitatorClient } from '@x402/core/server';
 import type { PaymentPayload, PaymentRequirements, SettleResponse, SupportedResponse, VerifyResponse } from '@x402/core/types';
+import { SettleError } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
 import { validateDiscoveryExtension, type DiscoveryExtension } from '@x402/extensions/bazaar';
 import { wrapFetchWithPayment } from '@x402/fetch';
@@ -538,6 +539,50 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
       expect(screen).toHaveBeenCalledTimes(1);
       expect(facilitator.settled).toHaveLength(2);
       expect(readReceipt).not.toHaveBeenCalled();
+    }
+  });
+
+  it('reads a settle refused with a 4xx and no transaction as failed: 402 with the reason, and the same header may pay later', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    // Coinbase's facilitator answers an unfunded wallet this way, and the client throws it.
+    facilitator.respond = async () => {
+      throw new SettleError(400, { success: false, errorReason: 'insufficient_funds', errorMessage: 'contract call failed', transaction: '', network: 'eip155:84532' });
+    };
+    const readReceipt = vi.fn(noChain);
+    const { appFetch, client, screen } = await setup({ facilitator, readReceipt });
+    const header = await signedHeader(appFetch, client);
+    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(first.status).toBe(402);
+    expect(decodePaymentResponseHeader(first.headers.get('payment-response') as string).errorReason).toBe('insufficient_funds');
+    expect(JSON.stringify(await first.json())).not.toContain('decision');
+    expect(screen).not.toHaveBeenCalled();
+
+    // The claim was released, not kept unsure: once the wallet is funded the same header settles and is screened once.
+    facilitator.respond = null;
+    const funded = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(funded.status).toBe(200);
+    expect(screen).toHaveBeenCalledTimes(1);
+    expect(facilitator.settled).toHaveLength(2);
+    expect(readReceipt).not.toHaveBeenCalled();
+  });
+
+  it('keeps a thrown settle answer unknown when it carries a 5xx status or names a transaction: 503 retry, never 402', async () => {
+    const unknown = {
+      'a 5xx status': new SettleError(502, { success: false, errorReason: 'unexpected_settle_error', transaction: '', network: 'eip155:84532' }),
+      'a transaction hash': new SettleError(400, { success: false, errorReason: 'unexpected_settle_error', transaction: SETTLE_TX, network: 'eip155:84532' }),
+    };
+    for (const [name, failure] of Object.entries(unknown)) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      facilitator.respond = async () => {
+        throw failure;
+      };
+      const { appFetch, client, screen } = await setup({ facilitator });
+      const header = await signedHeader(appFetch, client);
+      const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(first.status, name).toBe(503);
+      expect(await first.json(), name).toEqual({ retry: true });
+      expect(first.headers.get('payment-response'), name).toBeNull();
+      expect(screen, name).not.toHaveBeenCalled();
     }
   });
 
