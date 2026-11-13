@@ -214,7 +214,8 @@ export async function connectBase(rpcUrl: string, fork: boolean): Promise<Connec
   const chain = baseChain(rpcUrl);
   // The configured endpoint answers, or nothing does: an HTTP redirect is refused (C38).
   const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2, fetchOptions: { redirect: 'error' } });
-  const publicClient = createPublicClient({ chain, transport });
+  // No offchain lookup: a chain read is never sent on to a URL a contract names (C38).
+  const publicClient = createPublicClient({ chain, transport, ccipRead: false });
   const chainId = await publicClient.getChainId();
   let clientVersion = '';
   try {

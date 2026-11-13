@@ -50,7 +50,8 @@ export async function connectBaseSepolia(rpcUrl: string): Promise<Connection> {
   const chain = baseSepoliaChain(rpcUrl);
   // The configured endpoint answers, or nothing does: an HTTP redirect is refused (C38).
   const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2, fetchOptions: { redirect: 'error' } });
-  const publicClient = createPublicClient({ chain, transport });
+  // No offchain lookup: a chain read is never sent on to a URL a contract names (C38).
+  const publicClient = createPublicClient({ chain, transport, ccipRead: false });
   const reported = await publicClient.getChainId();
   if (reported !== BASE_SEPOLIA.id) {
     throw new ChainCallError(`the RPC is on chain ${reported}; this runs only on Base Sepolia (${BASE_SEPOLIA.id})`);
