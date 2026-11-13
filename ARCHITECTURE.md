@@ -890,9 +890,10 @@ Not built yet:
 
 - No owner sign-in, so no real session can supply the owner's confirmation. An operator's command settles appeals.
 - The scorecard does not score appeals. The export is input for the next rulebook change and nothing reads it yet.
-- One Reppo evaluation has been made for an appeal, on 13 Nov 2026 (`cmwegxukf000508l98c92l3va`: route `review`, 440 credits charged
-  once, the owner upheld the decision). The routes `ship` and `block`, a reversal and the failure paths have run only
-  in tests, against a stand-in for Reppo.
+- Two Reppo evaluations have been made for appeals, both on 13 Nov 2026 and both against one test wallet's partial
+  decision (`cmwegxukf000508l98c92l3va`: route `review`, on a local run; `cmwezv7mt000007lbw9ii5xzp`: route `ship`, on the hosted demo
+  campaign; 440 credits each, charged once, the owner upheld both). The route `block`, a reversal and the failure
+  paths have run only in tests, against a stand-in for Reppo.
 - Contract wallets cannot appeal, nor can a wallet whose type could not be read.
 - A reversal changes the ask and its slot, not the vault. The wallet is paid only after the worker posts a new list and
   the vault's delay passes.

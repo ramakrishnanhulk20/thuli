@@ -45,7 +45,7 @@ Not built yet:
 
 - A campaign on Base mainnet. The vault factory is deployed on Base mainnet and one proof vault there paid 1 real USDC (see [Contracts and addresses](/docs/contracts)), but the campaign runs on Base Sepolia with test money.
 - Self-serve campaigns for a project: owner sign-in, an owner dashboard and a route to upload its own claim list. Today a project registers a campaign with two commands, described on [Contracts and addresses](/docs/contracts).
-- Owner sign-in for appeals. A campaign takes a signed appeal and sends Thuli's own decision to Reppo for a check. One appeal has been checked that way against the real service, with the route `review`, and the owner upheld the decision. The owner's call is made by an operator's command, because owner sign-in is not built. See [Live campaign](/docs/campaigns).
+- Owner sign-in for appeals. A campaign takes a signed appeal and sends Thuli's own decision to Reppo for a check. Two appeals have been checked that way against the real service, with the routes `review` and `ship`, and the owner upheld both. The owner's call is made by an operator's command, because owner sign-in is not built. See [Live campaign](/docs/campaigns).
 - Worker hosting as code. The worker runs as one process on a host, set up by hand in the host's settings. The repository holds no container file or host configuration for it.
 - Paid data lookups. Nothing calls a paid data provider today.
 

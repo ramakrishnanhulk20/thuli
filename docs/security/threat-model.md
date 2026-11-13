@@ -735,10 +735,10 @@ or attack that demonstrates it. A change that touches an invariant also carries 
    - The scorecard does not score appeals yet. `appeal:export` writes checked appeals, with the outside check's whole
      verdict and the owner's outcome, as input for the next rulebook change, and nothing reads that file. To fix: add the
      exported appeals to the scorecard's input.
-   - One appeal has been checked by Reppo live, on 13 November 2026: the route was `review`, it cost 440 credits, and
-     the owner upheld the decision. The routes `ship` and `block`, a live reversal and the failure paths have run only in
-     tests, against a stand-in for the outside check. To fix: run more appeals, one of them reversed, and record each
-     result.
+   - Two appeals have been checked by Reppo live, both on 13 November 2026 and both against the same test wallet's
+     partial decision: one came back `review` and one `ship`, each cost 440 credits, and the owner upheld both. The
+     route `block`, a live reversal and the failure paths have run only in tests, against a stand-in for the outside
+     check. To fix: run more appeals, one of them reversed, and record each result.
    - The paid route's two named limits (C48). A crash between the facilitator settling a payment and the store recording
      it leaves that payment unredeemable, refunded by hand; to fix, read settlements from the chain on a schedule and
      record any that have no claim. A redeem does not check the signature again; to fix, check it on every redeem, at
