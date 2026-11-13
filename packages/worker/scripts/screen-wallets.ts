@@ -17,12 +17,12 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { CHAINS, CURRENT_RULEBOOK, DEFAULT_SETTINGS, graphVersion, parseAddress, SCREENED_CHAIN_NAME, type Address } from '@thuli/core';
 import { addAsk, createCampaign, getAsk, migrate, openMemoryDb } from '@thuli/store';
-import { screenChains } from '../src/campaign/chain.ts';
+import { ethereumFacts, screenChains } from '../src/campaign/chain.ts';
 import { scrubber } from '../src/campaign/config.ts';
 import { screenNextAsk } from '../src/campaign/screen.ts';
 import { emptyChainMemory } from '../src/campaign/vault.ts';
 import { EnvError, loadEnv } from '../src/env.ts';
-import { accountStateAtFinalizedBlock, factsAtFinalizedBlock } from '../src/screen/single.ts';
+import { accountStateAtFinalizedBlock } from '../src/screen/single.ts';
 import { decideViaGraph, decideViaV2 } from '../src/serv/client.ts';
 
 /** Wallets one run screens at most: each is one model screening. */
@@ -100,7 +100,7 @@ async function main(): Promise<number> {
     let clock = Date.now();
     const deps = {
       db,
-      facts: factsAtFinalizedBlock(explorer, 'ethereum'),
+      facts: ethereumFacts(explorer),
       accountState: accountStateAtFinalizedBlock({ rpcUrl: env.ETH_RPC_URL }, 'ethereum'),
       ...(chains === undefined ? {} : { chains }),
       serv: {

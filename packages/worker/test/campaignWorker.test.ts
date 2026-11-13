@@ -568,6 +568,20 @@ function deps(vault: StandInVault, serv: DecideDeps = confirmingServ()): WorkerD
   };
 }
 
+/**
+ * The same worker as one that read both chains: neither chain shows any activity, so the facts are read through the
+ * Ethereum reader, which answers from the same `facts` and `states` as the worker's Ethereum-only readers. Only a worker
+ * that read both chains may hold a wallet as never used; one that read Ethereum alone gives such an ask back.
+ */
+function onBothChains(worker: WorkerDeps): WorkerDeps {
+  const reader = {
+    firstActivity: async () => ({ time: null, block: 100 }),
+    facts: (wallet: Address) => worker.facts(wallet),
+    accountState: (address: Address) => worker.accountState(address),
+  };
+  return { ...worker, chains: { ethereum: reader, base: reader } };
+}
+
 /** Signs and queues one ask from a fresh key, a second later than the one before so the queue order is known. */
 async function ask(
   read: Facts | Error | ((wallet: Address) => Facts),
@@ -1328,11 +1342,11 @@ describe('found by a second independent check of the worker', () => {
     expect(vault.sent.filter((fn) => fn === 'claim')).toHaveLength(1);
   });
 
-  it('decides a wallet that was never used by code alone: hold under A1, on its first try, with no SERV call (C11, C12, C24, C26)', async () => {
+  it('decides a wallet never used on either chain by code alone: hold under A1, on its first try, with no SERV call (C11, C12, C24, C26)', async () => {
     await createCampaign(db, terms());
     const serv = confirmingServ();
     const wallet = await ask(neverUsed());
-    const outcomes = await screenAll(deps(new StandInVault(3n * REWARD), serv));
+    const outcomes = await screenAll(onBothChains(deps(new StandInVault(3n * REWARD), serv)));
 
     expect(outcomes).toEqual([
       { kind: 'decided', campaignId: CAMPAIGN, wallet: wallet.address, action: 'hold', rule: 'A1', slot: null, servRequestId: null },
@@ -1345,13 +1359,26 @@ describe('found by a second independent check of the worker', () => {
       action: 'hold',
       shareBps: 0,
       rule: 'A1',
-      reason: 'A1: This wallet has never been used on Ethereum, so there is nothing to screen.',
+      reason: 'A1: This wallet has never been used on Ethereum or Base, so there is nothing to screen.',
       citedTxs: [],
       notChecked: ['sharedDepositAddress', 'sweptToSharedCollector', 'claimPaidToOtherAddress', 'fundingBurst', 'passThroughFunding'],
       servRequestId: null,
       slot: null,
       facts: { ageDays: 0, txCount: 0, accountType: 'eoa', funder: null },
     });
+  });
+
+  it('gives the same wallet back, deciding nothing and calling no model, on a worker that read Ethereum alone (C11, C60)', async () => {
+    await createCampaign(db, terms());
+    const serv = confirmingServ();
+    const wallet = await ask(neverUsed());
+    const [first] = await screenAll(deps(new StandInVault(3n * REWARD), serv));
+
+    expect(first).toEqual({ kind: 'released', campaignId: CAMPAIGN, wallet: wallet.address, cause: CAMPAIGN_SCREEN_CAUSES.baseUnread, status: 'queued' });
+    expect(await getAsk(db, CAMPAIGN, wallet.address)).toMatchObject({ status: 'failed', servRequestId: null, slot: null, facts: null });
+    expect(serv.viaGraph).not.toHaveBeenCalled();
+    expect(serv.viaV2).not.toHaveBeenCalled();
+    expect(decideWallet).not.toHaveBeenCalled();
   });
 
   it('still asks the model about a wallet that sent a transaction, has a funder, was not read in full, or does not start on hold under A1', async () => {
@@ -1369,7 +1396,7 @@ describe('found by a second independent check of the worker', () => {
       await ask(neverUsed({ missing: SINGLE_READ_MISSING })),
       await ask(neverUsed({ missing: SINGLE_READ_MISSING }), 'no-partial'),
     ];
-    await screenAll(deps(new StandInVault(3n * REWARD), serv), [CAMPAIGN, 'no-partial']);
+    await screenAll(onBothChains(deps(new StandInVault(3n * REWARD), serv)), [CAMPAIGN, 'no-partial']);
 
     const modelled = new Set(vi.mocked(decideWallet).mock.calls.map(([row]) => row.wallet));
     expect(modelled).toEqual(new Set(wallets.map((wallet) => wallet.address)));
@@ -1664,7 +1691,7 @@ describe('the day budget for model screenings', () => {
       CAMPAIGN_SCREENINGS_DAY_COUNTER,
       CAMPAIGN_SCREENINGS_DAY_MAX - 1,
     ]);
-    const worker = deps(new StandInVault(3n * REWARD));
+    const worker = onBothChains(deps(new StandInVault(3n * REWARD)));
     const lastOfDay = await ask(basicRead(freshFunder()));
     const over = await ask(basicRead(freshFunder()));
     const empty = await ask(neverUsed());
@@ -1725,7 +1752,7 @@ describe('the record a decision rested on', () => {
     const serv = confirmingServ();
     const modelled = await ask(basicRead(freshFunder()));
     const empty = await ask(neverUsed());
-    await screenAll(deps(new StandInVault(3n * REWARD), serv));
+    await screenAll(onBothChains(deps(new StandInVault(3n * REWARD), serv)));
     const recordOf = async (wallet: Wallet) =>
       (await db.query<{ record: unknown }>('SELECT record FROM asks WHERE wallet = $1', [wallet.address]))[0]?.record;
 

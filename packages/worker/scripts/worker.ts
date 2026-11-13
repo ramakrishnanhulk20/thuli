@@ -20,11 +20,11 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { connectPostgres, openCampaigns } from '@thuli/store';
 import { reppoForAppeals } from '../src/campaign/appeals.ts';
-import { screenChains } from '../src/campaign/chain.ts';
+import { ethereumFacts, screenChains } from '../src/campaign/chain.ts';
 import { loadWorkerConfig, readFactoryRecord, scrubber, secretsOf, WorkerConfigError } from '../src/campaign/config.ts';
 import { runLoop } from '../src/campaign/loop.ts';
 import { campaignVault, emptyChainMemory, safeCause } from '../src/campaign/vault.ts';
-import { accountStateAtFinalizedBlock, factsAtFinalizedBlock } from '../src/screen/single.ts';
+import { accountStateAtFinalizedBlock } from '../src/screen/single.ts';
 import { decideViaGraph, decideViaV2 } from '../src/serv/client.ts';
 import { connectBaseSepolia } from '../src/vault/chain.ts';
 
@@ -66,10 +66,11 @@ async function main(): Promise<number> {
     const runs = await runLoop(
       {
         db,
-        facts: factsAtFinalizedBlock(
-          { rpcUrl: config.ethRpcUrl, blockscoutApi: config.blockscoutApi, ...(config.blockscoutApiKey === null ? {} : { apiKey: config.blockscoutApiKey }) },
-          'ethereum',
-        ),
+        facts: ethereumFacts({
+          rpcUrl: config.ethRpcUrl,
+          blockscoutApi: config.blockscoutApi,
+          ...(config.blockscoutApiKey === null ? {} : { apiKey: config.blockscoutApiKey }),
+        }),
         accountState: accountStateAtFinalizedBlock({ rpcUrl: config.ethRpcUrl }, 'ethereum'),
         ...(chains === undefined ? {} : { chains }),
         serv: {

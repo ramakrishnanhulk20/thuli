@@ -93,8 +93,9 @@ const DEFAULTED: readonly { name: string; valid(value: string): boolean; needs: 
  * Reads and checks every variable the worker needs before anything connects, so a missing one stops it at start rather
  * than at its first screening. Base URLs lose any trailing slash, as env.ts does. REPPO_API_KEY is optional: without it
  * the appeal step is skipped; with it, REPPO_BASE_URL must be an https URL. BASE_RPC_URL is optional, with Base's
- * public endpoint as its default, and BLOCKSCOUT_API_KEY is optional. Whether asks are read on both chains is not a
- * setting: screenChains probes the two RPC endpoints at start.
+ * public endpoint as its default, and BLOCKSCOUT_API_KEY is optional. Whether asks are read on both chains follows
+ * from what the two configured RPC endpoints serve: screenChains probes them at start, and an endpoint that gives no
+ * answer then stops the worker rather than choose the mode.
  *
  * @throws WorkerConfigError naming each missing or invalid variable on its own line, with what it must be. No value is
  *   ever part of the message (C40).

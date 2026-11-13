@@ -37,6 +37,12 @@ export interface FactSources {
   apiKey?: string;
   /** Told which fact could not be read and why, in fixed words with no URLs or secrets. */
   onProblem?: (fact: FactName, cause: string) => void;
+  /**
+   * Told each time a read itself failed: the RPC or the history gave no usable answer. A fact the data that was read
+   * leaves unknown, such as no funding found, is not a failed read. A caller that can try again later uses it to tell
+   * the two apart, so an outage is never stored as a fact about the wallet (C11).
+   */
+  onFailedRead?: () => void;
 }
 
 /** A wallet's history at or before a block, in the shape core's facts functions take. readHistory is Blockscout's. */
@@ -47,6 +53,7 @@ export interface HistorySources {
   rpcUrl: string;
   history: HistoryReader;
   onProblem?: FactSources['onProblem'];
+  onFailedRead?: FactSources['onFailedRead'];
 }
 
 const hasHistoryReader = (sources: FactSources | HistorySources): sources is HistorySources => 'history' in sources;
@@ -66,12 +73,16 @@ function baseSourcesFromEnv(): HistorySources {
 
 const VIEM_CHAINS: Readonly<Record<ScreenedChain, Chain>> = { ethereum: mainnet, base };
 
+/** Each screened chain's id, the one its RPC endpoint must answer with. */
+export const SCREENED_CHAIN_ID: Readonly<Record<ScreenedChain, number>> = { ethereum: mainnet.id, base: base.id };
+
 /** A read-only client for one screened chain, with the fact reads' timeout and one retry. */
 export function chainClient(chain: ScreenedChain, rpcUrl: string) {
-  // ccipRead off: a chain read must never be redirected to an off-chain URL a contract names (threat model C38).
+  // ccipRead off: a chain read must never be redirected to an off-chain URL a contract names. An HTTP redirect is
+  // refused for the same reason: the configured endpoint answers, or nothing does (threat model C38).
   return createPublicClient({
     chain: VIEM_CHAINS[chain],
-    transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1 }),
+    transport: http(rpcUrl, { timeout: REQUEST_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }),
     ccipRead: false,
   });
 }
@@ -287,7 +298,7 @@ function errorKind(reason: unknown): string {
  *
  * Group, shared deposit address and claim-paid-elsewhere are not computed in this version and are always listed in
  * missing. Any fact that cannot be read is set to null or "unknown" and named in missing, so the ceiling holds the
- * wallet instead of guessing (threat model C11). That includes a wallet with no funding found: Blockscout's internal
+ * wallet instead of guessing (threat model C11), and each read that failed is told to sources.onFailedRead. That includes a wallet with no funding found: Blockscout's internal
  * index can lag the chain, so an empty internal list is not proof that nothing funded it. Every request has a 15 second
  * timeout and each transaction list stops at 20 pages (C41).
  *
@@ -309,6 +320,10 @@ export async function collectBasicFacts(
     missing.add(fact);
     sources.onProblem?.(fact, cause);
   };
+  const failedRead = (fact: FactName, cause: string) => {
+    problem(fact, cause);
+    sources.onFailedRead?.();
+  };
 
   const [snapshotBlock, txCount, code, history] = await Promise.allSettled([
     client.getBlock({ blockNumber }),
@@ -320,12 +335,12 @@ export async function collectBasicFacts(
 
   let txCountAtSnapshot: number | null = null;
   if (txCount.status === 'fulfilled') txCountAtSnapshot = txCount.value;
-  else problem('txCountAtSnapshot', `transaction count read failed (${errorKind(txCount.reason)})`);
+  else failedRead('txCountAtSnapshot', `transaction count read failed (${errorKind(txCount.reason)})`);
 
   let accountType: AccountType = 'unknown';
   if (code.status === 'fulfilled') accountType = accountTypeFromCode(code.value);
   if (accountType === 'unknown') {
-    problem('accountType', code.status === 'rejected' ? `code read failed (${errorKind(code.reason)})` : 'code was not hex');
+    failedRead('accountType', code.status === 'rejected' ? `code read failed (${errorKind(code.reason)})` : 'code was not hex');
   }
 
   let firstFunder: Facts['firstFunder'] = null;
@@ -334,7 +349,7 @@ export async function collectBasicFacts(
   if (history.status === 'rejected') {
     const cause = `transaction history read failed (${errorKind(history.reason)})`;
     problem('firstFunder', cause);
-    problem('walletAgeDays', cause);
+    failedRead('walletAgeDays', cause);
   } else {
     const funding = fundingTransfer(address, history.value);
     if (funding.status === 'found') {
@@ -344,7 +359,7 @@ export async function collectBasicFacts(
       problem('firstFunder', 'no incoming value transfer at or before the wallet first sent');
     }
     if (snapshotBlock.status === 'rejected') {
-      problem('walletAgeDays', `snapshot block read failed (${errorKind(snapshotBlock.reason)})`);
+      failedRead('walletAgeDays', `snapshot block read failed (${errorKind(snapshotBlock.reason)})`);
     } else {
       ageDays = walletAgeDays(address, history.value, Number(snapshotBlock.value.timestamp));
       if (ageDays === null) problem('walletAgeDays', 'the wallet age could not be worked out from its transfers');

@@ -2,13 +2,16 @@
 // real endpoint marks reverted frames, names selfdestructs and honours trace_filter's count the way the stand-in does is
 // left to npm run history:compare, run against the endpoints in .env. The campaign path on these readers is
 // campaignChain.test.ts.
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { createPublicClient, http, keccak256, toHex } from 'viem';
 import { mainnet } from 'viem/chains';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { firstActivityTime, fundingTransfer, parseAddress, SECONDS_PER_DAY, walletAgeDays, type Transfer } from '@thuli/core';
 import { rpcFirstActivity } from '../src/campaign/chain.ts';
-import { collectBasicFacts } from '../src/facts/basic.ts';
+import { chainClient, collectBasicFacts } from '../src/facts/basic.ts';
 import {
+  callBudget,
   firstSendBlock,
   firstUsedBlock,
   historyClientOf,
@@ -25,6 +28,7 @@ import {
   RpcRefused,
   rpcHistory,
   transfersInBlock,
+  TRY_LATER_CODES,
   type HistoryClient,
 } from '../src/facts/rpcHistory.ts';
 
@@ -93,7 +97,7 @@ const moves = (trace: RawTrace) => trace.type === 'suicide' || trace.type === 'r
  * `emptyBlocks`. Every call is recorded; `fail` may answer one with an error instead.
  */
 function standIn(
-  state: { funded?: number; sent?: number; derive?: boolean; credits?: Record<number, bigint>; traces?: RawTrace[]; emptyBlocks?: number[] },
+  state: { funded?: number; sent?: number; derive?: boolean; credits?: Record<number, bigint>; traces?: RawTrace[]; emptyBlocks?: number[]; chainId?: number },
   fail?: (method: string, params: readonly unknown[]) => Error | undefined,
 ) {
   const calls: { method: string; params: readonly unknown[] }[] = [];
@@ -120,6 +124,7 @@ function standIn(
       calls.push({ method, params });
       const refusal = fail?.(method, params);
       if (refusal !== undefined) throw refusal;
+      if (method === 'eth_chainId') return toHex(state.chainId ?? 1);
       if (method === 'eth_getBlockByNumber') {
         const block = blockOf(params[0]);
         const transactions = state.emptyBlocks?.includes(block) === true ? [] : [hashOf(`background ${block}`)];
@@ -455,6 +460,47 @@ describe('rpcHistory gathers every inflow up to the first own send', () => {
     expect(causes[0]).toMatch(/^transaction history read failed \(more than 24 blocks paid the wallet/);
   });
 
+  it('refuses a history whose rows for a block do not add up to its balance rise, so a trace answer cut short never names a smaller payer as the funder (C11)', async () => {
+    // Dust first, the real funding later, then the first send: the larger inflow is the funder.
+    const dust = callTrace(B, SENDER, SELF, 1_000n);
+    const real = callTrace(B + 400, EXCHANGE, SELF, ONE_ETH);
+    const extra = callTrace(B + 400, CONTRACT, SELF, 7n);
+    const traces = [dust, real, extra, callTrace(SEND, SELF, SHOP, 1n)];
+    expect(await judged({ derive: true, traces })).toMatchObject({ funder: EXCHANGE, evidence: real.transactionHash, ageDays: AGE });
+
+    // The same chain behind an endpoint whose trace_filter answer for one block comes back short.
+    const short = (block: number, keep: (trace: RawTrace) => boolean): HistoryClient => {
+      const { client } = standIn({ derive: true, traces });
+      return {
+        request: async (method, params, signal) => {
+          const answer = await client.request(method, params, signal);
+          const asked = Number((params[0] as { fromBlock?: string } | undefined)?.fromBlock);
+          return method === 'trace_filter' && asked === block ? (answer as RawTrace[]).filter(keep) : answer;
+        },
+      };
+    };
+    const unequal = "the transfers read for a block do not add up to the rise in the wallet's balance there";
+    // Nothing for the funding block: without the check the dust sender would be the funder.
+    await expect(rpcHistory(short(B + 400, () => false), WALLET, TOP)).rejects.toThrow(unequal);
+    // One of the block's two inflows dropped, the larger or the smaller.
+    await expect(rpcHistory(short(B + 400, (trace) => trace !== real), WALLET, TOP)).rejects.toThrow(unequal);
+    await expect(rpcHistory(short(B + 400, (trace) => trace !== extra), WALLET, TOP)).rejects.toThrow(unequal);
+    // An answer that leaves the block whole is read as before.
+    expect(fundingTransfer(WALLET, await rpcHistory(short(B + 400, () => true), WALLET, TOP))).toMatchObject({ status: 'found', transfer: { from: EXCHANGE } });
+  });
+
+  it('refuses a block that paid the wallet with no transaction after its first block, and counts a failed inflow as no rise', async () => {
+    const funding = callTrace(B, EXCHANGE, SELF, ONE_ETH);
+    const send = callTrace(SEND, SELF, SHOP, 1n);
+    // A staking withdrawal or a block's fees: the balance rises and no trace says who paid.
+    await expect(rpcHistory(standIn({ derive: true, credits: { [B + 200]: 5n }, traces: [funding, send] }).client, WALLET, TOP)).rejects.toThrow(
+      "the transfers read for a block do not add up to the rise in the wallet's balance there",
+    );
+    // A reverted inflow moves no balance, so its block is not one that paid, and nothing has to add up there.
+    const reverted = callTrace(B + 200, SENDER, SELF, 9n * ONE_ETH, { error: 'Reverted' });
+    expect(await judged({ derive: true, traces: [funding, reverted, send] })).toMatchObject({ funder: EXCHANGE, evidence: funding.transactionHash });
+  });
+
   it('bounds the funder by a first act that is a deployment (f)', async () => {
     const funding = callTrace(B, EXCHANGE, SELF, ONE_ETH);
     const deploy = { ...callTrace(SEND, SELF, CONTRACT, 0n), type: 'create', action: { from: SELF, value: '0x0', gas: '0x0', init: '0x' } };
@@ -504,14 +550,32 @@ describe('rpcHistory gathers every inflow up to the first own send', () => {
 });
 
 describe('rpcFirstActivity', () => {
-  it('dates the wallet by its first used block, null when never used, unknown when that block holds no qualifying row (C11, C20)', async () => {
+  it("dates the wallet by its first used block, null when never used, and gives that block's time as a bound when it holds no qualifying row or cannot be read (C11, C15, C20)", async () => {
     expect(await rpcFirstActivity(standIn({ funded: B, traces: [callTrace(B, EXCHANGE, SELF, ONE_ETH)] }).client, WALLET)).toEqual({ time: timeOf(B), block: TOP });
     expect(await rpcFirstActivity(standIn({}).client, WALLET)).toEqual({ time: null, block: TOP });
+    const bound = { notBefore: timeOf(B), block: TOP };
     const reward = { ...callTrace(B, SENDER, SELF, 0n), type: 'reward', action: { author: SELF, value: toHex(ONE_ETH) }, transactionHash: null };
     const unread: RawTrace[][] = [[], [callTrace(B, EXCHANGE, SELF, ONE_ETH, { error: 'Reverted' })], [callTrace(B, SENDER, SELF, 0n)], [reward]];
-    for (const traces of unread) expect(await rpcFirstActivity(standIn({ funded: B, traces }).client, WALLET)).toBe('unknown');
+    for (const traces of unread) expect(await rpcFirstActivity(standIn({ funded: B, traces }).client, WALLET)).toEqual(bound);
     const refusing = standIn({ funded: B, traces: [callTrace(B, EXCHANGE, SELF, ONE_ETH)] }, (method) => (method === 'trace_filter' ? new RpcRefused('refused') : undefined));
-    expect(await rpcFirstActivity(refusing.client, WALLET)).toBe('unknown');
+    expect(await rpcFirstActivity(refusing.client, WALLET)).toEqual(bound);
+    // What anyone can do to a wallet's unused chain for cents: one block with more transactions calling the wallet from
+    // inside than the reader takes, one of them carrying 1 wei. The block still bounds the first activity.
+    const crowd = Array.from({ length: MAX_TRACED_TRANSACTIONS + 1 }, (_, index) => {
+      const hash = hashOf(`crowd ${index}`);
+      return [callTrace(B, SENDER, CONTRACT, 0n, { hash }), callTrace(B, CONTRACT, SELF, index === 0 ? 1n : 0n, { hash, at: [0] })];
+    }).flat();
+    expect(await rpcFirstActivity(standIn({ funded: B, traces: crowd }).client, WALLET)).toEqual(bound);
+  });
+
+  it('settles nothing when the first used block or its time cannot be read (C11)', async () => {
+    const traces = [callTrace(B, EXCHANGE, SELF, ONE_ETH)];
+    const noTime = standIn({ funded: B, traces }, (method, params) => (method === 'eth_getBlockByNumber' && params[0] === toHex(B) ? new HistoryError('no answer') : undefined));
+    expect(await rpcFirstActivity(noTime.client, WALLET)).toBe('unknown');
+    const noSearch = standIn({ funded: B, traces }, (method) => (method === 'eth_getBalance' ? new RpcRefused('refused') : undefined));
+    expect(await rpcFirstActivity(noSearch.client, WALLET)).toBe('unknown');
+    const noTop = standIn({ funded: B, traces }, (method, params) => (method === 'eth_getBlockByNumber' && params[0] === 'finalized' ? new Error('socket hang up') : undefined));
+    expect(await rpcFirstActivity(noTop.client, WALLET)).toBe('unknown');
   });
 
   it('reads nothing more once its signal aborts, and answers unknown (C41)', async () => {
@@ -533,20 +597,59 @@ describe('historyProbe', () => {
   const traced = [callTrace(TOP, SENDER, SHOP, 1n, { hash: hashOf(`background ${TOP}`) })];
 
   it('passes an endpoint that serves old state and traces, stepping back from a finalized block with no transaction', async () => {
-    expect(await historyProbe(standIn({ traces: traced }).client)).toEqual({ ok: true });
+    expect(await historyProbe(standIn({ traces: traced }).client, 1)).toEqual({ ok: true });
     const { client, calls } = standIn({ traces: [callTrace(TOP - 1, SENDER, SHOP, 1n, { hash: hashOf(`background ${TOP - 1}`) })], emptyBlocks: [TOP] });
-    expect(await historyProbe(client)).toEqual({ ok: true });
+    expect(await historyProbe(client, 1)).toEqual({ ok: true });
     expect(calls.find((call) => call.method === 'eth_getBalance')?.params).toEqual(['0x0000000000000000000000000000000000000000', '0x1']);
   });
 
   it("answers its three failures: no answer, old state refused, traces refused or empty for a block with transactions", async () => {
     const failing = (method: string, error: Error) => standIn({ traces: traced }, (asked) => (asked === method ? error : undefined)).client;
-    expect(await historyProbe(failing('eth_getBlockByNumber', new HistoryError('the RPC gave no answer to eth_getBlockByNumber')))).toEqual({ ok: false, lacks: 'no answer' });
-    expect(await historyProbe(failing('eth_getBalance', new RpcRefused('the RPC refused eth_getBalance')))).toEqual({ ok: false, lacks: 'old state' });
-    expect(await historyProbe(failing('eth_getBalance', new Error('socket hang up')))).toEqual({ ok: false, lacks: 'no answer' });
-    expect(await historyProbe(failing('trace_filter', new RpcRefused('the RPC refused trace_filter')))).toEqual({ ok: false, lacks: 'traces' });
-    expect(await historyProbe(failing('trace_transaction', new RpcRefused('the RPC refused trace_transaction')))).toEqual({ ok: false, lacks: 'traces' });
-    expect(await historyProbe(standIn({ traces: [] }).client)).toEqual({ ok: false, lacks: 'traces' });
+    expect(await historyProbe(failing('eth_getBlockByNumber', new HistoryError('the RPC gave no answer to eth_getBlockByNumber')), 1)).toEqual({ ok: false, lacks: 'no answer' });
+    expect(await historyProbe(failing('eth_getBalance', new RpcRefused('the RPC refused eth_getBalance')), 1)).toEqual({ ok: false, lacks: 'old state' });
+    expect(await historyProbe(failing('eth_getBalance', new Error('socket hang up')), 1)).toEqual({ ok: false, lacks: 'no answer' });
+    expect(await historyProbe(failing('trace_filter', new RpcRefused('the RPC refused trace_filter')), 1)).toEqual({ ok: false, lacks: 'traces' });
+    expect(await historyProbe(failing('trace_transaction', new RpcRefused('the RPC refused trace_transaction')), 1)).toEqual({ ok: false, lacks: 'traces' });
+    expect(await historyProbe(standIn({ traces: [] }).client, 1)).toEqual({ ok: false, lacks: 'traces' });
+  });
+});
+
+describe('historyProbe on the chain id', () => {
+  const traced = [callTrace(TOP, SENDER, SHOP, 1n, { hash: hashOf(`background ${TOP}`) })];
+
+  it('refuses an endpoint of another chain before anything else is read, and one that will not name its chain', async () => {
+    const sepolia = standIn({ traces: traced, chainId: 84_532 });
+    expect(await historyProbe(sepolia.client, 8_453)).toEqual({ ok: false, lacks: 'chain' });
+    expect(sepolia.calls.map((call) => call.method)).toEqual(['eth_chainId']);
+    expect(await historyProbe(standIn({ traces: traced, chainId: 8_453 }).client, 8_453)).toEqual({ ok: true });
+    const failing = (error: Error) => standIn({ traces: traced }, (asked) => (asked === 'eth_chainId' ? error : undefined)).client;
+    expect(await historyProbe(failing(new RpcRefused('the RPC refused eth_chainId')), 1)).toEqual({ ok: false, lacks: 'chain' });
+    expect(await historyProbe(failing(new Error('socket hang up')), 1)).toEqual({ ok: false, lacks: 'no answer' });
+    const odd: HistoryClient = { request: async () => 'mainnet' };
+    expect(await historyProbe(odd, 1)).toEqual({ ok: false, lacks: 'chain' });
+  });
+});
+
+describe('callBudget', () => {
+  it("refuses every call past a read's budget without sending it, in fixed words (C41, C49)", async () => {
+    const { client, calls } = standIn({ funded: B });
+    const budgeted = callBudget(client, 3);
+    for (let asked = 0; asked < 3; asked += 1) expect(await budgeted.request('eth_getBalance', [SELF, toHex(TOP)])).toBe(toHex(ONE_ETH));
+    const refusal = await budgeted.request('eth_getBalance', [SELF, toHex(TOP)]).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(HistoryError);
+    expect((refusal as Error).message).toBe('the read asked for more than 3 RPC calls');
+    expect(calls).toHaveLength(3);
+  });
+
+  it('fails a history read that needs more calls than its budget, and leaves one within it unchanged', async () => {
+    const traces = [callTrace(B, EXCHANGE, SELF, ONE_ETH), callTrace(B + 9, SELF, SHOP, 1n)];
+    const whole = standIn({ derive: true, traces });
+    const data = await rpcHistory(whole.client, WALLET, TOP);
+    const needed = whole.calls.length;
+    expect(await rpcHistory(callBudget(standIn({ derive: true, traces }).client, needed), WALLET, TOP)).toEqual(data);
+    const tight = standIn({ derive: true, traces });
+    await expect(rpcHistory(callBudget(tight.client, needed - 1), WALLET, TOP)).rejects.toThrow(`the read asked for more than ${needed - 1} RPC calls`);
+    expect(tight.calls.length).toBeLessThan(needed);
   });
 });
 
@@ -612,6 +715,136 @@ describe('historyClientOf', () => {
     expect([fetches, waits]).toEqual([1, []]);
   });
 
+  it('sends a call answered with a rate-limit code again like one that got no answer, and refuses every other code at once', async () => {
+    const viemClient = () => createPublicClient({ chain: mainnet, transport: http(URL_WITH_TOKEN, { retryCount: 0 }) });
+    for (const code of TRY_LATER_CODES) {
+      const waits: number[] = [];
+      let fetches = 0;
+      vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+        fetches += 1;
+        const { id } = JSON.parse(String(init?.body)) as { id: number };
+        const body = fetches < 3 ? { error: { code, message: `slow down, ${URL_WITH_TOKEN}` } } : { result: '0x2a' };
+        return Response.json({ jsonrpc: '2.0', id, ...body });
+      });
+      const client = historyClientOf(viemClient(), async (ms) => {
+        waits.push(ms);
+      });
+      expect(await client.request('trace_filter', [{}]), String(code)).toBe('0x2a');
+      expect([fetches, waits], String(code)).toEqual([3, [...NO_ANSWER_WAITS_MS]]);
+    }
+
+    // QuickNode's own shape for a rate limit: HTTP 429 with the JSON-RPC error in the body. It never clears here.
+    let limited = 0;
+    vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+      limited += 1;
+      const { id } = JSON.parse(String(init?.body)) as { id: number };
+      const body = { jsonrpc: '2.0', id, error: { code: 429, message: 'The requests per second (RPS) of your requests are higher than your plan allows.' } };
+      return new Response(JSON.stringify(body), { status: 429, headers: { 'content-type': 'application/json' } });
+    });
+    const busy = historyClientOf(viemClient(), async () => undefined);
+    const error = await busy.request('trace_filter', [{}]).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(HistoryError);
+    expect(error).not.toBeInstanceOf(RpcRefused);
+    expect((error as Error).message).toBe('the RPC gave no answer to trace_filter');
+    expect(limited).toBe(NO_ANSWER_WAITS_MS.length + 1);
+    // So a rate limit at start is "no answer" to the probe, never something the endpoint lacks.
+    expect(await historyProbe(busy, 1)).toEqual({ ok: false, lacks: 'no answer' });
+
+    for (const code of [-32000, -32601, -32602, -32611, 3]) {
+      let asked = 0;
+      vi.stubGlobal('fetch', async (_input: unknown, init?: RequestInit) => {
+        asked += 1;
+        const { id } = JSON.parse(String(init?.body)) as { id: number };
+        return Response.json({ jsonrpc: '2.0', id, error: { code, message: 'no' } });
+      });
+      await expect(historyClientOf(viemClient(), async () => undefined).request('trace_filter', [{}]), String(code)).rejects.toBeInstanceOf(RpcRefused);
+      expect(asked, String(code)).toBe(1);
+    }
+  });
+
+  it('does not follow an HTTP redirect to another host: the configured endpoint answers, or nothing does (C38)', async () => {
+    let reached = 0;
+    const elsewhere = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      request.on('end', () => {
+        reached += 1;
+        const call = JSON.parse(body) as { id: number };
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, result: '0x2a' }));
+      });
+    });
+    await new Promise<void>((resolve) => elsewhere.listen(0, '127.0.0.1', resolve));
+    const redirecting = createServer((request, response) => {
+      request.resume();
+      response.statusCode = 307;
+      response.setHeader('location', `http://127.0.0.1:${(elsewhere.address() as AddressInfo).port}/`);
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirecting.listen(0, '127.0.0.1', resolve));
+    try {
+      const client = historyClientOf(chainClient('ethereum', `http://127.0.0.1:${(redirecting.address() as AddressInfo).port}`), async () => undefined);
+      await expect(client.request('eth_getBalance', [SELF, '0x1'])).rejects.toThrow('the RPC gave no answer to eth_getBalance');
+      expect(reached).toBe(0);
+      // The same client reaches a node that answers for itself.
+      const direct = historyClientOf(chainClient('ethereum', `http://127.0.0.1:${(elsewhere.address() as AddressInfo).port}`), async () => undefined);
+      expect(await direct.request('eth_getBalance', [SELF, '0x1'])).toBe('0x2a');
+      expect(reached).toBe(1);
+    } finally {
+      await new Promise((resolve) => redirecting.close(resolve));
+      await new Promise((resolve) => elsewhere.close(resolve));
+    }
+  });
+
+  it('does not send a call whose signal aborted while it waited for a place or for its next send (C41)', async () => {
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+    const stop = new AbortController();
+    const release: (() => void)[] = [];
+    let sent = 0;
+    const slow = historyClientOf({
+      request: async () => {
+        sent += 1;
+        await new Promise<void>((resolve) => release.push(resolve));
+        return '0x1';
+      },
+    } as never);
+    const running = Array.from({ length: MAX_CALLS_IN_FLIGHT }, (_, index) => slow.request('eth_getBalance', [SELF, toHex(index)], stop.signal));
+    const waiting = Array.from({ length: 4 }, (_, index) => slow.request('eth_getBalance', [SELF, toHex(100 + index)], stop.signal).catch((error: unknown) => error));
+    while (release.length < MAX_CALLS_IN_FLIGHT) await tick();
+    expect(sent).toBe(MAX_CALLS_IN_FLIGHT);
+    stop.abort();
+    for (const done of release.splice(0)) done();
+    expect(await Promise.all(running)).toHaveLength(MAX_CALLS_IN_FLIGHT);
+    for (const error of await Promise.all(waiting)) {
+      expect(error).toBeInstanceOf(HistoryError);
+      expect((error as Error).message).toBe('the read was stopped');
+    }
+    expect(sent).toBe(MAX_CALLS_IN_FLIGHT);
+    // Every place is free again: the next read's calls are sent at once.
+    const next = Array.from({ length: MAX_CALLS_IN_FLIGHT }, (_, index) => slow.request('eth_getBalance', [SELF, toHex(200 + index)]));
+    while (release.length < MAX_CALLS_IN_FLIGHT) await tick();
+    for (const done of release.splice(0)) done();
+    expect(await Promise.all(next)).toHaveLength(MAX_CALLS_IN_FLIGHT);
+
+    const halt = new AbortController();
+    let asked = 0;
+    const flaky = historyClientOf(
+      {
+        request: async () => {
+          asked += 1;
+          throw new Error('socket hang up');
+        },
+      } as never,
+      async () => halt.abort(),
+    );
+    await expect(flaky.request('eth_getBalance', [SELF, '0x1'], halt.signal)).rejects.toThrow('the read was stopped');
+    expect(asked).toBe(1);
+    await expect(flaky.request('eth_getBalance', [SELF, '0x1'], halt.signal)).rejects.toThrow('the read was stopped');
+    expect(asked).toBe(1);
+  });
+
   it(`runs at most ${MAX_CALLS_IN_FLIGHT} calls at once and still answers every one (C41)`, async () => {
     let running = 0;
     let most = 0;
@@ -637,12 +870,14 @@ describe('historyClientOf', () => {
 
   it('lets the probe tell a node that refuses traces from one that gives no answer', async () => {
     const node = (method: string) =>
-      method === 'eth_getBlockByNumber'
+      method === 'eth_chainId'
+        ? Response.json({ result: '0x1' })
+        : method === 'eth_getBlockByNumber'
         ? Response.json({ result: { number: toHex(TOP), timestamp: toHex(TOP_TIME), transactions: [hashOf('t')] } })
         : method === 'eth_getBalance'
           ? Response.json({ result: '0x0' })
           : Response.json({ error: { code: -32611, message: 'rejected due to request filter settings' } });
-    expect(await historyProbe(stubNode(node))).toEqual({ ok: false, lacks: 'traces' });
-    expect(await historyProbe(stubNode(() => new Response('', { status: 500 })))).toEqual({ ok: false, lacks: 'no answer' });
+    expect(await historyProbe(stubNode(node), 1)).toEqual({ ok: false, lacks: 'traces' });
+    expect(await historyProbe(stubNode(() => new Response('', { status: 500 })), 1)).toEqual({ ok: false, lacks: 'no answer' });
   });
 });

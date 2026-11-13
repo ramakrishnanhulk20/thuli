@@ -27,7 +27,8 @@ const MAX_CAUSE_DEPTH = 8;
  * node answered but not with what was asked, and with any other error when it gave no answer.
  */
 export interface HistoryClient {
-  request(method: string, params: readonly unknown[]): Promise<unknown>;
+  /** `signal`, when given, stops a call that has not been sent yet or is waiting to be sent again. */
+  request(method: string, params: readonly unknown[], signal?: AbortSignal): Promise<unknown>;
 }
 
 /** An error this file wrote, in fixed words: never an endpoint address, a key, or a value the node sent (C40). */
@@ -40,10 +41,20 @@ export class RpcRefused extends HistoryError {
   override name = 'RpcRefused';
 }
 
+/**
+ * Error codes a node answers when it is asked too fast, which says nothing about what it serves: HTTP's 429 written into
+ * a JSON-RPC body, EIP-1474's limit exceeded, and QuickNode's per-second, per-minute, per-method and plain rate limits,
+ * as its error reference lists them. A call answered with one is sent again like a call that got no answer. Not covered:
+ * a provider that reports a rate limit under any other code. That reads as a refusal, so the read it belongs to fails
+ * and its try is given back, and at start the probe reads it as something the endpoint lacks.
+ */
+export const TRY_LATER_CODES: readonly number[] = [429, -32005, -32007, -32008, -32011, -32029];
+
+// True when the node answered with an error about the request itself, not about how fast it was asked.
 function answeredWithError(error: unknown): boolean {
   let cause = error;
   for (let depth = 0; depth < MAX_CAUSE_DEPTH && cause instanceof Error; depth += 1) {
-    if (cause instanceof RpcRequestError) return true;
+    if (cause instanceof RpcRequestError) return !TRY_LATER_CODES.includes(cause.code);
     cause = cause.cause;
   }
   return false;
@@ -57,9 +68,11 @@ export const NO_ANSWER_WAITS_MS: readonly number[] = [400, 1_200];
 
 /**
  * A HistoryClient on a viem client, chainClient's in production, so every call keeps its 15 second timeout. At most
- * MAX_CALLS_IN_FLIGHT calls run at once, and a call that got no answer (a rate limit, a dropped connection) is sent
- * again after each of NO_ANSWER_WAITS_MS; a call the node refused is not. viem's own errors name the endpoint, which
- * can carry a token, so a failure leaves here as fixed words with no cause attached (C40).
+ * MAX_CALLS_IN_FLIGHT calls run at once, and a call that got no answer (a rate limit, a dropped connection, an error
+ * answer with one of TRY_LATER_CODES) is sent again after each of NO_ANSWER_WAITS_MS; a call the node refused is not. A
+ * call whose signal has aborted is not sent, whether it was waiting for a place or for its next send, so a read that was
+ * given up on stops holding the places the next read needs (C41). viem's own errors name the endpoint, which can carry a
+ * token, so a failure leaves here as fixed words with no cause attached (C40).
  */
 export function historyClientOf(
   client: Pick<PublicClient, 'request'>,
@@ -78,10 +91,14 @@ export function historyClientOf(
     else next();
   };
   return {
-    async request(method, params) {
+    async request(method, params, signal) {
+      // Asked through a function each time: the signal can abort while this call waits for a place or for its next send.
+      const stopped = () => signal?.aborted === true;
+      if (stopped()) throw new HistoryError('the read was stopped');
       await enter();
       try {
         for (let attempt = 0; ; attempt += 1) {
+          if (stopped()) throw new HistoryError('the read was stopped');
           try {
             const result: unknown = await client.request({ method, params: [...params] } as never);
             return result;
@@ -95,6 +112,27 @@ export function historyClientOf(
       } finally {
         leave();
       }
+    },
+  };
+}
+
+/**
+ * RPC calls one history read may ask for at most: one chain's first-activity read for the pick, or the full facts read on
+ * the chosen chain. Measured on the stand-in chains at Ethereum's and Base's heights (campaignChain.test.ts), a wallet
+ * funded once and then active asks for 55 and 57 calls in a pick and 99 and 105 in its facts read. The other caps in this
+ * file each bound one part of a read; this bounds the whole, so a wallet shaped to reach several of them at once is not read,
+ * rather than read slowly (C41, C49). A call sent again after no answer counts once.
+ */
+export const MAX_READ_CALLS = 1_000;
+
+/** A HistoryClient for one read: it refuses every call past `max` in fixed words, without sending it. */
+export function callBudget(client: HistoryClient, max: number): HistoryClient {
+  let asked = 0;
+  return {
+    request(method, params, signal) {
+      if (asked >= max) return Promise.reject(new HistoryError(`the read asked for more than ${max} RPC calls`));
+      asked += 1;
+      return client.request(method, params, signal);
     },
   };
 }
@@ -149,6 +187,18 @@ async function header(client: HistoryClient, tag: string): Promise<{ number: num
 /** The chain's latest finalized block number, the block every campaign read is taken at. */
 export async function finalizedBlock(client: HistoryClient): Promise<number> {
   return (await header(client, 'finalized')).number;
+}
+
+/**
+ * One block's time in seconds, from its header.
+ *
+ * @throws HistoryError for a block that is not a whole number, a read that fails, or a header naming another block.
+ */
+export async function blockTime(client: HistoryClient, block: number): Promise<number> {
+  if (!isBlock(block)) throw new HistoryError('the block must be a whole number of 0 or more');
+  const head = await header(client, hex(block));
+  if (head.number !== block) throw new RpcRefused('the RPC answer to eth_getBlockByNumber named another block');
+  return head.time;
 }
 
 // One step of the search: both reads for the block at once, so a step costs one round trip.
@@ -265,6 +315,18 @@ interface Span {
  * @throws HistoryError for blocks out of order, a read that fails or comes back out of shape, or a balance that fell.
  */
 export async function inflowBlocks(client: HistoryClient, wallet: Address, from: number, to: number, cap: number): Promise<number[] | 'too many'> {
+  const found = await inflowsIn(client, wallet, from, to, cap);
+  return found === 'too many' ? found : found.map((inflow) => inflow.block);
+}
+
+/** A block that paid the wallet, and how much its balance rose in that block, in wei. */
+interface Inflow {
+  block: number;
+  rise: bigint;
+}
+
+// inflowBlocks' search, keeping each found block's rise: the two balances that found it are already read.
+async function inflowsIn(client: HistoryClient, wallet: Address, from: number, to: number, cap: number): Promise<Inflow[] | 'too many'> {
   if (!isBlock(from) || !isBlock(to) || from > to || !isBlock(cap)) throw new HistoryError('the blocks must be whole numbers with from at or before to');
   if (from === to) return [];
   const self = wallet.toLowerCase();
@@ -278,12 +340,12 @@ export async function inflowBlocks(client: HistoryClient, wallet: Address, from:
   const [low, high] = await Promise.all([balanceAt(from - 1), balanceAt(to - 1)]);
   if (high < low) throw new HistoryError('the balance fell before the first send, so the inflows could not be found');
   let open: Span[] = high > low ? [{ after: from - 1, at: to - 1, low, high }] : [];
-  const found: number[] = [];
+  const found: Inflow[] = [];
   while (open.length > 0) {
     if (found.length + open.length > cap) return 'too many';
     const splits: Span[] = [];
     for (const span of open) {
-      if (span.at - span.after === 1) found.push(span.at);
+      if (span.at - span.after === 1) found.push({ block: span.at, rise: span.high - span.low });
       else splits.push(span);
     }
     if (reads + splits.length > MAX_INFLOW_READS) return 'too many';
@@ -298,7 +360,7 @@ export async function inflowBlocks(client: HistoryClient, wallet: Address, from:
       if (span.high > balance) open.push({ after: block, at: span.at, low: balance, high: span.high });
     }
   }
-  return found.sort((a, b) => a - b);
+  return found.sort((a, b) => a.block - b.block);
 }
 
 async function tracesWhere(client: HistoryClient, filter: Record<string, unknown>): Promise<Trace[]> {
@@ -465,8 +527,11 @@ export const MAX_FAILED_SEND_BLOCKS = 4;
  * Where that cannot be established the read fails rather than give part of a history (C11): F holds no transfer that
  * dates the wallet (money that came with no transaction, such as a staking withdrawal); the sent count rose by more or
  * less than the wallet's own transactions in that block (an EIP-7702 delegation, after which its code can move its
- * balance); more than MAX_FAILED_SEND_BLOCKS blocks hold only failed sends; or more than MAX_INFLOW_BLOCKS blocks paid
- * it. Both pages of a used wallet are marked incomplete, so core finds a funder among the rows or says 'unknown', never
+ * balance); more than MAX_FAILED_SEND_BLOCKS blocks hold only failed sends; more than MAX_INFLOW_BLOCKS blocks paid
+ * it; or the transfers read for a block that paid it do not add up to that block's rise in its balance. The last is two
+ * reads of one fact disagreeing: a trace answer cut short would otherwise drop the real funding and leave a smaller
+ * payer as the funder. It also refuses a block that paid the wallet with no transaction at all (a staking withdrawal, a
+ * block's fees), since nothing read there says who paid. Both pages of a used wallet are marked incomplete, so core finds a funder among the rows or says 'unknown', never
  * 'none'. A wallet never used comes back as two empty, complete pages, what the explorer reads for it.
  *
  * @throws HistoryError when any read fails or any of those cases holds. Its message holds no endpoint address (C40).
@@ -487,14 +552,18 @@ export async function rpcHistory(client: HistoryClient, wallet: Address, block: 
     new HistoryError(`more than ${MAX_INFLOW_BLOCKS} blocks paid the wallet before its first send, or finding them passed ${MAX_INFLOW_READS} reads`);
 
   const blocks = new Set<number>([first]);
+  const rises = new Map<number, bigint>();
   let from = first;
   let nextCount = 1;
   for (let failedBlocks = 0; ; ) {
     const spent = await firstBlockWithSentCount(client, wallet, nextCount, from, block);
     const end = spent ?? block;
-    const paid = await inflowBlocks(client, wallet, from, end, MAX_INFLOW_BLOCKS);
+    const paid = await inflowsIn(client, wallet, from, end, MAX_INFLOW_BLOCKS);
     if (paid === 'too many') throw tooMany();
-    for (const at of paid) blocks.add(at);
+    for (const inflow of paid) {
+      blocks.add(inflow.block);
+      rises.set(inflow.block, inflow.rise);
+    }
     blocks.add(end);
     if (blocks.size > MAX_INFLOW_BLOCKS + MAX_FAILED_SEND_BLOCKS + 2) throw tooMany();
     if (spent === null) break;
@@ -520,21 +589,40 @@ export async function rpcHistory(client: HistoryClient, wallet: Address, block: 
   const read = (at: number): BlockRows => rows.get(at) ?? { external: [], internal: [] };
   // The picker dates the wallet by the same rule over the same block, so the pick and the age stay one thing (C20).
   if (firstActivityTime(wallet, unsure(read(first))) === null) throw new HistoryError('the first used block holds no transfer that dates the wallet');
+  // In a block found by its balance rise the wallet signed nothing, so the rise is exactly what was paid in. Rows that
+  // add up to anything else were read short, or the money came with no transaction, and either way the funder is not known.
+  for (const [at, rise] of rises) {
+    const here = read(at);
+    let received = 0n;
+    for (const transfer of [...here.external, ...here.internal]) {
+      if (transfer.to === self && transfer.from !== self && !transfer.failed) received += BigInt(transfer.valueWei);
+    }
+    if (received !== rise) throw new HistoryError("the transfers read for a block do not add up to the rise in the wallet's balance there");
+  }
   return unsure({ external: ordered.flatMap((at) => read(at).external), internal: ordered.flatMap((at) => read(at).internal) });
 }
 
-export type HistoryLack = 'old state' | 'traces' | 'no answer';
+export type HistoryLack = 'chain' | 'old state' | 'traces' | 'no answer';
 
 /**
- * Whether an endpoint can serve rpcHistory: its finalized block, a balance at block 1 (old state), and trace_filter on
- * one recent finalized block, with trace_transaction on the transaction found there, since transfersInBlock needs both.
- * The finalized block can hold no transaction, so up to four blocks back are tried for one that does.
+ * Whether an endpoint can serve rpcHistory for the chain with id `chainId`: its own chain id, its finalized block, a
+ * balance at block 1 (old state), and trace_filter on one recent finalized block, with trace_transaction on the
+ * transaction found there, since transfersInBlock needs both. The finalized block can hold no transaction, so up to four
+ * blocks back are tried for one that does. The chain id comes first: an endpoint of another chain would answer every
+ * read, about the wrong wallets.
  *
- * @returns ok, or what the endpoint lacks: 'no answer' when a read gets no answer at all, else 'old state' or 'traces'
- *   for the read it refused or answered out of shape. Never throws, and holds nothing the endpoint sent (C40).
+ * @returns ok, or what the endpoint lacks: 'no answer' when a read gets no answer at all, else 'chain' when it names
+ *   another chain id or refuses to name one, 'old state' or 'traces' for the read it refused or answered out of shape.
+ *   Never throws, and holds nothing the endpoint sent (C40).
  */
-export async function historyProbe(client: HistoryClient): Promise<{ ok: true } | { ok: false; lacks: HistoryLack }> {
+export async function historyProbe(client: HistoryClient, chainId: number): Promise<{ ok: true } | { ok: false; lacks: HistoryLack }> {
   const lacking = (lack: HistoryLack, error: unknown) => ({ ok: false as const, lacks: error instanceof RpcRefused ? lack : 'no answer' });
+  try {
+    const named = wholeNumber(parsed(QUANTITY, await client.request('eth_chainId', []), 'eth_chainId'), 'eth_chainId');
+    if (named !== chainId) return { ok: false, lacks: 'chain' };
+  } catch (error) {
+    return lacking('chain', error);
+  }
   let head: { number: number; transactions: number };
   try {
     head = await header(client, 'finalized');
