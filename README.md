@@ -346,7 +346,7 @@ flowchart TB
 
 ## The two-minute judge path
 
-This needs no key and no wallet. You need git and Node 26 or newer. The output below is from a fresh clone on 11 November 2026.
+This needs no key and no wallet. You need git and Node 26 or newer. The output below is from a fresh clone on 13 November 2026.
 
 1. Clone and install.
 
@@ -368,10 +368,10 @@ This needs no key and no wallet. You need git and Node 26 or newer. The output b
 
    ```text
     Test Files  74 passed (74)
-         Tests  2064 passed | 102 skipped (2166)
+         Tests  2083 passed | 104 skipped (2187)
    ```
 
-   It takes about 75 seconds. The 102 skipped tests need things a fresh clone does not have: a real Postgres for 95 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
+   It takes about 80 seconds. The 104 skipped tests need things a fresh clone does not have: a real Postgres for 97 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
 
 3. Check the vault proof against Base Sepolia.
 
@@ -631,22 +631,22 @@ The chain id and the vault address sit inside the leaf, so a proof for one vault
 
 ## Tests and gas
 
-Tests, run on a fresh clone on 11 November 2026.
+Tests, run on a fresh clone on 13 November 2026.
 
 ```text
 $ npx vitest run
  Test Files  74 passed (74)
-      Tests  2064 passed | 102 skipped (2166)
+      Tests  2083 passed | 104 skipped (2187)
 
 $ npm run typecheck
 > tsc -p tsconfig.typecheck.json --noEmit
 (exit code 0, nothing more printed)
 
 $ npm run contracts:test
-Ran 6 test suites in 21.65s (57.70s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
+Ran 6 test suites in 17.88s (48.76s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
 ```
 
-The 102 skipped TypeScript tests are explained in step 2 of the judge path: 95 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2065 passed and 101 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
+The 104 skipped TypeScript tests are explained in step 2 of the judge path: 97 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2084 passed and 103 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
 
 The 79 Foundry tests are 64 unit tests, 1 demo test (30 farm wallets cannot take more than 20 USDC, and none gets more than 1 USDC), 1 fixture test that pins one list and its proofs, 11 fuzz tests at 10,000 random cases each, 1 fork test of a full campaign on real USDC, and 1 invariant suite with 7 invariants run as 256 random call sequences, up to 64 calls deep. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens, and the fork tests do not cover Circle freezing or pausing USDC or gas prices on Base. None of this replaces an outside audit.
 
