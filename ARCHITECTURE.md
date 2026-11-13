@@ -970,7 +970,7 @@ Rules every route keeps:
 | Route | Answer |
 | --- | --- |
 | `GET /api/campaigns/:id` | 200 with the campaign below |
-| `GET /api/campaigns/:id/board?before=<ISO time>` | 200 `{"asks": [...]}`: 50 decided or failed asks, newest decision first, plus every further ask decided at the same instant as the 50th (at most 100 more), decided strictly before `before` when it is given. A page never ends inside a tie, so walking the board with `before` set to the last ask's `decidedAt` skips no ask; 400 for a time that is not ISO 8601 |
+| `GET /api/campaigns/:id/board?before=<ISO time>` | 200 `{"asks": [...], "payouts": [...]}`. `asks`: 50 decided or failed asks, newest decision first, plus every further ask decided at the same instant as the 50th (at most 100 more), decided strictly before `before` when it is given. `payouts`: for each wallet on the page with a confirmed claim relay, `{wallet, amount, transaction}`, the newest confirmed relay's cumulative amount and its claim (`confirmedPayouts` in the store); a wallet that claimed with its own ticket has no relay and no entry. A page never ends inside a tie, so walking the board with `before` set to the last ask's `decidedAt` skips no ask; 400 for a time that is not ISO 8601 |
 | `POST /api/campaigns/:id/asks` | the ask answers below |
 | `POST /api/campaigns/:id/appeals` | the appeal answers below |
 | `GET /api/campaigns/:id/asks/:wallet` | 200 `{"ask": ..., "ticket": ...}`, with `ticket` only for a wallet on the active list; 400 `{"error": "the wallet is not a valid address"}`; 404 `{"error": "no ask from this wallet"}` |

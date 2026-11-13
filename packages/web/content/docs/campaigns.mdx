@@ -106,6 +106,8 @@ The rulebook's fixed checks, A1 to A9, then run in code and set the most generou
 
 The decision, the rule behind it and the reason are posted on the board for everyone to read. A board row also holds the transactions the reason cites, the facts the decision rested on (wallet age, transactions sent, first funder and its kind, how many asking wallets that funder paid, and the size of the linked group), the list of things the screening did not measure, and the appeal, if there is one. It never holds your signature or your network address.
 
+Once the vault has paid a wallet, its row carries a PAID mark. Opened, the row says how much the vault has paid that wallet in all and links the claim transaction on the explorer. The mark comes from the worker's own record of a claim it submitted and saw confirmed. A wallet that submitted its own claim, with its own ticket, is paid just the same but has no such record, so its row shows no mark.
+
 ### 5. An approved wallet takes the next free slot
 
 A wallet approved in full or for a partial reward takes the next free slot. Slots go in the order wallets are decided, not the order they asked. A held or excluded wallet never takes a slot. Once every slot is taken the campaign takes no new ask. An ask that was already waiting is still decided, but it takes no slot.
@@ -138,7 +140,7 @@ If the owner cancels a list, the worker records it as cancelled and does not pos
 
 ### 8. The worker submits your claim
 
-When the delay is over, the vault pays that list. The worker marks the list active, then submits one claim for each listed wallet the vault still owes, from its own key. What is owed is the listed amount less what the vault says the wallet has already claimed. The gas comes from the worker's key, not from your wallet. It runs each claim as a dry run first, and a wallet that has already been paid gets no claim. The vault pays only the wallet named in the list, whoever sends the claim.
+When the delay is over, the vault pays that list. The worker marks the list active, then submits one claim for each listed wallet the vault still owes, from its own key. What is owed is the listed amount less what the vault says the wallet has already claimed. The gas comes from the worker's key, not from your wallet. It runs each claim as a dry run first, and a wallet that has already been paid gets no claim. The vault pays only the wallet named in the list, whoever sends the claim. Once a claim is confirmed, the board marks that wallet PAID and links the transaction.
 
 The worker sends one claim, pauses for about 5 seconds, then sends the next. A long list is therefore paid wallet by wallet over several minutes after the delay ends. A paused vault answers nothing to a claim, so while the owner has the vault paused the worker waits and looks again every 10 minutes, and those waits use up none of a claim's tries.
 
@@ -237,7 +239,7 @@ Each route below is a read you can open in a browser. `:id` is the campaign's id
 | Route | What it returns |
 | --- | --- |
 | `GET /api/campaigns/:id` | The campaign: `name`, `chain` (84532 for Base Sepolia), `vault`, `token`, `rewardPerWallet` and `perWalletCap` (in the token's smallest unit, so 1 USDC is `1000000`), `maxSlots`, `status` (`open` or `closed`), `opensAt`, `closesAt`, the `counts` (`asked`, `queued`, `decided`, `held`, `slotsTaken`, `slotsLeft`, `asksLeft`, and `appeals` with `filed`, `checked`, `block` and `reversed`), and `lists`, one entry per list with its `version`, `root`, `status`, `claimableAt` and `postTx`. |
-| `GET /api/campaigns/:id/board` | The 50 newest decided asks, newest decision first. Each holds the decision, rule, reason, cited transactions, the facts, the not-checked list, the slot and the `appeal`, which is null when there is none. Add `?before=` and an ISO time such as `2026-11-11T12:00:00.000Z` to read older ones. Use the last row's `decidedAt` and no ask is skipped, because a page never ends inside a tie. |
+| `GET /api/campaigns/:id/board` | The 50 newest decided asks, newest decision first, in `asks`. Each holds the decision, rule, reason, cited transactions, the facts, the not-checked list, the slot and the `appeal`, which is null when there is none. `payouts` holds one entry for each wallet on the page that the vault has paid: the `wallet`, the total `amount` in base units and the claim `transaction`. Add `?before=` and an ISO time such as `2026-11-11T12:00:00.000Z` to read older ones. Use the last row's `decidedAt` and no ask is skipped, because a page never ends inside a tie. |
 | `GET /api/campaigns/:id/asks/:wallet` | One wallet's ask. Once the wallet is on a paying list, the answer also holds its claim ticket: `cumulativeAmount`, `proof`, `root`, and `claimed` and `claimable` when the vault can be read. |
 | `GET /api/campaigns/:id/lists/:version` | One posted list as a JSON array of `account` and `cumulativeAmount`, exactly as stored. |
 
