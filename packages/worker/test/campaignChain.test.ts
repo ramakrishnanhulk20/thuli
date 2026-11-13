@@ -443,6 +443,46 @@ describe('screenChains', () => {
     ]);
   });
 
+  it("counts an endpoint's unanswered trace calls for that endpoint alone: a first silence on a later probe is asked again, not final (C60)", async () => {
+    const both = nodes();
+    // Probe 1: Ethereum answers nothing. Probe 2: Ethereum is back, and Base's trace calls are limited for the first time.
+    serve([both.ethereum, both.base], { url: ETH_URL, status: 503 });
+    const waits: number[] = [];
+    const chains = await screenChains(config, log, async (ms) => {
+      waits.push(ms);
+      if (probeWaits(waits).length === 1 && PROBE_WAITS_MS.includes(ms)) {
+        both.base.refusing = { method: 'trace_filter', times: 3, message: 'request limit reached', code: -32008 };
+        serve([both.ethereum, both.base]);
+      }
+    });
+    expect(Object.keys(chains ?? {}).sort()).toEqual(['base', 'ethereum']);
+    expect(probeWaits(waits)).toEqual(PROBE_WAITS_MS.slice(0, 2));
+    expect(said).toEqual([
+      "screen: Ethereum's endpoint (ETH_RPC_URL) gave no answer at start; asking again in 2 s",
+      "screen: Base's endpoint (BASE_RPC_URL) gave no answer to its trace calls at start; asking again in 5 s",
+      HISTORY_ON,
+    ]);
+  });
+
+  it('reads an endpoint still silent on its trace calls as serving none once the waits are used up, and never stops the worker for it', async () => {
+    const both = nodes();
+    // Ethereum's plain reads fail on every probe but the last; Base's trace calls are limited only on the last.
+    serve([both.ethereum, both.base], { url: ETH_URL, status: 503 });
+    const waits: number[] = [];
+    const chains = await screenChains(config, log, async (ms) => {
+      waits.push(ms);
+      if (probeWaits(waits).length === PROBE_WAITS_MS.length && PROBE_WAITS_MS.includes(ms)) {
+        both.base.refusing = { method: 'trace_filter', times: 999, message: 'request limit reached', code: -32008 };
+        serve([both.ethereum, both.base]);
+      }
+    });
+    expect(chains).toBeUndefined();
+    expect(probeWaits(waits)).toEqual([...PROBE_WAITS_MS]);
+    expect(said.at(-1)).toBe(
+      "screen: RPC history is off because Base's endpoint (BASE_RPC_URL) gave no answer to its trace calls, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
+    );
+  });
+
   it('keeps waiting on an endpoint that answers nothing while another only lacks trace answers, and stops the worker if it stays silent (C60)', async () => {
     const both = nodes();
     both.ethereum.refusing = { method: 'trace_filter', times: 999, message: 'limit exceeded', code: -32005 };

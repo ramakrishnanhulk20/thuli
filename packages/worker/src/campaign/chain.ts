@@ -302,9 +302,9 @@ export const HISTORY_ON = 'screen: RPC history is on, so every ask is screened o
 export const PROBE_WAITS_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000];
 
 /**
- * Probes after which an endpoint that answers plain reads and still leaves its trace calls unanswered is read as serving
- * no traces. One more try than the first rides out a paid endpoint's short burst limit; a public endpoint that limits
- * every trace call answers the same on both.
+ * Probes on which one endpoint may answer its plain reads and leave its trace calls unanswered before it is read as
+ * serving no traces, counted for that endpoint alone. One more try than the first rides out a paid endpoint's short
+ * burst limit; a public endpoint that limits every trace call answers the same on both.
  */
 export const TRACE_ANSWER_TRIES = 2;
 
@@ -318,9 +318,10 @@ export const TRACE_ANSWER_TRIES = 2;
  * endpoint that gave no answer to a plain read is probed again after each of PROBE_WAITS_MS and never chooses the mode:
  * one blip at start would otherwise leave every ask of this process on the Ethereum-only path (C60). An endpoint whose
  * plain reads answer and whose trace calls get no answer is another matter: the public endpoints this project names as
- * defaults limit every trace call that way, for good. After TRACE_ANSWER_TRIES probes such an endpoint is read as
- * serving no traces, so a worker on those defaults starts with RPC history off, where a wallet used on Base is never
- * decided. The worker calls this once, at start.
+ * default for Ethereum limits every trace call that way, for good. An endpoint that has done so on
+ * TRACE_ANSWER_TRIES probes of its own is read as serving no traces, as it is when the waits run out with every plain
+ * read answered, so a worker on the defaults starts with RPC history off, where a wallet used on Base is never decided.
+ * The worker calls this once, at start.
  *
  * @throws WorkerConfigError, in fixed words with no address or value (C40), when an endpoint names another chain's id,
  *   or still gives no answer after the last wait.
@@ -335,15 +336,26 @@ export async function screenChains(
     ethereum: historyClientOf(chainClient('ethereum', urls.ethereum), sleep),
     base: historyClientOf(chainClient('base', urls.base), sleep),
   };
+  const traceSilences: Record<ScreenedChain, number> = { ethereum: 0, base: 0 };
   for (let attempt = 0; ; attempt += 1) {
     const probes = await Promise.all(SCREENED_CHAINS.map(async (chain) => [chain, await historyProbe(clients[chain], SCREENED_CHAIN_ID[chain])] as const));
     const lacks: Partial<Record<ScreenedChain, HistoryLack>> = {};
     for (const [chain, probe] of probes) if (!probe.ok) lacks[chain] = probe.lacks;
+    // The endpoints whose trace calls went unanswered and that have not yet used up their own tries.
+    const asking: Partial<Record<ScreenedChain, HistoryLack>> = {};
+    for (const chain of SCREENED_CHAINS) {
+      if (lacks[chain] !== 'no trace answer') continue;
+      traceSilences[chain] += 1;
+      if (traceSilences[chain] < TRACE_ANSWER_TRIES) asking[chain] = 'no trace answer';
+    }
     const wrongChain = lackWords(lacks, ['chain']);
     if (wrongChain !== '') throw new WorkerConfigError(`${wrongChain}, so the worker did not start. Set it to an endpoint of that chain.`);
     const unanswered = lackWords(lacks, ['no answer']);
-    const untraced = attempt + 1 < TRACE_ANSWER_TRIES ? lackWords(lacks, ['no trace answer']) : '';
-    if (unanswered === '' && untraced === '') {
+    const untraced = lackWords(asking, ['no trace answer']);
+    const wait = PROBE_WAITS_MS[attempt];
+    // Settled when nothing is left to ask again, or when the waits are used up with every plain read answered: an
+    // endpoint still silent on its trace calls then serves none.
+    if (unanswered === '' && (untraced === '' || wait === undefined)) {
       if (Object.keys(lacks).length > 0) {
         log(historyOffLine(lacks));
         return undefined;
@@ -351,7 +363,6 @@ export async function screenChains(
       log(HISTORY_ON);
       return { ethereum: chainReader('ethereum', { rpcUrl: urls.ethereum }), base: chainReader('base', { rpcUrl: urls.base }) };
     }
-    const wait = PROBE_WAITS_MS[attempt];
     if (wait === undefined) throw new WorkerConfigError(`${unanswered} at start, so the worker did not start. Start it again once the endpoint answers.`);
     log(`screen: ${[unanswered, untraced].filter((words) => words !== '').join(' and ')} at start; asking again in ${wait / 1000} s`);
     await sleep(wait);
