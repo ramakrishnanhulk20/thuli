@@ -31,6 +31,7 @@ import {
   latestList,
   listText,
   listVersions,
+  markRelay,
   MAX_RELAY_ATTEMPTS,
   migrate,
   openMemoryDb,
@@ -1660,6 +1661,23 @@ describe('a paused vault and a claim\'s tries', () => {
     const tx = paid.kind === 'relayed' ? paid.tx : null;
     expect(tx).toMatch(/^0x[0-9a-f]{64}$/);
     expect(await confirmedPayouts(db, CAMPAIGN, [wallet.address])).toEqual([{ wallet: wallet.address, amount: REWARD.toString(), tx }]);
+  });
+
+  it('confirms a claim with the very hash whose receipt it read, whatever another step wrote on the relay meanwhile (C61)', async () => {
+    const { vault, worker, wallet } = await queuedClaim();
+    const late = `0x${'a1'.repeat(32)}`;
+    // While our claim waits for its receipt, a step whose lease ran out records its own send on the same relay.
+    const confirm = vault.confirmClaim.bind(vault);
+    vault.confirmClaim = async (hash) => {
+      expect(await markRelay(db, { campaignId: CAMPAIGN, wallet: wallet.address, version: 1 }, { status: 'sent', tx: late }, clock)).toBe('sent');
+      return confirm(hash);
+    };
+    const paid = await relayNext(worker);
+    expect(paid).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed' });
+    const proven = paid.kind === 'relayed' ? paid.tx : null;
+    expect(proven).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(proven).not.toBe(late);
+    expect(await confirmedPayouts(db, CAMPAIGN, [wallet.address])).toEqual([{ wallet: wallet.address, amount: REWARD.toString(), tx: proven }]);
   });
 
   it('(g) gives a claim back the same way when its simulation reverts with the pause error a lagging read missed', async () => {

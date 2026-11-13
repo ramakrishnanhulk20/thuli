@@ -129,10 +129,14 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
   const key = { campaignId: relay.campaignId, wallet: relay.wallet, version: relay.version };
   let tx: Hash | null = null;
   let gasUsed: bigint | null = null;
-  const finish = async (status: RelayStatus, cause: string, forgetTx = false): Promise<RelayOutcome> => {
+  // `proof` says what the confirmed write records as the payout's transaction: the hash whose receipt this step read, or
+  // none at all. Left out, the write leaves the recorded transaction as it is, which is right only for a relay that is
+  // not confirmed.
+  const finish = async (status: RelayStatus, cause: string, proof?: { tx: Hash } | { forgetTx: true }): Promise<RelayOutcome> => {
     checkpoint(signal, 'recording a relay');
     const wait = status === 'pending' ? retryDelaySeconds(relay.attempts) : undefined;
-    const stored = await markRelay(deps.db, key, { status, retryAfterSeconds: wait, ...(forgetTx && { forgetTx }) }, deps.now());
+    const proven = proof === undefined ? {} : 'tx' in proof ? { tx: proof.tx.toLowerCase() } : { forgetTx: true };
+    const stored = await markRelay(deps.db, key, { status, retryAfterSeconds: wait, ...proven }, deps.now());
     const retryAfterSeconds = stored === 'pending' && wait !== undefined ? wait : null;
     const outcome = retryAfterSeconds === null ? (stored ?? 'not recorded') : `pending, next try in ${retryAfterSeconds} s`;
     deps.log(`relay ${relay.campaignId} ${relay.wallet} list version ${relay.version}: ${outcome}, ${cause}`);
@@ -166,7 +170,7 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
     if (!simulated.ok) {
       // No receipt was read in this step, so a claim recorded on an earlier try (it may have reverted, or the wallet may
       // have claimed first with the public ticket) is not kept as this payout's transaction.
-      if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet', true);
+      if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet', { forgetTx: true });
       if (simulated.error === PAUSE_ERROR) return pausedBack(waiting);
       return finish('pending', `the claim would revert with ${simulated.error}`);
     }
@@ -178,7 +182,9 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
     const receipt = await deps.chain.confirmClaim(tx);
     gasUsed = receipt.gasUsed;
     if (!receipt.ok) return finish('pending', `claim ${tx} reverted on chain`);
-    return finish('confirmed', `claimed ${ticket.cumulativeAmount} cumulative base units in ${tx} (gas ${receipt.gasUsed})`);
+    // The hash is written again with the confirmation: a step whose lease ran out can still record its own send over
+    // ours, and the payout must name the transaction this step proved, whatever the row held a moment ago (C61).
+    return finish('confirmed', `claimed ${ticket.cumulativeAmount} cumulative base units in ${tx} (gas ${receipt.gasUsed})`, { tx });
   } catch (error) {
     // A stopped step writes nothing more: the relay stays leased and is taken again once its lease runs out (C41).
     if (error instanceof StepStopped) throw error;

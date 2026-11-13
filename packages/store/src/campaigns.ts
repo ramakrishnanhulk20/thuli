@@ -1151,11 +1151,12 @@ export const MAX_PAYOUT_WALLETS = MAX_BOARD_PAGE + MAX_BOARD_TIES;
 
 /**
  * What the vault has paid each of the given wallets in one campaign, as the worker recorded it: for each wallet, its
- * newest claim relay that is confirmed and has a transaction. A relay's amount is cumulative, so the newest confirmed
- * one is the total paid to that wallet so far, and its transaction is the claim that brought it there. A wallet with no
- * such relay is left out. A confirmed relay keeps a transaction only when the worker read that transaction's receipt as
- * successful: one confirmed because the vault had nothing left to pay is recorded with forgetTx (see markRelay), so an
- * earlier claim of ours that reverted or never landed is never shown as the payout.
+ * newest confirmed claim relay, and only when that relay has a transaction. A relay's amount is cumulative, so the
+ * newest confirmed one is the total paid to that wallet so far, and its transaction is the claim that brought it there.
+ * A wallet whose newest confirmed relay has no transaction is left out, rather than shown with an older list's smaller
+ * amount. A confirmed relay holds a transaction only when the worker read that transaction's receipt as successful and
+ * wrote that very hash with the confirmation; one confirmed because the vault had nothing left to pay is recorded with
+ * forgetTx (see markRelay), so a claim of ours that reverted or never landed is never shown as the payout.
  * Not covered: a claim a wallet or anyone else submitted with the public ticket has no relay transaction, so that
  * wallet does not show here even though the vault paid it.
  * @param wallets canonical addresses, as the asks table stores them; at most MAX_PAYOUT_WALLETS.
@@ -1167,11 +1168,15 @@ export async function confirmedPayouts(db: Db, campaignId: string, wallets: read
   if (!isCampaignId(campaignId) || wallets.length === 0) return [];
   // The wallets travel as one JSON text, which both database drivers pass the same way.
   const rows = await db.query<{ wallet: string; amount: string; tx: string }>(
-    `SELECT DISTINCT ON (wallet) wallet, amount, tx
-       FROM claim_relays
-      WHERE campaign_id = $1 AND status = 'confirmed' AND tx IS NOT NULL
-        AND wallet IN (SELECT jsonb_array_elements_text($2::jsonb))
-      ORDER BY wallet, version DESC`,
+    `SELECT wallet, amount, tx
+       FROM (
+         SELECT DISTINCT ON (wallet) wallet, amount, tx
+           FROM claim_relays
+          WHERE campaign_id = $1 AND status = 'confirmed'
+            AND wallet IN (SELECT jsonb_array_elements_text($2::jsonb))
+          ORDER BY wallet, version DESC
+       ) AS newest
+      WHERE tx IS NOT NULL`,
     [campaignId, JSON.stringify(wallets)],
   );
   return rows.map((row) => ({ wallet: row.wallet as Address, amount: row.amount, tx: row.tx }));

@@ -1021,6 +1021,43 @@ for (const { name, open } of TARGETS) {
       expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([]);
     });
 
+    it('C61: shows the newest confirmed relay or nothing, so a newer list confirmed with no transaction hides an older, smaller payout', async () => {
+      await createCampaign(db, terms());
+      await activeVersion(1);
+      const first = `0x${'a1'.repeat(32)}`;
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(1), amount: '250000' }], NOW)).toBe(1);
+      expect(await takeRelay(db, plus(10), 60)).toMatchObject({ wallet: wallet(1), version: 1 });
+      expect(await markRelay(db, { campaignId: CAMPAIGN, wallet: wallet(1), version: 1 }, { status: 'sent', tx: first }, plus(11))).toBe('sent');
+      expect(await markRelay(db, { campaignId: CAMPAIGN, wallet: wallet(1), version: 1 }, { status: 'confirmed', tx: first }, plus(12))).toBe('confirmed');
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([{ wallet: wallet(1), amount: '250000', tx: first }]);
+
+      // A second list raises the wallet's total, and the wallet claims that one itself: our relay finds nothing to pay.
+      await activeVersion(2, plus(20));
+      expect(await queueRelays(db, CAMPAIGN, 2, [{ wallet: wallet(1), amount: '500000' }], plus(21))).toBe(1);
+      expect(await takeRelay(db, plus(30), 60)).toMatchObject({ wallet: wallet(1), version: 2 });
+      expect(await markRelay(db, { campaignId: CAMPAIGN, wallet: wallet(1), version: 2 }, { status: 'confirmed', forgetTx: true }, plus(31))).toBe('confirmed');
+      // "Paid 0.25" would understate what the vault paid, and no receipt of ours proves the rest: no mark at all.
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([]);
+    });
+
+    it('C61: a confirmation that names its transaction replaces whatever a late write left on the relay', async () => {
+      await createCampaign(db, terms());
+      await activeVersion(1);
+      const key = { campaignId: CAMPAIGN, wallet: wallet(1), version: 1 };
+      const proven = `0x${'b1'.repeat(32)}`;
+      const late = `0x${'a1'.repeat(32)}`;
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(1), amount: '250000' }], NOW)).toBe(1);
+      expect(await takeRelay(db, plus(10), 60)).toMatchObject({ wallet: wallet(1) });
+      expect(await markRelay(db, key, { status: 'sent', tx: proven }, plus(11))).toBe('sent');
+      // A step whose lease ran out records its own send over ours, while ours is the one whose receipt was read.
+      expect(await markRelay(db, key, { status: 'sent', tx: late }, plus(12))).toBe('sent');
+      expect(await markRelay(db, key, { status: 'confirmed', tx: proven }, plus(13))).toBe('confirmed');
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([{ wallet: wallet(1), amount: '250000', tx: proven }]);
+      // Once confirmed, a late write changes nothing.
+      expect(await markRelay(db, key, { status: 'sent', tx: late }, plus(14))).toBeNull();
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([{ wallet: wallet(1), amount: '250000', tx: proven }]);
+    });
+
     it('C41: a relay given back with a retry delay waits that long, a ready one is taken meanwhile, and an ended one never again', async () => {
       await createCampaign(db, terms());
       await activeVersion(1);
