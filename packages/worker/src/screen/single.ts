@@ -11,8 +11,9 @@ import {
   type ScreenedChain,
   type Settings,
   type Start,
+  onChainOnly,
 } from '@thuli/core';
-import { chainClient, collectBasicFacts, type FactSources } from '../facts/basic.ts';
+import { chainClient, collectBasicFacts, SCREENED_CHAIN_ID, type FactSources } from '../facts/basic.ts';
 import { DecisionRecord, decideWallet, OutOfCredit, type DecideDeps } from '../replay/decide.ts';
 
 export const SINGLE_SCOPE = 'one wallet on Ethereum, no claim list';
@@ -243,25 +244,30 @@ export function accountStateAtFinalizedBlock(
   chain: ScreenedChain = 'ethereum',
 ): (address: Address) => Promise<AccountState> {
   const client = chainClient(chain, sources.rpcUrl);
-  return async (address) => {
-    const block = await client.getBlock({ blockTag: 'finalized' });
-    const [nonce, code] = await Promise.all([
-      client.getTransactionCount({ address, blockNumber: block.number }),
-      client.getCode({ address, blockNumber: block.number }),
-    ]);
-    return { nonce, code: code ?? '0x' };
-  };
+  const onItsChain = onChainOnly(() => client.getChainId(), SCREENED_CHAIN_ID[chain]);
+  return (address) =>
+    onItsChain(async () => {
+      const block = await client.getBlock({ blockTag: 'finalized' });
+      const [nonce, code] = await Promise.all([
+        client.getTransactionCount({ address, blockNumber: block.number }),
+        client.getCode({ address, blockNumber: block.number }),
+      ]);
+      return { nonce, code: code ?? '0x' };
+    });
 }
 
 /**
  * Reads one wallet's free facts as of the chain's latest finalized block, Ethereum unless another screened chain is
  * named, so a reorg cannot change what was screened. The block read has the same timeout as every fact read, and
- * offchain lookups are off (C38, C41).
+ * offchain lookups are off (C38, C41). Before its first read the endpoint must name the chain's own id, asked once; it
+ * rejects with WrongChainError while the endpoint names another (C2).
  */
 export function factsAtFinalizedBlock(sources: FactSources, chain: ScreenedChain = 'ethereum'): (wallet: Address) => Promise<Facts> {
   const client = chainClient(chain, sources.rpcUrl);
-  return async (wallet) => {
-    const block = await client.getBlock({ blockTag: 'finalized' });
-    return collectBasicFacts(wallet, { chain, block: Number(block.number) }, sources);
-  };
+  const onItsChain = onChainOnly(() => client.getChainId(), SCREENED_CHAIN_ID[chain]);
+  return (wallet) =>
+    onItsChain(async () => {
+      const block = await client.getBlock({ blockTag: 'finalized' });
+      return collectBasicFacts(wallet, { chain, block: Number(block.number) }, sources);
+    });
 }

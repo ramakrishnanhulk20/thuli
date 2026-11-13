@@ -45,6 +45,7 @@ import { buildRoot, publishList } from '@thuli/worker/src/vault/root.ts';
 import { createApp } from '../src/app.ts';
 import {
   accountReader,
+  vaultReaders,
   APPEALS_PER_CALLER_HOUR,
   BASE_PUBLIC_RPC,
   ASK_CLIENT_MAX_PER_MINUTE,
@@ -966,6 +967,54 @@ describe('campaign routes', () => {
     } finally {
       await new Promise((resolve) => redirecting.close(resolve));
       await new Promise((resolve) => elsewhere.close(resolve));
+    }
+  });
+
+  it('a vault reader answers nothing from an endpoint of another chain, and does not follow a redirect (C2, C38)', async () => {
+    const methods: string[] = [];
+    let chainId = '0x14a34';
+    const node = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+      });
+      request.on('end', () => {
+        const call = JSON.parse(body) as { id: number; method: string };
+        methods.push(call.method);
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ jsonrpc: '2.0', id: call.id, result: call.method === 'eth_chainId' ? chainId : '0x' }));
+      });
+    });
+    await new Promise<void>((resolve) => node.listen(0, '127.0.0.1', resolve));
+    const redirecting = createServer((request, response) => {
+      request.resume();
+      response.statusCode = 307;
+      response.setHeader('location', `http://127.0.0.1:${(node.address() as AddressInfo).port}/`);
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirecting.listen(0, '127.0.0.1', resolve));
+    try {
+      // Base Sepolia behind the setting for Base: the reader for chain 8453 asks the id and stops there.
+      const wrong = vaultReaders(`http://127.0.0.1:${(node.address() as AddressInfo).port}`)(8453);
+      await expect(wrong?.isContract(walletOf(0))).rejects.toThrow('the endpoint is on another chain');
+      await expect(wrong?.claimed(walletOf(1), walletOf(0))).rejects.toThrow('the endpoint is on another chain');
+      await expect(wrong?.claimable(walletOf(1), walletOf(0), 1n)).rejects.toThrow('the endpoint is on another chain');
+      expect(methods).toEqual(['eth_chainId']);
+
+      // On its own chain the same endpoint is read.
+      methods.length = 0;
+      chainId = '0x2105';
+      const right = vaultReaders(`http://127.0.0.1:${(node.address() as AddressInfo).port}`)(8453);
+      expect(await right?.isContract(walletOf(0))).toBe(false);
+      expect(methods).toEqual(['eth_chainId', 'eth_getCode']);
+
+      methods.length = 0;
+      const redirected = vaultReaders(`http://127.0.0.1:${(redirecting.address() as AddressInfo).port}`)(8453);
+      await expect(redirected?.isContract(walletOf(0))).rejects.toThrow();
+      expect(methods).toEqual([]);
+    } finally {
+      await new Promise((resolve) => redirecting.close(resolve));
+      await new Promise((resolve) => node.close(resolve));
     }
   });
 

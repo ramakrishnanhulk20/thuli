@@ -17,6 +17,45 @@ export class ChainError extends Error {
   override name = 'ChainError';
 }
 
+/** An RPC endpoint named another chain's id. Fixed words, so the message may be logged and shown (C40). */
+export class WrongChainError extends Error {
+  override name = 'WrongChainError';
+  override message = 'the endpoint is on another chain';
+}
+
+/**
+ * A gate for the reads made through one RPC endpoint (threat model C2): a read runs only once the endpoint has named
+ * `expected` as its chain id. The id is asked once, before the first read. While the endpoint names another chain,
+ * every read rejects with WrongChainError and nothing more is asked of it: an endpoint of another network would answer
+ * every question, about the wrong accounts. A read of the id that fails rejects the read that needed it and is asked
+ * again on the next one, so one blip closes nothing for good.
+ *
+ * @param readChainId asks the endpoint for its chain id.
+ * @param onMismatch told the id the endpoint named, each time it is read as wrong, for a log line.
+ */
+export function onChainOnly(
+  readChainId: () => Promise<number>,
+  expected: number,
+  onMismatch?: (answered: number) => void,
+): <T>(read: () => Promise<T>) => Promise<T> {
+  let checked: Promise<void> | null = null;
+  return async (read) => {
+    checked ??= readChainId().then((answered) => {
+      if (answered !== expected) {
+        onMismatch?.(answered);
+        throw new WrongChainError();
+      }
+    });
+    try {
+      await checked;
+    } catch (error) {
+      if (!(error instanceof WrongChainError)) checked = null;
+      throw error;
+    }
+    return read();
+  };
+}
+
 // Canonical spellings only: decimal without leading zeros, or a JSON-RPC hex quantity (no leading zeros either).
 const DECIMAL_ID = /^(0|[1-9][0-9]{0,15})$/;
 const HEX_ID = /^0x(0|[1-9a-fA-F][0-9a-fA-F]{0,13})$/;

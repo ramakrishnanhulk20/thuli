@@ -15,6 +15,7 @@ import {
   type LeafTree,
   type MerkleHash,
   type ScreenedChain,
+  onChainOnly,
 } from '@thuli/core';
 import {
   activeList,
@@ -876,37 +877,21 @@ export function accountReader(rpcUrl: string, chain: ScreenedChain): AccountRead
     transport: http(rpcUrl, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }),
     ccipRead: false,
   });
-  let chainChecked: Promise<void> | null = null;
-  const onItsChain = async <T>(read: () => Promise<T>): Promise<T> => {
-    chainChecked ??= client.getChainId().then((answered) => {
-      if (answered !== expected.id) {
-        console.error(`api ask door: the ${chain} endpoint answers for chain ${answered}, not ${expected.id}`);
-        throw new WrongChain();
-      }
-    });
-    try {
-      await chainChecked;
-    } catch (error) {
-      // A wrong chain stays refused; a read that only failed is asked again next time.
-      if (!(error instanceof WrongChain)) chainChecked = null;
-      throw error;
-    }
-    return read();
-  };
+  const onItsChain = onChainOnly(
+    () => client.getChainId(),
+    expected.id,
+    (answered) => console.error(`api ask door: the ${chain} endpoint answers for chain ${answered}, not ${expected.id}`),
+  );
   return Object.assign(async (address: Address) => onItsChain(async () => isContractCode(await client.getCode({ address }))), {
     sentCount: (address: Address) => onItsChain(() => client.getTransactionCount({ address, blockTag: 'finalized' })),
     balance: (address: Address) => onItsChain(() => client.getBalance({ address, blockTag: 'finalized' })),
   });
 }
 
-class WrongChain extends Error {
-  override name = 'WrongChain';
-  override message = 'the endpoint is on another chain';
-}
-
 /**
  * The vault readers by chain: Base Sepolia (84532) on its public RPC, and Base (8453) on baseRpcUrl when one is given.
- * Any other chain has no reader. Offchain lookups are off (C38), and each read gives up after 10 seconds.
+ * Any other chain has no reader. Offchain lookups are off and an HTTP redirect is refused (C38), each read gives up
+ * after 10 seconds, and every read waits on the endpoint naming its own chain id, as accountReader's do (C2).
  */
 export function vaultReaders(baseRpcUrl: string | null): (chainId: number) => VaultReader | null {
   const sources = new Map<number, { chain: Chain; url: string }>([[baseSepolia.id, { chain: baseSepolia, url: BASE_SEPOLIA_RPC }]]);
@@ -919,14 +904,19 @@ export function vaultReaders(baseRpcUrl: string | null): (chainId: number) => Va
     if (known !== undefined) return known;
     const client = createPublicClient({
       chain: source.chain,
-      transport: http(source.url, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1 }),
+      transport: http(source.url, { timeout: CHAIN_READ_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }),
       ccipRead: false,
     });
+    const onItsChain = onChainOnly(
+      () => client.getChainId(),
+      chainId,
+      (answered) => console.error(`api vault reader: the endpoint for chain ${chainId} answers for chain ${answered}`),
+    );
     const reader: VaultReader = {
-      claimed: (vault, account) => client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimed', args: [account] }),
+      claimed: (vault, account) => onItsChain(() => client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimed', args: [account] })),
       claimable: (vault, account, cumulativeAmount) =>
-        client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimable', args: [account, cumulativeAmount] }),
-      isContract: async (address) => isContractCode(await client.getCode({ address })),
+        onItsChain(() => client.readContract({ address: vault, abi: VAULT_ABI, functionName: 'claimable', args: [account, cumulativeAmount] })),
+      isContract: (address) => onItsChain(async () => isContractCode(await client.getCode({ address }))),
     };
     readers.set(chainId, reader);
     return reader;

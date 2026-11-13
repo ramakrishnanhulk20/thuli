@@ -48,7 +48,8 @@ export interface Connection {
  */
 export async function connectBaseSepolia(rpcUrl: string): Promise<Connection> {
   const chain = baseSepoliaChain(rpcUrl);
-  const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2 });
+  // The configured endpoint answers, or nothing does: an HTTP redirect is refused (C38).
+  const transport = http(rpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 2, fetchOptions: { redirect: 'error' } });
   const publicClient = createPublicClient({ chain, transport });
   const reported = await publicClient.getChainId();
   if (reported !== BASE_SEPOLIA.id) {

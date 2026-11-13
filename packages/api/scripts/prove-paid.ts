@@ -84,7 +84,7 @@ function usdc(units: bigint): string {
  */
 async function balanceReader(config: ApiConfig, payer: Address): Promise<() => Promise<bigint>> {
   const rpcName = config.network === 'base' ? 'BASE_RPC_URL' : config.settlementRpcUrl;
-  const client = createPublicClient({ transport: http(config.settlementRpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 1 }), ccipRead: false });
+  const client = createPublicClient({ transport: http(config.settlementRpcUrl, { timeout: RPC_TIMEOUT_MS, retryCount: 1, fetchOptions: { redirect: 'error' } }), ccipRead: false });
   const chainId = await client.getChainId();
   if (chainId !== config.chainId) {
     throw new UsageError(`${rpcName} answers for chain ${chainId}, but X402_NETWORK is ${config.network} (chain ${config.chainId}).`);
