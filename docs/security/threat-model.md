@@ -5,8 +5,8 @@ functional description of the system. Sections A and B say what kind of system t
 after. Section C is the definition of done: the build is finished only when every numbered invariant below is upheld
 and shown by its test.
 
-Rules C48 to C59 were added on 11 Nov 2026, from the build of the live campaign and appeals, and C60 on 12 Nov 2026
-with the two-chain history read. Each names the file and
+Rules C48 to C59 were added on 11 Nov 2026, from the build of the live campaign and appeals, C60 on 12 Nov 2026
+with the two-chain history read, and C61 on 13 Nov 2026 with the board's paid mark. Each names the file and
 function that upholds it and the test that shows it. Everything in this file describes the code at that date; nothing is
 hosted, and the live campaign runs on Base Sepolia with test money.
 
@@ -165,7 +165,13 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   checksummed forms makes one set of paid calls.
 - **C2. Only chains we chose.** `chainId` is parsed once and selects a chain only from the operator's configuration.
   8453 and "0x2105" resolve to the same chain or are both rejected. An unknown chain is rejected before any network
-  call. Shown by: an unknown chain id returns an error with zero outbound requests.
+  call. An endpoint is checked the same way as a chain id: every RPC client whose reads feed a decision or the door
+  asks its endpoint for its chain id and takes nothing from one that names another chain. The worker's history readers
+  ask at start (`historyProbe`, `screenChains`), and a mismatch stops the worker; the door's account readers ask before
+  their first answer (`accountReader`), and a mismatch answers busy. Shown by: an unknown chain id returns an error with
+  zero outbound requests; `packages/worker/test/campaignChain.test.ts`, "does not start on an endpoint of another chain,
+  naming the setting and no address (C2, C40)"; `packages/api/test/campaigns.test.ts`, "a door reader answers nothing
+  from an endpoint of another chain, and asks the chain id again after a read of it that failed (C2)".
 - **C3. Money is integers.** A share is parsed once as a decimal and turned into USDC base units (6 decimals) by one
   function that rounds down. Floating point never touches an amount. Shown by: a fuzz test over shares and deposits in
   which leaf sums never exceed the deposit.
@@ -198,8 +204,12 @@ or attack that demonstrates it. A change that touches an invariant also carries 
 **Decision integrity**
 - **C11. Doubt means hold.** Missing, truncated, rate-limited, timed-out, oversized or contradictory data, any provider
   or model error, and any output that fails C13 all produce "hold for review" with the cause stated. Doubt never
-  produces full, partial or exclude. Shown by: stopping the RPC, a provider and the model one at a time during a run;
-  every affected wallet lands in hold.
+  produces full, partial or exclude. Two reads of one fact that disagree are doubt too: the transfers read for a block
+  that paid a wallet must add up to that block's rise in its balance, or the history is not used (`rpcHistory`), so a
+  trace answer cut short cannot leave a smaller payer as the funder. Shown by: stopping the RPC, a provider and the
+  model one at a time during a run; every affected wallet lands in hold; `packages/worker/test/rpcHistory.test.ts`,
+  "refuses a history whose rows for a block do not add up to its balance rise, so a trace answer cut short never names
+  a smaller payer as the funder (C11)".
 - **C12. The model cannot lift a wallet above what code allows.** Code-computed facts and the owner's numeric settings
   set a ceiling for each wallet before the model runs; the final decision is never more generous. The model may lower
   an outcome with a reason. Its one allowed raise is rule B2 on an A4 to A6 hold, and the ceiling still bounds it. Shown by: a stand-in model that always answers "full, share 1" gets no
@@ -218,8 +228,14 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   wallet received can link it into a group, because farm wallets never send before a claim and their shared funder is
   how they are caught, but evidence the wallet did not author can move it to hold, never to exclude. Facts are read at
   the campaign snapshot, before the claim list is public, so a stranger cannot target listed wallets in time. Non-goal:
-  someone who knew the list before the snapshot could fund listed wallets and cause holds, which a person then reviews. Shown by: on a fork, a token that emits
-  `Transfer(victim, collector)` plus dust from a farm funder leaves the victim's decision unchanged.
+  someone who knew the list before the snapshot could fund listed wallets and cause holds, which a person then reviews.
+  A campaign ask has no snapshot: its facts are read when it is screened. A stranger can then fill the first block of a
+  wallet's unused chain with more calls than the reader takes, for cents. That block's time still bounds the wallet's
+  first activity there, so this stops the pick only when that chain could be the older one (`rpcFirstActivity`,
+  `olderOf`). Shown by: on a fork, a token that emits
+  `Transfer(victim, collector)` plus dust from a farm funder leaves the victim's decision unchanged;
+  `packages/worker/test/campaignChain.test.ts`, "screens a wallet on its real chain when a stranger fills the first
+  block of its unused chain with more calls than the reader takes (C15)".
 - **C16. Shared infrastructure is not a cluster.** A funder that funds many unrelated wallets does not link them by
   itself. This is a structural fan-out rule over the data we hold, backed by provider labels, not a hand-kept list of
   exchange addresses. It misses a farm running its own high fan-out funder. Shown by: wallets whose only shared fact is
@@ -279,10 +295,16 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer
   of exactly the price from the payer to our payTo in the network's USDC; a used nonce alone is not proof, because a
   payer can cancel or spend it elsewhere. A timeout or error returns retry with the claim kept, so a header never pays
-  twice and is never served on a guess. One answer is not an unknown: a settle the facilitator refuses outright, with a
-  4xx answer that names no transaction, is a failed settle, so the buyer gets 402 with the facilitator's reason and the
-  claim is released. Coinbase's facilitator answers an unfunded wallet and a bad signature this way (shown live with
-  payments that could not move money: `insufficient_funds` and `invalid_exact_evm_payload_signature`). An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
+  twice and is never served on a guess. A settle the facilitator refuses with an answer that names no transaction is
+  unknown too, and keeps the claim: an authorization that has already paid is refused in that same shape on a second
+  settle, so such an answer is never read as proof that nothing moved. When one request's settle is answered pending
+  with a transaction and the library's second ask is then refused, the transaction the first answer named is kept and
+  its receipt decides, as for any pending settlement (`packages/api/test/payment.test.ts`, "reads every thrown settle
+  answer as unknown, a 4xx refusal that names no transaction included: 503 retry, never 402" and "keeps the hash a
+  pending answer named when the library asks again and is refused: served on its receipt, else 503, never 402"). Named
+  limit: a buyer whose wallet is short is told to try again and not why, because telling the two refusals apart needs a
+  read of the authorization on the chain, which this version does not make (seen live against Coinbase's facilitator
+  with payments that could not move money: a wallet holding nothing and a broken signature each got retry). An authorization past its validBefore is refused before it is claimed. An authorization valid for longer than the
   route's timeout plus 30 seconds is refused, and a used claim is remembered until its validBefore, so no copy of a header
   can outlive its claim. With a database configured the claims live in Postgres, shared by every server copy and kept
   across a restart. Once a settlement is confirmed the buyer gets the result whatever the store does: a claim the store
@@ -337,7 +359,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
 **Outputs**
 - **C33. Nothing anyone else wrote becomes a link or markup.** Text from a model, a provider, the chain, a claimant or an
   owner never renders as HTML, markdown or a clickable link. The only links on public pages are built by code from
-  validated hashes and addresses, pointing to one fixed explorer origin. Shown by: a stored reason containing
+  validated hashes and addresses, pointing to an explorer origin that one file names, taken from one table by the chain
+  the link is about. A chain with no entry in the table gets no link (`packages/web/lib/explorer.ts`; its test fails if
+  any other file of the site names an explorer host). Shown by: a stored reason containing
   `<img src=x onerror=alert(1)>`, `[claim](https://evil.example)` and a bare `https://evil.example` renders as inert
   text.
 - **C34. Our JSON is safe for the agent that reads it.** Every API response follows a fixed schema, and no free-text
@@ -357,8 +381,11 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   non-zero exit is a failed call. Shown by: provider fixtures whose next-hop "address" is `$(touch /tmp/x)` or
   `--url=https://evil.example` are rejected before kpass runs.
 - **C38. The servers talk only to hosts we configured.** No chain read follows an EIP-3668 offchain lookup, no provider
-  redirect is followed, and EIP-1271 checks run as gas-capped `eth_call`s with no lookup. Shown by: an `eth_call` to a
-  fork contract that reverts with `OffchainLookup` pointing at a local listener; the listener receives nothing.
+  redirect is followed, no chain client follows an HTTP redirect, and EIP-1271 checks run as gas-capped `eth_call`s
+  with no lookup. Shown by: an `eth_call` to a fork contract that reverts with `OffchainLookup` pointing at a local
+  listener; the listener receives nothing; `packages/worker/test/rpcHistory.test.ts`, "does not follow an HTTP redirect
+  to another host: the configured endpoint answers, or nothing does (C38)"; `packages/api/test/campaigns.test.ts`, "a
+  door reader does not follow an HTTP redirect to another host (C38)".
 - **C39. No internet-facing handler holds a key that moves money.** x402 income goes to a payTo address whose key is on
   no server. The Reppo-paying key and the vault agent key live only on the worker, and no web handler signs: the
   campaign worker reads the approved wallets from the database and posts the list itself. If the worker is compromised,
@@ -372,8 +399,13 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   and requests to one provider run in bounded batches, one after another, never all at once.
   First-funder tracing follows at most 6 single-use pass-through wallets (one in, one out, so a cycle cannot form);
   money still passing through at the 6th hop is doubt, not a source. Transfers per wallet, CSV rows and bytes, rules length,
-  appeal length and graph size all have stated caps. Hitting a cap means hold under C11. Shown by: a wallet fixture with
-  a million transfers and one still passing money on at the hop cap both end in hold within the timeout.
+  appeal length and graph size all have stated caps. Hitting a cap means hold under C11. One history read for a
+  campaign ask asks for at most 1,000 RPC calls (`MAX_READ_CALLS`), and the chain reads of a try are told to stop when
+  its time is up, so a read that was given up on does not hold the places the next ask's reads need. Shown by: a wallet
+  fixture with a million transfers and one still passing money on at the hop cap both end in hold within the timeout;
+  `packages/worker/test/rpcHistory.test.ts`, "refuses every call past a read's budget without sending it, in fixed
+  words (C41, C49)" and "does not send a call whose signal aborted while it waited for a place or for its next send
+  (C41)"; `packages/worker/test/campaignChain.test.ts`, "stops a try's chain reads when its 120 seconds are up (C41)".
 - **C42. Public endpoints are rate limited on an identity the client cannot forge**, using the platform's trusted client
   address, never a client-sent `X-Forwarded-For`. The paid route also caps each client's running screenings, request rate
   and failed settlement attempts, so unfunded signed payments cannot fill it. With a database configured these limits are
@@ -429,7 +461,7 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   1 USDC and the vault holds only the demo deposit. Shown by: 30 signed asks from farm wallets on a fork; no more than
   20 USDC leaves the vault and no address gets more than 1 USDC.
 
-**The live campaign, its worker and appeals (C48 to C60, added 11 and 12 Nov 2026 from the build of the live campaign, appeals and the two-chain read)**
+**The live campaign, its worker and appeals (C48 to C61, added 11 to 13 Nov 2026 from the build of the live campaign, appeals, the two-chain read and the board's paid mark)**
 - **C48. A paid request ends before the host ends it, and a settled payment always ends with a stored result.** Every
   paid request answers within 240 seconds of its first line (`REQUEST_DEADLINE_MS`), under the host's 300. It settles
   nothing unless the time left covers two settle calls, the slowest receipt read and the start of a screening (120.5
@@ -458,7 +490,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   reads at 600 a minute, each counted in the store before the read is made, and a count that cannot be read refuses. One
   caller gets 20 requests a minute across asks and appeals, 5 asks and 2 appeals an hour. Appeals are 10 a UTC day for
   one campaign and 20 across all. The worker runs at most 2,000 model screenings a UTC day across every campaign, counted
-  in one store statement before SERV is called, and sends each appeal to the outside check once. The appeal route looks the wallet's ask up in Thuli's own database after the signature is checked and before any chain read (`appealStanding`), so a key that never asked causes no outbound work (`packages/api/test/campaigns.test.ts`, "answers a valid signature from a key with no ask from the store alone: no chain read, no type-read count, no hour"). Upheld by:
+  in one store statement before SERV is called, and sends each appeal to the outside check once. One try of an ask makes
+  at most three history reads, one on each chain for the pick and one for the facts, each capped at 1,000 RPC calls; a
+  wallet funded once and then active takes about 220 calls in all. The appeal route looks the wallet's ask up in Thuli's own database after the signature is checked and before any chain read (`appealStanding`), so a key that never asked causes no outbound work (`packages/api/test/campaigns.test.ts`, "answers a valid signature from a key with no ask from the store alone: no chain read, no type-read count, no hour"). Upheld by:
   `countPost`, `countedTypeReader` and the door and ticket reads in `packages/api/src/campaigns.ts`; `checkAsk` and
   `checkAppeal` in `packages/core`; `addAppeal` in `packages/store/src/appeals.ts`; and `decisionFor` in
   `packages/worker/src/campaign/screen.ts`. Non-goal: the ceilings protect money and the RPC, not a campaign's service.
@@ -479,7 +513,9 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   Locking a campaign this way costs an attacker the cap times one funded wallet. Upheld by: `neverUsedOnBothChains` and the
   ask route in `packages/api/src/campaigns.ts`, and `addAsk` and `askLifetimeCap` in `packages/store/src/campaigns.ts`.
   Non-goal: that price is at least 1,000 wallets that each hold a balance or have sent a transaction, and one set of
-  funded wallets can fill every campaign's cap. Shown by: `packages/api/test/campaigns.test.ts`, "C24, C42: 1,000
+  funded wallets can fill every campaign's cap. Since the door counts Base, a balance there is enough, and it costs 1
+  wei and a fee of well under a cent: the cap bounds the work an attacker can cause, and is not a cost that keeps one
+  out. Shown by: `packages/api/test/campaigns.test.ts`, "C24, C42: 1,000
   never-used wallets store nothing and take no cap, so the next honest wallet is still queued", "C11, fail closed: a count
   or balance read that fails, is missing or is not a whole number is 503 and stores nothing", "C24: the route answers
   full while 200 asks wait undecided, and queues again once one of them is decided" and "C24: the route answers full at
@@ -545,12 +581,17 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   appeal.** `campaign:requeue` moves a failed ask, the A1 hold left when every try at screening ran out, back to the queue
   from the start. It never touches a decided ask, a decided hold included, an ask that holds a slot, or a failed ask that
   has an appeal. The only other way a decided ask changes is the owner settling an appeal toward an approval (C57). No
-  command can approve a wallet directly. Upheld by: `requeueFailedAsk` in `packages/store/src/campaigns.ts`, `requeueAsk`
+  command can approve a wallet directly. So that an outage always leaves a failed ask and never a decided hold, a
+  campaign screening in which any read failed gives the try back rather than hold on facts marked missing
+  (`chainReader` and `ethereumFacts` in `packages/worker/src/campaign/chain.ts`). Upheld by: `requeueFailedAsk` in `packages/store/src/campaigns.ts`, `requeueAsk`
   in `packages/worker/src/campaign/register.ts`, and `settleAppeal` in `packages/store/src/appeals.ts`. Shown by:
   `packages/store/test/campaigns.test.ts`, "C11: requeueFailedAsk screens a failed ask again from the start, and never
   touches a decided, waiting or slotted ask"; `packages/store/test/appeals.test.ts`, "C11, C17: requeueFailedAsk refuses
   a failed ask that has an appeal, saying so, and queues one that has none"; `packages/worker/test/registerCampaign.test.ts`,
-  "puts only a failed ask back in the queue, and only with --write".
+  "puts only a failed ask back in the queue, and only with --write"; `packages/worker/test/campaignChain.test.ts`,
+  "gives the ask back when a read of the chosen chain fails after the pick, and decides it on the next try: an outage
+  is never stored as a hold (C11, C55)" and "never stores a hold for a wallet whose history the reader cannot read
+  whole: every try is given back and the ask ends held for review (C11, C41, C55)".
 - **C56. A paid call that cannot be deduplicated is marked first, repeated at most once on an unclear outcome, and
   followed to its result once it has an id.** The outside check charges for every submit and cannot tell that a text
   was sent twice. The worker marks the appeal in the store before it sends, makes one POST with no retry inside it and
@@ -630,20 +671,33 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   whole decides nothing.** The worker finds the wallet's first activity on Ethereum and on Base mainnet by the rule
   that sets its age, and screens the chain where that is older. The door and the worker read both chains at the
   finalized block, so they count the same history. If either chain cannot be read, the try fails and is taken again:
-  an ask is never decided from the other chain alone. The history is read with plain RPC calls and no explorer: a
+  an ask is never decided from the other chain alone. One case loses nothing: when a chain's first used block was
+  found but could not be read, that block's time is a lower bound on the wallet's first activity there, and the other
+  chain is picked when it is older than the bound. The history is read with plain RPC calls and no explorer: a
   search over old state for the first block where the sent count or the balance is above zero, then every block that
   paid the wallet until its first own transaction that succeeded, then those blocks' transfers from their traces. So
   the rows the funder and age rules range over are all there, or the read fails. Money that arrived with no
   transaction, a sent count that rose by something other than the wallet's own transactions, more than 24 paying
-  blocks, and a trace of a kind the reader does not know are each "unknown", never "no history". The two-chain read is
-  on only when both RPC endpoints pass a probe at start; otherwise the worker says so once and reads Ethereum only.
+  blocks, transfers that do not add up to a block's balance rise, a read that asks for more than 1,000 calls, and a
+  trace of a kind the reader does not know are each "unknown", never "no history". Whether the two-chain read is on
+  follows from what the two configured endpoints serve, checked by a probe at start: an endpoint that answers and
+  serves no old state or no traces turns it off, and the worker says so once. An endpoint that gives no answer is asked
+  again and never chooses the mode: if it stays silent, or names another chain's id, the worker does not start. With
+  the two-chain read off the worker reads Ethereum only, and decides no wallet that has no Ethereum history: the door
+  let such a wallet in for its Base history, which that worker cannot read, so its tries fail and the ask ends held for
+  review, where an operator can queue it again (C55).
   Upheld by: `pickChain`, `rpcFirstActivity` and `screenChains` in `packages/worker/src/campaign/chain.ts`;
   `firstUsedBlock`, `inflowBlocks`, `transfersInBlock`, `rpcHistory` and `historyProbe` in
   `packages/worker/src/facts/rpcHistory.ts`; `ownFacts` in `packages/worker/src/campaign/screen.ts`; `olderChain` and
   `firstActivityTime` in `packages/core`; and `neverUsedOnBothChains` and `accountReader` in
   `packages/api/src/campaigns.ts`. Non-goal: the thresholds and the false-hold rate were measured on Ethereum history
   only. Only native ETH counts, so a wallet that has only held tokens reads as never used. A group funded on one chain
-  is not linked when its wallets are older on the other chain. Shown by: `packages/worker/test/campaignChain.test.ts`,
+  is not linked when its wallets are older on the other chain, and anyone can make a wallet older on the other chain by
+  sending it 1 wei there first. Shown by: `packages/worker/test/campaignChain.test.ts`, "with RPC history off, screens a
+  wallet with Ethereum history on Ethereum and decides nothing for one with none (k, C11, C55, C60)", "does not start,
+  and chooses no mode, when an endpoint stays silent through every wait, whatever the other endpoint lacks (C60)",
+  "picks the other chain against one that gave only a bound when it is older than the bound, and nothing while the
+  bounded chain could be the older (C11, C15)",
   "picks the chain with the older first activity, the only chain with any, and an exact tie as Ethereum, with both
   blocks", "decides nothing while Base cannot be read, even with Ethereum history, and decides on the next try once it
   can (f, C11)", "holds a wallet used on neither chain by code, with the two-chain reason and no model call (e)" and
@@ -655,6 +709,20 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   "queues a wallet empty on Ethereum that has sent a transaction on Base, or holds only a balance there". Live,
   read-only, 12 November 2026: `npm run history:compare` on 31 Ethereum wallets gave the same age, sent count, account
   type, first funder and funding transaction as the explorer's whole history on all 29 the explorer could serve.
+- **C61. A public paid mark names only a payout the worker proved.** The campaign board marks a wallet paid, with the amount and a link to the
+  transaction, only from a claim relay that is confirmed and holds a transaction, and a relay keeps a transaction only
+  when the worker read that transaction's receipt as successful. A relay confirmed because the vault already owed the
+  wallet nothing (the wallet claimed first with its own ticket, or an earlier try had landed) keeps no transaction, so
+  a claim of the worker's that reverted or never landed is never shown as the payout. The board sends payouts only for
+  wallets that hold a slot, and the page shows the mark only on a row that holds one. Upheld by: `relayNext` in
+  `packages/worker/src/campaign/relay.ts`, `markRelay` and `confirmedPayouts` in `packages/store/src/campaigns.ts`, the
+  board route in `packages/api/src/campaigns.ts`, and `Board` in `packages/web/components/campaign/Board.tsx`. Non-goal:
+  a wallet that claimed with its own ticket was paid by the vault and shows no mark, because no receipt of the
+  worker's proves it. Shown by: `packages/worker/test/campaignWorker.test.ts`, "keeps no transaction for a claim
+  confirmed because the wallet had already claimed, so the board cannot link our reverted claim" and "keeps the
+  transaction of a claim whose receipt it read as successful, which is the one the board links";
+  `packages/store/test/campaigns.test.ts`, "a relay confirmed with forgetTx names no transaction, so a claim that
+  reverted is never shown as the payout".
 
 ### C.2 General standards, applied to this system
 1. **Primitives over lists.** Addresses: one library parser and checksum function (C1). Signatures: one verifier for
@@ -706,8 +774,8 @@ or attack that demonstrates it. A change that touches an invariant also carries 
    - High-volume funders. A first funder with 10,000 or more transactions sent (`HIGH_VOLUME_NONCE`, read when the ask
      is screened), or with contract code, is treated as an exchange or service and links nobody, so wallets funded
      straight from such an address are not linked by funding (C16).
-   - Facts a campaign cannot measure. Campaign facts come from free public data: the wallet's own Ethereum history and
-     the campaign's own asks. A shared deposit address, a sweep to a shared collector, a funding burst, a claim paid to
+   - Facts a campaign cannot measure. Campaign facts come from free public data: the wallet's own history on the chain
+     it was screened on and the campaign's own asks. A shared deposit address, a sweep to a shared collector, a funding burst, a claim paid to
      another address and funding through pass-through wallets are not measured for campaign asks, and every decision
      lists them as not checked (`CAMPAIGN_NOT_CHECKED`).
    - More than one campaign worker. The worker is meant to run as one process. Two for a few seconds are safe for

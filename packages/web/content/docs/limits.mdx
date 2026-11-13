@@ -3,7 +3,7 @@ title: Limits and non-goals
 description: What Thuli does not catch, does not defend against, has not built, and has not measured.
 ---
 
-The "not built" items describe the code on 11 November 2026.
+The "not built" items describe the code on 13 November 2026.
 
 ## What Thuli does not catch
 
@@ -12,7 +12,7 @@ The "not built" items describe the code on 11 November 2026.
 - A farm running its own high fan-out funder is missed by the shared-funder rule.
 - A farm that pays its collector from enough throwaway wallets first makes it look public, so A3 stops firing there. Shared funding still catches it.
 - A funding burst split across UTC midnight, or kept under the minimum, is not caught.
-- Only native ETH funding is traced, not tokens. Only Ethereum is read. In the replay, transfers past a wallet's first 100 are not read.
+- Only native ETH funding is traced, not tokens. The replay, the free check and the paid check read Ethereum only; a campaign ask is read on Ethereum or Base mainnet. In the replay, transfers past a wallet's first 100 are not read.
 - One wallet screened alone cannot show a group, a shared deposit address, a funding burst or a claim paid elsewhere.
 
 It can also be wrong the other way:
@@ -38,7 +38,7 @@ It can also be wrong the other way:
 
 ## What the campaign worker does not do
 
-The campaign worker is the script that screens each ask, posts the approved wallets' list to the vault, submits their claims and sends appealed decisions to an outside check. It runs from this repository against Base Sepolia with test money, and nothing is hosted. Its limits, each with what it would take to fix:
+The campaign worker is the script that screens each ask, posts the approved wallets' list to the vault, submits their claims and sends appealed decisions to an outside check. It runs against Base Sepolia with test money. One copy is hosted for the demo campaign, as a single process on its own host, sharing a hosted database with the site; a project with its own campaign runs it from this repository. Its limits, each with what it would take to fix:
 
 - It judges each ask as it arrives, so it sees a group of linked wallets only as the group grows. Until a group reaches the campaign's group size (5 unless the campaign sets another), each wallet in it looks alone and can be approved, and a wallet that has been decided is not looked at again. Screening a whole claim list at once, as the replay does, has no such gap. To fix it, hold approvals until a campaign closes and screen the whole list at once, which makes every wallet wait.
 - It links wallets through the first wallet that funded each one, and only that one. If the money passed through in-between wallets first, the worker does not follow it back, where the offline replay follows up to 6 such wallets. To fix it, run the same trace on each ask, which costs more chain reads for every ask against the same ceilings.
@@ -48,9 +48,11 @@ The campaign worker is the script that screens each ask, posts the approved wall
 - Every threshold (30 days, 5 transactions, an exchange at 10,000 sends) and the false-hold rate on the control sample were measured on Ethereum history. Nothing has been measured on Base history, where transactions are cheaper and wallets are busier. To fix it, a labelled sample of Base wallets and a second measurement.
 - The two-chain read cannot date some wallets and holds them for a person: one whose first money arrived with no transaction (a staking payout or a block reward), one that delegated its code before its first own transaction, one paid in more than 24 separate blocks before it first sent anything, and one with more than 4 blocks of failed transactions before its first that succeeded. To fix it, an indexed history for those cases.
 - A group whose wallets share a funder on one chain is not linked when each wallet is older on the other chain, where its funder differs. To fix it, read the funder on both chains for every ask.
-- The two-chain read needs RPC endpoints that serve old state and traces, about 200 calls for one ask. If the endpoint is down, every try fails until it is back, and an ask that fails ten times is held until an operator puts it back in the queue. Without such endpoints the worker reads Ethereum only.
+- The two-chain read needs RPC endpoints that serve old state and traces, about 220 calls for one ask, with a ceiling of 1,000 calls for each of its three reads. If the endpoint is down, every try fails until it is back, and an ask that fails ten times is held until an operator puts it back in the queue. A failed read is never stored as a decision. Without such endpoints the worker reads Ethereum only, and does not decide a wallet that has no Ethereum history: that ask ends held for review too. An endpoint that gives no answer when the worker starts stops the worker, so an outage never chooses the mode.
+- A wallet whose history the reader cannot read whole is not decided either: more than 24 blocks that paid it before its first send, money that arrived with no transaction (a staking withdrawal, a block's fees), or a first block on its older chain that someone filled with more calls than the reader takes. Its ask ends held for review. To fix it, an indexed source of traces, which costs money for each ask.
+- Which chain is the older one can be arranged: 1 wei sent to a wallet on the other chain before its real funding makes that chain the one screened, where the wallet has done almost nothing. A group funded on one chain is then not linked by that funding. To fix it, read and link the funding on both chains for every ask.
 - The single-wallet reader used by the free check, the paid API and the replay fetches a wallet's internal transfers only when its ordinary transactions name no funder. For a wallet whose first money came through a contract and whose larger funding came later, it counts the age from the later transfer. A live comparison found this on 1 of 29 wallets (272 days against 283). To fix it, always read both lists, which would move the replay's measured numbers and so needs a new replay.
-- It uses only free public data: the wallet's own Ethereum history and the campaign's own asks. It does not measure a shared deposit address, a sweep to one shared collector, a funding burst, a claim paid to another address or funding through in-between wallets. Every decision says these were not checked.
+- It uses only free public data: the wallet's own history on the chain it was screened on and the campaign's own asks. It does not measure a shared deposit address, a sweep to one shared collector, a funding burst, a claim paid to another address or funding through in-between wallets. Every decision says these were not checked.
 - It is meant to run as one copy. Two copies for a few seconds cannot pay anyone twice, because the vault pays a wallet only what it has not yet received. They can post the same list twice, which restarts that list's waiting time.
 - If the worker stops after it has sent a list, then restarts, the earlier transaction lands, and the owner cancels that list, all before the next run, the worker can post the cancelled list again. The owner's pause stops it. To fix it, read the owner's cancel from the vault's logs, not only from its state.
 - A resend of a lost post takes fresh fees with no bump, so a node that still holds the lost transaction at the same fee may refuse it. The worker tries again 10 minutes later, at most 5 times. To fix it, raise the fee on each resend by the amount nodes ask to replace a transaction.

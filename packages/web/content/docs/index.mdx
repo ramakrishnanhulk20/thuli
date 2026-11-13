@@ -35,7 +35,7 @@ Live on the site:
 - The paid screening route, `POST /api/x402/screen`, also served by the site. It charges 5 cents in USDC per wallet over x402, a standard for paying for a web request. See [The paid API](/docs/paid-api).
 - [Try to break it](/break): ten live attacks you run from your browser against the vault and the site's own routes, with the answer to each shown beside it.
 
-Live on a testnet:
+Live, with test money unless a line says real:
 
 - The reward vault on Base Sepolia, with a live proof. Realised, with test USDC that has no real value: one approved wallet claimed 1 USDC from the vault, and a wallet left off the list was refused with the error `InvalidProof`. Anyone with the repository can check that record against the chain with `npm run prove:vault -- verify`. See [The vault](/docs/vault) and [Contracts and addresses](/docs/contracts).
 - The paid route, with one real payment. Realised, with real USDC: one screening was bought for 5 cents on Base mainnet and settled in [this transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4). Ten more requests with the same payment returned the stored result and were not charged. Before that, the same proof ran on Base Sepolia with test USDC through a local build of the site ([transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1)). See [Check a wallet and the paid API](/docs/paid-api).
