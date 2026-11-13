@@ -1666,6 +1666,10 @@ export async function markRelay(
   if (result.forgetTx !== undefined && typeof result.forgetTx !== 'boolean') throw new StoreError('forgetTx must be true or false');
   const forgetTx = result.forgetTx === true;
   if (forgetTx && tx !== null) throw new StoreError('forgetTx cannot be given together with a tx');
+  // The board links a confirmed relay's transaction as the payout, so the write that confirms says what it proved (C61).
+  if (result.status === 'confirmed' && !forgetTx && tx === null) {
+    throw new StoreError('a confirmed relay must name the transaction it proved, or forgetTx');
+  }
   if (!isCampaignId(key.campaignId)) return null;
   const [row] = await db.query<{ status: RelayStatus }>(
     `UPDATE claim_relays

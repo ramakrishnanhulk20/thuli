@@ -946,7 +946,7 @@ for (const { name, open } of TARGETS) {
 
       const key = { campaignId: CAMPAIGN, wallet: wallet(1).toLowerCase(), version: 1 };
       expect(await markRelay(db, key, { status: 'sent', tx: HASH }, plus(30))).toBe('sent');
-      expect(await markRelay(db, key, { status: 'confirmed' }, plus(31))).toBe('confirmed');
+      expect(await markRelay(db, key, { status: 'confirmed', tx: HASH }, plus(31))).toBe('confirmed');
       expect(await markRelay(db, key, { status: 'pending' }, plus(32))).toBeNull();
       const [confirmed] = await db.query<{ tx: string; status: string }>(
         'SELECT tx, status FROM claim_relays WHERE wallet = $1',
@@ -1055,6 +1055,8 @@ for (const { name, open } of TARGETS) {
       expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([{ wallet: wallet(1), amount: '250000', tx: proven }]);
       // Once confirmed, a late write changes nothing.
       expect(await markRelay(db, key, { status: 'sent', tx: late }, plus(14))).toBeNull();
+      // A confirmation must say what it proved: a transaction, or none.
+      await expect(markRelay(db, key, { status: 'confirmed' }, plus(15))).rejects.toThrow(StoreError);
       expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([{ wallet: wallet(1), amount: '250000', tx: proven }]);
     });
 
