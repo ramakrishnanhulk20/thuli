@@ -193,6 +193,15 @@ export interface PublicAsk {
   appeal: PublicAppeal | null;
 }
 
+/** What the vault has paid one wallet, from the worker's record of a confirmed claim. */
+export interface Payout {
+  wallet: Address;
+  /** The total paid to the wallet so far, in the token's base units. */
+  amount: string;
+  /** The claim transaction that brought the total there: 0x and 64 lowercase hex characters. */
+  tx: string;
+}
+
 /** The ask takeAsk handed to one worker, which holds it until leaseUntil. */
 export interface TakenAsk {
   campaignId: string;
@@ -1135,6 +1144,34 @@ export async function board(db: Db, campaignId: string, limit: number, beforeDec
     [campaignId, before, limit, limit + MAX_BOARD_TIES],
   );
   return rows.map(readPublicAsk);
+}
+
+/** The most wallets one confirmedPayouts call looks up: a board page with its ties. */
+export const MAX_PAYOUT_WALLETS = MAX_BOARD_PAGE + MAX_BOARD_TIES;
+
+/**
+ * What the vault has paid each of the given wallets in one campaign, as the worker recorded it: for each wallet, its
+ * newest claim relay that is confirmed and has a transaction. A relay's amount is cumulative, so the newest confirmed
+ * one is the total paid to that wallet so far, and its transaction is the claim that brought it there. A wallet with no
+ * such relay is left out. A relay is marked confirmed only after the claim's receipt was read (see markRelay).
+ * Not covered: a claim a wallet submitted itself, with its own ticket, has no relay and so does not show here.
+ * @param wallets canonical addresses, as the asks table stores them; at most MAX_PAYOUT_WALLETS.
+ * @throws StoreError when more than MAX_PAYOUT_WALLETS wallets are given or one of them is not text.
+ */
+export async function confirmedPayouts(db: Db, campaignId: string, wallets: readonly string[]): Promise<Payout[]> {
+  if (wallets.length > MAX_PAYOUT_WALLETS) throw new StoreError(`at most ${MAX_PAYOUT_WALLETS} wallets in one call`);
+  if (wallets.some((wallet) => typeof wallet !== 'string')) throw new StoreError('every wallet must be text');
+  if (!isCampaignId(campaignId) || wallets.length === 0) return [];
+  // The wallets travel as one JSON text, which both database drivers pass the same way.
+  const rows = await db.query<{ wallet: string; amount: string; tx: string }>(
+    `SELECT DISTINCT ON (wallet) wallet, amount, tx
+       FROM claim_relays
+      WHERE campaign_id = $1 AND status = 'confirmed' AND tx IS NOT NULL
+        AND wallet IN (SELECT jsonb_array_elements_text($2::jsonb))
+      ORDER BY wallet, version DESC`,
+    [campaignId, JSON.stringify(wallets)],
+  );
+  return rows.map((row) => ({ wallet: row.wallet as Address, amount: row.amount, tx: row.tx }));
 }
 
 /**

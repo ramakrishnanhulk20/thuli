@@ -14,6 +14,7 @@ import {
   ASK_BACKLOG_CAP,
   askLifetimeCap,
   board,
+  confirmedPayouts,
   CAMPAIGN_SCREENINGS_DAY_COUNTER,
   counts,
   createCampaign,
@@ -32,6 +33,7 @@ import {
   markListUnsent,
   requeueFailedAsk,
   markRelay,
+  MAX_PAYOUT_WALLETS,
   MAX_FUNDER_LINKS,
   MAX_RELAY_ATTEMPTS,
   openCampaigns,
@@ -959,6 +961,43 @@ for (const { name, open } of TARGETS) {
       await expect(queueRelays(db, CAMPAIGN, 1, entries, plus(41))).rejects.toThrow(StoreError);
       const [after] = await db.query<{ relays: number }>('SELECT count(*)::int AS relays FROM claim_relays');
       expect(after?.relays).toBe(8);
+    });
+
+    it('confirmedPayouts gives each wallet its newest confirmed claim with a transaction, and nothing for the rest', async () => {
+      await createCampaign(db, terms());
+      await activeVersion(1);
+      const entries = [1, 2, 3].map((n) => ({ wallet: wallet(n), amount: '250000' }));
+      expect(await queueRelays(db, CAMPAIGN, 1, entries, NOW)).toBe(3);
+      const asked = [1, 2, 3, 4].map(wallet);
+      expect(await confirmedPayouts(db, CAMPAIGN, asked)).toEqual([]);
+
+      // Wallet 1 is paid, wallet 2 is only sent, wallet 3 is still pending, wallet 4 has no relay at all.
+      const first = `0x${'a1'.repeat(32)}`;
+      for (let taken = 0; taken < 3; taken += 1) expect(await takeRelay(db, plus(10), 60)).not.toBeNull();
+      const key = (n: number, version = 1) => ({ campaignId: CAMPAIGN, wallet: wallet(n), version });
+      expect(await markRelay(db, key(1), { status: 'confirmed', tx: first }, plus(11))).toBe('confirmed');
+      expect(await markRelay(db, key(2), { status: 'sent', tx: HASH }, plus(11))).toBe('sent');
+      expect(await markRelay(db, key(3), { status: 'pending' }, plus(11))).toBe('pending');
+      expect(await confirmedPayouts(db, CAMPAIGN, asked)).toEqual([{ wallet: wallet(1), amount: '250000', tx: first }]);
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(2), wallet(4)])).toEqual([]);
+
+      // A newer list raises wallet 1's total: the newest confirmed relay is the one shown, the older one is not.
+      const second = `0x${'b2'.repeat(32)}`;
+      await activeVersion(2, plus(20));
+      expect(await queueRelays(db, CAMPAIGN, 2, [{ wallet: wallet(1), amount: '500000' }], plus(21))).toBe(1);
+      expect((await confirmedPayouts(db, CAMPAIGN, asked))[0]).toMatchObject({ amount: '250000', tx: first });
+      // Wallet 3's relay is ready again too, so both are taken before the new one is confirmed.
+      const taken = [await takeRelay(db, plus(22), 60), await takeRelay(db, plus(22), 60)];
+      expect(taken.map((relay) => `${relay?.wallet} v${relay?.version}`).sort()).toEqual([`${wallet(1)} v2`, `${wallet(3)} v1`].sort());
+      expect(await markRelay(db, key(1, 2), { status: 'confirmed', tx: second }, plus(23))).toBe('confirmed');
+      expect(await confirmedPayouts(db, CAMPAIGN, asked)).toEqual([{ wallet: wallet(1), amount: '500000', tx: second }]);
+
+      // Another campaign, an unknown id and no wallets give nothing; too many wallets is refused before any read.
+      expect(await confirmedPayouts(db, 'other', asked)).toEqual([]);
+      expect(await confirmedPayouts(db, 'not a campaign id', asked)).toEqual([]);
+      expect(await confirmedPayouts(db, CAMPAIGN, [])).toEqual([]);
+      await expect(confirmedPayouts(db, CAMPAIGN, Array.from({ length: MAX_PAYOUT_WALLETS + 1 }, (_, n) => wallet(n)))).rejects.toThrow(StoreError);
+      await expect(confirmedPayouts(db, CAMPAIGN, [7 as unknown as string])).rejects.toThrow(StoreError);
     });
 
     it('C41: a relay given back with a retry delay waits that long, a ready one is taken meanwhile, and an ended one never again', async () => {
