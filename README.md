@@ -1,3 +1,5 @@
+<img src="docs/assets/thuli-mark.svg" width="56" alt="The Thuli mark: a gold drop on a dark square">
+
 # Thuli
 
 Thuli screens an airdrop or reward claim list for farm wallets, gives a reason for every wallet it holds back, and pays the approved wallets from a vault on Base where Thuli's own key can post a list and nothing else.
