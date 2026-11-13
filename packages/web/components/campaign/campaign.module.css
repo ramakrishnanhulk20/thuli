@@ -866,7 +866,8 @@
   color: var(--color-ink-3);
 }
 
-.chipReversed {
+.chipReversed,
+.chipPaid {
   border-color: var(--color-full);
   color: var(--color-full);
 }

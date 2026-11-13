@@ -235,8 +235,35 @@ export function isAskView(value: unknown): value is AskView {
   return isRecord(value) && isAskJson(value.ask) && (value.ticket === undefined || isTicket(value.ticket));
 }
 
-export function isBoardPage(value: unknown): value is { asks: AskJson[] } {
-  return isRecord(value) && Array.isArray(value.asks) && value.asks.every(isAskJson);
+/** What the vault has paid one wallet on the board, as the board route sends it. */
+export interface PayoutJson {
+  wallet: string;
+  /** The total paid to the wallet so far, in the token's base units. */
+  amount: string;
+  /** The claim transaction that brought the total there. */
+  transaction: string;
+}
+
+function isPayoutJson(value: unknown): value is PayoutJson {
+  return (
+    isRecord(value) &&
+    isText(value.wallet) &&
+    /^0x[0-9a-fA-F]{40}$/.test(value.wallet) &&
+    isText(value.amount) &&
+    /^[1-9][0-9]{0,77}$/.test(value.amount) &&
+    isText(value.transaction) &&
+    /^0x[0-9a-f]{64}$/.test(value.transaction)
+  );
+}
+
+/** A board page. A server that sends no payouts reads as nobody paid; payouts that are sent must each be well formed. */
+export function isBoardPage(value: unknown): value is { asks: AskJson[]; payouts?: PayoutJson[] } {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.asks) &&
+    value.asks.every(isAskJson) &&
+    (value.payouts === undefined || (Array.isArray(value.payouts) && value.payouts.every(isPayoutJson)))
+  );
 }
 
 // ---------------------------------------------------------------- requests
@@ -336,7 +363,7 @@ export async function postAsk(
 
 export const BOARD_PAGE_SIZE = 50;
 
-export type BoardRead = { kind: 'page'; asks: AskJson[] } | { kind: 'busy' } | { kind: 'failed' };
+export type BoardRead = { kind: 'page'; asks: AskJson[]; payouts: PayoutJson[] } | { kind: 'busy' } | { kind: 'failed' };
 
 /** One page of the board, newest decision first; busy for a 429, failed when it could not be read. */
 export async function fetchBoard(id: string, before: string | null, request: Fetcher = fetch): Promise<BoardRead> {
@@ -346,7 +373,7 @@ export async function fetchBoard(id: string, before: string | null, request: Fet
     if (response.status === 429) return { kind: 'busy' };
     if (response.status !== 200) return { kind: 'failed' };
     const body = await readJson(response);
-    return isBoardPage(body) ? { kind: 'page', asks: body.asks } : { kind: 'failed' };
+    return isBoardPage(body) ? { kind: 'page', asks: body.asks, payouts: body.payouts ?? [] } : { kind: 'failed' };
   } catch {
     return { kind: 'failed' };
   }
@@ -359,6 +386,20 @@ export function mergeBoard(current: readonly AskJson[], fresh: readonly AskJson[
   const time = (row: AskJson) => Date.parse(row.decidedAt ?? row.askedAt);
   return [...byWallet.values()].sort((a, b) => time(b) - time(a));
 }
+
+/** The payouts the board knows, by lowercase wallet. A fresh page's entry replaces the one kept: a total only grows. */
+export function mergePayouts(current: ReadonlyMap<string, PayoutJson>, fresh: readonly PayoutJson[]): Map<string, PayoutJson> {
+  const byWallet = new Map(current);
+  for (const payout of fresh) byWallet.set(payout.wallet.toLowerCase(), payout);
+  return byWallet;
+}
+
+/** What an opened board row says about a payout, such as "The vault has paid this wallet 0.25 USDC." */
+export function payoutWords(payout: PayoutJson): string {
+  return `The vault has paid this wallet ${usdc(payout.amount)} USDC.`;
+}
+
+export const PAYOUT_COPY = { chip: 'PAID', label: 'PAID BY THE VAULT', link: 'See the payout' } as const;
 
 // ---------------------------------------------------------------- what the page says
 
@@ -600,7 +641,8 @@ const BOARD_WORDS: Record<Action, string> = {
 
 /**
  * The words for a decision. The panel headline also says whether the vault has paid the wallet; a board row shows the
- * decision alone, because the board has no payment data, so `paid` does not change a board label.
+ * decision alone, so `paid` does not change a board label. A board row says "paid" in a chip of its own, from the
+ * payouts the board route sends (PAYOUT_COPY).
  */
 export function outcomeWords(action: Action, paid: boolean, place: 'panel' | 'board' = 'panel'): string {
   if (place === 'board') return BOARD_WORDS[action];

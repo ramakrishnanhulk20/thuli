@@ -132,7 +132,7 @@ export function CampaignPage({ campaignId, walletConnectProjectId }: { campaignI
         </WalletProvider>
         <Steps current={step} />
       </div>
-      <Board campaignId={campaignId} appeals={appealCountsOf(campaign)} onSlowed={reportSlowed} />
+      <Board campaignId={campaignId} chain={campaign.chain} appeals={appealCountsOf(campaign)} onSlowed={reportSlowed} />
       <Lists campaignId={campaignId} campaign={campaign} />
       <div className={styles.ownerLine} data-owner-link>
         <p className={styles.ownerText}>Running a reward drop of your own?</p>

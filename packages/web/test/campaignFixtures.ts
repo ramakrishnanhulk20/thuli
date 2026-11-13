@@ -176,13 +176,23 @@ export function buildFixtures({ wallet, now = Date.now() }: FixtureOptions) {
   const withAppeal = <T extends object>(source: T, view: ReturnType<typeof appeal>) => ({ ...source, appeal: view });
 
   /** A board page: `count` rows, newest first, the first one decided `startMinutes` ago and each next one a minute earlier. */
-  const board = (count: number, startMinutes = 1, appealAt?: (index: number) => ReturnType<typeof appeal> | undefined) => ({
-    asks: Array.from({ length: count }, (_, index) => {
+  const board = (
+    count: number,
+    startMinutes = 1,
+    appealAt?: (index: number) => ReturnType<typeof appeal> | undefined,
+    paidAt?: (index: number) => boolean,
+  ) => {
+    const asks = Array.from({ length: count }, (_, index) => {
       const row = ask((['full', 'hold', 'partial', 'exclude', 'full'] as const)[index % 5] as AskKind, fixtureWallet(100 + startMinutes + index), index % 5 === 0 || index % 5 === 2 ? index + 1 : null, startMinutes + index);
       const view = appealAt?.(index);
       return view === undefined ? row : withAppeal(row, view);
-    }),
-  });
+    });
+    // One payout for each row the test names: half a USDC, with a transaction of its own.
+    const payouts = asks.flatMap((row, index) =>
+      paidAt?.(index) === true ? [{ wallet: row.wallet, amount: '500000', transaction: `0x${'a'.repeat(62)}${(index % 100).toString().padStart(2, '0')}` }] : [],
+    );
+    return { asks, payouts };
+  };
 
   /** What the ask route answers with when the wallet has sent no transaction and holds nothing: nothing is stored. */
   const neverUsed = { neverUsed: true };

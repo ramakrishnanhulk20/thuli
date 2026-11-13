@@ -56,6 +56,9 @@ import {
   isAppealView,
   isAskView,
   isBoardPage,
+  mergePayouts,
+  PAYOUT_COPY,
+  payoutWords,
   isCampaignView,
   LIST_STATUS_WORDS,
   mergeBoard,
@@ -233,9 +236,46 @@ describe('the requests', () => {
     expect(await fetchCampaign(CAMPAIGN_ID, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
     expect(await fetchAsk(CAMPAIGN_ID, signer.address, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
     expect(await fetchBoard(CAMPAIGN_ID, null, reply(429, { busy: true }))).toEqual({ kind: 'busy' });
-    expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, fx.board(2)))).toEqual({ kind: 'page', asks: fx.board(2).asks });
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, fx.board(2)))).toEqual({ kind: 'page', asks: fx.board(2).asks, payouts: [] });
     expect(await fetchBoard(CAMPAIGN_ID, null, reply(500, {}))).toEqual({ kind: 'failed' });
     expect(BusyBody.safeParse({ busy: true }).success).toBe(true);
+  });
+
+  it('reads the payouts a board page carries, reads none when the server sends none, and refuses a page with a damaged one', async () => {
+    const page = fx.board(3, 1, undefined, (index) => index === 0);
+    expect(BoardSchema.safeParse(page).success).toBe(true);
+    expect(isBoardPage(page)).toBe(true);
+    expect(page.payouts).toHaveLength(1);
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, page))).toEqual({ kind: 'page', asks: page.asks, payouts: page.payouts });
+    expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, { asks: page.asks }))).toEqual({ kind: 'page', asks: page.asks, payouts: [] });
+    const good = page.payouts[0] as { wallet: string; amount: string; transaction: string };
+    const damaged: unknown[] = [
+      { ...good, amount: '0.5' },
+      { ...good, amount: '0' },
+      { ...good, transaction: good.transaction.toUpperCase() },
+      { ...good, wallet: 'nope' },
+      'paid',
+    ];
+    for (const bad of damaged) {
+      expect(isBoardPage({ asks: page.asks, payouts: [bad] })).toBe(false);
+      expect(await fetchBoard(CAMPAIGN_ID, null, reply(200, { asks: page.asks, payouts: [bad] }))).toEqual({ kind: 'failed' });
+    }
+    expect(isBoardPage({ asks: page.asks, payouts: 'none' })).toBe(false);
+  });
+
+  it('keeps payouts by wallet whatever its letter case, lets a newer total replace an older one, and words one in USDC', () => {
+    const page = fx.board(3, 1, undefined, () => true);
+    const first = page.payouts[0] as { wallet: string; amount: string; transaction: string };
+    const kept = mergePayouts(new Map(), page.payouts);
+    expect(kept.size).toBe(3);
+    expect(kept.get(first.wallet.toLowerCase())).toEqual(first);
+    const merged = mergePayouts(kept, [{ ...first, wallet: first.wallet.toLowerCase(), amount: '750000' }]);
+    expect(merged.size).toBe(3);
+    expect(merged.get(first.wallet.toLowerCase())?.amount).toBe('750000');
+    expect(kept.get(first.wallet.toLowerCase())?.amount).toBe('500000');
+    expect(payoutWords(first)).toBe('The vault has paid this wallet 0.5 USDC.');
+    expect(payoutWords({ ...first, amount: '250000' })).toBe('The vault has paid this wallet 0.25 USDC.');
+    expect(PAYOUT_COPY.chip).toBe('PAID');
   });
 
   it('reads an ask lookup as found, none or error', async () => {

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { relativeTime } from '@/lib/check';
-import { addressLink, historyChainId, shortAddress } from '@/lib/explorer';
+import { addressLink, historyChainId, shortAddress, txLink } from '@/lib/explorer';
 import { displayReason } from '@/lib/rules';
 import { formatInt } from '@/lib/format';
 import {
@@ -16,12 +16,16 @@ import {
   funderKindWords,
   groupText,
   mergeBoard,
+  mergePayouts,
   outcomeWords,
+  PAYOUT_COPY,
+  payoutWords,
   pollDelay,
   settledWords,
   type AppealCounts,
   type AppealView,
   type AskJson,
+  type PayoutJson,
 } from '@/lib/campaign';
 import { Drop } from '../Drop';
 import { CitedList, WhatToDo } from './Decision';
@@ -98,7 +102,24 @@ function BoardCheck({ appeal }: { appeal: AppealView }) {
   );
 }
 
-function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
+function BoardPayout({ payout, chain }: { payout: PayoutJson; chain: number }) {
+  const link = txLink(chain, payout.transaction);
+  return (
+    <div className={styles.boardCheck} data-board-payout>
+      <p className={styles.factName}>{PAYOUT_COPY.label}</p>
+      <p className={styles.factValue} data-board-payout-words>
+        {payoutWords(payout)}
+      </p>
+      {link === null ? null : (
+        <a className={styles.tx} href={link} target="_blank" rel="noopener noreferrer">
+          <span className={styles.txText}>{PAYOUT_COPY.link}</span>
+        </a>
+      )}
+    </div>
+  );
+}
+
+function BoardRow({ ask, payout, chain, now }: { ask: AskJson; payout: PayoutJson | null; chain: number; now: number }) {
   const [open, setOpen] = useState(false);
   const action = ask.action ?? 'hold';
   const detailsId = `board-${ask.wallet}`;
@@ -116,6 +137,11 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
               {chip.text}
             </span>
           )}
+          {payout === null ? null : (
+            <span className={`${styles.chip} ${styles.chipPaid}`} data-paid>
+              {PAYOUT_COPY.chip}
+            </span>
+          )}
         </span>
         <span className={styles.rowRule}>{ask.rule === null ? '' : `RULE ${ask.rule}`}</span>
         <span className={styles.rowReason}>{ask.reason === null ? '' : displayReason(ask.reason)}</span>
@@ -131,6 +157,7 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
           <p className={styles.citedLabel}>Cited transactions</p>
           <CitedList hashes={ask.citedTxs ?? []} chain={ask.facts?.chain ?? 'ethereum'} />
           <Facts ask={ask} />
+          {payout === null ? null : <BoardPayout payout={payout} chain={chain} />}
           {ask.appeal ? <BoardCheck appeal={ask.appeal} /> : null}
         </div>
       ) : null}
@@ -138,8 +165,20 @@ function BoardRow({ ask, now }: { ask: AskJson; now: number }) {
   );
 }
 
-export function Board({ campaignId, appeals, onSlowed }: { campaignId: string; appeals: AppealCounts; onSlowed: (route: string, slowed: boolean) => void }) {
+export function Board({
+  campaignId,
+  chain,
+  appeals,
+  onSlowed,
+}: {
+  campaignId: string;
+  /** The campaign's chain, where its vault pays, so a payout opens on that chain's explorer. */
+  chain: number;
+  appeals: AppealCounts;
+  onSlowed: (route: string, slowed: boolean) => void;
+}) {
   const [rows, setRows] = useState<AskJson[] | null>(null);
+  const [paid, setPaid] = useState<Map<string, PayoutJson>>(() => new Map());
   const [more, setMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const now = useNow(30_000);
@@ -157,6 +196,7 @@ export function Board({ campaignId, appeals, onSlowed }: { campaignId: string; a
     ok();
     const page = read.asks;
     setRows((current) => (current === null ? page : mergeBoard(current, page)));
+    setPaid((current) => mergePayouts(current, read.payouts));
     setMore((current) => (current ? current : page.length === BOARD_PAGE_SIZE));
   }, [campaignId, busy, ok, quiet]);
 
@@ -180,6 +220,7 @@ export function Board({ campaignId, appeals, onSlowed }: { campaignId: string; a
     ok();
     const page = read.asks;
     setRows((current) => mergeBoard(current ?? [], page));
+    setPaid((current) => mergePayouts(current, read.payouts));
     setMore(page.length === BOARD_PAGE_SIZE);
   }
 
@@ -204,7 +245,7 @@ export function Board({ campaignId, appeals, onSlowed }: { campaignId: string; a
       ) : (
         <ul className={styles.rows}>
           {(rows ?? []).map((ask) => (
-            <BoardRow key={ask.wallet} ask={ask} now={now} />
+            <BoardRow key={ask.wallet} ask={ask} payout={paid.get(ask.wallet.toLowerCase()) ?? null} chain={chain} now={now} />
           ))}
         </ul>
       )}
