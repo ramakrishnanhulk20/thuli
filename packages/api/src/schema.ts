@@ -276,7 +276,17 @@ export const AskView = z.strictObject({ ask: AskJson, ticket: TicketJson.optiona
 export const ExistsBody = z.strictObject({ exists: z.literal(true), ask: AskJson });
 // The most one board call can return: its own page limit, then the asks that share the last one's instant. A page
 // that runs on through a tie must still pass, or the tie would turn into a 500.
-export const BoardPage = z.strictObject({ asks: z.array(AskJson).max(MAX_BOARD_PAGE + MAX_BOARD_TIES) });
+/**
+ * What the vault has paid one wallet on the page: the total so far in base units and the claim transaction that brought
+ * it there, from the worker's record of a confirmed claim. The token and its chain are the campaign's.
+ */
+export const PayoutJson = z.strictObject({ wallet: CanonicalAddressText, amount: AmountText, transaction: HashText });
+export type PayoutJson = z.infer<typeof PayoutJson>;
+/** asks is the page. payouts holds one entry for each wallet on the page that the vault has paid, and none for the rest. */
+export const BoardPage = z.strictObject({
+  asks: z.array(AskJson).max(MAX_BOARD_PAGE + MAX_BOARD_TIES),
+  payouts: z.array(PayoutJson).max(MAX_BOARD_PAGE + MAX_BOARD_TIES),
+});
 
 /**
  * A cached free check read back from the store, checked like an input before it goes out again (C34): it must pass

@@ -24,6 +24,7 @@ import {
   APPEALS_PER_CAMPAIGN_DAY,
   board,
   campaignAppealsCounter,
+  confirmedPayouts,
   counts,
   dayCount,
   getAppeal,
@@ -37,6 +38,7 @@ import {
   type AppealStanding,
   type Campaign,
   type Db,
+  type Payout,
   type PublicAppeal,
   type PublicAsk,
 } from '@thuli/store';
@@ -393,13 +395,21 @@ export function registerCampaignRoutes<E extends Env>(app: Hono<E>, deps: Campai
       before = time;
     }
     let asks: PublicAsk[];
+    let paid: Payout[];
     try {
       asks = await board(db, campaign.id, BOARD_PAGE_SIZE, before);
+      // Only a wallet that holds a slot is ever listed, so only those can have been paid.
+      paid = await confirmedPayouts(
+        db,
+        campaign.id,
+        asks.filter((ask) => ask.slot !== null).map((ask) => ask.wallet),
+      );
     } catch (error) {
       storeFailed('reading a board', error);
       return busy(c);
     }
-    return answer(c, BoardPage, { asks: asks.map(askJson) }, 200);
+    const payouts = paid.map((payout) => ({ wallet: payout.wallet, amount: payout.amount, transaction: payout.tx }));
+    return answer(c, BoardPage, { asks: asks.map(askJson), payouts }, 200);
   });
 
   app.post(

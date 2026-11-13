@@ -25,13 +25,16 @@ import {
   decideAsk,
   markListActive,
   markListPosted,
+  markRelay,
   migrate,
   openMemoryDb,
+  queueRelays,
   recordAppealCheck,
   settleAppeal,
   StoreError,
   takeAppeal,
   takeAsk,
+  takeRelay,
   type AskDecision,
   type CampaignInput,
   type Db,
@@ -1434,6 +1437,46 @@ describe('campaign routes', () => {
     expect(AskView.safeParse({ ...view, ask: { ...view.ask, facts: { ...facts, chain: 'base' } } }).success).toBe(true);
   });
 
+  it('the board names each wallet the vault has paid, with the total and the claim, and no wallet whose claim is not confirmed', async () => {
+    await createCampaign(db, terms());
+    expect(await decided(0, 'full')).toEqual({ slot: 1 });
+    expect(await decided(1, 'full')).toEqual({ slot: 2 });
+    expect(await decided(2, 'hold')).toEqual({ slot: null });
+    const send = campaignApp();
+    const before = BoardPage.parse(JSON.parse((await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board`)).text));
+    expect(before.asks).toHaveLength(3);
+    expect(before.payouts).toEqual([]);
+
+    const { version } = await publish([
+      { index: 0, action: 'full' },
+      { index: 1, action: 'full' },
+    ]);
+    const owed = [0, 1].map((index) => ({ wallet: walletOf(index), amount: '1000000' }));
+    expect(await queueRelays(db, CAMPAIGN, version, owed, NOW)).toBe(2);
+    expect(await takeRelay(db, NOW, 60)).not.toBeNull();
+    expect(await takeRelay(db, NOW, 60)).not.toBeNull();
+    const claim = `0x${'c3'.repeat(32)}`;
+    const key = (index: number) => ({ campaignId: CAMPAIGN, wallet: walletOf(index), version });
+    expect(await markRelay(db, key(0), { status: 'confirmed', tx: claim }, NOW)).toBe('confirmed');
+    // Wallet 1's claim was sent and is not confirmed, so the board does not call it paid.
+    expect(await markRelay(db, key(1), { status: 'sent', tx: HASH }, NOW)).toBe('sent');
+
+    const page = BoardPage.parse(JSON.parse((await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board`)).text));
+    expect(page.asks).toHaveLength(3);
+    expect(page.payouts).toEqual([{ wallet: walletOf(0), amount: '1000000', transaction: claim }]);
+
+    // C34: an entry that is not exactly a wallet, an amount and a lowercase hash fails the answer's own shape.
+    const good = page.payouts[0];
+    const refused: unknown[] = [
+      { ...good, amount: '1.5' },
+      { ...good, transaction: claim.toUpperCase() },
+      { ...good, wallet: walletOf(0).toLowerCase() },
+      { ...good, extra: 1 },
+    ];
+    for (const bad of refused) expect(BoardPage.safeParse({ asks: page.asks, payouts: [bad] }).success).toBe(false);
+    expect(BoardPage.safeParse({ asks: page.asks }).success).toBe(false);
+  });
+
   it('C33: a reason with markup cannot be stored, and the board returns reasons unchanged as strings', async () => {
     await createCampaign(db, terms());
     await expect(decided(0, 'hold', 'Held: <b>bold</b>')).rejects.toThrow(StoreError);
@@ -1444,7 +1487,7 @@ describe('campaign routes', () => {
     expect(page.asks.map((ask) => ask.reason)).toEqual([reason]);
     expect(typeof page.asks[0]?.reason).toBe('string');
     const earlier = await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board?before=${NOW.toISOString()}`);
-    expect(BoardPage.parse(JSON.parse(earlier.text))).toEqual({ asks: [] });
+    expect(BoardPage.parse(JSON.parse(earlier.text))).toEqual({ asks: [], payouts: [] });
     const badTime = await send(`${CAMPAIGNS_PATH}/${CAMPAIGN}/board?before=yesterday`);
     expect(badTime.status).toBe(400);
   });
