@@ -563,10 +563,10 @@ Errors, in the order the route checks for them:
 | 503 | `{"busy": true}` | the store that keeps the ceilings could not be reached; no payment was asked for |
 | 402 | `{"error": "Payment required"}` with `PAYMENT-REQUIRED` | no payment header |
 | 402 | `{"error": "No matching payment requirements"}` with a fresh `PAYMENT-REQUIRED` | the payment header does not match the terms |
-| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A settle the facilitator answers with `success: false` carries the facilitator's reason. |
+| 402 | `{}` with `PAYMENT-RESPONSE` holding `success: false` and an `errorReason` | the payment was refused at settlement. Thuli's own reasons: `payment_not_understood`, `payment_terms_mismatch`, `payment_expired`, `payment_valid_too_long` (signed to stay valid past 300 seconds plus a 30 second clock allowance), `payment_already_used`. A settle the facilitator answers as plainly failed (a 200 with `success: false`, no pending reason and no transaction left to wait for) carries the facilitator's reason. |
 | 503 | `{"busy": true}` | under 120.5 seconds of the deadline are left, so nothing was claimed or settled |
 | 503 | `{"retry": true}` | the store could not record the claim on this payment, so it was not settled. Send the same payment header again. |
-| 503 | `{"retry": true}` | the settlement's outcome is unknown: no answer, a timeout, any error answer from the facilitator, or a pending settlement whose receipt could not be read. Coinbase's facilitator refuses a payment it will not send with a 400 that names no transaction, the shape a second settle of a paid authorization would also get, so that answer is unknown too and a buyer short of funds is not told why. Send the same payment header again; it can never pay twice. |
+| 503 | `{"retry": true}` | the settlement's outcome is unknown: no answer, a timeout, any error answer from the facilitator, an answer that says pending, or one that names a transaction whose receipt is not there yet. Every transaction named is kept with the claim, and a later copy of the header is served once a receipt proves the payment. Coinbase's facilitator refuses a payment it will not send with a 400 that names no transaction, the shape a second settle of a paid authorization would also get, so that answer is unknown too and a buyer short of funds is not told why. Send the same payment header again; it can never pay twice. |
 | 503 | `{"settled": true, "retry": true, "message": "The payment has settled. Send the same payment header again to get the screening it bought."}` with `Retry-After: 10` | the payment settled and no result is stored yet: under 20 seconds were left to screen, a screening before the last try ran out of time, or another request is screening this payment now. Send the same payment header again; it is never charged again. |
 | 500 | `{"error": "the payment could not be confirmed"}` or `{"error": "internal error"}` | an internal fault; no detail is returned |
 
@@ -1024,8 +1024,8 @@ One ask, as `ask` in the answers above and as each entry of the board:
 A failed ask is one whose screening could not finish after its attempts: it reads action `hold`, rule `A1` and the
 reason "Held for review: the screening could not finish." A wallet that had never been used on Ethereum or Base when the
 worker looked at it is held by code under `A1`, with the reason "A1: This wallet has never been used on Ethereum or
-Base, so there is nothing to screen." and no model call. A worker reading Ethereum only decides no such wallet: its
-tries fail and the ask ends held for review. Held and excluded wallets never take a slot, and slots go in the order asks are
+Base, so there is nothing to screen." and no model call. A worker whose Base history is off decides no such wallet:
+its tries fail and the ask ends held for review. Held and excluded wallets never take a slot, and slots go in the order asks are
 decided. A reversed appeal can give an ask a slot later (4.6).
 
 One appeal, as `appeal` on an ask and in the appeals answers:
@@ -1231,18 +1231,19 @@ way on every run is logged once, again only when its cause changes, and a line s
    `pickChain` reads the wallet's first activity on Ethereum and on Base mainnet, by core's `firstActivityTime`, and
    `olderChain` names the chain where it is older (one chain only: that one; a tie: Ethereum). A chain whose first used
    block was found but could not be read gives that block's time as a lower bound, and the other chain is picked only
-   when it is older than the bound. The facts are then read on that chain at the block the picker read it at, with
+   when it is older than the bound, or as old when that other chain is Ethereum, where a tie goes. The facts are then read on that chain at the block the picker read it at, with
    plain RPC calls and no explorer (`rpcHistory` in `packages/worker/src/facts/rpcHistory.ts`): a halving search for
    the first block where the sent count or the balance is above zero, every block that paid the wallet until its first
    own transaction that succeeded, and those blocks' transfers from their traces, which must add up to each block's
-   rise in the balance. The funder's kind is read on the same chain. The chain is stored in the ask's public facts as
+   rise in the balance for every block before the wallet's own first send. The funder's kind is read on the same chain. The chain is stored in the ask's public facts as
    `chain` (`ethereum` or `base`). If either chain cannot be read, or any read of the facts fails, the try fails and
    is taken again: a failed read is never stored as a hold. About 220 RPC calls an ask, and at most 1,000
    (`MAX_READ_CALLS`) for each of its three history reads; the reads of a try stop when the try ends.
    At start, an endpoint that answers and serves no old state or no traces turns the two-chain read off: one log line
-   says which endpoint lacks what, every ask is read on Ethereum through the explorer reader, and a wallet with no
-   Ethereum history is not decided ("the wallet has no Ethereum history, and Base history is off"). An endpoint that
-   gives no answer is asked again after 2, 5, 15 and 30 seconds, and if it stays silent, or names another chain's id,
+   says which endpoint lacks what. The worker then asks Base, with two plain calls, whether the wallet was used there. A
+   wallet used on Base is not decided ("the wallet was used on Base, and Base history is off"); only a wallet not used
+   there is read on Ethereum through the explorer reader. An endpoint that gives no answer, a rate limit or a server
+   fault included, is asked again after 2, 5, 15 and 30 seconds, and if it stays silent, or names another chain's id,
    the worker does not start. `npm run campaign:screen` runs this path for any wallet and stores nothing.
 3. The first funder's kind is read from the chain. The facts reader leaves it unknown, so the worker reads the funder's
    code and its count of transactions sent at a finalized block, when the ask is screened, and applies core's
@@ -1255,8 +1256,7 @@ way on every run is logged once, again only when its cause changes, and a line s
 5. A wallet that was never used is decided by code. If its own facts show no transaction sent, a plain account, no first
    funder in a history that was read, and an age that is known, and its start and ceiling are both a hold under `A1`, the
    decision is that hold with the reason "A1: This wallet has never been used on Ethereum or Base, so there is nothing to
-   screen." (or "on Ethereum" when only Ethereum is read)
-   and no model call, on its first try. The model could only have written the reason. A read that failed leaves a fact
+   screen." and no model call, on its first try. Only a worker that read both chains' histories decides this. The model could only have written the reason. A read that failed leaves a fact
    unknown, so a failed read is never taken for an empty wallet.
 6. Every other screening first takes one count of the day's budget: 2,000 model screenings a UTC day across every
    campaign (`CAMPAIGN_SCREENINGS_DAY_MAX`), counted in one store statement right before SERV is called, so two workers

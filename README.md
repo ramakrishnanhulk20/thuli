@@ -82,7 +82,7 @@ Reppo's outside judges read 49 of Thuli's own decisions, chosen by group and not
 
 ## Features
 
-Everything on chain below is Base Sepolia with test money. Two things ran on Base mainnet with real USDC, and both are in the Deployments section: the factory with one proof vault that paid 1 USDC, and one 5 cent payment to the paid check.
+Everything on chain below is Base Sepolia with test money. Two things ran on Base mainnet with real USDC: the factory with one proof vault that paid 1 USDC, in the Deployments section, and one 5 cent payment to the paid check, described with the paid route below.
 
 For a project that is about to pay rewards:
 
@@ -97,7 +97,7 @@ For a wallet:
 - A free check. Paste any Ethereum address at `/check`, or call `POST /api/check`. No sign-in and no payment, up to 5 new checks an hour for each visitor.
 - A reason. Every decision shows the outcome, the rule, a plain-text reason, the transactions it cites and the list of facts the screening did not measure.
 - A live campaign with no gas. A wallet signs a four-line text message, which costs nothing and moves nothing. Thuli screens it in public. If it is approved it takes a slot, and after the vault's delay the worker submits the claim from its own key and pays the gas. On Base Sepolia with test USDC. A wallet that has never been used on Ethereum or on Base is told so at the door, and nothing is stored.
-- Screened on the chain where the wallet is older. A campaign ask is read on Ethereum or on Base mainnet, whichever the wallet was active on first, and the decision says which. A wallet used only on Base is screened on its Base history. This needs the worker's two RPC endpoints to serve old state and traces, which it checks at start. With an endpoint that answers and serves neither, it reads Ethereum only, says so in its log, and does not decide a wallet that has no Ethereum history. An endpoint that gives no answer at start, or answers for another chain, stops the worker instead. `npm run campaign:screen -- --wallets <address>` shows the chain and the decision for any wallet without storing anything.
+- Screened on the chain where the wallet is older. A campaign ask is read on Ethereum or on Base mainnet, whichever the wallet was active on first, and the decision says which. A wallet used only on Base is screened on its Base history. This needs the worker's two RPC endpoints to serve old state and traces, which it checks at start. With an endpoint that answers and serves neither, it reads Ethereum only, says so in its log, and decides only a wallet that two plain calls show was never used on Base. An endpoint that gives no answer at start, or answers for another chain, stops the worker instead. `npm run campaign:screen -- --wallets <address>` shows the chain and the decision for any wallet without storing anything.
 - An appeal. A wallet that was held, excluded, cut to a partial reward or whose screening could not finish can file one appeal per campaign: one line of text, signed with the wallet like the ask, with no gas. Thuli's own decision for that wallet, with the parts that identify it removed, goes to Reppo for an outside check. The wallet's own words go to no model and appear on no public page. The route Reppo gives (ship, review, block or unreadable) and a short note are shown beside the decision. The check is advice. This is built and covered by tests, and two appeals have been run live, both against the same test wallet's partial decision: Reppo answered `review` on one and `ship` on the other, and the owner upheld both (see [A local run of the live campaign](#a-local-run-of-the-live-campaign)).
 
 For another agent or a developer:
@@ -368,10 +368,10 @@ This needs no key and no wallet. You need git and Node 26 or newer. The output b
 
    ```text
     Test Files  74 passed (74)
-         Tests  2005 passed | 98 skipped (2103)
+         Tests  2037 passed | 99 skipped (2136)
    ```
 
-   It takes about 75 seconds. The 98 skipped tests need things a fresh clone does not have: a real Postgres for 91 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
+   It takes about 75 seconds. The 99 skipped tests need things a fresh clone does not have: a real Postgres for 92 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
 
 3. Check the vault proof against Base Sepolia.
 
@@ -636,7 +636,7 @@ Tests, run on a fresh clone on 11 November 2026.
 ```text
 $ npx vitest run
  Test Files  74 passed (74)
-      Tests  2005 passed | 98 skipped (2103)
+      Tests  2037 passed | 99 skipped (2136)
 
 $ npm run typecheck
 > tsc -p tsconfig.typecheck.json --noEmit
@@ -646,7 +646,7 @@ $ npm run contracts:test
 Ran 6 test suites in 21.65s (57.70s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
 ```
 
-The 98 skipped TypeScript tests are explained in step 2 of the judge path: 91 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2006 passed and 97 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
+The 99 skipped TypeScript tests are explained in step 2 of the judge path: 92 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2038 passed and 98 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
 
 The 79 Foundry tests are 64 unit tests, 1 demo test (30 farm wallets cannot take more than 20 USDC, and none gets more than 1 USDC), 1 fixture test that pins one list and its proofs, 11 fuzz tests at 10,000 random cases each, 1 fork test of a full campaign on real USDC, and 1 invariant suite with 7 invariants run as 256 random call sequences, up to 64 calls deep. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens, and the fork tests do not cover Circle freezing or pausing USDC or gas prices on Base. None of this replaces an outside audit.
 
@@ -704,7 +704,7 @@ Versions are from the `package.json` files and match the lockfiles.
 
 ## Security
 
-The threat model was written on 27 October 2026, before any code, by an independent pass that saw only a plain description of the system. It lists the attacks to expect and 61 numbered rules (C1 to C61), thirteen of them added on 11 and 12 November 2026 during the build of the live campaign, appeals and the two-chain history read; each rule names the test or attack that shows it, and a change that touches a rule has to carry its test. The worker's key can post a list to a vault and, like anyone, submit a claim, which pays only the wallet named in the list. It cannot withdraw, cancel, pause, extend the end, replace itself or rescue a token. Every list waits a delay the owner can use to cancel it, each wallet is capped, and the total paid cannot pass the deposit. If the worker's key were stolen and nobody cancelled in time, the stated loss is whatever the deposit has not yet paid out, at most the cap per wallet, and no watcher exists yet to warn the owner. The vault protects claimants from a hacked Thuli server and from early withdrawal, and does not protect them from the project that funds it. The named limits are on the [limits page](packages/web/content/docs/limits.mdx) and under the non-goals in the [threat model](docs/security/threat-model.md) (section C.2, standard 5). No outside firm has audited Thuli. It is self-audited, with the threat model, rounds of internal checking and the tests. Every campaign vault holds only test USDC, and the one mainnet vault was the 2 USDC proof and is empty.
+The threat model was written on 27 October 2026, before any code, by an independent pass that saw only a plain description of the system. It lists the attacks to expect and 61 numbered rules (C1 to C61), fourteen of them added from 11 to 13 November 2026 during the build of the live campaign, appeals, the two-chain history read and the board's paid mark; each rule names the test or attack that shows it, and a change that touches a rule has to carry its test. The worker's key can post a list to a vault and, like anyone, submit a claim, which pays only the wallet named in the list. It cannot withdraw, cancel, pause, extend the end, replace itself or rescue a token. Every list waits a delay the owner can use to cancel it, each wallet is capped, and the total paid cannot pass the deposit. If the worker's key were stolen and nobody cancelled in time, the stated loss is whatever the deposit has not yet paid out, at most the cap per wallet, and no watcher exists yet to warn the owner. The vault protects claimants from a hacked Thuli server and from early withdrawal, and does not protect them from the project that funds it. The named limits are on the [limits page](packages/web/content/docs/limits.mdx) and under the non-goals in the [threat model](docs/security/threat-model.md) (section C.2, standard 5). No outside firm has audited Thuli. It is self-audited, with the threat model, rounds of internal checking and the tests. Every campaign vault holds only test USDC, and the one mainnet vault was the 2 USDC proof and is empty.
 
 ## What is not built yet
 
