@@ -108,6 +108,8 @@ class StubFacilitator implements FacilitatorClient {
   holdUnfunded: Promise<void> | null = null;
   /** When set, every settle answers with this instead, so a test can script a pending, a throw or a refusal. */
   respond: ((payload: PaymentPayload, requirements: PaymentRequirements) => Promise<SettleResponse>) | null = null;
+  /** When set, every verify answers with this instead, so a test can script a refusal or a throw. */
+  respondVerify: ((payload: PaymentPayload) => Promise<VerifyResponse>) | null = null;
   readonly #network: string;
 
   constructor(network: string) {
@@ -124,6 +126,7 @@ class StubFacilitator implements FacilitatorClient {
 
   async verify(payload: PaymentPayload): Promise<VerifyResponse> {
     this.verified += 1;
+    if (this.respondVerify !== null) return this.respondVerify(payload);
     return { isValid: true, payer: authorizationFrom(payload).from };
   }
 
@@ -1076,6 +1079,114 @@ function screeningThatTakes(ms: number, result: (wallet: Address) => SingleScree
       });
     });
 }
+
+describe.each(BACKENDS)("a facilitator's own words stay out of the reply (C34), on $name", (backend) => {
+  onBackend(backend);
+  const LEAK = /secret-token|facilitator\.example/;
+
+  it('hands on of a failed settle only a reason that is a code: prose, a message, extra fields and a payer or transaction out of shape are dropped', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, fetchAs, client, account, screen } = await setup({ facilitator });
+    facilitator.respond = async (_payload, requirements) =>
+      ({
+        success: false,
+        errorReason: 'Insufficient funds: top up at https://facilitator.example/pay?key=secret-token',
+        errorMessage: 'upstream said secret-token',
+        transaction: 'see https://facilitator.example/tx/secret-token',
+        network: requirements.network,
+        payer: 'the payer is secret-token',
+        amount: 'secret-token',
+        extensions: { note: 'secret-token' },
+      }) as SettleResponse;
+    const prose = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(prose.status).toBe(402);
+    const proseSaid = decodePaymentResponseHeader(prose.headers.get('payment-response') as string);
+    expect(proseSaid).toEqual({ success: false, errorReason: 'settlement_failed', transaction: '', network: 'eip155:84532' });
+    expect(`${await prose.text()} ${JSON.stringify(proseSaid)}`).not.toMatch(LEAK);
+
+    // A reason that is a code is the buyer's to read, with the payer in its own shape and still no message.
+    facilitator.respond = async (payload, requirements) => ({
+      success: false,
+      errorReason: 'insufficient_funds',
+      errorMessage: 'the wallet at secret-token is empty',
+      transaction: '',
+      network: requirements.network,
+      payer: authorizationFrom(payload).from.toLowerCase(),
+    });
+    const coded = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(coded.status).toBe(402);
+    expect(decodePaymentResponseHeader(coded.headers.get('payment-response') as string)).toEqual({
+      success: false,
+      errorReason: 'insufficient_funds',
+      transaction: '',
+      network: 'eip155:84532',
+      payer: account.address,
+    });
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it('hands on of a settled answer only its transaction, payer and network, and refuses one whose payer is out of shape without repeating it', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, fetchAs, client, account, screen } = await setup({ facilitator });
+    facilitator.respond = async (payload, requirements) =>
+      ({
+        success: true,
+        errorMessage: 'secret-token',
+        transaction: SETTLE_TX,
+        network: requirements.network,
+        payer: authorizationFrom(payload).from,
+        amount: 'secret-token',
+        extensions: { note: 'https://facilitator.example/?key=secret-token' },
+      }) as SettleResponse;
+    const paid = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(paid.status).toBe(200);
+    expect(decodePaymentResponseHeader(paid.headers.get('payment-response') as string)).toEqual({
+      success: true,
+      transaction: SETTLE_TX,
+      network: 'eip155:84532',
+      payer: account.address,
+    });
+
+    facilitator.respond = async (_payload, requirements) => ({
+      success: true,
+      transaction: SETTLE_TX,
+      network: requirements.network,
+      payer: 'the payer is secret-token',
+    });
+    const odd = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(odd.status).toBe(402);
+    const oddSaid = decodePaymentResponseHeader(odd.headers.get('payment-response') as string);
+    expect(oddSaid).toMatchObject({ success: false, errorReason: 'settlement_receipt_invalid' });
+    expect(`${await odd.text()} ${JSON.stringify(oddSaid)}`).not.toMatch(LEAK);
+
+    // A success that names another network is refused the same way, not taken as one on this route's network.
+    facilitator.respond = async (payload) => ({ success: true, transaction: SETTLE_TX, network: 'eip155:1', payer: authorizationFrom(payload).from });
+    const elsewhere = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(elsewhere.status).toBe(402);
+    expect(decodePaymentResponseHeader(elsewhere.headers.get('payment-response') as string)).toMatchObject({
+      success: false,
+      errorReason: 'settlement_receipt_invalid',
+    });
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
+  it("never asks the facilitator to verify, so its verify answer has no way into a reply: the settle alone establishes the payment", async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, client, screen } = await setup({ facilitator });
+    facilitator.respondVerify = async () => ({
+      isValid: false,
+      invalidReason: 'Bad signature, see https://facilitator.example/why?key=secret-token',
+      invalidMessage: 'secret-token',
+    });
+    const paid = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(paid.status).toBe(200);
+    expect(facilitator.verified).toBe(0);
+    expect(paid.headers.get('payment-required')).toBeNull();
+    const said = decodePaymentResponseHeader(paid.headers.get('payment-response') as string);
+    expect(`${await paid.text()} ${JSON.stringify(said)}`).not.toMatch(LEAK);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe.each(BACKENDS)('a paid request slower than the host allows (C25, C41), on $name', (backend) => {
   onBackend(backend);

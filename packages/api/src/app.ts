@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { AfterSettleAbortError, type FacilitatorClient, type RoutesConfig } from '@x402/core/server';
-import { SettleError } from '@x402/core/types';
+import { SettleError, type SettleResponse } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
 import { bazaarResourceServerExtension, declareDiscoveryExtension } from '@x402/extensions/bazaar';
 import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
@@ -189,6 +189,38 @@ const SettleReceipt = z.object({
   payer: AddressText,
   transaction: TxHashText,
 });
+
+// A facilitator's failure reason is handed on only when it is a code, never when it is prose. The longest reason the
+// payment libraries define is 63 characters.
+const REASON_CODE = /^[a-z0-9_]{1,64}$/;
+const UNCODED_SETTLE_FAILURE = 'settlement_failed';
+
+/**
+ * A facilitator's settle answer cut down to the fixed shape a buyer may be handed (C34). The payment library encodes
+ * the whole answer into the PAYMENT-RESPONSE header, so whatever a facilitator puts in it would reach the buyer word
+ * for word: prose for a reason, a message, extra fields, a payer or transaction that is not one. Kept: the outcome, a
+ * reason that is a code, and the transaction and payer in their own shapes, under this route's network. A success
+ * whose transaction, payer or network is out of shape comes out with no transaction, so the receipt check that follows
+ * refuses it as it would have refused the answer as given. This does not cover a thrown error, which never gets as
+ * far as a header: the settle-failure hook answers retry for it.
+ */
+function fixedSettleAnswer(answer: SettleResponse, network: SettleResponse['network']): SettleResponse {
+  const transaction = TxHashText.safeParse(answer.transaction);
+  const payer = answer.payer == null ? null : AddressText.safeParse(answer.payer);
+  const said = payer?.success === true ? { payer: payer.data } : {};
+  if (answer.success !== true) {
+    const coded = typeof answer.errorReason === 'string' && REASON_CODE.test(answer.errorReason);
+    return {
+      success: false,
+      errorReason: coded ? (answer.errorReason as string) : UNCODED_SETTLE_FAILURE,
+      transaction: transaction.success ? transaction.data : '',
+      network,
+      ...said,
+    };
+  }
+  if (!transaction.success || payer?.success === false || answer.network !== network) return { success: true, transaction: '', network };
+  return { success: true, transaction: transaction.data, network, ...said };
+}
 
 const refuse = (reason: string, message?: string) => ({ abort: true as const, reason, ...(message !== undefined && { message }) });
 
@@ -435,20 +467,23 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   };
   const facilitator: FacilitatorClient = {
     getSupported: () => config.facilitator.getSupported(),
+    // Never asked in this route's flow, where the settle itself establishes the payment, so a facilitator's verify
+    // answer has no way into a reply.
     verify: (payload, requirements) => config.facilitator.verify(payload, requirements),
     settle: async (payload, requirements) => {
       const request = paidRequests.getStore();
       if (request !== undefined) request.settleThrew = false;
-      // An authorization past its validBefore can never settle, so the facilitator is not asked. Such a claim was taken
-      // only because it still holds a transaction named for it; the settle-failure hook reads that receipt, and if it
-      // does not prove the payment the buyer gets this fixed reason, never a facilitator's words about an old header.
+      // An authorization past its validBefore by now can never settle, so the facilitator is not asked. Either its
+      // claim was taken because it still holds a transaction named for it, or it ran out between the claim and this
+      // call. The settle-failure hook reads any named receipt, and if none proves the payment the buyer gets this
+      // fixed reason, never a facilitator's words about an old header.
       if (request?.claim != null && hasExpired(request.claim.validBefore, BigInt(Math.floor(now().getTime() / 1000)))) {
         return { success: false, errorReason: 'payment_expired', transaction: '', network: requirements.network };
       }
       try {
         const answer = await config.facilitator.settle(payload, requirements);
         if (request !== undefined && !answer.success) noted(request, answer);
-        return answer;
+        return fixedSettleAnswer(answer, config.networkId);
       } catch (error) {
         if (request !== undefined) {
           request.settleThrew = true;
@@ -587,7 +622,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // one whose receipt was read as not this payment is taken off it, and beyond that only the cap of MAX_NAMED_TXS
   // ever takes one off, the oldest first. What falls through, so that the buyer gets 402: an answer that plainly
   // failed with nothing left to wait for, which is a facilitator's 200 with success false or this route's own
-  // "payment_expired" for an authorization that was past its validBefore when the request came.
+  // "payment_expired" for an authorization that was past its validBefore by the time the facilitator would be asked.
   resourceServer.onSettleFailure(async ({ phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) return;
