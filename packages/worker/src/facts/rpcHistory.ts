@@ -606,7 +606,7 @@ export async function rpcHistory(client: HistoryClient, wallet: Address, block: 
   return unsure({ external: ordered.flatMap((at) => read(at).external), internal: ordered.flatMap((at) => read(at).internal) });
 }
 
-export type HistoryLack = 'chain' | 'old state' | 'traces' | 'no answer';
+export type HistoryLack = 'chain' | 'old state' | 'traces' | 'no trace answer' | 'no answer';
 
 /**
  * Whether an endpoint can serve rpcHistory for the chain with id `chainId`: its own chain id, its finalized block, a
@@ -615,9 +615,10 @@ export type HistoryLack = 'chain' | 'old state' | 'traces' | 'no answer';
  * blocks back are tried for one that does. The chain id comes first: an endpoint of another chain would answer every
  * read, about the wrong wallets.
  *
- * @returns ok, or what the endpoint lacks: 'no answer' when a read gets no answer at all, else 'chain' when it names
- *   another chain id or refuses to name one, 'old state' or 'traces' for the read it refused or answered out of shape.
- *   Never throws, and holds nothing the endpoint sent (C40).
+ * @returns ok, or what the endpoint lacks: 'no answer' when a plain read gets no answer at all; 'no trace answer' when
+ *   its plain reads answered and a trace call then got none, as a public endpoint does that rate-limits every trace
+ *   call; else 'chain' when it names another chain id or refuses to name one, 'old state' or 'traces' for the read it
+ *   refused or answered out of shape. Never throws, and holds nothing the endpoint sent (C40).
  */
 export async function historyProbe(client: HistoryClient, chainId: number): Promise<{ ok: true } | { ok: false; lacks: HistoryLack }> {
   const lacking = (lack: HistoryLack, error: unknown) => ({ ok: false as const, lacks: error instanceof RpcRefused ? lack : 'no answer' });
@@ -638,12 +639,16 @@ export async function historyProbe(client: HistoryClient, chainId: number): Prom
   } catch (error) {
     return lacking('old state', error);
   }
+  // Set while a trace call is out, so a call left unanswered is told apart from a plain read left unanswered.
+  let tracing = false;
   try {
     for (let back = 0; back < PROBE_BLOCKS && head.number - back >= 0; back += 1) {
       const block = head.number - back;
       const at = back === 0 ? head : await header(client, hex(block));
+      tracing = true;
       const [first] = await tracesWhere(client, { fromBlock: hex(block), toBlock: hex(block), count: 1 });
       if (first === undefined) {
+        tracing = false;
         if (at.transactions > 0) return { ok: false, lacks: 'traces' };
         continue;
       }
@@ -653,6 +658,7 @@ export async function historyProbe(client: HistoryClient, chainId: number): Prom
     }
     return { ok: false, lacks: 'traces' };
   } catch (error) {
-    return lacking('traces', error);
+    if (error instanceof RpcRefused) return { ok: false, lacks: 'traces' };
+    return { ok: false, lacks: tracing ? 'no trace answer' : 'no answer' };
   }
 }

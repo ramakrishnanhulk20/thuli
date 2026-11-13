@@ -27,6 +27,7 @@ import {
   pickChain,
   PROBE_WAITS_MS,
   screenChains,
+  TRACE_ANSWER_TRIES,
   type ChainReader,
   type ChainReaders,
   type FirstActivity,
@@ -421,7 +422,39 @@ describe('screenChains', () => {
     });
     expect(chains).toBeDefined();
     expect(probeWaits(waits)).toEqual(PROBE_WAITS_MS.slice(0, 1));
-    expect(said).toEqual(["screen: Base's endpoint (BASE_RPC_URL) gave no answer at start; asking again in 2 s", HISTORY_ON]);
+    expect(said).toEqual(["screen: Base's endpoint (BASE_RPC_URL) gave no answer to its trace calls at start; asking again in 2 s", HISTORY_ON]);
+  });
+
+  it('starts with RPC history off on an endpoint that answers plain reads and limits every trace call for good, as the default public one does', async () => {
+    const both = nodes();
+    // What the public Ethereum endpoint in .env.example answers to every trace call, while its plain reads pass.
+    both.ethereum.refusing = { method: 'trace_filter', times: 999, message: 'limit exceeded', code: -32005 };
+    serve([both.ethereum, both.base]);
+    const waits: number[] = [];
+    const chains = await screenChains(config, log, async (ms) => {
+      waits.push(ms);
+    });
+    expect(chains).toBeUndefined();
+    expect(TRACE_ANSWER_TRIES).toBe(2);
+    expect(probeWaits(waits)).toEqual(PROBE_WAITS_MS.slice(0, TRACE_ANSWER_TRIES - 1));
+    expect(said).toEqual([
+      "screen: Ethereum's endpoint (ETH_RPC_URL) gave no answer to its trace calls at start; asking again in 2 s",
+      "screen: RPC history is off because Ethereum's endpoint (ETH_RPC_URL) gave no answer to its trace calls, so an ask is screened on Ethereum only, and a wallet that was used on Base is not decided",
+    ]);
+  });
+
+  it('keeps waiting on an endpoint that answers nothing while another only lacks trace answers, and stops the worker if it stays silent (C60)', async () => {
+    const both = nodes();
+    both.ethereum.refusing = { method: 'trace_filter', times: 999, message: 'limit exceeded', code: -32005 };
+    serve([both.ethereum, both.base], { url: BASE_URL, status: 500 });
+    const waits: number[] = [];
+    const failure = await screenChains(config, log, async (ms) => {
+      waits.push(ms);
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(WorkerConfigError);
+    expect((failure as Error).message).toBe("Base's endpoint (BASE_RPC_URL) gave no answer at start, so the worker did not start. Start it again once the endpoint answers.");
+    expect(probeWaits(waits)).toEqual([...PROBE_WAITS_MS]);
+    expect(said.some((line) => line.includes('RPC history is off'))).toBe(false);
   });
 
   it('does not start on an endpoint of another chain, naming the setting and no address (C2, C40)', async () => {

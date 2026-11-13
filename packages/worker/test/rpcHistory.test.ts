@@ -622,6 +622,18 @@ describe('historyProbe', () => {
     expect(calls.find((call) => call.method === 'eth_getBalance')?.params).toEqual(['0x0000000000000000000000000000000000000000', '0x1']);
   });
 
+  it('tells a trace call left unanswered from a plain read left unanswered, and both from a refusal', async () => {
+    const failing = (fails: (method: string, params: readonly unknown[]) => Error | undefined) => standIn({ traces: traced }, fails).client;
+    const silent = new HistoryError('the RPC gave no answer');
+    expect(await historyProbe(failing((method) => (method === 'trace_filter' ? silent : undefined)), 1)).toEqual({ ok: false, lacks: 'no trace answer' });
+    expect(await historyProbe(failing((method) => (method === 'trace_transaction' ? silent : undefined)), 1)).toEqual({ ok: false, lacks: 'no trace answer' });
+    // The finalized block holds no transaction here, so the probe steps back and reads one more header: a plain read.
+    const earlier = [callTrace(TOP - 1, SENDER, SHOP, 1n, { hash: hashOf(`background ${TOP - 1}`) })];
+    const noHeader = standIn({ traces: earlier, emptyBlocks: [TOP] }, (method, params) => (method === 'eth_getBlockByNumber' && params[0] !== 'finalized' ? silent : undefined));
+    expect(await historyProbe(noHeader.client, 1)).toEqual({ ok: false, lacks: 'no answer' });
+    expect(await historyProbe(failing((method) => (method === 'trace_filter' ? new RpcRefused('refused') : undefined)), 1)).toEqual({ ok: false, lacks: 'traces' });
+  });
+
   it("answers its three failures: no answer, old state refused, traces refused or empty for a block with transactions", async () => {
     const failing = (method: string, error: Error) => standIn({ traces: traced }, (asked) => (asked === method ? error : undefined)).client;
     expect(await historyProbe(failing('eth_getBlockByNumber', new HistoryError('the RPC gave no answer to eth_getBlockByNumber')), 1)).toEqual({ ok: false, lacks: 'no answer' });
