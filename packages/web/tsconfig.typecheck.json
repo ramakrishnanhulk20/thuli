@@ -7,6 +7,10 @@
     "components/**/*.ts",
     "components/**/*.tsx",
     "lib/**/*.ts",
-    "lib/**/*.tsx"
+    "lib/**/*.tsx",
+    "test/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
   ]
 }
