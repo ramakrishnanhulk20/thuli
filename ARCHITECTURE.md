@@ -1247,7 +1247,8 @@ way on every run is logged once, again only when its cause changes, and a line s
    there is read on Ethereum through the explorer reader. An endpoint that gives no answer to a plain read, a rate
    limit or a server fault included, is asked again after 2, 5, 15 and 30 seconds, and if it stays silent, or names
    another chain's id, the worker does not start. An endpoint that answers plain reads and leaves its trace calls
-   unanswered twice is read as serving no traces, which is how the free public endpoints in `.env.example` behave. `npm run campaign:screen` runs this path for any wallet and stores nothing.
+   unanswered on two of its probes is read as serving no traces. The free public Ethereum endpoint in `.env.example`
+   does that, and the public Base one refuses trace calls outright. `npm run campaign:screen` runs this path for any wallet and stores nothing.
 3. The first funder's kind is read from the chain. The facts reader leaves it unknown, so the worker reads the funder's
    code and its count of transactions sent at a finalized block, when the ask is screened, and applies core's
    `funderKind`: contract code makes it a `contract`, a plain address with 10,000 or more transactions sent
