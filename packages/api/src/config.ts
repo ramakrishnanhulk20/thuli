@@ -180,7 +180,9 @@ function publicOrigin(env: Env, isRequired: boolean): string | null {
   const own = read(env, 'PUBLIC_ORIGIN');
   const host = read(env, VERCEL_PRODUCTION_HOST);
   if (own === undefined && host === undefined) {
-    if (isRequired) throw new ConfigError('PUBLIC_ORIGIN is missing. Base mainnet needs the https origin the API is served at.');
+    if (isRequired) {
+      throw new ConfigError(`PUBLIC_ORIGIN is missing, and so is ${VERCEL_PRODUCTION_HOST}, which a Vercel host sets itself. Base mainnet needs the https origin the API is served at.`);
+    }
     return null;
   }
   // A PUBLIC_ORIGIN that is set and bad is refused, never swapped for the host, and both go through the one parser below.
