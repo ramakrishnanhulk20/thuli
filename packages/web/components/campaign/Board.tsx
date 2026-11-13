@@ -19,6 +19,7 @@ import {
   mergePayouts,
   outcomeWords,
   PAYOUT_COPY,
+  rowPayout,
   payoutWords,
   pollDelay,
   settledWords,
@@ -245,7 +246,7 @@ export function Board({
       ) : (
         <ul className={styles.rows}>
           {(rows ?? []).map((ask) => (
-            <BoardRow key={ask.wallet} ask={ask} payout={paid.get(ask.wallet.toLowerCase()) ?? null} chain={chain} now={now} />
+            <BoardRow key={ask.wallet} ask={ask} payout={rowPayout(ask, paid)} chain={chain} now={now} />
           ))}
         </ul>
       )}

@@ -74,6 +74,7 @@ import {
   READY_TEXT,
   readyVariant,
   refusalFor,
+  rowPayout,
   refusalWords,
   SLOWED_LINE,
   SLOWED_POLL_MILLISECONDS,
@@ -276,6 +277,16 @@ describe('the requests', () => {
     expect(payoutWords(first)).toBe('The vault has paid this wallet 0.5 USDC.');
     expect(payoutWords({ ...first, amount: '250000' })).toBe('The vault has paid this wallet 0.25 USDC.');
     expect(PAYOUT_COPY.chip).toBe('PAID');
+  });
+
+  it('shows a payout only on a row that holds a slot, whatever the board sent for its wallet (C61)', () => {
+    const page = fx.board(3, 1, undefined, () => true);
+    const first = page.payouts[0] as { wallet: string; amount: string; transaction: string };
+    const kept = mergePayouts(new Map(), page.payouts);
+    expect(rowPayout({ wallet: first.wallet, slot: 1 }, kept)).toEqual(first);
+    expect(rowPayout({ wallet: first.wallet.toUpperCase().replace('0X', '0x'), slot: 3 }, kept)).toEqual(first);
+    expect(rowPayout({ wallet: first.wallet, slot: null }, kept)).toBeNull();
+    expect(rowPayout({ wallet: `0x${'9'.repeat(40)}`, slot: 2 }, kept)).toBeNull();
   });
 
   it('reads an ask lookup as found, none or error', async () => {

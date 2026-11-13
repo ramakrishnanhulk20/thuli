@@ -394,6 +394,16 @@ export function mergePayouts(current: ReadonlyMap<string, PayoutJson>, fresh: re
   return byWallet;
 }
 
+/**
+ * The payout a board row shows: the one kept for its wallet, and only while the row holds a slot. The board route sends
+ * payouts for slot holders only; the page checks again, so a row without a slot never carries a paid mark whatever a
+ * page of the board held (C61).
+ */
+export function rowPayout(ask: Pick<AskJson, 'wallet' | 'slot'>, paid: ReadonlyMap<string, PayoutJson>): PayoutJson | null {
+  if (ask.slot === null) return null;
+  return paid.get(ask.wallet.toLowerCase()) ?? null;
+}
+
 /** What an opened board row says about a payout, such as "The vault has paid this wallet 0.25 USDC." */
 export function payoutWords(payout: PayoutJson): string {
   return `The vault has paid this wallet ${usdc(payout.amount)} USDC.`;
