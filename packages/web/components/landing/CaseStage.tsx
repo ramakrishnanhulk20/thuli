@@ -46,9 +46,11 @@ function geometry(hops: number, others: number) {
   // The fan spans -75 to +15 degrees and the trail leaves F at about 31, so the two never share a direction.
   const dots = Array.from({ length: others }, (_, index) => {
     const angle = others === 1 ? -30 : -75 + (90 * index) / (others - 1);
+    // Rounded, because the server and a browser can differ in the last digits of a sine, and the page must render the
+    // same attribute in both.
     return {
-      x: FUNDER_POINT.x + FAN_RADIUS * Math.cos((angle * Math.PI) / 180),
-      y: FUNDER_POINT.y + FAN_RADIUS * Math.sin((angle * Math.PI) / 180),
+      x: Math.round((FUNDER_POINT.x + FAN_RADIUS * Math.cos((angle * Math.PI) / 180)) * 100) / 100,
+      y: Math.round((FUNDER_POINT.y + FAN_RADIUS * Math.sin((angle * Math.PI) / 180)) * 100) / 100,
     };
   });
   return { nodes, dots };

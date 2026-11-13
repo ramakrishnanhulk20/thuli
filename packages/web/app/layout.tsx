@@ -18,8 +18,10 @@ export const viewport: Viewport = {
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
+  // The docs theme provider sets the colour scheme on the html element in the browser, after the server rendered it,
+  // so React is told not to report that one element's attributes as a mismatch.
   return (
-    <html lang="en" className={`${display.variable} ${body.variable} ${mono.variable}`}>
+    <html lang="en" className={`${display.variable} ${body.variable} ${mono.variable}`} suppressHydrationWarning>
       <body>
         <SmoothScroll>
           {children}
