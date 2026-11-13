@@ -1153,8 +1153,11 @@ export const MAX_PAYOUT_WALLETS = MAX_BOARD_PAGE + MAX_BOARD_TIES;
  * What the vault has paid each of the given wallets in one campaign, as the worker recorded it: for each wallet, its
  * newest claim relay that is confirmed and has a transaction. A relay's amount is cumulative, so the newest confirmed
  * one is the total paid to that wallet so far, and its transaction is the claim that brought it there. A wallet with no
- * such relay is left out. A relay is marked confirmed only after the claim's receipt was read (see markRelay).
- * Not covered: a claim a wallet submitted itself, with its own ticket, has no relay and so does not show here.
+ * such relay is left out. A confirmed relay keeps a transaction only when the worker read that transaction's receipt as
+ * successful: one confirmed because the vault had nothing left to pay is recorded with forgetTx (see markRelay), so an
+ * earlier claim of ours that reverted or never landed is never shown as the payout.
+ * Not covered: a claim a wallet or anyone else submitted with the public ticket has no relay transaction, so that
+ * wallet does not show here even though the vault paid it.
  * @param wallets canonical addresses, as the asks table stores them; at most MAX_PAYOUT_WALLETS.
  * @throws StoreError when more than MAX_PAYOUT_WALLETS wallets are given or one of them is not text.
  */
@@ -1631,16 +1634,19 @@ export async function takeRelay(db: Db, now: Date, leaseSeconds: number): Promis
  *   as a paused vault, so the try is handed back in this same statement, attempts falling by one but never below 0, and
  *   the relay is judged against MAX_RELAY_ATTEMPTS as if the try had not been made. The retry wait still applies, so a
  *   refund alone can never make a relay loop without pause (C41). Left out or false, behaviour is unchanged.
+ * @param result.forgetTx true drops the transaction recorded for the relay. For a relay confirmed without a receipt of
+ *   its own: the vault already owed the wallet nothing, so whatever claim was recorded before is not known to be the one
+ *   that paid. It cannot be given together with a tx. Left out or false, the recorded transaction is kept.
  * @returns the status the relay ended in, or null when there is no such relay or it was not sent, changing nothing.
  * @throws AddressError from @thuli/core when the wallet is not an address. StoreError when the status is not pending,
  *   sent, confirmed or failed, tx is not 0x and 64 lowercase hex, retryAfterSeconds is not a whole number from 0 to
- *   86,400, refundTry is given but is not true or false, version is not a whole number from 1, or now is not a valid
- *   Date, each before anything is written.
+ *   86,400, refundTry or forgetTx is given but is not true or false, forgetTx is true with a tx, version is not a
+ *   whole number from 1, or now is not a valid Date, each before anything is written.
  */
 export async function markRelay(
   db: Db,
   key: RelayKey,
-  result: { status: RelayStatus; tx?: string | null; retryAfterSeconds?: number; refundTry?: boolean },
+  result: { status: RelayStatus; tx?: string | null; retryAfterSeconds?: number; refundTry?: boolean; forgetTx?: boolean },
   now: Date,
 ): Promise<RelayStatus | null> {
   const nowAt = instant(now);
@@ -1652,17 +1658,20 @@ export async function markRelay(
   const retryAt = result.status === 'pending' ? shifted(now, delay) : null;
   const refundTry = refundOf(result);
   const refund = result.status === 'pending' ? refundTry : 0;
+  if (result.forgetTx !== undefined && typeof result.forgetTx !== 'boolean') throw new StoreError('forgetTx must be true or false');
+  const forgetTx = result.forgetTx === true;
+  if (forgetTx && tx !== null) throw new StoreError('forgetTx cannot be given together with a tx');
   if (!isCampaignId(key.campaignId)) return null;
   const [row] = await db.query<{ status: RelayStatus }>(
     `UPDATE claim_relays
         SET status = CASE WHEN $4::text = 'pending' AND GREATEST(attempts - $9::int, 0) >= $7::int THEN 'failed' ELSE $4::text END,
             attempts = GREATEST(attempts - $9::int, 0),
-            tx = COALESCE($5::text, tx),
+            tx = CASE WHEN $10::boolean THEN NULL ELSE COALESCE($5::text, tx) END,
             updated_at = $6::timestamptz,
             retry_at = CASE WHEN $4::text = 'pending' AND GREATEST(attempts - $9::int, 0) < $7::int THEN $8::timestamptz ELSE NULL END
       WHERE campaign_id = $1 AND wallet = $2 AND version = $3 AND status = 'sent'
      RETURNING status`,
-    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS, retryAt, refund],
+    [key.campaignId, wallet, key.version, result.status, tx, nowAt, MAX_RELAY_ATTEMPTS, retryAt, refund, forgetTx],
   );
   return row?.status ?? null;
 }

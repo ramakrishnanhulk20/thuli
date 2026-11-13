@@ -1000,6 +1000,27 @@ for (const { name, open } of TARGETS) {
       await expect(confirmedPayouts(db, CAMPAIGN, [7 as unknown as string])).rejects.toThrow(StoreError);
     });
 
+    it('a relay confirmed with forgetTx names no transaction, so a claim that reverted is never shown as the payout', async () => {
+      await createCampaign(db, terms());
+      await activeVersion(1);
+      expect(await queueRelays(db, CAMPAIGN, 1, [{ wallet: wallet(1), amount: '250000' }], NOW)).toBe(1);
+      const key = { campaignId: CAMPAIGN, wallet: wallet(1), version: 1 };
+      const reverted = `0x${'d4'.repeat(32)}`;
+      // Our claim is sent and reverts, because the wallet claimed first with its own ticket: the relay goes back.
+      expect(await takeRelay(db, plus(10), 60)).toMatchObject({ wallet: wallet(1) });
+      expect(await markRelay(db, key, { status: 'sent', tx: reverted }, plus(11))).toBe('sent');
+      expect(await markRelay(db, key, { status: 'pending' }, plus(12))).toBe('pending');
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([]);
+      // On the next take the vault owes nothing. Confirmed without forgetTx, the reverted hash would be published.
+      expect(await takeRelay(db, plus(13), 60)).toMatchObject({ wallet: wallet(1), tx: reverted });
+      await expect(markRelay(db, key, { status: 'confirmed', forgetTx: 'yes' as unknown as boolean }, plus(14))).rejects.toThrow(StoreError);
+      await expect(markRelay(db, key, { status: 'confirmed', tx: reverted, forgetTx: true }, plus(14))).rejects.toThrow(StoreError);
+      expect(await markRelay(db, key, { status: 'confirmed', forgetTx: true }, plus(14))).toBe('confirmed');
+      const [row] = await db.query<{ status: string; tx: string | null }>('SELECT status, tx FROM claim_relays WHERE wallet = $1', [wallet(1)]);
+      expect(row).toEqual({ status: 'confirmed', tx: null });
+      expect(await confirmedPayouts(db, CAMPAIGN, [wallet(1)])).toEqual([]);
+    });
+
     it('C41: a relay given back with a retry delay waits that long, a ready one is taken meanwhile, and an ended one never again', async () => {
       await createCampaign(db, terms());
       await activeVersion(1);

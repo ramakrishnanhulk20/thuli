@@ -129,10 +129,10 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
   const key = { campaignId: relay.campaignId, wallet: relay.wallet, version: relay.version };
   let tx: Hash | null = null;
   let gasUsed: bigint | null = null;
-  const finish = async (status: RelayStatus, cause: string): Promise<RelayOutcome> => {
+  const finish = async (status: RelayStatus, cause: string, forgetTx = false): Promise<RelayOutcome> => {
     checkpoint(signal, 'recording a relay');
     const wait = status === 'pending' ? retryDelaySeconds(relay.attempts) : undefined;
-    const stored = await markRelay(deps.db, key, { status, retryAfterSeconds: wait }, deps.now());
+    const stored = await markRelay(deps.db, key, { status, retryAfterSeconds: wait, ...(forgetTx && { forgetTx }) }, deps.now());
     const retryAfterSeconds = stored === 'pending' && wait !== undefined ? wait : null;
     const outcome = retryAfterSeconds === null ? (stored ?? 'not recorded') : `pending, next try in ${retryAfterSeconds} s`;
     deps.log(`relay ${relay.campaignId} ${relay.wallet} list version ${relay.version}: ${outcome}, ${cause}`);
@@ -164,7 +164,9 @@ export async function relayNext(deps: ChainDeps, signal?: AbortSignal): Promise<
     if ((await deps.chain.roots(vault)).paused) return pausedBack(waiting);
     const simulated = await deps.chain.simulateClaim(vault, ticket);
     if (!simulated.ok) {
-      if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet');
+      // No receipt was read in this step, so a claim recorded on an earlier try (it may have reverted, or the wallet may
+      // have claimed first with the public ticket) is not kept as this payout's transaction.
+      if (simulated.error === 'NothingToClaim') return finish('confirmed', 'the vault has nothing left to pay this wallet', true);
       if (simulated.error === PAUSE_ERROR) return pausedBack(waiting);
       return finish('pending', `the claim would revert with ${simulated.error}`);
     }

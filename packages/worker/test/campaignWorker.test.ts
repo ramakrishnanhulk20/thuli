@@ -38,6 +38,7 @@ import {
   slotHolders,
   type CampaignInput,
   type Db,
+  confirmedPayouts,
 } from '@thuli/store';
 import { NO_VAULT_BLOCK, runLoop, runOnce, type WorkerDeps } from '../src/campaign/loop.ts';
 import {
@@ -1599,6 +1600,39 @@ describe('a paused vault and a claim\'s tries', () => {
     vault.unpause();
     expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed' });
     expect(vault.paid.get(wallet.address)).toBe(REWARD);
+  });
+
+  it('keeps no transaction for a claim confirmed because the wallet had already claimed, so the board cannot link our reverted claim', async () => {
+    const { vault, worker, wallet } = await queuedClaim();
+    // The wallet claims with the public ticket between our simulation and our send, so our claim is mined and reverts.
+    const simulate = vault.simulateClaim.bind(vault);
+    vault.simulateClaim = async (address, ticket) => {
+      const answer = await simulate(address, ticket);
+      vault.claimed.set(ticket.account, REWARD);
+      return answer;
+    };
+    const first = await relayNext(worker);
+    expect(first).toMatchObject({ kind: 'relayed', status: 'pending' });
+    const sent = first.kind === 'relayed' ? first.tx : null;
+    expect(sent).toMatch(/^0x[0-9a-f]{64}$/);
+    const stored = async () => (await db.query<{ status: string; tx: string | null }>('SELECT status, tx FROM claim_relays WHERE wallet = $1', [wallet.address]))[0];
+    expect(await stored()).toEqual({ status: 'pending', tx: sent });
+    expect(await confirmedPayouts(db, CAMPAIGN, [wallet.address])).toEqual([]);
+
+    vault.simulateClaim = simulate;
+    clock = new Date(clock.getTime() + 600_000);
+    expect(await relayNext(worker)).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed', tx: null });
+    expect(await stored()).toEqual({ status: 'confirmed', tx: null });
+    expect(await confirmedPayouts(db, CAMPAIGN, [wallet.address])).toEqual([]);
+  });
+
+  it('keeps the transaction of a claim whose receipt it read as successful, which is the one the board links', async () => {
+    const { worker, wallet } = await queuedClaim();
+    const paid = await relayNext(worker);
+    expect(paid).toMatchObject({ kind: 'relayed', wallet: wallet.address, status: 'confirmed' });
+    const tx = paid.kind === 'relayed' ? paid.tx : null;
+    expect(tx).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(await confirmedPayouts(db, CAMPAIGN, [wallet.address])).toEqual([{ wallet: wallet.address, amount: REWARD.toString(), tx }]);
   });
 
   it('(g) gives a claim back the same way when its simulation reverts with the pause error a lagging read missed', async () => {
