@@ -46,8 +46,8 @@ for (const { name, open } of TARGETS) {
       expect([...UNICODE_RUN]).toHaveLength(150);
       const timing = { nowSeconds: NOW_SECONDS, latestSeconds: 330n };
       for (const fixture of FIXTURES) {
-        expect(await claimPayment(db, fixture, NOW_SECONDS + 60n, 'owner', timing)).toBe('taken');
-        expect(await claimPayment(db, fixture, NOW_SECONDS + 60n, 'other', timing)).toBe('in-use');
+        expect(await claimPayment(db, fixture, '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', NOW_SECONDS + 60n, 'owner', timing)).toBe('taken');
+        expect(await claimPayment(db, fixture, '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', NOW_SECONDS + 60n, 'other', timing)).toBe('in-use');
       }
       const keys = await db.query<{ key: string }>('SELECT key FROM payment_claims');
       expect(keys.map((row) => row.key).sort()).toEqual([...FIXTURES].sort());
@@ -75,7 +75,7 @@ for (const { name, open } of TARGETS) {
 
     it('C43: a lone surrogate, which a driver would silently rewrite, is refused rather than stored changed', async () => {
       const timing = { nowSeconds: NOW_SECONDS, latestSeconds: 330n };
-      await expect(claimPayment(db, 'key-\uD800', NOW_SECONDS + 60n, 'owner', timing)).rejects.toThrow(StoreError);
+      await expect(claimPayment(db, 'key-\uD800', '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', NOW_SECONDS + 60n, 'owner', timing)).rejects.toThrow(StoreError);
       expect(await db.query('SELECT key FROM payment_claims')).toEqual([]);
     });
   });

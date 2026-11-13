@@ -180,10 +180,10 @@ describe('migrate', () => {
     const timing = { nowSeconds: 1_800_000_010n, latestSeconds: 330n };
     const owned = { nowSeconds: 1_800_000_010n, ownedUntil: 1_800_000_340n };
     const wallet = '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a';
-    expect(await claimPayment(db, 'held', 1_800_000_300n, 'copy', timing)).toBe('in-use');
-    expect(await claimPayment(db, 'used', 1_800_000_300n, 'copy', timing)).toBe('in-use');
+    expect(await claimPayment(db, 'held', '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', 1_800_000_300n, 'copy', timing)).toBe('in-use');
+    expect(await claimPayment(db, 'used', '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', 1_800_000_300n, 'copy', timing)).toBe('in-use');
     expect(await redeemPayment(db, 'used', wallet, 'copy', owned)).toEqual({ found: 'none' });
-    expect(await claimPayment(db, 'unsure', 1_800_000_300n, 'retry', timing)).toBe('taken');
+    expect(await claimPayment(db, 'unsure', '0x041f77015fe51c51aE49a7f2F3Ff86C641fa190a', 1_800_000_300n, 'retry', timing)).toBe('taken');
     // A row the new rules forbid is refused by the table itself: settled with no wallet, served with no result.
     await expect(db.query("UPDATE payment_claims SET state = 'settled', owner = NULL WHERE key = 'used'")).rejects.toThrow(StoreError);
     await expect(
@@ -467,7 +467,7 @@ describe('migrate', () => {
       schema_migrations: ['name', 'sha256', 'applied_at'],
       payment_claims: [
         'key', 'state', 'owner', 'valid_before', 'updated_at', 'wallet', 'tx', 'settled_at', 'owned_until', 'result', 'screenings',
-        'owner_counted', 'named_txs',
+        'owner_counted', 'named_txs', 'for_wallet',
       ],
       leases: ['id', 'pool', 'expires_at'],
       rate_events: ['id', 'bucket', 'client', 'at'],

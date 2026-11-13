@@ -63,9 +63,9 @@ describe('sweep', () => {
   }
 
   it('deletes each kind exactly at its own boundary and reports the counts', async () => {
-    expect(await claimPayment(db, 'past-hour', NOW_SECONDS - 3_601n, 'a', at(NOW_SECONDS - 3_700n))).toBe('taken');
-    expect(await claimPayment(db, 'at-hour', NOW_SECONDS - 3_600n, 'a', at(NOW_SECONDS - 3_700n))).toBe('taken');
-    expect(await claimPayment(db, 'live', NOW_SECONDS + 100n, 'a', at(NOW_SECONDS))).toBe('taken');
+    expect(await claimPayment(db, 'past-hour', ADDRESS, NOW_SECONDS - 3_601n, 'a', at(NOW_SECONDS - 3_700n))).toBe('taken');
+    expect(await claimPayment(db, 'at-hour', ADDRESS, NOW_SECONDS - 3_600n, 'a', at(NOW_SECONDS - 3_700n))).toBe('taken');
+    expect(await claimPayment(db, 'live', ADDRESS, NOW_SECONDS + 100n, 'a', at(NOW_SECONDS))).toBe('taken');
     expect(await takeLease(db, 'pool', 5, 120, plus(-120))).not.toBeNull();
     expect(await takeLease(db, 'pool', 5, 120, plus(-119))).not.toBeNull();
     await recordEvent(db, 'bucket', 'client', plus(-7_200.001));
@@ -84,7 +84,7 @@ describe('sweep', () => {
     const day = BigInt(PAID_RESULT_KEEP_SECONDS);
     const settledAt = NOW_SECONDS - day;
     for (const key of ['settled', 'served']) {
-      expect(await claimPayment(db, key, settledAt + 300n, 'payer', at(settledAt))).toBe('taken');
+      expect(await claimPayment(db, key, ADDRESS, settledAt + 300n, 'payer', at(settledAt))).toBe('taken');
       await markPaymentSettled(db, key, 'payer', SETTLEMENT, owned(settledAt));
     }
     await servePayment(db, 'served', 'payer', { result: 1 });
@@ -95,7 +95,7 @@ describe('sweep', () => {
     expect(await db.query('SELECT key FROM payment_claims')).toEqual([]);
 
     // One second younger, the claim is still redeemable, and so the sweep keeps it.
-    expect(await claimPayment(db, 'young', settledAt + 301n, 'payer', at(settledAt + 1n))).toBe('taken');
+    expect(await claimPayment(db, 'young', ADDRESS, settledAt + 301n, 'payer', at(settledAt + 1n))).toBe('taken');
     await markPaymentSettled(db, 'young', 'payer', SETTLEMENT, owned(settledAt + 1n));
     await servePayment(db, 'young', 'payer', { result: 2 });
     expect(await sweep(db, plus(0.5))).toEqual({ claims: 0, leases: 0, events: 0, checks: 0 });
@@ -110,22 +110,26 @@ describe('sweep', () => {
     const day = BigInt(PAID_RESULT_KEEP_SECONDS);
     // Both authorizations ended a day ago, to the second.
     const validBefore = NOW_SECONDS - day;
-    expect(await claimPayment(db, 'waiting', validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
-    await keepPaymentUnsure(db, 'waiting', 'payer', [`0x${'7a'.repeat(32)}`]);
-    expect(await claimPayment(db, 'bare', validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
+    expect(await claimPayment(db, 'waiting', ADDRESS, validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
+    await keepPaymentUnsure(db, 'waiting', 'payer', { add: [`0x${'7a'.repeat(32)}`], drop: [] });
+    expect(await claimPayment(db, 'bare', ADDRESS, validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
     await keepPaymentUnsure(db, 'bare', 'payer');
+    // A buyer who came back late holds the third claim right now, while its receipt is being read.
+    expect(await claimPayment(db, 'held', ADDRESS, validBefore, 'payer', at(validBefore - 300n))).toBe('taken');
+    await keepPaymentUnsure(db, 'held', 'payer', { add: [`0x${'7b'.repeat(32)}`], drop: [] });
+    expect(await claimPayment(db, 'held', ADDRESS, validBefore, 'late', at(NOW_SECONDS - 60n))).toBe('taken');
 
     expect(await sweep(db, NOW)).toEqual({ claims: 1, leases: 0, events: 0, checks: 0 });
-    expect(await db.query('SELECT key FROM payment_claims')).toEqual([{ key: 'waiting' }]);
-    expect(await sweep(db, plus(0.5))).toEqual({ claims: 1, leases: 0, events: 0, checks: 0 });
+    expect((await db.query<{ key: string }>('SELECT key FROM payment_claims ORDER BY key')).map((found) => found.key)).toEqual(['held', 'waiting']);
+    expect(await sweep(db, plus(0.5))).toEqual({ claims: 2, leases: 0, events: 0, checks: 0 });
     expect(await db.query('SELECT key FROM payment_claims')).toEqual([]);
   });
 
   it('C41: a sweep far in the future empties every table outside input can grow', async () => {
-    expect(await claimPayment(db, 'held', NOW_SECONDS + 300n, 'a', at(NOW_SECONDS))).toBe('taken');
-    expect(await claimPayment(db, 'unsure', NOW_SECONDS + 300n, 'b', at(NOW_SECONDS))).toBe('taken');
+    expect(await claimPayment(db, 'held', ADDRESS, NOW_SECONDS + 300n, 'a', at(NOW_SECONDS))).toBe('taken');
+    expect(await claimPayment(db, 'unsure', ADDRESS, NOW_SECONDS + 300n, 'b', at(NOW_SECONDS))).toBe('taken');
     await keepPaymentUnsure(db, 'unsure', 'b');
-    expect(await claimPayment(db, 'settled', NOW_SECONDS + 300n, 'c', at(NOW_SECONDS))).toBe('taken');
+    expect(await claimPayment(db, 'settled', ADDRESS, NOW_SECONDS + 300n, 'c', at(NOW_SECONDS))).toBe('taken');
     await markPaymentSettled(db, 'settled', 'c', SETTLEMENT, owned(NOW_SECONDS));
     expect(await takeLease(db, 'pool', 5, 86_400, NOW)).not.toBeNull();
     expect(await recordIfUnder(db, 'bucket', 'client', 5, 60, NOW)).toBe(true);
@@ -142,8 +146,8 @@ describe('sweep', () => {
 
   it('C41: the length checks refuse an over-long key, pool, bucket, client and counter name', async () => {
     const timing = at(NOW_SECONDS);
-    await expect(claimPayment(db, 'k'.repeat(201), NOW_SECONDS + 10n, 'a', timing)).rejects.toThrow(StoreError);
-    expect(await claimPayment(db, 'k'.repeat(200), NOW_SECONDS + 10n, 'a', timing)).toBe('taken');
+    await expect(claimPayment(db, 'k'.repeat(201), ADDRESS, NOW_SECONDS + 10n, 'a', timing)).rejects.toThrow(StoreError);
+    expect(await claimPayment(db, 'k'.repeat(200), ADDRESS, NOW_SECONDS + 10n, 'a', timing)).toBe('taken');
     await expect(takeLease(db, 'p'.repeat(201), 5, 60, NOW)).rejects.toThrow(StoreError);
     await expect(recordIfUnder(db, 'b'.repeat(41), 'client', 5, 60, NOW)).rejects.toThrow(StoreError);
     await expect(recordIfUnder(db, 'bucket', 'c'.repeat(65), 5, 60, NOW)).rejects.toThrow(StoreError);

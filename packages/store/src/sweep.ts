@@ -32,7 +32,7 @@ export async function sweep(
       `WITH gone AS (
          DELETE FROM payment_claims
           WHERE valid_before < $1::bigint AND (settled_at IS NULL OR settled_at < $2::bigint)
-            AND NOT (state = 'unsure' AND jsonb_array_length(named_txs) > 0 AND valid_before >= $2::bigint)
+            AND NOT (jsonb_array_length(named_txs) > 0 AND valid_before >= $2::bigint)
          RETURNING 1
        ) SELECT count(*)::int AS gone FROM gone`,
       [String(nextSecond - CLAIM_KEEP_SECONDS), String(nextSecond - PAID_RESULT_KEEP_SECONDS)],

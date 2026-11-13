@@ -19,12 +19,34 @@ export const PAID_RESULT_KEEP_SECONDS = 86_400;
 export const REDEEM_SCREEN_TRIES = 2;
 
 /**
- * Transaction hashes kept with one claim at most (C41): every one a facilitator named for the payment while its
- * settlement was not proven. One settle is at most two facilitator calls, and a claim is tried a handful of times.
+ * Transaction hashes kept with one claim at most (C41): the ones a facilitator named for the payment whose receipts
+ * have not been read yet. One settle is at most two facilitator calls, and a hash leaves the list as soon as its
+ * receipt is read, so a real claim holds one or two. Past the cap the oldest is the one let go.
  */
 export const MAX_NAMED_TXS = 8;
 
 const NAMED_TX = /^0x[0-9a-f]{64}$/;
+
+/**
+ * What one request learned about the transactions named for a claim: `add`, the ones a facilitator named to it whose
+ * receipt it could not read yet, and `drop`, the ones whose receipt it read as not this payment. Nothing else ever
+ * takes a transaction off a claim (C25).
+ */
+export interface NamedChange {
+  add: readonly string[];
+  drop: readonly string[];
+}
+
+function namedTexts(change: NamedChange): [string, string] {
+  for (const list of [change.add, change.drop]) {
+    if (!Array.isArray(list)) throw new StoreError('named transactions must be given as lists');
+    if (list.length > 2 * MAX_NAMED_TXS) throw new StoreError(`at most ${2 * MAX_NAMED_TXS} named transactions in one change`);
+    if (list.some((hash) => typeof hash !== 'string' || !NAMED_TX.test(hash))) {
+      throw new StoreError('a named transaction must be 0x and 64 lowercase hex characters');
+    }
+  }
+  return [JSON.stringify(change.add), JSON.stringify(change.drop)];
+}
 
 export type ClaimResult = 'taken' | 'in-use' | 'expired' | 'too-long' | 'full';
 
@@ -71,6 +93,7 @@ interface ClaimRow {
   valid_before: string;
   settled_at: string | null;
   named: number;
+  for_wallet: string | null;
 }
 
 // An unsure claim that holds a transaction a facilitator named may have been paid by it. It waits for that receipt past
@@ -95,22 +118,27 @@ function isDue(entry: ClaimRow, nowSeconds: bigint): boolean {
  *   be settled, but that transaction may have paid it, and only its receipt can say.
  * - A row that is not held and whose validBefore has passed is treated as absent and replaced, unless it settled less
  *   than PAID_RESULT_KEEP_SECONDS ago or is waiting on such a receipt.
- * - An 'unsure' row is taken over by owner and keeps the later of the two validBefore values and its named
- *   transactions. Any other row is 'in-use'.
+ * - An 'unsure' row is taken over by owner, for the wallet it was first taken for only, and keeps the later of the two
+ *   validBefore values and its named transactions. For any other wallet it is 'in-use', as any other row is: a mined
+ *   transaction shows all it takes to rebuild the header, so a copy must not move the payment to another wallet.
  * - At MAX_PAYMENT_CLAIMS rows, the due ones are deleted first, and the answer is 'full' if it is still at the cap.
  * The decision runs in one transaction under an advisory lock on the key, and a new row also under one lock on the
  * cap, so copies of one authorization started together get exactly one 'taken'.
  * @param key at most 200 characters; owner at most 64, naming the one request settling it.
- * @throws StoreError when the key or owner is empty or too long, or the database refuses.
+ * @param wallet the wallet the request asks about, kept in its canonical form as the wallet the claim is for.
+ * @throws AddressError from @thuli/core when wallet is not an address. StoreError when the key or owner is empty or too
+ *   long, or the database refuses.
  */
 export async function claimPayment(
   db: Db,
   key: string,
+  wallet: string,
   validBefore: bigint,
   owner: string,
   timing: ClaimTiming,
 ): Promise<ClaimResult> {
   const { nowSeconds, latestSeconds } = timing;
+  const forWallet = parseAddress(wallet);
   const expired = validBefore <= nowSeconds;
   if (!expired && validBefore > nowSeconds + latestSeconds) return 'too-long';
   const now = nowSeconds.toString();
@@ -118,7 +146,8 @@ export async function claimPayment(
   return db.transaction(async (tx) => {
     await tx.query('SELECT pg_advisory_xact_lock(1001, hashtext($1))', [key]);
     let [entry] = await tx.query<ClaimRow>(
-      `SELECT state, valid_before::text AS valid_before, settled_at::text AS settled_at, jsonb_array_length(named_txs) AS named
+      `SELECT state, valid_before::text AS valid_before, settled_at::text AS settled_at, jsonb_array_length(named_txs) AS named,
+              for_wallet
          FROM payment_claims WHERE key = $1`,
       [key],
     );
@@ -129,11 +158,14 @@ export async function claimPayment(
     }
     if (entry !== undefined) {
       if (entry.state !== 'unsure') return 'in-use';
+      // A row from before the column has no wallet yet and takes this one.
+      if (entry.for_wallet !== null && entry.for_wallet !== forWallet) return 'in-use';
       await tx.query(
         `UPDATE payment_claims
-            SET state = 'held', owner = $2, valid_before = GREATEST(valid_before, $3::bigint), updated_at = to_timestamp($4::bigint)
+            SET state = 'held', owner = $2, valid_before = GREATEST(valid_before, $3::bigint), updated_at = to_timestamp($4::bigint),
+                for_wallet = $5
           WHERE key = $1`,
-        [key, owner, before, now],
+        [key, owner, before, now, forWallet],
       );
       return 'taken';
     }
@@ -149,9 +181,9 @@ export async function claimPayment(
       if ((await claimCount(tx)) >= MAX_PAYMENT_CLAIMS) return 'full';
     }
     await tx.query(
-      `INSERT INTO payment_claims (key, state, owner, valid_before, updated_at)
-       VALUES ($1, 'held', $2, $3::bigint, to_timestamp($4::bigint))`,
-      [key, owner, before, now],
+      `INSERT INTO payment_claims (key, state, owner, valid_before, updated_at, for_wallet)
+       VALUES ($1, 'held', $2, $3::bigint, to_timestamp($4::bigint), $5)`,
+      [key, owner, before, now, forWallet],
     );
     return 'taken';
   });
@@ -229,7 +261,7 @@ export async function markPaymentSettled(db: Db, key: string, owner: string, set
   await db.query(
     `UPDATE payment_claims
         SET state = 'settled', wallet = $3, tx = $4, settled_at = $5::bigint, owned_until = $6::bigint, updated_at = to_timestamp($5::bigint),
-            screenings = 1, owner_counted = true
+            screenings = 1, owner_counted = true, named_txs = '[]'::jsonb
       WHERE key = $1 AND state = 'held' AND owner = $2`,
     [key, owner, wallet, settlement.transaction, now, until],
   );
@@ -274,38 +306,54 @@ export async function leaveSettledPayment(db: Db, key: string, owner: string, ha
   );
 }
 
-/**
- * The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same authorization can
- * take it and ask again. `transactions` are the hashes a facilitator named for this payment in the request that is
- * ending. They are added to the ones the claim already holds, so the next request can read their receipts even when
- * the facilitator will not answer for the payment again (C25). Does nothing unless owner holds the key.
- * @throws StoreError when a transaction is not 0x and 64 lowercase hex characters, or more than MAX_NAMED_TXS are given.
- */
-export async function keepPaymentUnsure(db: Db, key: string, owner: string, transactions: readonly string[] = []): Promise<void> {
-  if (transactions.length > MAX_NAMED_TXS) throw new StoreError(`at most ${MAX_NAMED_TXS} named transactions for one claim`);
-  if (transactions.some((hash) => typeof hash !== 'string' || !NAMED_TX.test(hash))) {
-    throw new StoreError('a named transaction must be 0x and 64 lowercase hex characters');
-  }
-  // The hashes already held come first and are never pushed out: past the cap a new one is the one left out.
+// One statement for both callers below, so the list is changed and the claim is let go, or not, in a single step. The
+// list becomes what it held and `add`, less `drop`, oldest first; past MAX_NAMED_TXS the newest are the ones kept.
+async function changeNamed(db: Db, key: string, owner: string, change: NamedChange, letGo: boolean): Promise<void> {
+  const [add, drop] = namedTexts(change);
   await db.query(
     `UPDATE payment_claims
-        SET state = 'unsure', owner = NULL,
+        SET state = CASE WHEN $6::boolean THEN 'unsure' ELSE state END,
+            owner = CASE WHEN $6::boolean THEN NULL ELSE owner END,
             named_txs = (
               SELECT COALESCE(jsonb_agg(hash ORDER BY first_at), '[]'::jsonb)
                 FROM (
                   SELECT hash, min(at) AS first_at
                     FROM jsonb_array_elements_text(named_txs || $3::jsonb) WITH ORDINALITY AS named(hash, at)
-                   GROUP BY hash ORDER BY first_at LIMIT $4::int
+                   WHERE hash NOT IN (SELECT jsonb_array_elements_text($4::jsonb))
+                   GROUP BY hash ORDER BY first_at DESC LIMIT $5::int
                 ) AS kept
             )
       WHERE key = $1 AND state = 'held' AND owner = $2`,
-    [key, owner, JSON.stringify(transactions), MAX_NAMED_TXS],
+    [key, owner, add, drop, MAX_NAMED_TXS, letGo],
   );
 }
 
 /**
- * The transactions a facilitator has named for a claim, oldest first: what keepPaymentUnsure stored in earlier
- * requests. Empty unless owner holds the key.
+ * The settlement's outcome is unknown. The claim stays, owned by no request, so a retry of the same authorization, for
+ * the same wallet, can take it and ask again. `named` is what the request that is ending learned about the
+ * transactions named for this payment: the ones in `add` join the claim, so the next request can read their receipts
+ * even when the facilitator will not answer for the payment again, and the ones in `drop` leave it (C25). Does nothing
+ * unless owner holds the key.
+ * @throws StoreError when a transaction is not 0x and 64 lowercase hex characters, or a list is longer than twice
+ *   MAX_NAMED_TXS.
+ */
+export async function keepPaymentUnsure(db: Db, key: string, owner: string, named: NamedChange = { add: [], drop: [] }): Promise<void> {
+  await changeNamed(db, key, owner, named, true);
+}
+
+/**
+ * Takes off a held claim the transactions whose receipts were read as not this payment, and changes nothing else. A
+ * request calls it before it lets a plainly failed payment go, so that a claim is released with a list that holds only
+ * transactions still worth waiting for. Does nothing unless owner holds the key.
+ * @throws StoreError as keepPaymentUnsure does.
+ */
+export async function forgetPaymentTxs(db: Db, key: string, owner: string, drop: readonly string[]): Promise<void> {
+  await changeNamed(db, key, owner, { add: [], drop }, false);
+}
+
+/**
+ * The transactions a facilitator has named for a claim whose receipts are not read yet, oldest first: what earlier
+ * requests left with keepPaymentUnsure. Empty unless owner holds the key.
  */
 export async function namedPaymentTxs(db: Db, key: string, owner: string): Promise<string[]> {
   const [row] = await db.query<{ named: unknown }>(
@@ -316,7 +364,19 @@ export async function namedPaymentTxs(db: Db, key: string, owner: string): Promi
   return Array.isArray(named) ? named.filter((hash): hash is string => typeof hash === 'string' && NAMED_TX.test(hash)) : [];
 }
 
-/** The settlement failed outright. Frees the key for an honest retry, but only when owner holds it. */
+/**
+ * The request that holds the key lets it go without a settlement. A claim that holds no named transaction is deleted,
+ * which frees the key for an honest retry. A claim that still holds one is never deleted here: it goes back to unsure
+ * with its transactions, because one of them may yet prove the payment, whatever made this request give up (C25). Only
+ * when owner holds the key.
+ */
 export async function releasePayment(db: Db, key: string, owner: string): Promise<void> {
-  await db.query("DELETE FROM payment_claims WHERE key = $1 AND state = 'held' AND owner = $2", [key, owner]);
+  await db.transaction(async (tx) => {
+    await tx.query(
+      `UPDATE payment_claims SET state = 'unsure', owner = NULL
+        WHERE key = $1 AND state = 'held' AND owner = $2 AND jsonb_array_length(named_txs) > 0`,
+      [key, owner],
+    );
+    await tx.query("DELETE FROM payment_claims WHERE key = $1 AND state = 'held' AND owner = $2", [key, owner]);
+  });
 }

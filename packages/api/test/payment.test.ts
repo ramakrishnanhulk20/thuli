@@ -745,6 +745,92 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     expect(screen).toHaveBeenCalledTimes(1);
   });
 
+  it('serves a landed payment only to the wallet it was made for: a copy of the header naming another wallet, forged signature or not, is refused', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    let mined = false;
+    const receipt = provingReceipt(facilitator);
+    const readReceipt: ReadReceipt = async (hash) => {
+      if (!mined) throw new Error('no receipt yet');
+      return receipt.read(hash);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+    // The transaction lands. Its calldata shows the payer, the nonce and the signature: all a stranger needs.
+    mined = true;
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_nonce_already_used');
+    };
+    const asked = facilitator.settled.length;
+
+    const stolen = await fetchAs('198.51.100.66')(url(SCREEN_PATH), post({ wallet: OTHER_WALLET }, header));
+    expect(stolen.status).toBe(402);
+    expect(decodePaymentResponseHeader(stolen.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_already_used' });
+
+    // The same copy with a signature that is not the buyer's: only the payer and the nonce are the real ones.
+    const payload = decodePaymentSignatureHeader(Object.values(header)[0] as string);
+    const forged = { ...payload, payload: { ...(payload.payload as Record<string, unknown>), signature: `0x${'11'.repeat(65)}` } };
+    const forgedHeader = new x402HTTPClient(client).encodePaymentSignatureHeader(forged as PaymentPayload);
+    const forgedCopy = await fetchAs('198.51.100.67')(url(SCREEN_PATH), post({ wallet: OTHER_WALLET }, forgedHeader));
+    expect(forgedCopy.status).toBe(402);
+    expect(facilitator.settled).toHaveLength(asked);
+    expect(screen).not.toHaveBeenCalled();
+
+    // The buyer comes back for the wallet the payment was made for, and is served on the receipt.
+    const served = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(served.status).toBe(200);
+    expect(PaidScreenResponse.parse(await served.json())).toMatchObject({ wallet: WALLET, payment: { transaction: PENDING_TX } });
+    expect(screen).toHaveBeenCalledTimes(1);
+    expect(screen.mock.calls[0]?.[0]).toBe(WALLET);
+  });
+
+  it('keeps a named transaction when a later request fails before it could settle anything, so the buyer is still served', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    let mined = false;
+    const receipt = provingReceipt(facilitator);
+    const readReceipt: ReadReceipt = async (hash) => {
+      if (!mined) throw new Error('no receipt yet');
+      return receipt.read(hash);
+    };
+    const stores = await freshStores(() => new Date());
+    // The claim write lands and its answer is lost, once: the request ends with a claim it must give back.
+    let lose = false;
+    const flaky: Stores = {
+      ...stores,
+      claims: {
+        ...stores.claims,
+        claim: async (...args) => {
+          const answer = await stores.claims.claim(...args);
+          if (lose) {
+            lose = false;
+            throw new Error('connection reset');
+          }
+          return answer;
+        },
+      },
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt, stores: flaky });
+    const header = await signedHeader(appFetch, client);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+
+    lose = true;
+    const lost = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(lost.status).toBe(503);
+    expect(await lost.json()).toEqual({ retry: true });
+
+    // The release at the end of that request did not delete the claim or its transaction.
+    mined = true;
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_nonce_already_used');
+    };
+    const served = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(served.status).toBe(200);
+    expect(PaidScreenResponse.parse(await served.json()).payment.transaction).toBe(PENDING_TX);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
   it('never answers "expired" to a claim that holds a named transaction: its buyer is served on the receipt past validBefore, for a day', async () => {
     const pastValidBefore = async (minedLater: boolean) => {
       let clock = new Date();
@@ -821,6 +907,41 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     const again = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
     expect(again.status).toBe(402);
     expect(decodePaymentResponseHeader(again.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
+    expect(facilitator.settled).toHaveLength(asked);
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it('takes a named transaction off the claim once its receipt is read as not this payment, so the header is plainly expired afterwards', async () => {
+    let clock = new Date();
+    const facilitator = new StubFacilitator('eip155:84532');
+    facilitator.respond = pendingAnswer;
+    let mined = false;
+    // Once mined, the named transaction turns out to be the payer cancelling the authorization.
+    const receipt = receiptOf(facilitator, ({ from, nonce }) => [authorizationLog('AuthorizationCanceled', USDC_SEPOLIA, from, nonce)]);
+    const readReceipt: ReadReceipt = async (hash) => {
+      if (!mined) throw new Error('no receipt yet');
+      return receipt.read(hash);
+    };
+    const { appFetch, fetchAs, client, screen } = await setup({ facilitator, readReceipt, now: () => clock });
+    const header = await signedHeader(appFetch, client);
+    // Request 1 leaves the claim unsure with the transaction, not mined yet.
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header))).status).toBe(503);
+    const validBefore = Number(authorizationFrom(facilitator.settled[0] as PaymentPayload).validBefore);
+
+    // Request 2, still inside the window: the receipt now says "not this payment", and the facilitator throws.
+    mined = true;
+    facilitator.respond = async () => {
+      throw refusal('invalid_exact_evm_nonce_already_used');
+    };
+    const second = await fetchAs('198.51.100.3')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(second.status).toBe(503);
+    const asked = facilitator.settled.length;
+
+    // Past validBefore nothing is left to wait for: the claim is not taken again and the facilitator is not asked.
+    clock = new Date((validBefore + 60) * 1000);
+    const late = await fetchAs('198.51.100.4')(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(late.status).toBe(402);
+    expect(decodePaymentResponseHeader(late.headers.get('payment-response') as string)).toMatchObject({ success: false, errorReason: 'payment_expired' });
     expect(facilitator.settled).toHaveLength(asked);
     expect(screen).not.toHaveBeenCalled();
   });
@@ -1704,8 +1825,8 @@ async function claimBackend() {
       count: async () => claims.size,
       fillUnsure: async (count: number, validBefore: bigint, nowSeconds: bigint) => {
         for (let index = 0; index < count; index += 1) {
-          await store.claim(`unsure-${index}`, validBefore, 'filler', nowSeconds);
-          await store.keepUnsure(`unsure-${index}`, 'filler', []);
+          await store.claim(`unsure-${index}`, WALLET, validBefore, 'filler', nowSeconds);
+          await store.keepUnsure(`unsure-${index}`, 'filler', NOTHING_NAMED);
         }
       },
     };
@@ -1727,6 +1848,7 @@ async function claimBackend() {
 }
 
 const OTHER_WALLET = parseAddress('0x5555555555555555555555555555555555555555');
+const NOTHING_NAMED = { add: [], drop: [] };
 const settlementFor = (wallet: Address): Settlement => ({ wallet, transaction: `0x${'5e'.repeat(32)}` });
 
 describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
@@ -1737,86 +1859,137 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     const { store: claims, count, fillUnsure } = await claimBackend();
     const now = 1_000n;
     await fillUnsure(MAX_CLAIMS - 1, now + 10n, now);
-    expect(await claims.claim('held', now + 10n, 'holder', now)).toBe('taken');
+    expect(await claims.claim('held', WALLET, now + 10n, 'holder', now)).toBe('taken');
     expect(await count()).toBe(MAX_CLAIMS);
-    expect(await claims.claim('one-more', now + 100n, 'one-more', now)).toBe('full');
-    expect(await claims.claim('late', now + 100n, 'late', now + 10n)).toBe('taken');
+    expect(await claims.claim('one-more', WALLET, now + 100n, 'one-more', now)).toBe('full');
+    expect(await claims.claim('late', WALLET, now + 100n, 'late', now + 10n)).toBe('taken');
     expect(await count()).toBe(2);
-    expect(await claims.claim('expired', now + 10n, 'expired', now + 10n)).toBe('expired');
+    expect(await claims.claim('expired', WALLET, now + 10n, 'expired', now + 10n)).toBe('expired');
 
-    expect(await claims.claim('unsure', now + 50n, 'first', now)).toBe('taken');
-    expect(await claims.claim('unsure', now + 50n, 'second', now)).toBe('in-use');
-    await claims.keepUnsure('unsure', 'first', []);
-    expect(await claims.claim('unsure', now + 50n, 'second', now)).toBe('taken');
-    expect(await claims.claim('unsure', now + 50n, 'third', now)).toBe('in-use');
+    expect(await claims.claim('unsure', WALLET, now + 50n, 'first', now)).toBe('taken');
+    expect(await claims.claim('unsure', WALLET, now + 50n, 'second', now)).toBe('in-use');
+    await claims.keepUnsure('unsure', 'first', NOTHING_NAMED);
+    expect(await claims.claim('unsure', WALLET, now + 50n, 'second', now)).toBe('taken');
+    expect(await claims.claim('unsure', WALLET, now + 50n, 'third', now)).toBe('in-use');
     await claims.release('unsure', 'first');
     await claims.markSettled('unsure', 'second', settlementFor(WALLET), now);
     await claims.release('unsure', 'second');
-    expect(await claims.claim('unsure', now + 50n, 'fourth', now)).toBe('in-use');
+    expect(await claims.claim('unsure', WALLET, now + 50n, 'fourth', now)).toBe('in-use');
   });
 
-  it('C25: keeps every transaction named for an unsure claim, oldest first and at most MAX_NAMED_TXS, for the next holder only, and lets it outlive its validBefore by a day', async () => {
-    const { store: claims, count } = await claimBackend();
+  it('C25: keeps the transactions named for an unsure claim for its next holder, adds and drops them only as told, and lets the claim outlive its validBefore by a day', async () => {
+    const { store: claims } = await claimBackend();
     const now = 1_000n;
     const day = BigInt(PAID_RESULT_KEEP_SECONDS);
     const hash = (n: number) => `0x${n.toString(16).padStart(2, '0').repeat(32)}`;
-    expect(await claims.claim('paid', now + 300n, 'first', now)).toBe('taken');
+    expect(await claims.claim('paid', WALLET, now + 300n, 'first', now)).toBe('taken');
     expect(await claims.named('paid', 'first')).toEqual([]);
-    await claims.keepUnsure('paid', 'first', [hash(1), hash(2)]);
+    await claims.keepUnsure('paid', 'first', { add: [hash(1), hash(2)], drop: [] });
     // Nobody holds it now, so nobody reads its transactions.
     expect(await claims.named('paid', 'first')).toEqual([]);
-    expect(await claims.claim('paid', now + 300n, 'second', now + 5n)).toBe('taken');
+    expect(await claims.claim('paid', WALLET, now + 300n, 'second', now + 5n)).toBe('taken');
     expect(await claims.named('paid', 'second')).toEqual([hash(1), hash(2)]);
     expect(await claims.named('paid', 'first')).toEqual([]);
-    // A repeat adds nothing, a new one goes last, and past the cap the new ones are the ones left out.
-    await claims.keepUnsure('paid', 'second', [hash(2), hash(3)]);
-    expect(await claims.claim('paid', now + 300n, 'third', now + 6n)).toBe('taken');
-    expect(await claims.named('paid', 'third')).toEqual([hash(1), hash(2), hash(3)]);
-    await claims.keepUnsure('paid', 'third', Array.from({ length: MAX_NAMED_TXS }, (_, index) => hash(10 + index)));
-    expect(await claims.claim('paid', now + 300n, 'fourth', now + 7n)).toBe('taken');
-    expect(await claims.named('paid', 'fourth')).toEqual([hash(1), hash(2), hash(3), ...Array.from({ length: MAX_NAMED_TXS - 3 }, (_, index) => hash(10 + index))]);
-    await claims.keepUnsure('paid', 'fourth', []);
+    // A repeat adds nothing, a new one goes last, and one read as not this payment leaves.
+    await claims.keepUnsure('paid', 'second', { add: [hash(2), hash(3)], drop: [hash(1)] });
+    expect(await claims.claim('paid', WALLET, now + 300n, 'third', now + 6n)).toBe('taken');
+    expect(await claims.named('paid', 'third')).toEqual([hash(2), hash(3)]);
+    // Taking one off a held claim changes nothing else: the claim is still held by its owner.
+    await claims.forgetNamed('paid', 'third', [hash(2), hash(9)]);
+    expect(await claims.named('paid', 'third')).toEqual([hash(3)]);
+    expect(await claims.claim('paid', WALLET, now + 300n, 'other', now + 6n)).toBe('in-use');
+    // Past the cap the newest are the ones kept.
+    const many = Array.from({ length: MAX_NAMED_TXS }, (_, index) => hash(10 + index));
+    await claims.keepUnsure('paid', 'third', { add: many, drop: [] });
+    expect(await claims.claim('paid', WALLET, now + 300n, 'fourth', now + 7n)).toBe('taken');
+    expect(await claims.named('paid', 'fourth')).toEqual(many);
+    await claims.keepUnsure('paid', 'fourth', NOTHING_NAMED);
 
     // Past validBefore the authorization is still taken, to read those receipts, for a day and no longer.
-    expect(await claims.claim('paid', now + 300n, 'late', now + 300n)).toBe('taken');
-    await claims.keepUnsure('paid', 'late', []);
-    expect(await claims.claim('paid', now + 300n, 'last', now + 300n + day - 1n)).toBe('taken');
-    await claims.keepUnsure('paid', 'last', []);
-    expect(await claims.claim('paid', now + 300n, 'gone', now + 300n + day)).toBe('expired');
+    expect(await claims.claim('paid', WALLET, now + 300n, 'late', now + 300n)).toBe('taken');
+    await claims.keepUnsure('paid', 'late', NOTHING_NAMED);
+    expect(await claims.claim('paid', WALLET, now + 300n, 'last', now + 300n + day - 1n)).toBe('taken');
+    await claims.keepUnsure('paid', 'last', NOTHING_NAMED);
+    expect(await claims.claim('paid', WALLET, now + 300n, 'gone', now + 300n + day)).toBe('expired');
 
     // An unsure claim with nothing named ends with its authorization, as before, and a fresh claim replaces it.
-    expect(await claims.claim('bare', now + 300n, 'a', now)).toBe('taken');
-    await claims.keepUnsure('bare', 'a', []);
-    expect(await claims.claim('bare', now + 300n, 'b', now + 300n)).toBe('expired');
-    expect(await claims.claim('bare', now + 900n, 'c', now + 600n)).toBe('taken');
+    expect(await claims.claim('bare', WALLET, now + 300n, 'a', now)).toBe('taken');
+    await claims.keepUnsure('bare', 'a', NOTHING_NAMED);
+    expect(await claims.claim('bare', WALLET, now + 300n, 'b', now + 300n)).toBe('expired');
+    expect(await claims.claim('bare', WALLET, now + 900n, 'c', now + 600n)).toBe('taken');
     expect(await claims.named('bare', 'c')).toEqual([]);
-    expect(await count()).toBeGreaterThanOrEqual(1);
+  });
+
+  it('C25: an unsure claim is taken again only for the wallet it was first taken for, in any spelling of it', async () => {
+    const { store: claims } = await claimBackend();
+    const now = 1_000n;
+    const named = `0x${'7a'.repeat(32)}`;
+    expect(await claims.claim('paid', WALLET, now + 300n, 'buyer', now)).toBe('taken');
+    await claims.keepUnsure('paid', 'buyer', { add: [named], drop: [] });
+    // A copy of the header that names another wallet never takes the claim, before validBefore or after it.
+    expect(await claims.claim('paid', OTHER_WALLET, now + 300n, 'stranger', now + 5n)).toBe('in-use');
+    expect(await claims.claim('paid', OTHER_WALLET, now + 300n, 'stranger', now + 400n)).toBe('in-use');
+    expect(await claims.named('paid', 'stranger')).toEqual([]);
+    // The buyer's own copy does, and finds the transaction still there.
+    expect(await claims.claim('paid', WALLET.toLowerCase() as Address, now + 300n, 'buyer-again', now + 6n)).toBe('taken');
+    expect(await claims.named('paid', 'buyer-again')).toEqual([named]);
+    // With nothing named the rule is the same.
+    expect(await claims.claim('bare', WALLET, now + 300n, 'buyer', now)).toBe('taken');
+    await claims.keepUnsure('bare', 'buyer', NOTHING_NAMED);
+    expect(await claims.claim('bare', OTHER_WALLET, now + 300n, 'stranger', now + 5n)).toBe('in-use');
+    expect(await claims.claim('bare', WALLET, now + 300n, 'buyer-again', now + 6n)).toBe('taken');
+  });
+
+  it('C25: a release deletes a claim that holds no named transaction, and only sets one that holds one back to unsure', async () => {
+    const { store: claims, count } = await claimBackend();
+    const now = 1_000n;
+    const named = `0x${'7a'.repeat(32)}`;
+    expect(await claims.claim('bare', WALLET, now + 300n, 'a', now)).toBe('taken');
+    await claims.release('bare', 'a');
+    expect(await count()).toBe(0);
+
+    expect(await claims.claim('paid', WALLET, now + 300n, 'first', now)).toBe('taken');
+    await claims.keepUnsure('paid', 'first', { add: [named], drop: [] });
+    expect(await claims.claim('paid', WALLET, now + 300n, 'second', now + 5n)).toBe('taken');
+    // Whatever made the second request give up, the transaction is still there for the third.
+    await claims.release('paid', 'second');
+    expect(await count()).toBe(1);
+    expect(await claims.claim('paid', WALLET, now + 300n, 'third', now + 6n)).toBe('taken');
+    expect(await claims.named('paid', 'third')).toEqual([named]);
+    // Once its receipt was read as not this payment, the claim holds nothing and a release frees the key.
+    await claims.forgetNamed('paid', 'third', [named]);
+    await claims.release('paid', 'third');
+    expect(await count()).toBe(0);
+    // A release by a request that does not hold the key changes nothing.
+    expect(await claims.claim('paid', WALLET, now + 300n, 'fourth', now + 7n)).toBe('taken');
+    await claims.release('paid', 'first');
+    expect(await claims.claim('paid', WALLET, now + 300n, 'fifth', now + 8n)).toBe('in-use');
   });
 
   it('refuses a validBefore past maxTimeoutSeconds plus the clock allowance, and remembers every claim until its validBefore', async () => {
     const { store: claims, count } = await claimBackend();
     const now = 1_000n;
     const latest = now + 300n + CLOCK_ALLOWANCE_SECONDS;
-    expect(await claims.claim('years', now + 10n * 365n * 86_400n, 'a', now)).toBe('too-long');
-    expect(await claims.claim('just-over', latest + 1n, 'b', now)).toBe('too-long');
+    expect(await claims.claim('years', WALLET, now + 10n * 365n * 86_400n, 'a', now)).toBe('too-long');
+    expect(await claims.claim('just-over', WALLET, latest + 1n, 'b', now)).toBe('too-long');
     expect(await count()).toBe(0);
 
-    expect(await claims.claim('settled', latest, 'payer', now)).toBe('taken');
+    expect(await claims.claim('settled', WALLET, latest, 'payer', now)).toBe('taken');
     await claims.markSettled('settled', 'payer', settlementFor(WALLET), now);
-    expect(await claims.claim('unsure', latest, 'retrier', now)).toBe('taken');
-    await claims.keepUnsure('unsure', 'retrier', []);
-    expect(await claims.claim('settled', latest, 'c', latest - 1n)).toBe('in-use');
-    expect(await claims.claim('unsure', latest, 'late', latest - 1n)).toBe('taken');
-    await claims.keepUnsure('unsure', 'late', []);
-    expect(await claims.claim('settled', latest, 'd', latest)).toBe('expired');
-    expect(await claims.claim('unsure', latest, 'e', latest)).toBe('expired');
+    expect(await claims.claim('unsure', WALLET, latest, 'retrier', now)).toBe('taken');
+    await claims.keepUnsure('unsure', 'retrier', NOTHING_NAMED);
+    expect(await claims.claim('settled', WALLET, latest, 'c', latest - 1n)).toBe('in-use');
+    expect(await claims.claim('unsure', WALLET, latest, 'late', latest - 1n)).toBe('taken');
+    await claims.keepUnsure('unsure', 'late', NOTHING_NAMED);
+    expect(await claims.claim('settled', WALLET, latest, 'd', latest)).toBe('expired');
+    expect(await claims.claim('unsure', WALLET, latest, 'e', latest)).toBe('expired');
   });
 
   it('C25: keeps a settled claim for a day from its settlement, redeems it only for its wallet and one owner at a time, and forgets it after', async () => {
     const { store: claims, count } = await claimBackend();
     const settledAt = 1_000n;
     const day = BigInt(PAID_RESULT_KEEP_SECONDS);
-    expect(await claims.claim('paid', settledAt + 300n, 'payer', settledAt)).toBe('taken');
+    expect(await claims.claim('paid', WALLET, settledAt + 300n, 'payer', settledAt)).toBe('taken');
     await claims.markSettled('paid', 'payer', settlementFor(WALLET), settledAt);
     // The settling request owns it while it screens, so no copy screens beside it. Its own wallet hears in-use; another
     // wallet is refused, owned or not, because it is not this payment's buyer.
@@ -1845,7 +2018,7 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
     expect(await claims.redeem('paid', OTHER_WALLET, 'fetch', settledAt + day - 1n)).toEqual({ found: 'refused' });
     // Past its day the claim is gone for redeeming, and its authorization has long expired.
     expect(await claims.redeem('paid', WALLET, 'fetch', settledAt + day)).toEqual({ found: 'none' });
-    expect(await claims.claim('paid', settledAt + 300n, 'fetch', settledAt + day)).toBe('expired');
+    expect(await claims.claim('paid', WALLET, settledAt + 300n, 'fetch', settledAt + day)).toBe('expired');
     // Refusing it wrote nothing: the row waits for the sweep.
     expect(await count()).toBe(1);
   });
@@ -1863,7 +2036,7 @@ describe.each(BACKENDS)('PaymentClaims rules on $name', (backend) => {
       const { store: claims } = await claimBackend();
       let clock = 1_000n;
       const key = `walk-${run}`;
-      expect(await claims.claim(key, clock + 300n, 'first', clock)).toBe('taken');
+      expect(await claims.claim(key, WALLET, clock + 300n, 'first', clock)).toBe('taken');
       await claims.markSettled(key, 'first', settlementFor(WALLET), clock);
       let owner: string | null = 'first';
       let started = 0;

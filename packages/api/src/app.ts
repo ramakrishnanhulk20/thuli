@@ -304,7 +304,8 @@ function screenRoutes(config: ApiConfig, listed: boolean): RoutesConfig {
  * {busy: true}, a body over 1 KB gets 413, a body that is not exactly {wallet} or names a bad address gets 400, and a
  * full house gets 503 {busy: true} (C24, C42). Then the payment middleware answers 402 with the terms, or settles.
  * Before settling, an authorization that has expired, or that stays valid longer than the route's 300 seconds plus a
- * clock allowance, is refused with 402; the rest are claimed, so a copy is refused without reaching the facilitator. After settling, the receipt is checked and kept for the reply. A settlement left pending is served
+ * clock allowance, is refused with 402, unless its claim still waits on a transaction named for it; the rest are
+ * claimed, for the wallet the request asks about, so a copy is refused without reaching the facilitator. After settling, the receipt is checked and kept for the reply. A settlement left pending is served
  * only when its on-chain receipt proves this payment; any other unclear outcome answers 503 {retry: true} and keeps the
  * claim for a retry of the same header. The reply is the fixed PaidScreenResponse and nothing else (C34).
  *
@@ -512,7 +513,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
 
     let claimed: ClaimResult;
     try {
-      claimed = await byDeadline(request.deadlineAt, () => claims.claim(terms.key, terms.validBefore, request.owner, nowSeconds));
+      claimed = await byDeadline(request.deadlineAt, () => claims.claim(terms.key, request.wallet, terms.validBefore, request.owner, nowSeconds));
     } catch (error) {
       // The claim may have been written before the failure, so it is released when the request ends, and nothing is
       // settled on it. Caught here because the library would log the message and answer with its own reason.
@@ -572,22 +573,24 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
 
   // Settlement with no clear answer (C25). Every transaction a facilitator has named for this authorization, in this
   // request or in an earlier one that left the claim unsure, is a candidate: the payment is served only if one of
-  // their receipts proves this exact payment. Otherwise anything unclear keeps the claim, with the transactions, and
-  // answers 503 retry: a candidate with no receipt yet, a list of earlier ones that could not be read, and, while the
-  // authorization can still be settled, a throw, a timeout or an answer that said pending. The buyer resends the same
-  // header, which can never pay twice, and nothing is served on a guess. What falls through, so that the claim is
-  // released and the buyer gets 402: a plain "failed" answer with none of these, and an authorization past its
-  // validBefore with no receipt left to wait for, since nothing can settle it any more.
+  // their receipts proves this exact payment, and only to the wallet the claim was first taken for, which is this
+  // request's, or it would not hold the claim. Otherwise anything unclear keeps the claim and answers 503 retry: a
+  // candidate with no receipt yet, a list of earlier ones that could not be read, and, while the authorization can
+  // still be settled, a throw, a timeout or an answer that said pending. The buyer resends the same header, which can
+  // never pay twice, and nothing is served on a guess. A candidate with no receipt yet stays with the claim; one whose
+  // receipt was read as not this payment is taken off it, and nothing else ever is. What falls through, so that the
+  // buyer gets 402: a plain "failed" answer with none of these, and an authorization past its validBefore with no
+  // receipt left to wait for, since nothing can settle it any more.
   resourceServer.onSettleFailure(async ({ phase }) => {
     const request = paidRequests.getStore();
     if (phase !== 'before-handler' || request?.claim == null) return;
     const claim = request.claim;
     // The answer is set before the write, so a failed write still answers retry and still never releases the claim.
-    const keepForRetry = async () => {
+    const keepForRetry = async (named: { add: string[]; drop: string[] }) => {
       request.answer = 'retry';
       request.kept = true;
       try {
-        await byDeadline(request.deadlineAt, () => claims.keepUnsure(claim.key, request.owner, request.named));
+        await byDeadline(request.deadlineAt, () => claims.keepUnsure(claim.key, request.owner, named));
       } catch (storeError) {
         storeFailed('keeping an unsure payment', storeError);
       }
@@ -601,14 +604,16 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
         storeFailed('reading the transactions named for a payment', storeError);
         unread = true;
       }
-      // This request's own first: they are the newest word on the payment. Read one at a time, a bounded few (C41).
-      const candidates = [...new Set([...request.named, ...earlier])].slice(0, MAX_NAMED_TXS);
-      let waiting = unread;
+      // Every one is read, this request's own first: at most MAX_NAMED_TXS from each, one at a time (C41).
+      const candidates = [...new Set([...request.named, ...earlier])];
+      const unreadYet: string[] = [];
+      const notPaid: string[] = [];
       for (const candidate of candidates) {
         const hash = TxHashText.safeParse(candidate);
         if (!hash.success) continue;
         const said = await receiptSays(request, hash.data, claim);
-        if (said === 'unread') waiting = true;
+        if (said === 'unread') unreadYet.push(hash.data);
+        if (said === 'not-paid') notPaid.push(hash.data);
         if (said !== 'paid') continue;
         await markSettled(request, claim.key, Payment.parse({ network: config.networkId, payer: claim.payer, transaction: hash.data }));
         return {
@@ -616,12 +621,25 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
           result: { success: true, transaction: hash.data, network: config.networkId, payer: claim.payer },
         };
       }
+      const waiting = unread || unreadYet.length > 0;
       const settleable = !hasExpired(claim.validBefore, BigInt(Math.floor(now().getTime() / 1000)));
-      if (waiting || (settleable && (request.settleThrew || request.sawPending))) await keepForRetry();
+      if (waiting || (settleable && (request.settleThrew || request.sawPending))) {
+        await keepForRetry({ add: unreadYet, drop: notPaid });
+        return;
+      }
+      // Let go as a plain failure. The transactions just read as not this payment leave the claim first, so the release
+      // that follows finds nothing to wait for. If this write fails the claim only stays, unsure, with them.
+      if (notPaid.length > 0) {
+        try {
+          await byDeadline(request.deadlineAt, () => claims.forgetNamed(claim.key, request.owner, notPaid));
+        } catch (storeError) {
+          storeFailed('forgetting transactions that did not pay', storeError);
+        }
+      }
       return;
     } catch {
       // The library logs and skips a hook that throws, which would release the claim. Unknown stays unknown instead.
-      await keepForRetry();
+      await keepForRetry({ add: request.named, drop: [] });
     }
   });
 
