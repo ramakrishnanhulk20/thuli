@@ -46,7 +46,7 @@ Errors, in the order the route checks:
 | 413 or 400 | an `error` text | over 1 KB, not JSON, not exactly `wallet`, or a bad address |
 | 503 | `{"busy": true}` | service at a ceiling, or its stores unreachable or full |
 | 402 | an `error` text | no payment header, or one that does not match the terms |
-| 402 | `{}` | refused at settlement. The reason is in the `PAYMENT-RESPONSE` header: `payment_expired`, `payment_valid_too_long`, or `payment_already_used` for a copy of a payment that is held, or of a payment sent again for another wallet than the one it was first made for |
+| 402 | `{}` | refused at settlement. The reason is in the `PAYMENT-RESPONSE` header: `payment_expired`, `payment_valid_too_long`, or `payment_already_used` for a copy of a payment that is held, or of a payment sent again for another wallet than the one it was first made for. A reason that comes from the facilitator is passed on only as a code, such as `insufficient_funds`; anything else it says reads `settlement_failed` |
 | 503 | `{"busy": true}` | too little time left to settle and still screen, or the table of remembered payments is full. Nothing was charged |
 | 503 | `{"retry": true}` | claim not recorded or outcome unknown, which includes any error answer from the facilitator and any answer that says pending; resend the same header for the same wallet, it never pays twice |
 | 503 | `{"settled": true, "retry": true, "message": ...}` with `Retry-After: 10` | the payment settled and its result is not stored yet; send the same header again (next section) |
