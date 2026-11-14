@@ -12,7 +12,7 @@ Thuli is Tamil for "a drop": every drop of an airdrop should land in a real hand
 
 Each number has its limits stated in [What was measured](#what-was-measured).
 
-Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. The campaign and its vaults are on Base Sepolia with test USDC, which has no value. Two things have run with real USDC on Base mainnet: one small proof vault, and one 5 cent payment to the paid API. The site is live at [thuli-drop.vercel.app](https://thuli-drop.vercel.app), and each claim below also comes with a command you can run on a fresh clone.
+Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. The campaign and its vaults are on Base Sepolia with test USDC, which has no value. Two things have run with real USDC on Base mainnet: one small proof vault, and two 5 cent payments to the paid API, the second taken by the live site. The site is live at [thuli-drop.vercel.app](https://thuli-drop.vercel.app), and each claim below also comes with a command you can run on a fresh clone.
 
 [Live app](https://thuli-drop.vercel.app) | [Docs](https://thuli-drop.vercel.app/docs) (the `/docs` route of the app, source in [content/docs](packages/web/content/docs/index.mdx)) | [Architecture](ARCHITECTURE.md) | [Threat model](docs/security/threat-model.md) | [Licence](LICENSE)
 
@@ -82,7 +82,7 @@ Reppo's outside judges read 49 of Thuli's own decisions, chosen by group and not
 
 ## Features
 
-Everything on chain below is Base Sepolia with test money. Two things ran on Base mainnet with real USDC: the factory with one proof vault that paid 1 USDC, in the Deployments section, and one 5 cent payment to the paid check, described with the paid route below.
+Everything on chain below is Base Sepolia with test money. Two things ran on Base mainnet with real USDC: the factory with one proof vault that paid 1 USDC, in the Deployments section, and two 5 cent payments to the paid check, the second taken by the live site, described with the paid route below.
 
 For a project that is about to pay rewards:
 
@@ -102,7 +102,7 @@ For a wallet:
 
 For another agent or a developer:
 
-- A paid API over x402, a standard that puts payment inside an HTTP request. `POST /api/x402/screen` costs $0.05 in USDC (exactly `50000` base units) for one wallet. The payment settles before the screening runs and is charged once, and for 24 hours the same payment header for the same wallet returns the stored result at no charge. It has taken one real payment, 5 cents of USDC on Base mainnet ([transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4)), after a full run on Base Sepolia with test USDC.
+- A paid API over x402, a standard that puts payment inside an HTTP request. `POST /api/x402/screen` costs $0.05 in USDC (exactly `50000` base units) for one wallet. The payment settles before the screening runs and is charged once, and for 24 hours the same payment header for the same wallet returns the stored result at no charge. It has taken two real payments, 5 cents of USDC each on Base mainnet: one in a run on one machine ([transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4)) and one on the live site ([transaction](https://basescan.org/tx/0xf126522152fb9595a7a65043e81d1a42e06ca22569914abdff47d550f174e106)), after a full run on Base Sepolia with test USDC. Both came from Thuli's own wallet.
 - Public replay files under [`packages/web/public/replay`](packages/web/public/replay): the summary, one entry per claim wallet, one file per linked family, the rulebook scorecard, the Hop control numbers and the repeatability run. No file holds a raw model reply.
 - A page of ten live attacks at `/break`: five simulated calls against the proof vault, four requests to the site's own routes, and one check that a reason is shown as plain text.
 
@@ -566,7 +566,7 @@ The paid answer, a 200 with a `PAYMENT-RESPONSE` header ([`paid-screen-response.
 }
 ```
 
-Realised, with real USDC: that payment settled on 13 November 2026 in [this Base transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4), through Coinbase's facilitator. Ten more requests with the same header returned the identical stored result, a fresh header that never settled bought nothing, and the paying wallet's balance fell by exactly 0.05 USDC. The API ran in the proof script's own process on one machine, so this does not show a payment taken by a hosted site. Before it, with test USDC that has no value, the same proof ran on Base Sepolia ([transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1)), and a paid call through the built site was charged once and its stored result fetched again ([transaction](https://sepolia.basescan.org/tx/0x4dd9f6a26f42f72e562203ea9a9ac4cbcb27753ca580a4778ca7fa225a3574a1)).
+Realised, with real USDC: that payment settled on 13 November 2026 in [this Base transaction](https://basescan.org/tx/0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4), through Coinbase's facilitator. Ten more requests with the same header returned the identical stored result, a fresh header that never settled bought nothing, and the paying wallet's balance fell by exactly 0.05 USDC. The API ran in the proof script's own process on one machine, so this does not show a payment taken by a hosted site. That came on 14 November 2026: the live site at `https://thuli-drop.vercel.app/api/x402/screen` was paid 0.05 USDC in [this Base transaction](https://basescan.org/tx/0xf126522152fb9595a7a65043e81d1a42e06ca22569914abdff47d550f174e106), again through Coinbase's facilitator. Ten more requests with the same header returned the identical stored result, the paying wallet's balance fell by exactly 0.05 USDC, and a fresh header that never settled was answered 503 and got no result. Both payments came from Thuli's own wallet, so neither shows a paying customer. Before them, with test USDC that has no value, the same proof ran on Base Sepolia ([transaction](https://sepolia.basescan.org/tx/0x84e902d8bdb21c6e2e639611997d7b9d046fa1e8379741096db960c4797f63a1)), and a paid call through the built site was charged once and its stored result fetched again ([transaction](https://sepolia.basescan.org/tx/0x4dd9f6a26f42f72e562203ea9a9ac4cbcb27753ca580a4778ca7fa225a3574a1)).
 
 This wallet is held on rule A4 in the ROBO replay, as one of 19 linked wallets. Screened alone, it has no list around it, so the paid route cannot see the group. It answered partial on rule A8 and listed `group` under `notChecked`. Read a `full` or `partial` answer from this route as "its own history raised no hold", not as "it belongs to no group".
 

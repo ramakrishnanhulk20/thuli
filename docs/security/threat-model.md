@@ -285,8 +285,8 @@ or attack that demonstrates it. A change that touches an invariant also carries 
   for the wallet the payment was made for and within a day of the settlement, redeemed: it gets that payment's stored
   result and settles nothing (C48). The payment must be on the configured network, in that network's canonical USDC contract, to our payTo, for exactly the
   price (the exact scheme needs strict equality), inside its validity window. The route settles on the network the
-  configuration names: it is proved on Base Sepolia, and one real payment has been settled on Base mainnet
-  (13 Nov 2026). Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
+  configuration names: it is proved on Base Sepolia, and two real payments have been settled on Base mainnet
+  (13 Nov 2026 in a run on one machine, 14 Nov 2026 on the hosted site). Base Sepolia is refused unless the configured network says so. A screening that cannot finish still returns a decision
   (hold, with the cause), so a settled payment always buys a result. Shown by: one payment header replayed in 10 parallel
   requests yields one result, and a Base Sepolia payment to a mainnet route is refused. When settlement is pending, the
   result is served only if the facilitator's transaction receipt shows both the authorization being used and a transfer

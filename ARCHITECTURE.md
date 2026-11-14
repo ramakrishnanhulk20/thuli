@@ -947,8 +947,10 @@ searching the code.
 - Worker hosting as code. The worker runs as one process on Railway, set up by hand in the host's own settings (start
   command, restart policy, variables). The repository holds no container file and no host configuration.
 - A campaign on Base mainnet. The factory is deployed there and one proof vault paid 1 real USDC (4.1). That is one
-  vault, one list and one wallet; the campaign is on Base Sepolia. The paid route has settled one real payment on
-  Base mainnet (0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4, 13 Nov 2026), in a run on one machine.
+  vault, one list and one wallet; the campaign is on Base Sepolia. The paid route has settled two real payments on
+  Base mainnet, both from Thuli's own wallet: one in a run on one machine
+  (0xd55cd1ba2f1fcbc639a0d5d54ecf60fc9492226232f952da2d8af87bfcba47d4, 13 Nov 2026) and one on the hosted site
+  (0xf126522152fb9595a7a65043e81d1a42e06ca22569914abdff47d550f174e106, 14 Nov 2026).
 - Owner sign-in for appeals. Appeals are filed through the public route, checked by the outside check and settled by an
   operator's command (4.6). No owner can sign in to settle one, the scorecard does not score appeals, and no Reppo
   evaluation has been run for one yet.
