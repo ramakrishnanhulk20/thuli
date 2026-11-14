@@ -12,9 +12,9 @@ Thuli is Tamil for "a drop": every drop of an airdrop should land in a real hand
 
 Each number has its limits stated in [What was measured](#what-was-measured).
 
-Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. The campaign and its vaults are on Base Sepolia with test USDC, which has no value. Two things have run with real USDC on Base mainnet: one small proof vault, and one 5 cent payment to the paid API. The site is not hosted yet, so this repository is how you see it: each claim below comes with a command you can run on a fresh clone.
+Built for the OpenServ SERV hackathon. SERV Reasoning applies the rulebook, Reppo's judges scored a sample of the decisions, and the vault runs on Base. The campaign and its vaults are on Base Sepolia with test USDC, which has no value. Two things have run with real USDC on Base mainnet: one small proof vault, and one 5 cent payment to the paid API. The site is live at [thuli-drop.vercel.app](https://thuli-drop.vercel.app), and each claim below also comes with a command you can run on a fresh clone.
 
-[Docs](packages/web/content/docs/index.mdx) (the `/docs` route of the app) | [Architecture](ARCHITECTURE.md) | [Threat model](docs/security/threat-model.md) | [Licence](LICENSE)
+[Live app](https://thuli-drop.vercel.app) | [Docs](https://thuli-drop.vercel.app/docs) (the `/docs` route of the app, source in [content/docs](packages/web/content/docs/index.mdx)) | [Architecture](ARCHITECTURE.md) | [Threat model](docs/security/threat-model.md) | [Licence](LICENSE)
 
 ## Deployments
 
@@ -346,7 +346,14 @@ flowchart TB
 
 ## The two-minute judge path
 
-This needs no key and no wallet. You need git and Node 26 or newer. The output below is from a fresh clone on 14 November 2026.
+The fastest way is the live site, [thuli-drop.vercel.app](https://thuli-drop.vercel.app), with nothing to install:
+
+1. Click "Watch the replay". Open a family, then a wallet, and read its reason.
+2. Click "Check a wallet" and paste any Ethereum address. It is free. A wallet nobody has checked before takes one model call.
+3. Click "Campaign", connect a wallet and click "Sign and ask". It costs nothing and moves no money of yours. Your decision arrives on the board.
+4. Click "Versions" to see both rulebook versions scored the same way, and "Break it" to run ten attacks yourself.
+
+The rest of this section shows the same things on your own machine. It needs no key and no wallet. You need git and Node 26 or newer. The output below is from a fresh clone on 14 November 2026.
 
 1. Clone and install.
 
@@ -368,7 +375,7 @@ This needs no key and no wallet. You need git and Node 26 or newer. The output b
 
    ```text
     Test Files  75 passed (75)
-         Tests  2111 passed | 104 skipped (2215)
+         Tests  2113 passed | 104 skipped (2217)
    ```
 
    It takes about 80 seconds. The 104 skipped tests need things a fresh clone does not have: a real Postgres for 97 of them (point `STORE_TEST_URL` at an empty scratch database; the same tests already run on an in-memory Postgres), the compiled contracts for 1 (the contract tests create them when they compile), and stored replay data that is not in the repository for 6. This run does not cover the Solidity contracts. Those have their own tests in [Tests and gas](#tests-and-gas).
@@ -489,7 +496,8 @@ Commands, all from the root `package.json`:
 
 `POST /api/x402/screen` takes `{"wallet": "0x..."}`: one key, at most 1 KB. Without a payment it answers 402. The terms come back in the `PAYMENT-REQUIRED` header as base64 JSON, and the body is `{"error": "Payment required"}`. These examples are captured from a local build of the site and kept in [`packages/api/examples`](packages/api/examples).
 
-The request, which needs the site running with its settings:
+The request, which needs the site running with its settings. The same request works against the live site at
+`https://thuli-drop.vercel.app/api/x402/screen`, where the terms are for Base mainnet and a payment is 5 real cents:
 
 ```bash
 curl -i -X POST http://localhost:3000/api/x402/screen \
@@ -636,17 +644,17 @@ Tests, run on a fresh clone on 14 November 2026.
 ```text
 $ npx vitest run
  Test Files  75 passed (75)
-      Tests  2111 passed | 104 skipped (2215)
+      Tests  2113 passed | 104 skipped (2217)
 
 $ npm run typecheck
 > tsc -p tsconfig.typecheck.json --noEmit
 (exit code 0, nothing more printed)
 
 $ npm run contracts:test
-Ran 6 test suites in 18.23s (49.26s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
+Ran 6 test suites in 18.79s (49.45s CPU time): 77 tests passed, 0 failed, 2 skipped (79 total tests)
 ```
 
-The 104 skipped TypeScript tests are explained in step 2 of the judge path: 97 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2112 passed and 103 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
+The 104 skipped TypeScript tests are explained in step 2 of the judge path: 97 need a Postgres address in `STORE_TEST_URL`, 1 needs the compiled contracts and 6 need stored replay data. After the contracts are built the ABI test also runs, and the count is 2114 passed and 103 skipped. `npm run typecheck` runs the compiler over every package in turn, and the last line above is the last package's. The 2 skipped Foundry tests are the demo test and the fork test. Both run on a local copy of Base at block 55,661,700 with real USDC and skip until `BASE_RPC_URL` is set. With it set to Base's public endpoint, `BASE_RPC_URL=https://mainnet.base.org npm run contracts:test`, the summary reads `79 tests passed, 0 failed, 0 skipped (79 total tests)`. No transaction leaves your machine in either run.
 
 The 79 Foundry tests are 64 unit tests, 1 demo test (30 farm wallets cannot take more than 20 USDC, and none gets more than 1 USDC), 1 fixture test that pins one list and its proofs, 11 fuzz tests at 10,000 random cases each, 1 fork test of a full campaign on real USDC, and 1 invariant suite with 7 invariants run as 256 random call sequences, up to 64 calls deep. The random call-sequence tests use one vault, lists of up to five wallets and plain tokens, and the fork tests do not cover Circle freezing or pausing USDC or gas prices on Base. None of this replaces an outside audit.
 
