@@ -673,31 +673,67 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     }
   });
 
-  it('asks the facilitator once for a pending answer that names something that is not a transaction: retry with the claim kept, and the same header is served once it settles', async () => {
+  it('asks the facilitator once for a pending 200 that names something that is not a transaction and twice when that answer is thrown: retry with the claim kept, and the same header is served once it settles', async () => {
+    const pendingAnswer = (requirements: PaymentRequirements): SettleResponse => ({
+      success: false,
+      errorReason: 'settlement_pending',
+      transaction: 'pending-1',
+      network: requirements.network,
+    });
+    const settled = (payload: PaymentPayload, requirements: PaymentRequirements): SettleResponse => ({
+      success: true,
+      transaction: SETTLE_TX,
+      network: requirements.network,
+      payer: authorizationFrom(payload).from,
+    });
+    // A 200 is handed to the library with no transaction, so the library does not ask again inside the request. A
+    // throw reaches the library as it was thrown, its transaction text and all, and the library asks a second time.
+    for (const [shape, asked] of [
+      ['a 200', 1],
+      ['a throw', 2],
+    ] as const) {
+      const facilitator = new StubFacilitator('eip155:84532');
+      const { appFetch, client, screen } = await setup({ facilitator });
+      let calls = 0;
+      let pending = true;
+      facilitator.respond = async (payload, requirements) => {
+        calls += 1;
+        if (!pending) return settled(payload, requirements);
+        if (shape === 'a throw') throw new SettleError(400, pendingAnswer(requirements));
+        return pendingAnswer(requirements);
+      };
+      const header = await signedHeader(appFetch, client);
+      const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(first.status, shape).toBe(503);
+      expect(await first.json(), shape).toEqual({ retry: true });
+      expect(calls, shape).toBe(asked);
+      expect(screen, shape).not.toHaveBeenCalled();
+
+      pending = false;
+      const second = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(second.status, shape).toBe(200);
+      expect(calls, shape).toBe(asked + 1);
+      expect(screen, shape).toHaveBeenCalledTimes(1);
+
+      const third = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(third.status, shape).toBe(200);
+      expect(third.headers.get(STORED_HEADER), shape).toBe('true');
+      expect(calls, shape).toBe(asked + 1);
+      expect(screen, shape).toHaveBeenCalledTimes(1);
+    }
+
+    // When the second call inside the request settles, the request itself is served: two calls, one charge.
     const facilitator = new StubFacilitator('eip155:84532');
     const { appFetch, client, screen } = await setup({ facilitator });
     let calls = 0;
     facilitator.respond = async (payload, requirements) => {
       calls += 1;
-      if (calls === 1) return { success: false, errorReason: 'settlement_pending', transaction: 'pending-1', network: requirements.network };
-      return { success: true, transaction: SETTLE_TX, network: requirements.network, payer: authorizationFrom(payload).from };
+      if (calls === 1) throw new SettleError(400, pendingAnswer(requirements));
+      return settled(payload, requirements);
     };
-    const header = await signedHeader(appFetch, client);
-    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(first.status).toBe(503);
-    expect(await first.json()).toEqual({ retry: true });
-    // What it named is not a transaction, so the library is handed none and does not ask again inside this request.
-    expect(calls).toBe(1);
-    expect(screen).not.toHaveBeenCalled();
-
-    const second = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(second.status).toBe(200);
-    expect(calls).toBe(2);
-    expect(screen).toHaveBeenCalledTimes(1);
-
-    const third = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
-    expect(third.status).toBe(200);
-    expect(third.headers.get(STORED_HEADER)).toBe('true');
+    const served = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, await signedHeader(appFetch, client)));
+    expect(served.status).toBe(200);
+    expect(PaidScreenResponse.parse(await served.json()).payment.transaction).toBe(SETTLE_TX);
     expect(calls).toBe(2);
     expect(screen).toHaveBeenCalledTimes(1);
   });

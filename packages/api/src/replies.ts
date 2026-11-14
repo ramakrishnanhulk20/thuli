@@ -72,8 +72,9 @@ export function jsonReply(status: number, body: unknown, headers: Record<string,
  * Everything else is null, and the caller answers in fixed words.
  *
  * Not covered: the body and the PAYMENT-RESPONSE of a 200, which the route's handler and its settle steps write from
- * fixed shapes; the terms themselves, which come from the route's configuration; replies made before the payment step
- * or after it, which the route builds itself; and what the library writes to the log.
+ * fixed shapes; the terms themselves, which come from the route's configuration and, with no public origin set, the
+ * request's own Host header; replies made before the payment step or after it, which the route builds itself; and
+ * what the library writes to the log.
  */
 export async function documentedReply(reply: Response, rules: ReplyRules): Promise<Response | null> {
   if (reply.status === 200) return rules.settled ? reply : null;
