@@ -6,7 +6,7 @@ import { SettleError, type SettleResponse } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
 import { bazaarResourceServerExtension, declareDiscoveryExtension } from '@x402/extensions/bazaar';
 import { paymentMiddleware, x402ResourceServer } from '@x402/hono';
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { createMiddleware } from 'hono/factory';
 import { z } from 'zod';
@@ -856,6 +856,16 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       (settled ? jsonReply(503, SETTLED_RETRY, { 'retry-after': String(SETTLED_RETRY_AFTER_SECONDS) }) : jsonReply(500, INTERNAL_ERROR));
   });
 
+  // Built on the first paid request, not when the app is. Building it starts the payment library's call to the
+  // facilitator for what it supports, and nothing waits for that call until a paid request does. A host that pauses
+  // the process between requests cuts off a call left running behind another route's reply, and the first paid
+  // request after that fails on it.
+  let payment: MiddlewareHandler | null = null;
+  const takePayment: MiddlewareHandler = (c, next) => {
+    payment ??= paymentMiddleware(screenRoutes(config, deps.unlisted !== true), resourceServer);
+    return payment(c, next);
+  };
+
   // Every free check counts toward the minute, a cached one too, before its body is read.
   const checkClient = createMiddleware<AppEnv>(async (c, next) => {
     const client = clientOf(c, config.trustedClientHeader);
@@ -988,7 +998,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     readRequest,
     holdPlace,
     letOut,
-    paymentMiddleware(screenRoutes(config, deps.unlisted !== true), resourceServer),
+    takePayment,
     async (c) => {
       const request = paidRequests.getStore();
       // The upfront flow only reaches here after a settle this app recorded. Anything else is a broken invariant.

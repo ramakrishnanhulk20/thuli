@@ -220,6 +220,26 @@ describe.each(BACKENDS)('POST /api/x402/screen without payment, on $name', (back
     expect(facilitator.settled).toHaveLength(0);
   });
 
+  it('asks the facilitator what it supports on the first paid-route request, never when the app is built or another route answers', async () => {
+    let asked = 0;
+    class Counting extends StubFacilitator {
+      override async getSupported(): Promise<SupportedResponse> {
+        asked += 1;
+        return super.getSupported();
+      }
+    }
+    const { app, appFetch } = await setup({ facilitator: new Counting('eip155:84532') });
+    // Long enough for a call started while the app was being built to have been made.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(asked).toBe(0);
+    expect((await app.request(HEALTH_PATH)).status).toBe(200);
+    expect(asked).toBe(0);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(402);
+    expect(asked).toBe(1);
+    expect((await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(402);
+    expect(asked).toBe(1);
+  });
+
   it('sends the catalogue listing with a settled payment, and sends none from an unlisted server', async () => {
     const listed = await setup();
     expect((await listed.pay(url(SCREEN_PATH), post({ wallet: WALLET }))).status).toBe(200);

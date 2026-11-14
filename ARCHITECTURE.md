@@ -612,7 +612,10 @@ Mounting. The API is a Hono app built by `createApp(config: ApiConfig, deps: Api
 POST under `/api/x402/` and `/api/check` to the app unchanged, and `packages/web/app/api/campaigns/[...path]/route.ts`
 does the same for `/api/campaigns/`. All three run on Node.js, are always dynamic, and allow 300 seconds, the host's own
 limit, which the app's 240 second deadline stays under. Every answer, whatever its status, carries
-`cache-control: no-store`, on the site and on the standalone server alike.
+`cache-control: no-store`, on the site and on the standalone server alike. The payment library asks the
+facilitator what it supports on the first request to the paid route, inside that request, not when the app is
+built: a host that pauses the process between requests would cut off a call left running behind another
+route's reply, and the first paid request after it would answer 500.
 
 Inside the site, `thuliApi()` in `packages/web/lib/server/thuliApi.ts` builds the API once per server copy, from the
 process environment, through `siteApi(env, files)`, the API package's one entry (`@thuli/api/site`, source
