@@ -26,6 +26,7 @@ import { PRICE, PRICE_UNITS, REQUEST_DEADLINE_MS, SETTLE_TIMEOUT_MS, type ApiCon
 import type { Ticket } from './guard.ts';
 import { canonicalClient, type Limit, type Pass } from './limits.ts';
 import { RECEIPT_READ_WORST_MS, receiptPays, receiptReader, type ReadReceipt } from './receipt.ts';
+import { AddressText, documentedReply, INTERNAL_ERROR, jsonReply, REASON_CODE, TxHashText, UNCONFIRMED_PAYMENT } from './replies.ts';
 import {
   cachedBody,
   freeBody,
@@ -170,30 +171,15 @@ interface PaidRequest {
   answer: 'retry' | 'busy' | 'settled' | null;
 }
 
-const TxHashText = z
-  .string()
-  .regex(/^0x[0-9a-fA-F]{64}$/)
-  .transform((hash) => hash.toLowerCase() as `0x${string}`);
-
-const AddressText = z.string().transform((value, ctx) => {
-  try {
-    return parseAddress(value);
-  } catch {
-    ctx.addIssue({ code: 'custom', message: 'not an address' });
-    return z.NEVER;
-  }
-});
-
 const SettleReceipt = z.object({
   network: z.string(),
   payer: AddressText,
   transaction: TxHashText,
 });
 
-// A facilitator's failure reason is handed on only when it is a code, never when it is prose. The longest reason the
-// payment libraries define is 63 characters.
-const REASON_CODE = /^[a-z0-9_]{1,64}$/;
 const UNCODED_SETTLE_FAILURE = 'settlement_failed';
+// The one refusal of the route's own that carries a sentence beside its reason.
+const VALID_TOO_LONG_MESSAGE = `Sign a fresh payment for these terms, valid for at most ${MAX_TIMEOUT_SECONDS} seconds.`;
 
 /**
  * A facilitator's settle answer cut down to the fixed shape a buyer may be handed (C34). The payment library encodes
@@ -237,6 +223,9 @@ async function giveBack(step: string, call: () => Promise<void>): Promise<void> 
     storeFailed(step, error);
   }
 }
+
+// True when the request answers for itself in fixed words, whatever the payment step built: retry, busy or settled.
+const answersItself = (request: PaidRequest) => request.payment === null && request.answer !== null;
 
 // The same test the payment middleware uses to decide a request is paying, so the two never disagree about one request.
 const isPaying = (c: Context) => Boolean(c.req.header('payment-signature') || c.req.header('x-payment'));
@@ -339,7 +328,10 @@ function screenRoutes(config: ApiConfig, listed: boolean): RoutesConfig {
  * clock allowance, is refused with 402, unless its claim still waits on a transaction named for it; the rest are
  * claimed, for the wallet the request asks about, so a copy is refused without reaching the facilitator. After settling, the receipt is checked and kept for the reply. A settlement left pending is served
  * only when its on-chain receipt proves this payment; any other unclear outcome answers 503 {retry: true} and keeps the
- * claim for a retry of the same header. The reply is the fixed PaidScreenResponse and nothing else (C34).
+ * claim for a retry of the same header. The reply is the fixed PaidScreenResponse and nothing else (C34). Whatever
+ * the payment step answers passes documentedReply on its way out: the payment library's own error replies, its page
+ * for a browser and its own words beside the terms never leave as built, and a request whose payment has settled
+ * never answers with payment terms.
  *
  * Exactly once paid, as many times fetched (C25). A settled claim keeps the wallet and transaction it paid for, and
  * the reply is stored on it before it is sent. For a day from the settlement, the same header with the same wallet
@@ -565,7 +557,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     }
     if (claimed === 'expired') return refuse('payment_expired');
     if (claimed === 'too-long') {
-      return refuse('payment_valid_too_long', `Sign a fresh payment for these terms, valid for at most ${MAX_TIMEOUT_SECONDS} seconds.`);
+      return refuse('payment_valid_too_long', VALID_TOO_LONG_MESSAGE);
     }
     if (claimed === 'in-use') return refuse('payment_already_used');
     if (claimed === 'full') {
@@ -827,7 +819,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
       // has paid, so neither counts.
       c.get('pass').paymentFailed = request.payment === null && request.answer !== 'busy' && request.answer !== 'settled';
     }
-    if (request.payment === null && request.answer !== null) {
+    if (answersItself(request)) {
       // Built fresh, so no PAYMENT-REQUIRED or PAYMENT-RESPONSE header from the middleware's own answer is carried over,
       // and no client is handed fresh terms to pay a second time.
       const body = request.answer === 'settled' ? SETTLED_RETRY : request.answer === 'retry' ? { retry: true } : { busy: true };
@@ -841,6 +833,27 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
         },
       });
     }
+  });
+
+  // Around the payment step, so it reads every reply that step and the handler behind it are about to let out. The
+  // payment library answers on its own in ways this route does not document, a facilitator's words among them. None
+  // of those leaves as it was built (C34), and no payment terms leave once this request's payment has settled, so a
+  // buyer who paid is told to send the same header again, never to pay again (C25). Only the status is logged, and
+  // only when this reply is the one that leaves: a request that answers for itself has holdPlace's reply instead.
+  const letOut = createMiddleware<AppEnv>(async (c, next) => {
+    await next();
+    const built = c.res;
+    const request = paidRequests.getStore();
+    const settled = request?.payment != null;
+    const documented = await documentedReply(built, { settled, network: config.networkId, messages: [VALID_TOO_LONG_MESSAGE] });
+    if (documented === built) return;
+    if (documented === null && !(request !== undefined && answersItself(request))) {
+      console.warn(`api replaced a reply of the payment step: status ${built.status}`);
+    }
+    c.res = undefined;
+    c.res =
+      documented ??
+      (settled ? jsonReply(503, SETTLED_RETRY, { 'retry-after': String(SETTLED_RETRY_AFTER_SECONDS) }) : jsonReply(500, INTERNAL_ERROR));
   });
 
   // Every free check counts toward the minute, a cached one too, before its body is read.
@@ -963,7 +976,7 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
   // Library and network errors can quote URLs, so only the class name is logged and nothing is returned (C40).
   app.onError((error, c) => {
     console.error(`api error: ${error.name}`);
-    return c.json({ error: 'internal error' }, 500);
+    return c.json(INTERNAL_ERROR, 500);
   });
 
   app.get(HEALTH_PATH, (c) => c.json({ network: config.networkId, payTo: config.payTo, price: PRICE, scope: SINGLE_SCOPE }));
@@ -974,11 +987,12 @@ export function createApp(config: ApiConfig, deps: ApiDeps): Hono<AppEnv> {
     bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => c.json({ error: 'the body is too large' }, 413) }),
     readRequest,
     holdPlace,
+    letOut,
     paymentMiddleware(screenRoutes(config, deps.unlisted !== true), resourceServer),
     async (c) => {
       const request = paidRequests.getStore();
       // The upfront flow only reaches here after a settle this app recorded. Anything else is a broken invariant.
-      if (request?.payment == null || request.claim === null) return c.json({ error: 'the payment could not be confirmed' }, 500);
+      if (request?.payment == null || request.claim === null) return c.json(UNCONFIRMED_PAYMENT, 500);
       const wallet = c.get('wallet');
       const { key } = request.claim;
       if (request.redeemed && request.stored !== null) {

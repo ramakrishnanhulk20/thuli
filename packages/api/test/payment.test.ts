@@ -13,7 +13,7 @@ import type { AddressInfo } from 'node:net';
 import { serve } from '@hono/node-server';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import { decodePaymentRequiredHeader, decodePaymentResponseHeader, decodePaymentSignatureHeader } from '@x402/core/http';
-import { FacilitatorTimeoutError, type FacilitatorClient } from '@x402/core/server';
+import { FacilitatorResponseError, FacilitatorTimeoutError, x402ResourceServer, type FacilitatorClient } from '@x402/core/server';
 import type { PaymentPayload, PaymentRequirements, SettleResponse, SupportedResponse, VerifyResponse } from '@x402/core/types';
 import { SettleError } from '@x402/core/types';
 import { ExactEvmScheme } from '@x402/evm/exact/client';
@@ -673,6 +673,35 @@ describe.each(BACKENDS)('settlement with no clear answer (C25), on $name', (back
     }
   });
 
+  it('asks the facilitator once for a pending answer that names something that is not a transaction: retry with the claim kept, and the same header is served once it settles', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, client, screen } = await setup({ facilitator });
+    let calls = 0;
+    facilitator.respond = async (payload, requirements) => {
+      calls += 1;
+      if (calls === 1) return { success: false, errorReason: 'settlement_pending', transaction: 'pending-1', network: requirements.network };
+      return { success: true, transaction: SETTLE_TX, network: requirements.network, payer: authorizationFrom(payload).from };
+    };
+    const header = await signedHeader(appFetch, client);
+    const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(first.status).toBe(503);
+    expect(await first.json()).toEqual({ retry: true });
+    // What it named is not a transaction, so the library is handed none and does not ask again inside this request.
+    expect(calls).toBe(1);
+    expect(screen).not.toHaveBeenCalled();
+
+    const second = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(second.status).toBe(200);
+    expect(calls).toBe(2);
+    expect(screen).toHaveBeenCalledTimes(1);
+
+    const third = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+    expect(third.status).toBe(200);
+    expect(third.headers.get(STORED_HEADER)).toBe('true');
+    expect(calls).toBe(2);
+    expect(screen).toHaveBeenCalledTimes(1);
+  });
+
   it('reads the receipt of any transaction a failed answer names, whatever its reason: served when it proves the payment, kept when it does not', async () => {
     // The reference facilitator answers this way when it sent the transaction and then could not keep track of it.
     const named = (payload: PaymentPayload, requirements: PaymentRequirements): SettleResponse => ({
@@ -1185,6 +1214,164 @@ describe.each(BACKENDS)("a facilitator's own words stay out of the reply (C34), 
     const said = decodePaymentResponseHeader(paid.headers.get('payment-response') as string);
     expect(`${await paid.text()} ${JSON.stringify(said)}`).not.toMatch(LEAK);
     expect(screen).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe.each(BACKENDS)('the payment step lets out only the replies this route documents (C34), on $name', (backend) => {
+  onBackend(backend);
+  const LEAK = /secret-token|facilitator\.example/;
+  /** Everything a reply says: its body, its headers, and its two payment headers decoded. */
+  const allSaid = async (reply: Response) => {
+    const required = reply.headers.get('payment-required');
+    const response = reply.headers.get('payment-response');
+    return [
+      await reply.clone().text(),
+      JSON.stringify([...reply.headers]),
+      required === null ? '' : JSON.stringify(decodePaymentRequiredHeader(required)),
+      response === null ? '' : JSON.stringify(decodePaymentResponseHeader(response)),
+    ].join(' ');
+  };
+
+  it("answers 500 in fixed words while the facilitator's list of what it supports cannot be read, as a body that is not JSON or as an error, and the terms again once it answers", async () => {
+    // The payment library answers the first with 502 and the facilitator's words, the second with a 500 of its own.
+    const shapes: [string, number, () => Error][] = [
+      ['a body that is not JSON', 502, () => new FacilitatorResponseError('Facilitator supported returned invalid JSON: <html>secret-token</html>')],
+      ['an error', 500, () => new Error('Facilitator getSupported failed (500): https://facilitator.example/supported?key=secret-token')],
+    ];
+    for (const [shape, builtStatus, thrown] of shapes) {
+      let broken = true;
+      class Unsteady extends StubFacilitator {
+        override async getSupported(): Promise<SupportedResponse> {
+          if (broken) throw thrown();
+          return super.getSupported();
+        }
+      }
+      const facilitator = new Unsteady('eip155:84532');
+      const logs = captureLogs();
+      try {
+        const { fetchAs, screen } = await setup({ facilitator });
+        const unpaid = await fetchAs('192.0.2.31')(url(SCREEN_PATH), post({ wallet: WALLET }));
+        const paying = await fetchAs('192.0.2.32')(url(SCREEN_PATH), post({ wallet: WALLET }, { 'payment-signature': 'e30=' }));
+        for (const reply of [unpaid, paying]) {
+          expect(reply.status, shape).toBe(500);
+          expect(await reply.clone().json(), shape).toEqual({ error: 'internal error' });
+          expect(reply.headers.get('payment-required'), shape).toBeNull();
+          expect(await allSaid(reply), shape).not.toMatch(LEAK);
+        }
+        // The route's own line names the status it replaced and nothing else.
+        const lines = JSON.parse(logs.text()) as unknown[][];
+        expect(lines.filter((line) => String(line[0]).startsWith('api replaced')), shape).toEqual([
+          [`api replaced a reply of the payment step: status ${builtStatus}`],
+          [`api replaced a reply of the payment step: status ${builtStatus}`],
+        ]);
+        broken = false;
+        const after = await fetchAs('192.0.2.33')(url(SCREEN_PATH), post({ wallet: WALLET }));
+        expect(after.status, shape).toBe(402);
+        expect(await after.json(), shape).toEqual({ error: 'Payment required' });
+        expect(facilitator.settled, shape).toHaveLength(0);
+        expect(screen, shape).not.toHaveBeenCalled();
+      } finally {
+        logs.restore();
+      }
+    }
+  });
+
+  it('logs no replaced reply when the request answers retry for itself, though the refusal the library built for it would not pass', async () => {
+    const facilitator = new StubFacilitator('eip155:84532');
+    const { appFetch, client } = await setup({ facilitator });
+    const header = await signedHeader(appFetch, client);
+    facilitator.respond = async (_payload, requirements) => {
+      throw new SettleError(402, {
+        success: false,
+        errorReason: 'insufficient_funds',
+        errorMessage: 'the wallet at secret-token is empty',
+        transaction: '',
+        network: requirements.network,
+      });
+    };
+    const logs = captureLogs();
+    try {
+      const reply = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(reply.status).toBe(503);
+      expect(await reply.clone().json()).toEqual({ retry: true });
+      expect(await allSaid(reply)).not.toMatch(LEAK);
+      expect(logs.text()).not.toContain('api replaced');
+    } finally {
+      logs.restore();
+    }
+  });
+
+  it("answers a browser-like caller in JSON with the same terms, never the payment library's own page", async () => {
+    const { fetchAs } = await setup();
+    const plain = await fetchAs('192.0.2.41')(url(SCREEN_PATH), post({ wallet: WALLET }));
+    const browser = await fetchAs('192.0.2.42')(
+      url(SCREEN_PATH),
+      post({ wallet: WALLET }, { accept: 'text/html,application/xhtml+xml', 'user-agent': 'Mozilla/5.0 (X11; Linux x86_64)' }),
+    );
+    expect(browser.status).toBe(402);
+    expect(browser.headers.get('content-type')).toBe('application/json');
+    expect(await browser.text()).toBe('{"error":"Payment required"}');
+    expect(decodePaymentRequiredHeader(browser.headers.get('payment-required') as string)).toEqual(
+      decodePaymentRequiredHeader(plain.headers.get('payment-required') as string),
+    );
+  });
+
+  it('hands on with the terms only the two things this route documents: a version the library does not speak and an extension that does not match both read as no matching requirements, in the body and in the header', async () => {
+    const { fetchAs, client, facilitator, screen } = await setup();
+    const plain = await fetchAs('192.0.2.51')(url(SCREEN_PATH), post({ wallet: WALLET }));
+    const terms = decodePaymentRequiredHeader(plain.headers.get('payment-required') as string);
+    const header = await signedHeader(fetchAs('192.0.2.52'), client);
+    const name = Object.keys(header)[0] as string;
+    const signed = decodePaymentSignatureHeader(header[name] as string);
+    const odd: [string, unknown][] = [
+      ['a version it does not speak', { ...signed, x402Version: 'secret-token' }],
+      ['an extension that does not match', { ...signed, extensions: { bazaar: { info: { input: { type: 'http', method: 'GET', note: 'secret-token' } }, schema: {} } } }],
+    ];
+    for (const [index, [label, payload]] of odd.entries()) {
+      const sent = { [name]: Buffer.from(JSON.stringify(payload)).toString('base64') };
+      const reply = await fetchAs(`192.0.2.${53 + index}`)(url(SCREEN_PATH), post({ wallet: WALLET }, sent));
+      expect(reply.status, label).toBe(402);
+      expect(reply.headers.get('content-type'), label).toBe('application/json');
+      expect(await reply.clone().text(), label).toBe('{"error":"No matching payment requirements"}');
+      expect(decodePaymentRequiredHeader(reply.headers.get('payment-required') as string), label).toMatchObject({
+        error: 'No matching payment requirements',
+        accepts: terms.accepts,
+        resource: terms.resource,
+      });
+      expect(reply.headers.get('payment-response'), label).toBeNull();
+      expect(await allSaid(reply), label).not.toMatch(LEAK);
+    }
+    expect(facilitator.settled).toHaveLength(0);
+    expect(screen).not.toHaveBeenCalled();
+  });
+
+  it('hands out no payment terms once the payment has settled: a failure in the library after the settle answers the settled retry, and the same header then gets its result, charged once', async () => {
+    const { appFetch, client, facilitator, screen } = await setup();
+    const header = await signedHeader(appFetch, client);
+    const logs = captureLogs();
+    const broken = vi.spyOn(x402ResourceServer.prototype, 'createPaymentCancellationDispatcher').mockImplementationOnce(() => {
+      throw new Error('failed after settling, see https://facilitator.example/?key=secret-token');
+    });
+    try {
+      const first = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(broken).toHaveBeenCalledTimes(1);
+      expect(facilitator.settled).toHaveLength(1);
+      expect(first.status).toBe(503);
+      expect(SettledRetryBody.safeParse(await first.clone().json()).success).toBe(true);
+      expect(first.headers.get('retry-after')).toBe('10');
+      expect(first.headers.get('payment-required')).toBeNull();
+      expect(await allSaid(first)).not.toMatch(LEAK);
+      expect(screen).not.toHaveBeenCalled();
+
+      const second = await appFetch(url(SCREEN_PATH), post({ wallet: WALLET }, header));
+      expect(second.status).toBe(200);
+      expect(PaidScreenResponse.safeParse(await second.json()).success).toBe(true);
+      expect(facilitator.settled).toHaveLength(1);
+      expect(screen).toHaveBeenCalledTimes(1);
+    } finally {
+      broken.mockRestore();
+      logs.restore();
+    }
   });
 });
 
