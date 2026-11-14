@@ -1,7 +1,8 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { countOf, formatInt } from '@/lib/format';
+import { countOf, formatInt, formatUsdCents } from '@/lib/format';
 import { addressUrl, shortAddress, shortHash, txUrl } from '@/lib/explorer';
 import { hopsText, ruleMeaning } from '@/lib/rules';
 import { OUTCOME_STYLES, type Loaded, type WalletDetail } from '@/lib/replay/replayTypes';
@@ -16,6 +17,7 @@ interface WalletViewProps {
   /** null inside a ready state means the wallet file holds no such wallet; the page handles that. */
   state: Loaded<WalletDetail | null>;
   groups: WebGroup[];
+  run: { wallets: number; spentCents: number };
   onRetry: () => void;
   onBack: (family: number | null) => void;
   onOpenFamily: (family: number) => void;
@@ -126,7 +128,7 @@ function WhatTheCodeFound({ detail, groups, onOpenFamily }: { detail: WalletDeta
   );
 }
 
-function WalletReport({ detail, groups, onBack, onOpenFamily, address }: { detail: WalletDetail } & Omit<WalletViewProps, 'state' | 'onRetry'>) {
+function WalletReport({ detail, groups, run, onBack, onOpenFamily, address }: { detail: WalletDetail } & Omit<WalletViewProps, 'state' | 'onRetry'>) {
   const outcome = OUTCOME_STYLES[detail.outcome];
   const family = detail.group >= 0 ? groups[detail.group] : undefined;
   const meaning = ruleMeaning(detail.rule);
@@ -185,6 +187,11 @@ function WalletReport({ detail, groups, onBack, onOpenFamily, address }: { detai
         <p>{`The code's own checks started at ${start.outcome}, rule ${start.rule}.`}</p>
         <p>{`SERV answered on ${serv.mode === 'v3' ? 'the rules graph' : 'a rulebook call'}${serv.secondAsk ? ', on a second ask' : ''}.`}</p>
         {serv.accepted ? null : <p>{"The answer did not pass Thuli's checks, so the code's decision stands."}</p>}
+        <p>{`Screening all ${formatInt(run.wallets)} wallets cost ${formatUsdCents(run.spentCents)} of SERV credit, ${(run.spentCents / run.wallets).toFixed(2)} cents a wallet on average.`}</p>
+        <p>{"A sample of this replay's decisions went to Reppo's judges with every address removed."}</p>
+        <Link href="/versions" className={styles.quiet}>
+          <span className={styles.quietLabel}>What they blocked, and the rule that changed</span>
+        </Link>
         {serv.requestId === null ? null : <p className={styles.servRun}>{`SERV RUN ${serv.requestId}`}</p>}
       </div>
 
@@ -193,9 +200,9 @@ function WalletReport({ detail, groups, onBack, onOpenFamily, address }: { detai
   );
 }
 
-export function WalletView({ address, state, groups, onRetry, onBack, onOpenFamily }: WalletViewProps) {
+export function WalletView({ address, state, groups, run, onRetry, onBack, onOpenFamily }: WalletViewProps) {
   if (state.status === 'ready' && state.value !== null) {
-    return <WalletReport detail={state.value} address={address} groups={groups} onBack={onBack} onOpenFamily={onOpenFamily} />;
+    return <WalletReport detail={state.value} address={address} groups={groups} run={run} onBack={onBack} onOpenFamily={onOpenFamily} />;
   }
   return (
     <>

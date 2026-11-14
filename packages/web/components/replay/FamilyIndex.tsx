@@ -17,11 +17,12 @@ const SORTS: ReadonlyArray<{ key: SortKey; label: string }> = [
 
 interface FamilyIndexProps {
   groups: WebGroup[];
+  farmKey: { families: number; wallets: number };
   onSelect: (index: number) => void;
   onHover: (index: number | null) => void;
 }
 
-export function FamilyIndex({ groups, onSelect, onHover }: FamilyIndexProps) {
+export function FamilyIndex({ groups, farmKey, onSelect, onHover }: FamilyIndexProps) {
   const [sort, setSort] = useState<SortKey>('size');
   const [showAll, setShowAll] = useState(false);
 
@@ -43,7 +44,10 @@ export function FamilyIndex({ groups, onSelect, onHover }: FamilyIndexProps) {
     <>
       <h2 className={styles.heading}>Linked families</h2>
       <p className={styles.sub}>
-        {`${formatInt(groups.length)} families holding ${formatInt(totalWallets)} wallets. Pick one on the map or in the list.`}
+        {`${formatInt(groups.length)} families holding ${formatInt(totalWallets)} wallets, linked by Thuli's own code. Pick one on the map or in the list. "Held" counts wallets held for review or excluded.`}
+      </p>
+      <p className={styles.sub}>
+        {`The home page scores the result against a separate list: Bitquery's public farm list, which names ${formatInt(farmKey.families)} families and ${formatInt(farmKey.wallets)} wallets.`}
       </p>
       <div className={styles.chips} role="group" aria-label="Sort families">
         {SORTS.map((option) => (

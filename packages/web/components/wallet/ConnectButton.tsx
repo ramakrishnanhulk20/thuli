@@ -47,7 +47,13 @@ export function ConnectChoices() {
           >
             Browser wallet
           </button>
-          {found === 'none' ? <p className={styles.hint}>No browser wallet found.</p> : null}
+          {found === 'none' ? (
+            <p className={styles.hint}>
+              {walletConnect === undefined
+                ? 'No browser wallet found. Install one and reload this page.'
+                : 'No browser wallet found. Install one and reload this page, or use WalletConnect with a phone wallet.'}
+            </p>
+          ) : null}
         </div>
         {walletConnect === undefined ? null : (
           <button

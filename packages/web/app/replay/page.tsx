@@ -25,7 +25,13 @@ export default function ReplayPage() {
       <SiteNav mode="bar" />
       <main id="replay">
         <Suspense fallback={<div className={styles.page}>{head}</div>}>
-          <ReplayExplorer head={head} groups={summary.groups} usdPerRobo={summary.drop.usdPerRobo} />
+          <ReplayExplorer
+            head={head}
+            groups={summary.groups}
+            usdPerRobo={summary.drop.usdPerRobo}
+            run={{ wallets: summary.wallets, spentCents: summary.run.spentCents }}
+            farmKey={{ families: summary.farmKey.families.total, wallets: summary.farmKey.wallets }}
+          />
         </Suspense>
       </main>
     </>

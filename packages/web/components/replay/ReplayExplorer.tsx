@@ -57,9 +57,13 @@ interface ReplayExplorerProps {
   head: ReactNode;
   groups: WebGroup[];
   usdPerRobo: number;
+  /** The whole replay run: how many wallets it screened and what that cost in SERV credit. */
+  run: { wallets: number; spentCents: number };
+  /** The size of the public farm list the replay is scored against, which is not the list of linked families. */
+  farmKey: { families: number; wallets: number };
 }
 
-export function ReplayExplorer({ head, groups, usdPerRobo }: ReplayExplorerProps) {
+export function ReplayExplorer({ head, groups, usdPerRobo, run, farmKey }: ReplayExplorerProps) {
   const router = useRouter();
   const params = useSearchParams();
   const [searchError, setSearchError] = useState<SearchError>(null);
@@ -139,13 +143,14 @@ export function ReplayExplorer({ head, groups, usdPerRobo }: ReplayExplorerProps
         address={view.address}
         state={walletState}
         groups={groups}
+        run={run}
         onRetry={retryWallet}
         onBack={(family) => select(family === null ? null : { family })}
         onOpenFamily={(family) => select({ family })}
       />
     );
   } else {
-    body = <FamilyIndex groups={groups} onSelect={(index) => select({ family: index })} onHover={setListHover} />;
+    body = <FamilyIndex groups={groups} farmKey={farmKey} onSelect={(index) => select({ family: index })} onHover={setListHover} />;
   }
 
   return (

@@ -297,7 +297,7 @@ export function AskPanel({ campaignId, campaign, now, onGone, onStep, onSlowed }
             ) : (
               <>
                 <h2 id="ask-title" className={styles.panelTitle}>Ask for a slot</h2>
-                <p className={styles.panelBody}>Connect a wallet you control. You sign one short message. It costs nothing and moves nothing.</p>
+                <p className={styles.panelBody}>Connect a wallet you control. You sign one short message, shown in full before you sign. It costs nothing, sends no transaction and moves nothing.</p>
               </>
             )}
             <ConnectChoices />

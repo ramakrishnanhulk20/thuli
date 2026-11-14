@@ -91,7 +91,7 @@ function BoardCheck({ appeal }: { appeal: AppealView }) {
       </p>
       {words.note === null ? null : (
         <p className={styles.factValue} data-board-check-note>
-          {words.note}
+          {`Reppo's judges wrote: ${words.note}`}
         </p>
       )}
       {settled === null ? null : (
