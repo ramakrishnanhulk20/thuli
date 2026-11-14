@@ -140,7 +140,7 @@ export function BreakPage({ facts, settlementHref }: { facts: ProofFacts; settle
       </p>
       <h1 className={styles.title}>Attack it yourself.</h1>
       <p className={styles.body}>
-        Every row below is a real attack, run live from your browser against the vault on Base Sepolia or against this site&apos;s own routes. Nothing here is a recording. The vault rows ask the chain to try each call without sending it, so no transaction is made and you need no wallet. Press a button and read what comes back.
+        Every row below is a real attack, run live from your browser against Thuli&apos;s proof vault on Base Sepolia, which is a separate vault from the demo campaign&apos;s, or against this site&apos;s own routes. Nothing here is a recording. The vault rows ask the chain to try each call without sending it, so no transaction is made and you need no wallet. Press a button and read what comes back.
       </p>
       <div className={styles.controls}>
         <button type="button" className={styles.primary} onClick={runAll} disabled={runningAll} data-run-all>

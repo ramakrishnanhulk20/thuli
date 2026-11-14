@@ -481,7 +481,7 @@ The success answer is 200, with a `PAYMENT-RESPONSE` header (base64 JSON with `s
 | `decision.action` | `"full"`, `"partial"`, `"hold"` or `"exclude"` |
 | `decision.shareBps` | whole number from 0 to 10000: full is 10000, partial is the settings' partial share (5000 by default), hold and exclude are 0 |
 | `decision.rule` | `A1` to `A9`, `B1` or `B2` |
-| `decision.reason` | 1 to 400 characters of plain text by core's one plain-text rule (`isPlainText`): no link, markup, control character or invisible format character |
+| `decision.reason` | 1 to 400 characters of plain text by core's one plain-text rule (`isPlainText`): no link, markup, control character or invisible format character. A model's reason is held to 280 characters by the decision checks; 400 is the outer bound of this reply |
 | `decision.citedTxs` | up to 256 transaction hashes, each `0x` and 64 lowercase hex |
 | `servRequestId` | SERV's run id (letters, digits, `.`, `_`, `:`, `-`, up to 128 characters) or null |
 | `notChecked` | the facts this screening never measures, today always `["group", "sharedDepositAddress", "fundingBurst", "claimPaidToOtherAddress"]` |

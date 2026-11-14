@@ -118,7 +118,7 @@ A paid success is `200` with a `PAYMENT-RESPONSE` header. The free check returns
 - `decision.action`: `full`, `partial`, `hold` or `exclude`.
 - `decision.shareBps`: 0 to 10000; full 10000, partial 5000 by default, hold and exclude 0.
 - `decision.rule`: `A1` to `A9`, `B1` or `B2`.
-- `decision.reason`: plain text, 1 to 400 characters, with no link, markup, hidden character or broken text, by the same rule every answer's text passes; show it as text only.
+- `decision.reason`: plain text, 1 to 400 characters (a model's reason is held to 280 by the decision checks; 400 is the outer bound this reply allows), with no link, markup, hidden character or broken text, by the same rule every answer's text passes; show it as text only.
 - `decision.citedTxs`: up to 256 transaction hashes.
 - `servRequestId`: SERV's run id, or null.
 - `notChecked`: `group`, `sharedDepositAddress`, `fundingBurst`, `claimPaidToOtherAddress`. A lone wallet has no list to measure them against, so they are marked not checked, not counted as doubt, and a `full` or `partial` answer says only that its own history raised no hold.
